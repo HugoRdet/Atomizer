@@ -219,62 +219,36 @@ class Model_MAE(pl.LightningModule):
         
 
     def configure_optimizers(self):
-        if self.config["optimizer"]=="ADAM":
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        base_lr = self.lr
+        wd = self.weight_decay
 
-            accumulate_grad_batches = 1#self.config["trainer"].get("accumulate_grad_batches", 1)
-            batches_per_epoch = self.trainer.estimated_stepping_batches/self.config["trainer"]["epochs"]
-            steps_per_epoch = batches_per_epoch // accumulate_grad_batches
-
-            total_steps = self.config["trainer"]["epochs"] * steps_per_epoch
-            warmup_steps = 200#int(0.1 * total_steps)  # 10% warmup
-
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps
-            )
-
-            return {
-                'optimizer': optimizer,
-                'lr_scheduler': {
-                    'scheduler': scheduler,
-                    'interval': 'step',  # step-wise updating
-                    'monitor': 'val_reconstruction_loss'
-                }
-            }
+        if self.config["optimizer"] == "ADAM":
+            optimizer = torch.optim.Adam(self.parameters(), lr=base_lr, weight_decay=wd)
         else:
             import torch_optimizer as optim
-            
-            optimizer = optim.Lamb(
-                self.parameters(), 
-                lr=self.lr, 
-                weight_decay=self.weight_decay,
-                betas=(0.9, 0.999),
-                eps=1e-6
-            )
-            
-            accumulate_grad_batches = 64  # self.config["trainer"].get("accumulate_grad_batches", 1)
-            batches_per_epoch = self.trainer.estimated_stepping_batches / self.config["trainer"]["epochs"]
-            steps_per_epoch = batches_per_epoch // accumulate_grad_batches
-            
-            total_steps = self.config["trainer"]["epochs"] * steps_per_epoch
-            warmup_steps = int(0.1 * total_steps)  # 10% warmup
-            
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps
-            )
-            
-            return {
-                'optimizer': optimizer,
-                'lr_scheduler': {
-                    'scheduler': scheduler,
-                    'interval': 'step',  # step-wise updating
-                    'monitor': 'val_reconstruction_loss'
-                }
-            }
+            optimizer = optim.Lamb(self.parameters(), lr=base_lr, weight_decay=wd,
+                                betas=(0.9, 0.999), eps=1e-6)
+
+        # total optimizer steps for the entire fit (already accounts for grad accumulation & epochs)
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        
+        # pick a % warmup or your fixed value, but keep it <= total_steps
+        warmup_steps = min(1000, max(1, int(0.05 * total_steps)))
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",   # per-step schedule
+                # no 'monitor' here
+            },
+        }
         
         
                 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-
+from tqdm import tqdm
 
 ## Imports
 import os
@@ -191,7 +191,7 @@ def compute_channel_mean_std_FLAIR(images, masks, sentinel_imgs, centroid, senti
 
     time_series_data=[]
     
-    for img_idx in range(len(images)):
+    for img_idx in tqdm(range(len(images)),desc="channel computation"):
         # Ensure you use the correct index variable (img_idx) when calling get_sample.
         im, _ ,sen_spatch, _ , _ , _= get_sample(img_idx, images, masks, sentinel_imgs, centroid, sentinel_products,sentinel_masks,aer_mtd)
         

@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import einops as einops
 from einops import rearrange, repeat
 from einops.layers.torch import Reduce
-
+from pytorch_lightning.callbacks import LearningRateMonitor
 # ← new imports for the PyTorch profiler
 from pytorch_lightning.profilers import PyTorchProfiler
 from torch.profiler import ProfilerActivity
@@ -81,8 +81,8 @@ model = Model_FLAIR( #MODEL_MAE
 )
 
 data_module = Tiny_BigEarthNetDataModule(
-    f"./data/Tiny_BigEarthNet/{args.dataset_name}",
-    #f"./data/custom_flair/{args.dataset_name}",
+    #f"./data/Tiny_BigEarthNet/{args.dataset_name}",
+    f"./data/custom_flair/{args.dataset_name}",
     batch_size=config_model["dataset"]["batchsize"],
     num_workers=4,
     trans_modalities=modalities_trans,
@@ -91,7 +91,7 @@ data_module = Tiny_BigEarthNetDataModule(
     dataset_config=read_yaml(bands_yaml),
     config_model=config_model,
     look_up=lookup_table,
-    dataset_class=Tiny_BigEarthNet_MAE#FLAIR_MAE#R##
+    dataset_class=FLAIR_SEG#R##Tiny_BigEarthNet_MAE#
 )
 
 #reconstruction_callback = CustomMAEReconstructionCallback(
@@ -110,7 +110,7 @@ reconstruction_callback = FLAIR_CustomSegmentationCallback(
 #    knn_datamodule=data_module
 #)
 
-
+lr_monitor = LearningRateMonitor(logging_interval="step")
 
 checkpoint_val_mod_train = ModelCheckpoint(
     dirpath="./checkpoints/",
@@ -120,21 +120,23 @@ checkpoint_val_mod_train = ModelCheckpoint(
     save_top_k=1,
     verbose=True,
 )
-accumulator = GradientAccumulationScheduler(scheduling={0:64})
+accumulator = GradientAccumulationScheduler(scheduling={0:1})
 #reconstruction_callback,knn_callback_multiclass
 # Trainer
 trainer = Trainer(
     strategy="ddp_find_unused_parameters_true",#,
-    devices=1,
+    devices=-1,
     max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu",
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[ accumulator,reconstruction_callback], #checkpoint_val_mod_train,
+    callbacks=[ accumulator,reconstruction_callback,lr_monitor], #checkpoint_val_mod_train,reconstruction_callback
     default_root_dir="./checkpoints/",
     #profiler=profiler,           # ← attach the PyTorchProfiler here
-    #overfit_batches=1
+    #limit_train_batches=4,
+    overfit_batches=10
+    #limit_val_batches=1,
 )
 
 # Fit the model

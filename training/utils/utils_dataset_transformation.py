@@ -17,7 +17,7 @@ from torch.profiler import record_function
 
 
 
-def fourier_encode(x, max_freq, num_bands = 4):
+def fourier_encode(x, max_freq, num_bands = 4,low_pass=-1):
     x = x.unsqueeze(-1)
     device, dtype, orig_x = x.device, x.dtype, x
 
@@ -31,7 +31,16 @@ def fourier_encode(x, max_freq, num_bands = 4):
     #scales shape: [len(orig_x.shape),]
 
     x = x * scales * pi
-    x = torch.cat([x.sin(), x.cos()], dim = -1)
+    sin_x=x.sin()
+    cos_x=x.cos()
+    low_pass=-1
+    if low_pass!=-1:
+        sin_x[:,low_pass:]=0.0
+        cos_x[:,low_pass:]=0.0
+        
+        
+        
+    x = torch.cat([sin_x, cos_x], dim = -1)
     x = torch.cat((x, orig_x), dim = -1)
     return x
 
@@ -172,15 +181,39 @@ class transformations_config(nn.Module):
 
 
     
-    def pos_encoding(self,size,positional_scaling=None,max_freq=4,num_bands = 4,device="cpu"):
+    def pos_encoding(self,size,positional_scaling=None,max_freq=4,num_bands = 4,device="cpu",low_pass=None):
 
 
         axis = torch.linspace(-positional_scaling/2.0, positional_scaling/2.0, steps=size,device=device)
-        pos=fourier_encode(axis,max_freq=max_freq,num_bands = num_bands)
+        pos=fourier_encode(axis,max_freq=max_freq,num_bands = num_bands,low_pass=low_pass)
         
         return pos
     
-    
+    def compute_adaptive_cutoff(self,resolution, image_size, base_norm=105.0, total_bands=256):
+        """
+        Formule pratique pour estimer le cutoff optimal
+        """
+        # Échelle physique de l'image
+        physical_scale = resolution * image_size
+        
+        # Facteur d'échelle par rapport à la normalisation de base
+        scale_factor = physical_scale / base_norm
+        
+        # Cutoff basé sur une décroissance en racine carrée
+        # Empiriquement bon compromis entre Nyquist et considérations pratiques
+        
+        if scale_factor <= 1.0:
+            cutoff_ratio = 1.0
+        else:
+            cutoff_ratio = 1.0 / np.sqrt(scale_factor)
+        
+        # Assurer un minimum de fréquences (au moins 10% pour capturer structure de base)
+        cutoff_ratio = max(0.1, cutoff_ratio)
+        
+        return int(total_bands * cutoff_ratio)
+
+
+
     def get_positional_encoding_fourrier(
         self,
         size,             # e.g. (B_size, T_size, H, W, C)
@@ -202,11 +235,12 @@ class transformations_config(nn.Module):
 
         # -- 2) compute positional scaling per band: [B, C]
         
-        pos_scalings = (size * resolution) / 102.4
+        pos_scalings = (size * resolution) / 105
         
   
         max_freq  = self.config["Atomiser"]["pos_max_freq"]
         num_bands = self.config["Atomiser"]["pos_num_freq_bands"]
+        cutoff = self.compute_adaptive_cutoff(resolution=resolution,image_size=size,base_norm=105 ,total_bands= num_bands)      # ≈ 20 bands (63%)
         
         
         
@@ -219,8 +253,15 @@ class transformations_config(nn.Module):
             positional_scaling=pos_scalings,
             max_freq=max_freq,
             num_bands=num_bands,
-            device=device
+            device=device,
+            low_pass=cutoff
         )
+        
+        
+  
+        
+        
+    
         
         return raw
 

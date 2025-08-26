@@ -20,6 +20,6 @@ conda activate venv
 
 MODEL_NAME=config_test-Atomiser_Atos_One.yaml
 
-sh TrainEval_MAE.sh "$EXPERIMENT_NAME" "$MODEL_NAME" regular
+sh TrainEval_FLAIR.sh "$EXPERIMENT_NAME" "$MODEL_NAME" regular
 
 []

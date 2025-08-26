@@ -257,6 +257,9 @@ class Tiny_BigEarthNetDataModule(pl.LightningDataModule):
             persistent_workers=True  # avoid worker restart overhead
         )
 
+        if self.dataset_class!=Tiny_BigEarthNet:
+            return val_mod_val
+            
         val_mod_train=DataLoader(
             self.val_dataset_mode_train,
             num_workers=self.num_workers,
@@ -267,6 +270,7 @@ class Tiny_BigEarthNetDataModule(pl.LightningDataModule):
             prefetch_factor=8,  # increased prefetch for smoother transfers
             persistent_workers=True  # avoid worker restart overhead
         )
+        
         return [val_mod_val,val_mod_train]
 
 

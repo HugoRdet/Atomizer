@@ -36,6 +36,7 @@ def load_data (config: dict, val_percent=0.8):
                 smasks = sorted(list(list_items(Path(paths_data['path_sen_'+status])/domain/Path(area), '*masks.npy')))
                 coords = [] 
                 
+                
                 for k in aerial: 
                     coords.append(matching_dict[k.split('/')[-1]]) 
                 data['PATH_IMG'] += aerial 
@@ -43,9 +44,8 @@ def load_data (config: dict, val_percent=0.8):
                 data['PATH_SP_DATES'] += sprods*len(aerial)
                 data['PATH_SP_MASKS'] += smasks*len(aerial) 
                 data['SP_COORDS'] += coords 
+                data['PATH_LABELS'] += sorted(list(list_items(Path(paths_data['path_labels_'+status])/domain/Path(area), 'MSK*.tif')), key=lambda x: int(x.split('_')[-1][:-4])) 
                 
-                if test_set == False: 
-                    data['PATH_LABELS'] += sorted(list(list_items(Path(paths_data['path_labels_'+status])/domain/Path(area), 'MSK*.tif')), key=lambda x: int(x.split('_')[-1][:-4])) 
         
         if config['aerial_metadata'] == True:
             data = adding_encoded_metadata(config['data']['path_metadata_aerial'], data) 
@@ -65,6 +65,8 @@ def load_data (config: dict, val_percent=0.8):
     dict_val = get_data_paths(config, val_domains, paths_data, matching_dict, test_set=False) 
     path_test = Path(paths_data['path_aerial_test']) 
     test_domains = os.listdir(path_test) 
+    
+    
     dict_test = get_data_paths(config, test_domains, paths_data, matching_dict, test_set=True) 
     
     print(len(dict_train['PATH_IMG'])) 

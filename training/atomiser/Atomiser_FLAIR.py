@@ -23,7 +23,7 @@ def cache_fn(f):
     return cached_fn
 
 
-class Atomiser(pl.LightningModule):
+class Atomiser_FLAIR(pl.LightningModule):
     """
     Clean implementation of the Atomizer model for satellite image processing.
     
@@ -177,10 +177,7 @@ class Atomiser(pl.LightningModule):
                 dropout=0.0)
         
         # Simple output head (no redundant LayerNorm)
-        self.recon_tologits =nn.Sequential(
-            nn.Linear(self.query_dim_recon, self.num_classes)  # Reconstruct reflectance only
-        )
-        
+        self.recon_tologits = nn.Linear(self.query_dim_recon, self.num_classes)  # Reconstruct reflectance only
         
         self.recon_head = nn.Sequential(
             nn.LayerNorm(self.query_dim_recon),
@@ -294,7 +291,7 @@ class Atomiser(pl.LightningModule):
         predictions = attended+skip_co
         
         predictions = self.recon_tologits(predictions)
-       
+        
         return predictions, processed_mask
     
     def classify(self, latents):
