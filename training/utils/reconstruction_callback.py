@@ -629,21 +629,25 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         """Perform segmentation using your custom data loading."""
         
         # Get the dataset from the trainer
-        dataset = trainer.datamodule.val_dataset
+        dataset_train = trainer.datamodule.val_dataset
         
         for i, sample_idx in enumerate(self.sample_indices):
-            self._process_single_sample(sample_idx, i, dataset, pl_module, trainer.current_epoch)
+            self._process_single_sample(sample_idx, i, dataset_train, pl_module, trainer.current_epoch,id="TEST")
             
-        dataset = trainer.datamodule.train_dataset
+        dataset_val = trainer.datamodule.train_dataset
         
-        for i, sample_idx in enumerate([3000,4000]):
-            self._process_single_sample(sample_idx, i, dataset, pl_module, trainer.current_epoch)
+        
             
-    def _process_single_sample(self, dataset_idx: int, viz_idx: int, dataset, pl_module, epoch: int):
+        for i, sample_idx in enumerate(self.sample_indices):
+            self._process_single_sample(sample_idx, i, dataset_val, pl_module, trainer.current_epoch,id="VAL")
+            
+            
+            
+    def _process_single_sample(self, dataset_idx: int, viz_idx: int, dataset, pl_module, epoch: int,id="val"):
         """Process a single sample using your get_samples_to_viz function."""
         
         # Get data from your custom method
-        image_tokens, attention_mask, mae_tokens, mask_MAE_res = dataset.get_samples_to_viz(dataset_idx)
+        image,image_tokens, attention_mask, mae_tokens, mask_MAE_res,label_res = dataset.get_samples_to_viz(dataset_idx)
         
         # Move to device
         mae_tokens_mask = torch.ones(mae_tokens.shape[0])
@@ -672,17 +676,19 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                 
                 # Remove batch dimension for visualization
                 y_hat = y_hat.squeeze(0)
+                mae_tokens=mae_tokens.squeeze(0)
+                labels = label_res
                 mae_tokens = rearrange(mae_tokens, "(c h w) b -> h w c b", h=512, w=512, c=5, b=5)
                 
                 # Reshape to spatial format
-                bandvalues = mae_tokens[:, :, :, 0]  # [h, w, channels] - B,G,R,NIR,elevation
-                classes = mae_tokens[:, :, 0, 4]     # [h, w] - ground truth classes
+                bandvalues = image# mae_tokens[:, :, :, 0]  # [h, w, channels] - B,G,R,NIR,elevation
+                classes = labels
                 
+                y_hat = torch.argmax(y_hat.clone(), dim=-1)
                 
-                preds = torch.argmax(y_hat.clone(), dim=-1)
+                y_hat = rearrange(y_hat, "(h w ) -> h w", h=512, w=512)
+                labels=rearrange(labels,"c h w -> h w c").squeeze(-1)
                 
-                y_hat = rearrange(preds, "(b h w ) -> h w b ", b=5, h=512, w=512)
-                y_hat = y_hat[:, :, 0]  # [h, w] - predictions
                 
                 print(f"✓ Successfully reconstructed sample {dataset_idx}")
                 
@@ -698,9 +704,10 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                 sample_idx=dataset_idx,
                 viz_idx=viz_idx,
                 bandvalues=bandvalues,        # [h, w, 5] - B,G,R,NIR,elevation
-                ground_truth=classes,        # [h, w] - ground truth classes
+                ground_truth=labels,        # [h, w] - ground truth classes
                 prediction=y_hat,            # [h, w] - predicted classes
-                epoch=epoch
+                epoch=epoch,
+                id=id
             )
         except Exception as e:
             print(f"Error creating segmentation visualization for sample {dataset_idx}: {e}")
@@ -729,7 +736,7 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         return iou_scores
     
     def _create_and_upload_segmentation_visualization(self, sample_idx, viz_idx, bandvalues, 
-                                                    ground_truth, prediction, epoch):
+                                                    ground_truth, prediction, epoch,id):
         """Create and upload segmentation visualization to wandb."""
         
         # Convert to numpy for visualization
@@ -748,7 +755,7 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         # Prepare wandb data
         wandb_data = {
             # Main segmentation visualization
-            f"segmentation/epoch_{epoch}_sample_{sample_idx}": wandb.Image(
+            f"segmentation/epoch_{epoch}_sample_{sample_idx} {id}": wandb.Image(
                 segmentation_fig, 
                 caption=f"Segmentation - Epoch {epoch}, Sample {sample_idx}, Accuracy: {accuracy:.3f}"
             ),

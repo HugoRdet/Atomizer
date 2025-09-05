@@ -30,7 +30,7 @@ fi
 echo "Training complete. Captured WandB Run ID: $RUN_ID"
 echo "Starting evaluation..."
 
-python script_evaluation.py --run_id "$RUN_ID" --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET" 
-#python script_evaluation_spec.py --run_id "$RUN_ID" --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET" 
+#python script_evaluation.py --run_id "$RUN_ID" --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET" 
+python script_evaluation_spec.py --run_id "$RUN_ID" --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET" 
 
 #python script_evaluation.py --run_id AYAYdsdsqA --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET" 

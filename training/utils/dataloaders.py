@@ -139,7 +139,7 @@ class Tiny_BigEarthNetDataModule(pl.LightningDataModule):
                 dataset_class=Tiny_BigEarthNet):
         super().__init__()
         self.train_file = path + "_train.h5"
-        self.val_file = path + "_train.h5"#"_validation.h5"
+        self.val_file = path + "_val.h5"#"_validation.h5"
         self.test_file = path + "_test.h5"
         self.batch_size = batch_size
         self.num_workers = num_workers

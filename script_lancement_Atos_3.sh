@@ -12,7 +12,7 @@ conda activate venv
 
 
 
-MODEL_NAME=config_test-Atomiser_Atos2.yaml
+MODEL_NAME=config_test-ScaleMAE.yaml
 
 #sh TrainEval.sh "$EXPERIMENT_NAME" "$MODEL_NAME" add_1
 #sh TrainEval.sh "$EXPERIMENT_NAME" "$MODEL_NAME" add_2
@@ -24,4 +24,9 @@ MODEL_NAME=config_test-Atomiser_Atos2.yaml
 #sh TrainEval.sh "$EXPERIMENT_NAME" "$MODEL_NAME" test_2
 #sh TrainEval.sh "$EXPERIMENT_NAME" "$MODEL_NAME" test_3
 #sh TrainEval.sh "$EXPERIMENT_NAME" "$MODEL_NAME" train_1
+sh Eval_modalities.sh "$EXPERIMENT_NAME" "$MODEL_NAME" Big_r1
+sh Eval_modalities.sh "$EXPERIMENT_NAME" "$MODEL_NAME" Big_r2
+sh Eval_modalities.sh "$EXPERIMENT_NAME" "$MODEL_NAME" Big_r3
 sh Eval_modalities.sh "$EXPERIMENT_NAME" "$MODEL_NAME" Big_r4
+sh Eval_modalities.sh "$EXPERIMENT_NAME" "$MODEL_NAME" Big_r5
+sh Eval_modalities.sh "$EXPERIMENT_NAME" "$MODEL_NAME" Big_r6

@@ -21,7 +21,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 # ← new imports for the PyTorch profiler
 from pytorch_lightning.profilers import PyTorchProfiler
 from torch.profiler import ProfilerActivity
-
+from pytorch_lightning.callbacks import LearningRateFinder
 import matplotlib.pyplot as plt
 
 from configilm import util
@@ -73,7 +73,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     wandb_logger = WandbLogger(project="MAE_debug")
     
 
-model = Model_FLAIR( #MODEL_MAE
+model = Model_MAE(#Model_FLAIR( #
     config_model,
     wand=True,
     name=xp_name,
@@ -94,16 +94,16 @@ data_module = Tiny_BigEarthNetDataModule(
     dataset_class=FLAIR_SEG#R##Tiny_BigEarthNet_MAE#
 )
 
-#reconstruction_callback = CustomMAEReconstructionCallback(
-#    config=config_model
-#    )
-
-reconstruction_callback = FLAIR_CustomSegmentationCallback(
+reconstruction_callback = CustomMAEReconstructionCallback(
     config=config_model
     )
 
+#reconstruction_callback = FLAIR_CustomSegmentationCallback(
+#    config=config_model
+#    )
 
 
+LR_finder=LearningRateFinder(min_lr=1e-05, max_lr=1, num_training_steps=450, mode='exponential', early_stop_threshold=4.0, update_attr=True, attr_name='')
 
 #knn_callback_multiclass=KNNEvaluationCallback(
 #    config=config_model,
@@ -120,7 +120,7 @@ checkpoint_val_mod_train = ModelCheckpoint(
     save_top_k=1,
     verbose=True,
 )
-accumulator = GradientAccumulationScheduler(scheduling={0:1})
+accumulator = GradientAccumulationScheduler(scheduling={0:256})
 #reconstruction_callback,knn_callback_multiclass
 # Trainer
 trainer = Trainer(
@@ -131,12 +131,11 @@ trainer = Trainer(
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[ accumulator,reconstruction_callback,lr_monitor], #checkpoint_val_mod_train,reconstruction_callback
+    callbacks=[ accumulator,lr_monitor,reconstruction_callback,LR_finder], #checkpoint_val_mod_train,
     default_root_dir="./checkpoints/",
     #profiler=profiler,           # ← attach the PyTorchProfiler here
     #limit_train_batches=4,
-    overfit_batches=10
-    #limit_val_batches=1,
+    #limit_val_batches=16,
 )
 
 # Fit the model

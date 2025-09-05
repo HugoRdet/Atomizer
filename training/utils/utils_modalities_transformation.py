@@ -212,7 +212,7 @@ class modalities_transformations_config:
         apply transformations specified in {self.path}/{idx}_transfos.yaml file.
         This is the function you should call in the get_item
         """
-        return img,mask,1.0
+     
         
       
 
@@ -223,12 +223,20 @@ class modalities_transformations_config:
 
 
         transfos=self.force_modality
+        
+        
+        
         if self.force_modality==None:
             file_path=f"{self.path}/{mode}/{idx}_transfos_{modality_mode}.yaml"
             if self.name_config!="":
                 file_path=f"{self.path}/{self.name_config}/{mode}/{idx}_transfos_{modality_mode}.yaml"
 
             transfos=read_yaml(file_path)
+        else:
+          
+            file_path=f"./data/Tiny_BigEarthNet/custom_modalities/configs_dataset_"+self.force_modality+".yaml"
+            transfos=read_yaml(file_path)
+     
             
 
         resolution_change=1.0

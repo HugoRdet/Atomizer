@@ -68,7 +68,7 @@ class Model_FLAIR(pl.LightningModule):
 
         y_hat, y_mask = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
         
-        labels = mae_tokens[:,:,4]
+        labels = mae_tokens[:,::5,4]
         
         labels_loss=rearrange(labels,"b p -> (b p)")
         y_hat_loss =rearrange(y_hat.clone() ,"b t c -> (b t) c")
@@ -112,7 +112,8 @@ class Model_FLAIR(pl.LightningModule):
         
         y_hat, y_mask = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
         
-        labels = mae_tokens[:,:,4]
+        labels = mae_tokens[:,::5,4]
+        
         
         
         labels_loss=rearrange(labels,"b p -> (b p)")
@@ -148,7 +149,7 @@ class Model_FLAIR(pl.LightningModule):
         y_hat, y_mask = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
         
         # Get labels and predictions - keep original format
-        labels = mae_tokens[:, :, 4]
+        labels = mae_tokens[:, ::5, 4]
         preds = torch.argmax(y_hat.clone(), dim=-1)
         y_hat = y_hat.squeeze(-1)
         

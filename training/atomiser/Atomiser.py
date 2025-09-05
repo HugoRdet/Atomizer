@@ -5,7 +5,7 @@ import pytorch_lightning as pl
 from functools import wraps
 from einops import repeat
 from .nn_comp import PreNorm, CrossAttention, SelfAttention, FeedForward, LatentAttentionPooling
-
+import einops as einops
 
 def cache_fn(f):
     """Cache function results for weight sharing across layers"""
@@ -66,7 +66,7 @@ class Atomiser(pl.LightningModule):
         
         # Compute input dimensions based on encoding configuration
         self.input_dim = self._compute_input_dim()
-        self.query_dim_recon = self._compute_query_dim_recon()
+        self.query_dim_recon = self._compute_input_dim()#self._compute_query_dim_recon()
         
         # Initialize model components
         self._init_latents()
@@ -197,7 +197,7 @@ class Atomiser(pl.LightningModule):
     def _init_classifier(self):
         """Initialize classification head"""
         if self.final_classifier_head:
-            self.classifier = nn.Sequential(
+            self.to_logits = nn.Sequential(
                 LatentAttentionPooling(
                     self.latent_dim, 
                     heads=self.latent_heads, 
@@ -208,7 +208,7 @@ class Atomiser(pl.LightningModule):
                 nn.Linear(self.latent_dim, self.num_classes)
             )
         else:
-            self.classifier = nn.Identity()
+            self.to_logits = nn.Identity()
     
     def _subsample_tokens(self, tokens, mask, max_tokens, training=True):
         """Randomly subsample tokens to fit memory constraints"""
@@ -292,8 +292,10 @@ class Atomiser(pl.LightningModule):
         # Project to output
         
         predictions = attended+skip_co
-        
         predictions = self.recon_tologits(predictions)
+        predictions = einops.rearrange(predictions,"b (q u) c -> b q u c",b=predictions.shape[0],c=predictions.shape[-1],q=5)
+        predictions = predictions.mean(dim=1)
+        
        
         return predictions, processed_mask
     
@@ -307,7 +309,7 @@ class Atomiser(pl.LightningModule):
         Returns:
             logits: [B, num_classes] classification logits
         """
-        return self.classifier(latents)
+        return self.to_logits(latents)
     
     def forward(self, data, mask, mae_tokens=None, mae_tokens_mask=None, 
                 training=True, task="reconstruction"):
@@ -365,8 +367,10 @@ class Atomiser(pl.LightningModule):
     
     def freeze_classifier(self):
         """Freeze classifier parameters"""
-        self._set_requires_grad(self.classifier, False)
+        #self._set_requires_grad(self.classifier, False)
+        pass
     
     def unfreeze_classifier(self):
         """Unfreeze classifier parameters"""
-        self._set_requires_grad(self.classifier, True)
+        #self._set_requires_grad(self.classifier, True)
+        pass

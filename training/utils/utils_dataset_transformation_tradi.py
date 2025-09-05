@@ -109,7 +109,7 @@ class transformations_config_tradi(nn.Module):
             res.append(band["resolution"])
 
 
-        return torch.from_numpy(np.array([10 for _ in range(12)]))
+        return torch.from_numpy(np.array([20 for _ in range(12)]))
    
 
 

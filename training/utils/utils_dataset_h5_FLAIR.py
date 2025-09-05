@@ -65,7 +65,7 @@ def monthly_image(sp_patch, sp_raw_dates):
     return np.array(average_patch), average_dates
 
 
-def create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtd, name="tiny", mode="train", stats=None):
+def create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtd, name="tiny", mode="train", stats=None,max_samples=-1):
     """
     Creates an HDF5 dataset using the given sample indices (dico_idxs) from ds.
     If stats (per-channel mean/std) is None, computes it on-the-fly in a streaming fashion.
@@ -100,6 +100,7 @@ def create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_pro
 
     # 3) Create a new HDF5 file
     db = h5py.File(h5_path, 'w')
+    cpt_sample=0
 
 
     # 4) Iterate through your dictionary of IDs, fetch images, and store them
@@ -170,6 +171,11 @@ def create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_pro
         db.create_dataset(f'mask_{idx_img}',data=mask)
         db.create_dataset(f'sen_mask_{idx_img}',data=sen_mask)
         db.create_dataset(f'aerial_mtd_{idx_img}',data=aerial_date)
+        
+        cpt_sample+=1
+        if max_samples!=-1 and cpt_sample>max_samples:
+            db.close()
+            return stats
   
 
 
@@ -256,8 +262,6 @@ class FLAIR_MAE(Dataset):
         return self.h5
 
     def __len__(self):
-        print(self.num_samples)
-        raise("hoho")
         return self.num_samples
     
     def set_modality_mode(self, mode):
@@ -465,57 +469,97 @@ class FLAIR_MAE(Dataset):
         return image, attention_mask, mae_tokens, mae_tokens_mask, label
  
     def get_samples_to_viz(self, idx):
-        """Fixed version that properly opens HDF5 file."""
+        label = None
+        id_img = None
+        idx=10 # DEBUGGGGG
+
+
         # Ensure HDF5 file is open
         f = self._ensure_h5_open()
-        idx=10
+
+        
+
+        im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
+        #im_sen = torch.tensor(f[f'img_sen_{idx}'][:], dtype=torch.float32)  # [12,10,40,40]
+        #days = torch.tensor(f[f'days_{idx}'][:], dtype=torch.float32)
+        #months = torch.tensor(f[f'months_{idx}'][:], dtype=torch.float32)
+        #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
+        label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
+        label = self.process_mask(label)
+        attention_mask=torch.zeros(im_aerial.shape)
+        
+        
+        
+        
+        #sen_mask = f[f'sen_mask_{idx}'][:]
+        #aerial_date = f[f'aerial_mtd_{idx}'].asstr()[()]
 
 
-        image = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
-        labels = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
-        labels = self.process_mask(labels)
-        label_segment=labels.clone()
-        label_segment=label_segment.repeat(image.shape[0],1,1)
-        attention_mask=torch.zeros(image.shape)
+
+
+
         
         mask_MAE = None
-        new_resolution = 0.2 #in M/px
+
+        #image, attention_mask, new_resolution = self.transform.apply_transformations(
+        #    image, attention_mask, id_img, mode=self.mode, modality_mode=self.modality_mode, 
+        #    f_s=self.fixed_size, f_r=self.fixed_resolution
+        #)
+        new_resolution=0.2 #m/px
         
-        self.mask_gen.H, self.mask_gen.W = image.shape[1], image.shape[2]
+        self.mask_gen.H, self.mask_gen.W = im_aerial.shape[1], im_aerial.shape[2]
         mask_MAE = self.mask_gen.generate_mask()
-        mask_MAE_res = mask_MAE.clone()
-        mask_MAE = mask_MAE.repeat(image.shape[0], 1, 1)  # Repeat for all bands
+        mask_MAE = mask_MAE.repeat(im_aerial.shape[0], 1, 1)  # Repeat for all bands
+        label_segment=label.clone()
+        label_segment=label_segment.repeat(im_aerial.shape[0],1,1)
+
         
-        
-        idxs_bandwidths = self.get_wavelengths_coordinates(image.shape)
-        x_indices, y_indices = self.get_position_coordinates(image.shape, new_resolution)
+        idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
+        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution)
         
         
         # Concatenate all token data
         image = torch.cat([
-            image.unsqueeze(-1),      # Band values
+            im_aerial.unsqueeze(-1),      # Band values
             x_indices.float(),        # Global X indices
             y_indices.float(),        # Global Y indices  
             idxs_bandwidths.float(),   # Bandwidth indices
             label_segment.float().unsqueeze(-1)
         ], dim=-1)
+ 
         
+
+
+
         
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
         MAE_mask = einops.rearrange(mask_MAE, "c h w -> (c h w)")
-        mae_tokens = image.clone()
+        
+        
+        
+        # Filter valid tokens
         image = image[attention_mask==0.0]          # image get resized and invalid bands removed
-        
-        
-        
         mask_MAE = MAE_mask[attention_mask==0.0]    # same for mask
         
-        input_tokens = image[mask_MAE==0.0].clone()
-        attention_mask=torch.zeros(input_tokens.shape[0])
         
-        return input_tokens, attention_mask, mae_tokens, mask_MAE_res
+        
+        # Shuffle tokens
+        im_aerial, mask_MAE = self.shuffle_arrays([image, mask_MAE])
+        
+        # Split into input and target tokens
+        input_tokens = image[mask_MAE==0.0].clone()
+        mae_tokens = image[mask_MAE==1.0].clone()
+        
+        # Take required number of tokens
+        im_aerial = input_tokens[:self.nb_tokens]
+        #mae_tokens = mae_tokens[:self.max_tokens_reconstruction]
+        
+        mae_tokens, mae_tokens_mask = self.padding_mae(mae_tokens)
+        image, attention_mask = self.padding_image(image)
+        
+        return image, attention_mask, mae_tokens, mae_tokens_mask, label
 
     def close(self):
         """Close HDF5 file if it's open."""
@@ -752,26 +796,32 @@ class FLAIR_SEG(Dataset):
         idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
         x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution)
         
-        
         # Concatenate all token data
         image = torch.cat([
             im_aerial.unsqueeze(-1),      # Band values
             x_indices.float(),        # Global X indices
             y_indices.float(),        # Global Y indices  
             idxs_bandwidths.float(),   # Bandwidth indices
-            label_segment.float().unsqueeze(-1)
+            label_segment.float().unsqueeze(-1),
         ], dim=-1)
         
-        print("shape de l image: ",image.shape)
+        #at this point image shape is [5,512,512,5]
+        # 5 -> channels
+        # 512 512 -> H W
+        # 5 -> meta data
         
-        queries=image.clone()[0,:,:,:]
+        
+        queries=image.clone()
         
         
-
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
-        queries= einops.rearrange(queries,"h w c -> (h w) c")
+        queries= einops.rearrange(queries,"b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
+
+
+        nb_queries=self.config_model["trainer"]["max_tokens_reconstruction"]
+        queries=queries[:nb_queries]
         
         
         
@@ -788,57 +838,91 @@ class FLAIR_SEG(Dataset):
         return image, attention_mask, queries,queries_mask,label
  
     def get_samples_to_viz(self, idx):
-        """Fixed version that properly opens HDF5 file."""
+        label = None
+        id_img = None
+        
+
+
         # Ensure HDF5 file is open
         f = self._ensure_h5_open()
+
         
 
+        im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
+        image_to_return=im_aerial.clone()
+        image_to_return=einops.rearrange(image_to_return,"c h w -> h w c")
+        #im_sen = torch.tensor(f[f'img_sen_{idx}'][:], dtype=torch.float32)  # [12,10,40,40]
+        #days = torch.tensor(f[f'days_{idx}'][:], dtype=torch.float32)
+        #months = torch.tensor(f[f'months_{idx}'][:], dtype=torch.float32)
+        #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
+        label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
+        label = self.process_mask(label)
+        attention_mask=torch.zeros(im_aerial.shape)
+        
+        
+        
+        
+        #sen_mask = f[f'sen_mask_{idx}'][:]
+        #aerial_date = f[f'aerial_mtd_{idx}'].asstr()[()]
 
-        image = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
-        labels = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
-        labels = self.process_mask(labels)
-        label_segment=labels.clone()
-        label_segment=label_segment.repeat(image.shape[0],1,1)
-        attention_mask=torch.zeros(image.shape)
+
+
+
+
         
-        mask_MAE = None
-        new_resolution = 0.2 #in M/px
+
+        #image, attention_mask, new_resolution = self.transform.apply_transformations(
+        #    image, attention_mask, id_img, mode=self.mode, modality_mode=self.modality_mode, 
+        #    f_s=self.fixed_size, f_r=self.fixed_resolution
+        #)
+        new_resolution=0.2 #m/px
+        label_segment=label.clone()
         
-        self.mask_gen.H, self.mask_gen.W = image.shape[1], image.shape[2]
-        mask_MAE = self.mask_gen.generate_mask()
-        mask_MAE_res = mask_MAE.clone()
-        mask_MAE = mask_MAE.repeat(image.shape[0], 1, 1)  # Repeat for all bands
+        label_segment=label_segment.repeat(im_aerial.shape[0],1,1)
         
         
-        idxs_bandwidths = self.get_wavelengths_coordinates(image.shape)
-        x_indices, y_indices = self.get_position_coordinates(image.shape, new_resolution)
-        
+        idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
+        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution)
         
         # Concatenate all token data
         image = torch.cat([
-            image.unsqueeze(-1),      # Band values
+            im_aerial.unsqueeze(-1),      # Band values
             x_indices.float(),        # Global X indices
             y_indices.float(),        # Global Y indices  
             idxs_bandwidths.float(),   # Bandwidth indices
-            label_segment.float().unsqueeze(-1)
+            label_segment.float().unsqueeze(-1),
         ], dim=-1)
+        
+        #at this point image shape is [5,512,512,5]
+        # 5 -> channels
+        # 512 512 -> H W
+        # 5 -> meta data
+        
+        
+        queries=image.clone()
         
         
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
+        queries= einops.rearrange(queries,"b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
-        MAE_mask = einops.rearrange(mask_MAE, "c h w -> (c h w)")
-        mae_tokens = image.clone()
-        image = image[attention_mask==0.0]          # image get resized and invalid bands removed
+
+
         
         
         
-        mask_MAE = MAE_mask[attention_mask==0.0]    # same for mask
         
-        input_tokens = image[mask_MAE==0.0].clone()
-        attention_mask=torch.zeros(input_tokens.shape[0])
         
-        return input_tokens, attention_mask, mae_tokens, mask_MAE_res
+        
+        
+        # Shuffle tokens
+        #image = self.shuffle_arrays([image])[0]
+        
+    
+        
+        queries_mask=torch.zeros(queries.shape[0])
+        #
+        return image_to_return,image, attention_mask, queries,queries_mask,label
 
     def close(self):
         """Close HDF5 file if it's open."""

@@ -150,8 +150,10 @@ class Model(pl.LightningModule):
         self.lr = float(config["trainer"]["lr"])
         
     def forward(self, x,mask,resolution,size,training=True):
+        if "Atomiser_tradi" in self.config["encoder"]:
+            return self.encoder(x,mask,resolution,size,training=training)
         if "Atomiser" in self.config["encoder"]:
-            return self.encoder(x,mask,resolution,size,training=training,reconstruction=False)
+            return self.encoder(x,mask,resolution,size,training=training,task="classification")
         else:
             if "Perceiver" in self.config["encoder"]:
                 tmp_resolutions=10/resolution#self.resolutions/resolution
