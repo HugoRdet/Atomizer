@@ -161,12 +161,12 @@ class CrossAttention(nn.Module):
         #k = self.to_k(context)  # (B, Nk, 2·inner)
         k=None
 
-        if id>0:
-            context_k=context.clone()
-            context_k[:,:,:129]=0.0
-            k = self.to_k(context_k)  # each (B, Nk, inner)
-        else:
-            k=self.to_k(context)
+        #if id>0:
+        #    context_k=context.clone()
+        #    context_k[:,:,:129]=0.0
+        #    k = self.to_k(context_k)  # each (B, Nk, inner)
+        #else:
+        k=self.to_k(context)
         v = self.to_v(context)  # each (B, Nk, inner)
         
         # 2) Split heads

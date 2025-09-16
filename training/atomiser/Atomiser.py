@@ -40,10 +40,15 @@ class Atomiser(pl.LightningModule):
         self.config = config
         self.transform = transform
         
+        # Compute dimensions first
+        self.input_dim = self._compute_input_dim()
+        self.query_dim_recon = self._compute_query_dim_recon()
+        
         # Extract model architecture parameters
         self.depth = config["Atomiser"]["depth"]
         self.num_latents = config["Atomiser"]["num_latents"]
-        self.latent_dim = config["Atomiser"]["latent_dim"]
+        # Use config latent_dim if available, otherwise fall back to input_dim
+        self.latent_dim = config["Atomiser"].get("latent_dim", self.input_dim)
         self.cross_heads = config["Atomiser"]["cross_heads"]
         self.latent_heads = config["Atomiser"]["latent_heads"]
         self.cross_dim_head = config["Atomiser"]["cross_dim_head"]
@@ -55,18 +60,9 @@ class Atomiser(pl.LightningModule):
         self.self_per_cross_attn = config["Atomiser"]["self_per_cross_attn"]
         self.final_classifier_head = config["Atomiser"]["final_classifier_head"]
         
-        
-        #self.VV = nn.Parameter(torch.empty(dw))
-        #self.VH = nn.Parameter(torch.empty(dw))
-        #nn.init.trunc_normal_(self.VH, std=0.02, a=-2., b=2.)
-        
         # Token limits for different phases
         self.max_tokens_forward = config["trainer"]["max_tokens_forward"]
         self.max_tokens_val = config["trainer"]["max_tokens_val"]
-        
-        # Compute input dimensions based on encoding configuration
-        self.input_dim = self._compute_input_dim()
-        self.query_dim_recon = self._compute_input_dim()#self._compute_query_dim_recon()
         
         # Initialize model components
         self._init_latents()
@@ -85,7 +81,8 @@ class Atomiser(pl.LightningModule):
         """Compute query dimension for reconstruction (no band values)"""
         pos_dim = self._get_encoding_dim("pos")
         wavelength_dim = self._get_encoding_dim("wavelength")
-        return 2 * pos_dim + wavelength_dim  # position + wavelength only
+        reflectance_dim = self._get_encoding_dim("bandvalue")  # No band values in reconstruction queries
+        return 2 * pos_dim + wavelength_dim #+ reflectance_dim  # position + wavelength only
     
     def _get_encoding_dim(self, attribute):
         """Get encoding dimension for a specific attribute"""
@@ -110,20 +107,30 @@ class Atomiser(pl.LightningModule):
             raise ValueError(f"Unknown encoding type: {encoding_type}")
     
     def _init_latents(self):
-        """Initialize learnable latent vectors"""
+        """Initialize learnable latent vectors and input projection"""
         self.latents = nn.Parameter(torch.randn(self.num_latents, self.latent_dim))
         nn.init.trunc_normal_(self.latents, std=0.02, a=-2., b=2.)
+        
+        # Add input projection if dimensions don't match
+        if self.input_dim != self.latent_dim:
+            self.input_projection = nn.Linear(self.input_dim, self.latent_dim)
+        else:
+            self.input_projection = nn.Identity()
     
     def _init_encoder_layers(self):
         """Initialize encoder layers with optional weight sharing"""
         # Create cached layer factories for weight sharing
         get_cross_attn = cache_fn(lambda: 
-            CrossAttention(
-                query_dim=self.latent_dim,
-                context_dim=self.input_dim,
-                heads=self.cross_heads,
-                dim_head=self.cross_dim_head,
-                dropout=self.attn_dropout,
+            PreNorm(
+                dim=self.latent_dim,
+                fn=CrossAttention(
+                    query_dim=self.latent_dim,
+                    context_dim=self.latent_dim,  # Both are latent_dim after projection
+                    heads=self.cross_heads,
+                    dim_head=self.cross_dim_head,
+                    dropout=self.attn_dropout,
+                ),
+                context_dim=self.latent_dim
             ))
         
         get_cross_ff = cache_fn(lambda: PreNorm(
@@ -168,31 +175,35 @@ class Atomiser(pl.LightningModule):
             self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns]))
     
     def _init_decoder(self):
-        """Initialize decoder for reconstruction"""
-        self.recon_cross = CrossAttention(
+        """Initialize decoder for reconstruction following Perceiver IO formula"""
+        # Cross-attention with PreNorm (applies LayerNorm before attention)
+        #533 512
+        #print(self.query_dim_recon,self.latent_dim,"fhkdfhskjlhfdsjkql"*100)
+      
+        self.recon_cross = PreNorm(
+            dim=self.query_dim_recon,
+            fn=CrossAttention(
                 query_dim=self.query_dim_recon,
                 context_dim=self.latent_dim,
                 heads=self.latent_heads,
                 dim_head=self.latent_dim_head,
-                dropout=0.0)
-        
-        # Simple output head (no redundant LayerNorm)
-        self.recon_tologits =nn.Sequential(
-            nn.Linear(self.query_dim_recon, self.num_classes)  # Reconstruct reflectance only
+                dropout=0.0
+            ),
+            context_dim= self.latent_dim # For normalizing context (latents)
         )
         
-        
-        self.recon_head = nn.Sequential(
-            nn.LayerNorm(self.query_dim_recon),
-            nn.Linear(self.query_dim_recon,self.query_dim_recon*2),
-            nn.GELU(),                # ReLU works too; GELU is smoother
-            nn.LayerNorm(self.query_dim_recon*2),
-            nn.Linear(self.query_dim_recon*2,self.query_dim_recon),
-            nn.GELU(),
-            nn.LayerNorm(self.query_dim_recon),
-            nn.Linear(self.query_dim_recon,self.query_dim_recon)  # linear output for regression
+        # MLP with PreNorm (applies LayerNorm before MLP)
+        self.recon_ff = PreNorm(
+            dim=self.query_dim_recon,
+            fn=FeedForward(
+                dim=self.query_dim_recon, 
+                mult=4, 
+                dropout=0.0
+            )
         )
-        #self.decoder_ff = PreNorm(self.query_dim_recon, FeedForward(queries_dim))
+        
+        # Final output projection
+        self.recon_to_logits = nn.Linear(self.query_dim_recon, self.num_classes)  # Single reflectance value
     
     def _init_classifier(self):
         """Initialize classification head"""
@@ -236,9 +247,11 @@ class Atomiser(pl.LightningModule):
             latents: [B, num_latents, latent_dim] encoded representations
         """
         B = tokens.shape[0]
-        
-        # Initialize latents
+
+        # FIXED: Initialize latents from learnable parameters (not from input tokens!)
         latents = repeat(self.latents, 'n d -> b n d', b=B)
+
+        
         
         # Process through encoder layers
         for layer_idx, (cross_attn, cross_ff, self_attns) in enumerate(self.encoder_layers):
@@ -247,18 +260,19 @@ class Atomiser(pl.LightningModule):
             current_tokens, current_mask = self._subsample_tokens(tokens, mask, max_tokens, training)
             
             # Process tokens through transform
-            
-            processed_tokens, processed_mask = self.transform.process_data(current_tokens, current_mask,query=False)
+            processed_tokens, processed_mask = self.transform.process_data(current_tokens, current_mask, query=False)
             processed_mask = processed_mask.bool()
             
+            # Project input tokens to latent dimension
+            processed_tokens = self.input_projection(processed_tokens)
             
             # Mask invalid tokens
             processed_tokens = processed_tokens.masked_fill_(processed_mask.unsqueeze(-1), 0.0)
             
-            # Cross-attention: latents attend to tokens
+            # ENCODER: Cross-attention - latents attend to tokens
             latents = cross_attn(latents, context=processed_tokens, mask=~processed_mask) + latents
             
-            # Cross feedforward
+            # Cross feedforward with residual connection
             latents = cross_ff(latents) + latents
             
             # Self-attention blocks
@@ -270,7 +284,7 @@ class Atomiser(pl.LightningModule):
     
     def reconstruct(self, latents, query_tokens, query_mask):
         """
-        Reconstruct token values from latent representations
+        Reconstruct token values from latent representations following Perceiver IO
         
         Args:
             latents: [B, num_latents, latent_dim] encoded representations
@@ -286,17 +300,28 @@ class Atomiser(pl.LightningModule):
             query_tokens, query_mask, query=True
         )
         
-        # Cross-attention: query tokens attend to latents
-        attended = self.recon_cross(processed_query, context=latents, mask=None)
-        skip_co=self.recon_head(attended)
-        # Project to output
-        
-        predictions = attended+skip_co
-        predictions = self.recon_tologits(predictions)
-        predictions = einops.rearrange(predictions,"b (q u) c -> b q u c",b=predictions.shape[0],c=predictions.shape[-1],q=5)
-        predictions = predictions.mean(dim=1)
-        
+        # CORRECT Perceiver IO decoder formula:
+        # Step 1: Cross-attention - queries attend to latents
+        # X_QKV = Attn(layerNorm(X_Q), layerNorm(X_KV)) + X_Q
        
+        x = self.recon_cross(processed_query, context=latents, mask=None) #+ processed_query
+        
+        # Step 2: MLP with residual connection  
+        # X_QKV = X_QKV + MLP(layerNorm(X_QKV))
+        x = x + self.recon_ff(x)
+        
+        # Step 3: Final projection to output space
+        predictions = self.recon_to_logits(x)  # [B, N, 1]
+
+        
+
+        #predictions = einops.rearrange( predictions, "b (q u) c -> b q u c", 
+        #                                b=predictions.shape[0], 
+        #                                c=predictions.shape[-1], 
+        #                                q=5)
+    
+        #predictions = predictions.mean(dim=1)
+        
         return predictions, processed_mask
     
     def classify(self, latents):
@@ -335,7 +360,24 @@ class Atomiser(pl.LightningModule):
         if task == "encoder":
             return latents
         elif task == "reconstruction":
-            return self.reconstruct(latents, mae_tokens, mae_tokens_mask)
+            # Handle large token sequences by chunking
+            nb_tokens_processed = 100000
+            if mae_tokens.shape[1] > nb_tokens_processed:
+                preds_list = []
+                mask_list = []
+                for i in range(0, mae_tokens.shape[1], nb_tokens_processed):
+                    chunk_tokens = mae_tokens[:, i:i+nb_tokens_processed]
+                    chunk_mask = mae_tokens_mask[:, i:i+nb_tokens_processed]
+                    p, m = self.reconstruct(latents, chunk_tokens, chunk_mask)
+                    preds_list.append(p)
+                    mask_list.append(m)
+                
+                preds = torch.cat(preds_list, dim=1)
+                out_mask = torch.cat(mask_list, dim=1)
+                return preds, out_mask
+            else:
+                return self.reconstruct(latents, mae_tokens, mae_tokens_mask)
+            
         else:  # task == "classification"
             return self.classify(latents)
     
@@ -348,29 +390,31 @@ class Atomiser(pl.LightningModule):
     def freeze_encoder(self):
         """Freeze encoder parameters"""
         self._set_requires_grad(self.encoder_layers, False)
+        self._set_requires_grad(self.input_projection, False)
         self.latents.requires_grad = False
     
     def unfreeze_encoder(self):
         """Unfreeze encoder parameters"""
         self._set_requires_grad(self.encoder_layers, True)
+        self._set_requires_grad(self.input_projection, True)
         self.latents.requires_grad = True
     
     def freeze_decoder(self):
         """Freeze decoder parameters"""
         self._set_requires_grad(self.recon_cross, False)
-        self._set_requires_grad(self.recon_head, False)
+        self._set_requires_grad(self.recon_ff, False)
+        self._set_requires_grad(self.recon_to_logits, False)
     
     def unfreeze_decoder(self):
         """Unfreeze decoder parameters"""
         self._set_requires_grad(self.recon_cross, True)
-        self._set_requires_grad(self.recon_head, True)
+        self._set_requires_grad(self.recon_ff, True)
+        self._set_requires_grad(self.recon_to_logits, True)
     
     def freeze_classifier(self):
         """Freeze classifier parameters"""
-        #self._set_requires_grad(self.classifier, False)
-        pass
+        self._set_requires_grad(self.to_logits, False)
     
     def unfreeze_classifier(self):
         """Unfreeze classifier parameters"""
-        #self._set_requires_grad(self.classifier, True)
-        pass
+        self._set_requires_grad(self.to_logits, True)

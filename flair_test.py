@@ -34,7 +34,7 @@ aerial_mtds=d_train["MTD_AERIAL"]
 print("images train: ",len(images))
 
 
-stats=create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtds, name="o_regular", mode="train", stats=None,max_samples=50)
+stats=create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtds, name="regular", mode="train", stats=None,max_samples=150)
 
 
 images = d_val["PATH_IMG"]
@@ -45,7 +45,7 @@ sentinel_products = d_val["PATH_SP_DATES"] # Needed to get the dates of the sent
 centroids = d_val["SP_COORDS"] # Position of the aerial image in the sentinel super area
 aerial_mtds=d_val["MTD_AERIAL"]
 
-create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtds, name="o_regular", mode="val", stats=stats,max_samples=50)
+create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtds, name="regular", mode="val", stats=stats,max_samples=150)
 
 
 
@@ -58,5 +58,5 @@ centroids = d_test["SP_COORDS"] # Position of the aerial image in the sentinel s
 aerial_mtds=d_test["MTD_AERIAL"]
 
 print("images test: ",len(labels))
-create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtds, name="o_regular", mode="test", stats=stats,max_samples=50)
+create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtds, name="regular", mode="test", stats=stats,max_samples=150)
 

@@ -644,7 +644,7 @@ class transformations_config(nn.Module):
 
     def apply_transformations_optique(self, im_sen, mask_sen, mode,query=False):
         if query:
-            value_processed = self.get_bvalue_processing(im_sen[:,:,0])
+            #value_processed = self.get_bvalue_processing(im_sen[:,:,0])
             central_wavelength_processing = self.get_wavelength_encoding(im_sen[:,:,3],device=im_sen.device)
             p_x=self.get_fourrier_encoding(im_sen,device=im_sen.device)
             #band_post_proc_0=self.get_gaussian_encoding(im_sen,8,100, im_sen.device,extremums=600)
@@ -652,8 +652,10 @@ class transformations_config(nn.Module):
             #band_post_proc_2=self.get_gaussian_encoding(im_sen,32,10.0, im_sen.device,extremums=300)
             #band_post_proc_3=self.get_gaussian_encoding(im_sen,64,3.0, im_sen.device,extremums=150)
             #band_post_proc_4=self.get_gaussian_encoding(im_sen,300,0.2, im_sen.device,extremums=150)
+
+     
             tokens = torch.cat([
-                value_processed,
+                #value_processed,
                 central_wavelength_processing,
                 p_x
             ], dim=-1)

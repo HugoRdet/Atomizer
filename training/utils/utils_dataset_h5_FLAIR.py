@@ -407,11 +407,6 @@ class FLAIR_MAE(Dataset):
 
         
         mask_MAE = None
-
-        #image, attention_mask, new_resolution = self.transform.apply_transformations(
-        #    image, attention_mask, id_img, mode=self.mode, modality_mode=self.modality_mode, 
-        #    f_s=self.fixed_size, f_r=self.fixed_resolution
-        #)
         new_resolution=0.2 #m/px
         
         self.mask_gen.H, self.mask_gen.W = im_aerial.shape[1], im_aerial.shape[2]
@@ -769,7 +764,12 @@ class FLAIR_SEG(Dataset):
         #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
         label = self.process_mask(label)
-        attention_mask=torch.zeros(im_aerial.shape)
+        attention_mask=torch.ones(im_aerial.shape)
+        attention_mask[:,128:384,128:384]=0.0
+
+
+
+        
         
         
         
@@ -818,6 +818,8 @@ class FLAIR_SEG(Dataset):
         image = einops.rearrange(image, "b h w c -> (b h w) c")
         queries= einops.rearrange(queries,"b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
+        image= image[attention_mask==0.0]          # image get resized and invalid bands removed
+        queries= queries[attention_mask==0.0]    # same for mask
 
 
         nb_queries=self.config_model["trainer"]["max_tokens_reconstruction"]
@@ -831,7 +833,9 @@ class FLAIR_SEG(Dataset):
         
         
         # Shuffle tokens
-        #image = self.shuffle_arrays([image])[0]
+        image,attention_mask = self.shuffle_arrays([image,attention_mask])
+        queries= self.shuffle_arrays([queries])[0]
+        
     
         
         queries_mask=torch.zeros(queries.shape[0])
@@ -857,7 +861,8 @@ class FLAIR_SEG(Dataset):
         #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
         label = self.process_mask(label)
-        attention_mask=torch.zeros(im_aerial.shape)
+        attention_mask=torch.ones(im_aerial.shape)
+        attention_mask[:,128:384,128:384]=0.0
         
         
         
@@ -906,6 +911,8 @@ class FLAIR_SEG(Dataset):
         image = einops.rearrange(image, "b h w c -> (b h w) c")
         queries= einops.rearrange(queries,"b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
+
+        image= image[attention_mask==0.0]          # image get resized and invalid bands removed
 
 
         

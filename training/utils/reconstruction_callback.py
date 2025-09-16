@@ -632,14 +632,14 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         dataset_train = trainer.datamodule.val_dataset
         
         for i, sample_idx in enumerate(self.sample_indices):
-            self._process_single_sample(sample_idx, i, dataset_train, pl_module, trainer.current_epoch,id="TEST")
+            self._process_single_sample(sample_idx, i, dataset_train, pl_module, trainer.current_epoch,id="validation")
             
         dataset_val = trainer.datamodule.train_dataset
         
         
             
         for i, sample_idx in enumerate(self.sample_indices):
-            self._process_single_sample(sample_idx, i, dataset_val, pl_module, trainer.current_epoch,id="VAL")
+            self._process_single_sample(sample_idx, i, dataset_val, pl_module, trainer.current_epoch,id="train")
             
             
             
@@ -686,7 +686,8 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                 
                 y_hat = torch.argmax(y_hat.clone(), dim=-1)
                 
-                y_hat = rearrange(y_hat, "(h w ) -> h w", h=512, w=512)
+                y_hat = rearrange(y_hat, "(c h w ) -> c h w", h=512, w=512 ,c=5)
+                y_hat=y_hat[0,:,:]
                 labels=rearrange(labels,"c h w -> h w c").squeeze(-1)
                 
                 

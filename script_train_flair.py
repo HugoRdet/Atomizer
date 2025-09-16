@@ -67,13 +67,13 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
     wandb.init(
         name=config_model["encoder"],
-        project="MAE_debug",
+        project="FLAIR_seg_overfitting",
         config=config_model
     )
-    wandb_logger = WandbLogger(project="MAE_debug")
+    wandb_logger = WandbLogger(project="FLAIR_seg_overfitting")
     
 
-model = Model_MAE(#Model_FLAIR( #
+model = Model_FLAIR(#Model_MAE
     config_model,
     wand=True,
     name=xp_name,
@@ -94,7 +94,7 @@ data_module = Tiny_BigEarthNetDataModule(
     dataset_class=FLAIR_SEG#R##Tiny_BigEarthNet_MAE#
 )
 
-reconstruction_callback = CustomMAEReconstructionCallback(
+reconstruction_callback = FLAIR_CustomSegmentationCallback( #CustomMAEReconstructionCallback
     config=config_model
     )
 
@@ -120,7 +120,7 @@ checkpoint_val_mod_train = ModelCheckpoint(
     save_top_k=1,
     verbose=True,
 )
-accumulator = GradientAccumulationScheduler(scheduling={0:256})
+accumulator = GradientAccumulationScheduler(scheduling={0:1})
 #reconstruction_callback,knn_callback_multiclass
 # Trainer
 trainer = Trainer(
@@ -131,7 +131,7 @@ trainer = Trainer(
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[ accumulator,lr_monitor,reconstruction_callback,LR_finder], #checkpoint_val_mod_train,
+    callbacks=[ accumulator,lr_monitor,reconstruction_callback], #checkpoint_val_mod_train,LR_finder
     default_root_dir="./checkpoints/",
     #profiler=profiler,           # ← attach the PyTorchProfiler here
     #limit_train_batches=4,
