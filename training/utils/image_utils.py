@@ -178,3 +178,100 @@ def create_dico_transfo(path,img_id,sizes=[],resolutions=[],channels=[]):
     pass
 
 
+
+
+import torch
+import numpy as np
+import random
+from typing import Tuple, Union
+
+def augment_image_and_label(
+    image: Union[torch.Tensor, np.ndarray], 
+    label: Union[torch.Tensor, np.ndarray],
+    rotation_angle: int = None,
+    flip_horizontal: bool = None,
+    flip_vertical: bool = None
+) -> Tuple[Union[torch.Tensor, np.ndarray], Union[torch.Tensor, np.ndarray]]:
+    """
+    Apply the same rotation and flip transformations to both image and label.
+    
+    Args:
+        image: Image tensor of shape [5, 512, 512] or numpy array
+        label: Label tensor of shape [1, 512, 512] or numpy array  
+        rotation_angle: Rotation angle in degrees [0, 90, 180, 270]. If None, randomly chosen.
+        flip_horizontal: Whether to flip horizontally. If None, randomly chosen.
+        flip_vertical: Whether to flip vertically. If None, randomly chosen.
+        
+    Returns:
+        Tuple of (transformed_image, transformed_label)
+    """
+    
+    # Convert to torch tensors if numpy arrays
+    is_numpy_image = isinstance(image, np.ndarray)
+    is_numpy_label = isinstance(label, np.ndarray)
+    
+    if is_numpy_image:
+        image = torch.from_numpy(image)
+    if is_numpy_label:
+        label = torch.from_numpy(label)
+    
+    # Randomly choose transformations if not specified
+    if rotation_angle is None:
+        rotation_angle = random.choice([0, 90, 180, 270])
+    if flip_horizontal is None:
+        flip_horizontal = random.choice([True, False])
+    if flip_vertical is None:
+        flip_vertical = random.choice([True, False])
+    
+    # Apply rotation
+    if rotation_angle == 90:
+        # Rotate 90 degrees clockwise: transpose then flip horizontally
+        image = torch.transpose(image, -2, -1).flip(-1)
+        label = torch.transpose(label, -2, -1).flip(-1)
+    elif rotation_angle == 180:
+        # Rotate 180 degrees: flip both dimensions
+        image = image.flip(-2).flip(-1)
+        label = label.flip(-2).flip(-1)
+    elif rotation_angle == 270:
+        # Rotate 270 degrees clockwise: transpose then flip vertically
+        image = torch.transpose(image, -2, -1).flip(-2)
+        label = torch.transpose(label, -2, -1).flip(-2)
+    # rotation_angle == 0: no rotation needed
+    
+    # Apply horizontal flip
+    if flip_horizontal:
+        image = image.flip(-1)  # flip along width dimension
+        label = label.flip(-1)
+    
+    # Apply vertical flip
+    if flip_vertical:
+        image = image.flip(-2)  # flip along height dimension
+        label = label.flip(-2)
+    
+    # Convert back to numpy if input was numpy
+    if is_numpy_image:
+        image = image.numpy()
+    if is_numpy_label:
+        label = label.numpy()
+    
+    image = torch.from_numpy(image) if is_numpy_image else image
+    label = torch.from_numpy(label) if is_numpy_label else label
+    return image, label
+
+
+def random_augment_image_and_label(
+    image: Union[torch.Tensor, np.ndarray], 
+    label: Union[torch.Tensor, np.ndarray]
+) -> Tuple[Union[torch.Tensor, np.ndarray], Union[torch.Tensor, np.ndarray]]:
+    """
+    Apply random rotation and flip transformations to both image and label.
+    
+    Args:
+        image: Image tensor of shape [5, 512, 512] or numpy array
+        label: Label tensor of shape [1, 512, 512] or numpy array
+        
+    Returns:
+        Tuple of (transformed_image, transformed_label)
+    """
+    return augment_image_and_label(image, label)
+

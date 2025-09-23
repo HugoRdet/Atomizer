@@ -218,7 +218,8 @@ class transformations_config(nn.Module):
         self,
         size,             # e.g. (B_size, T_size, H, W, C)
         resolution: float,      # shape [C], base resolution per band
-        device
+        device,
+        sampling=None
         ):
         """
         Returns: Tensor [B_size, T_size, H, W, C, D]
@@ -228,7 +229,8 @@ class transformations_config(nn.Module):
 
         # spatial size (assume H == W)
    
-
+        if sampling is None:
+            sampling=size
         # -- 1) compute per-sample, per-band new resolution: [B, C]
         #    new_res[i, b] = resolution[b] / resolution_factor[i]
         
@@ -249,7 +251,7 @@ class transformations_config(nn.Module):
         
         
         raw = self.pos_encoding(
-            size,
+            size=sampling,
             positional_scaling=pos_scalings,
             max_freq=max_freq,
             num_bands=num_bands,
@@ -370,6 +372,54 @@ class transformations_config(nn.Module):
         
         return result
     
+    def get_fourrier_encoding_queries(
+        self,
+        token_data: torch.Tensor,  # [batch, tokens, data] 
+        device=None
+    ):
+        """
+        Compute Fourier encoding for tokens with explicit position information.
+
+        Args:
+            token_data: [batch, tokens, data] where:
+                - data[..., 1]: global x-axis pixel index 
+                - data[..., 2]: global y-axis pixel index
+                
+        Returns:
+            responses: [batch, tokens, 2 * num_gaussians]
+        """
+        
+        # Create cache key based on encoding parameters only
+        cache_key = f"positional_encoding_fourrier_queries"
+        
+        # Check if we have cached encodings
+        if not hasattr(self, cache_key):
+            self._precompute_global_fourrier_encodings(device,queries=True)
+        
+        cached_encoding = getattr(self, cache_key)  # [total_positions, num_gaussians]
+        
+        # Extract global pixel indices from token_data
+        global_indices = token_data[:,0, 5].long()  # [batch, tokens]
+        
+        
+        
+        global_indices=global_indices.unsqueeze(1) + torch.arange(0,self.lookup_table.nb_tokens_queries,device=device)
+        encoding=cached_encoding[global_indices]
+        
+        B, C, E = encoding.shape
+        idx = torch.arange(C, device=device)
+        i, j = torch.meshgrid(idx, idx, indexing="ij")  # each [C, C]
+        i = i.reshape(-1)  # [C*C]
+        j = j.reshape(-1)  # [C*C]
+        encoding_i = encoding[:, i, :]  # [B, C*C, E]  -> first index of each pair
+        encoding_j = encoding[:, j, :]  # [B, C*C, E]  -> second index of each pair
+        
+        
+        # Concatenate x and y encodings
+        result = torch.cat([encoding_i,encoding_j], dim=-1)  # [batch, tokens, 2*num_gaussians]
+        
+        return result
+    
     
     def _precompute_global_gaussian_encodings(self, num_gaussians, sigma, device, cache_key,extremums=1200):
         """
@@ -418,7 +468,7 @@ class transformations_config(nn.Module):
 
         
         
-    def _precompute_global_fourrier_encodings(self, device):
+    def _precompute_global_fourrier_encodings(self, device,queries=False):
         """
         Precompute fourrier encodings for ALL possible pixel positions across all modalities.
         This creates a single global lookup table.
@@ -426,6 +476,9 @@ class transformations_config(nn.Module):
         
         # Get total number of positions from lookup table
         max_global_index = sum(size for _, size in self.lookup_table.table.keys())
+
+        if queries:
+            max_global_index = len(self.lookup_table.table_queries.keys())*self.lookup_table.nb_tokens_queries
         
         # Initialize global encoding tensor
         num_bands = self.config["Atomiser"]["pos_num_freq_bands"]* 2 + 1
@@ -436,21 +489,31 @@ class transformations_config(nn.Module):
             resolution, image_size = modality
             
             # Get global offset for this modality
-            pos=self.get_positional_encoding_fourrier(image_size,resolution,device)
+            if queries:
+                pos=self.get_positional_encoding_fourrier(image_size,resolution,device,sampling=self.lookup_table.nb_tokens_queries)
+            else:
+                pos=self.get_positional_encoding_fourrier(image_size,resolution,device)
             
             
             
             modality_key = (int(1000 * resolution), image_size)
             global_offset = self.lookup_table.table[modality_key]
+            if queries:
+                global_offset = self.lookup_table.table_queries[modality_key]
+
             
             
-            
+            if queries:
+                global_encoding[global_offset:global_offset + self.lookup_table.nb_tokens_queries] = pos
+            else:
             # Place encodings at correct global indices
-            global_encoding[global_offset:global_offset + image_size] = pos
+                global_encoding[global_offset:global_offset + image_size] = pos
         
         
         # Store the global encoding
         cache_key = f"positional_encoding_fourrier"
+        if queries:
+            cache_key = f"positional_encoding_fourrier_queries"
         setattr(self, cache_key, global_encoding)
         
     def _precompute_global_wavelength_encodings(self, device):
@@ -668,6 +731,9 @@ class transformations_config(nn.Module):
         value_processed = self.get_bvalue_processing(im_sen[:,:,0])
         
         p_x=self.get_fourrier_encoding(im_sen,device=im_sen.device)
+        p_latents=self.get_fourrier_encoding_queries(im_sen,device=im_sen.device)
+
+        
         #band_post_proc_0=self.get_gaussian_encoding(im_sen,8,100, im_sen.device,extremums=600)
         #band_post_proc_1=self.get_gaussian_encoding(im_sen,16,40.0, im_sen.device,extremums=600)
         #band_post_proc_2=self.get_gaussian_encoding(im_sen,32,10.0, im_sen.device,extremums=300)
@@ -692,7 +758,7 @@ class transformations_config(nn.Module):
         
 
 
-        return tokens, mask_sen
+        return tokens, mask_sen, p_latents
     
     
     def get_tokens(self,img,mask,mode="optique",modality="s2",wave_encoding=None,query=False):

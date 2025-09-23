@@ -280,12 +280,12 @@ class FLAIR_MAE(Dataset):
         self.bandwidths=torch.Tensor(res_band)
         self.wavelengths=torch.Tensor(res_wave)
 
-    def get_position_coordinates(self, image_shape, new_resolution):
+    def get_position_coordinates(self, image_shape, new_resolution,table=None):
         image_size = image_shape[-1]
         channels_size = image_shape[0]
 
         tmp_resolution = int(new_resolution*1000)
-        global_offset = self.look_up.table[(tmp_resolution, image_size)]
+        global_offset = table[(tmp_resolution, image_size)]
         
         # Create LOCAL pixel indices (0 to image_size-1)
         y_indices = torch.arange(image_size).unsqueeze(1).expand(image_size, image_size)
@@ -297,6 +297,27 @@ class FLAIR_MAE(Dataset):
         # Expand for all bands
         x_indices = einops.repeat(x_indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
         y_indices = einops.repeat(y_indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
+
+        return x_indices, y_indices
+    
+    def get_position_coordinates_queries(self, image_shape, new_resolution,table=None):
+        image_size = image_shape[-1]
+        channels_size = image_shape[0]
+
+        tmp_resolution = int(new_resolution*1000)
+        global_offset = table[(tmp_resolution, image_size)]
+        
+        # Create LOCAL pixel indices (0 to image_size-1)
+        y_indices = torch.arange(image_size).unsqueeze(1).expand(image_size, image_size)
+        x_indices = torch.arange(image_size).unsqueeze(0).expand(image_size, image_size)
+        print(x_indices.shape)
+        raise("hoho")
+        
+
+        
+        # Expand for all bands
+        x_indices = einops.repeat(x_indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
+    
 
         return x_indices, y_indices
     
@@ -417,7 +438,8 @@ class FLAIR_MAE(Dataset):
 
         
         idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
-        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution)
+        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution,table=self.look_up.table)
+        indices_queries= self.get_position_coordinates_queries(im_aerial.shape, new_resolution,table=self.look_up.table_queries)
         
         
         # Concatenate all token data
@@ -426,7 +448,8 @@ class FLAIR_MAE(Dataset):
             x_indices.float(),        # Global X indices
             y_indices.float(),        # Global Y indices  
             idxs_bandwidths.float(),   # Bandwidth indices
-            label_segment.float().unsqueeze(-1)
+            label_segment.float().unsqueeze(-1),
+            indices_queries.float()
         ], dim=-1)
  
         
@@ -651,12 +674,12 @@ class FLAIR_SEG(Dataset):
         self.bandwidths=torch.Tensor(res_band)
         self.wavelengths=torch.Tensor(res_wave)
 
-    def get_position_coordinates(self, image_shape, new_resolution):
+    def get_position_coordinates(self, image_shape, new_resolution,table=None):
         image_size = image_shape[-1]
         channels_size = image_shape[0]
 
         tmp_resolution = int(new_resolution*1000)
-        global_offset = self.look_up.table[(tmp_resolution, image_size)]
+        global_offset = table[(tmp_resolution, image_size)]
         
         # Create LOCAL pixel indices (0 to image_size-1)
         y_indices = torch.arange(image_size).unsqueeze(1).expand(image_size, image_size)
@@ -670,6 +693,25 @@ class FLAIR_SEG(Dataset):
         y_indices = einops.repeat(y_indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
 
         return x_indices, y_indices
+    
+    def get_position_coordinates_queries(self, image_shape, new_resolution,table=None):
+        image_size = image_shape[-1]
+        channels_size = image_shape[0]
+
+        tmp_resolution = int(new_resolution*1000)
+        global_offset = table[(tmp_resolution, image_size)]
+        
+        # Create LOCAL pixel indices (0 to image_size-1)
+        indices = torch.full((image_size, image_size),global_offset)
+        
+        
+        
+        # Expand for all bands
+        indices = einops.repeat(indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
+
+        return indices
+    
+
     
     def get_wavelengths_coordinates(self, image_shape):
         image_size = image_shape[-1]
@@ -763,9 +805,12 @@ class FLAIR_SEG(Dataset):
         #months = torch.tensor(f[f'months_{idx}'][:], dtype=torch.float32)
         #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
+
+        im_aerial,label=random_augment_image_and_label(im_aerial,label)
+
         label = self.process_mask(label)
-        attention_mask=torch.ones(im_aerial.shape)
-        attention_mask[:,128:384,128:384]=0.0
+        attention_mask=torch.zeros(im_aerial.shape)
+        
 
 
 
@@ -794,7 +839,9 @@ class FLAIR_SEG(Dataset):
         
         
         idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
-        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution)
+        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution,table=self.look_up.table)
+        indices_queries = self.get_position_coordinates_queries(im_aerial.shape, new_resolution,table=self.look_up.table_queries)
+        
         
         # Concatenate all token data
         image = torch.cat([
@@ -803,6 +850,7 @@ class FLAIR_SEG(Dataset):
             y_indices.float(),        # Global Y indices  
             idxs_bandwidths.float(),   # Bandwidth indices
             label_segment.float().unsqueeze(-1),
+            indices_queries.float()
         ], dim=-1)
         
         #at this point image shape is [5,512,512,5]
@@ -811,7 +859,7 @@ class FLAIR_SEG(Dataset):
         # 5 -> meta data
         
         
-        queries=image.clone()
+        queries=image[0].clone().unsqueeze(0)
         
         
         # Reshape and sample tokens
@@ -819,7 +867,7 @@ class FLAIR_SEG(Dataset):
         queries= einops.rearrange(queries,"b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
         image= image[attention_mask==0.0]          # image get resized and invalid bands removed
-        queries= queries[attention_mask==0.0]    # same for mask
+        #queries= queries[attention_mask==0.0]    # same for mask
 
 
         nb_queries=self.config_model["trainer"]["max_tokens_reconstruction"]

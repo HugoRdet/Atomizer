@@ -4,6 +4,9 @@ __pycache__/
 wandb/*
 data/Tiny_BigEarthNet/transformations/*
 *.mdb
+*.zip
+data/eurosat/2750/*
+data/eurosat/eurosat/2750/*
 *.parquet
 key_vast
 key_vast.pub

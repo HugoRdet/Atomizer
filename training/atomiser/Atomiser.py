@@ -48,7 +48,7 @@ class Atomiser(pl.LightningModule):
         self.depth = config["Atomiser"]["depth"]
         self.num_latents = config["Atomiser"]["num_latents"]
         # Use config latent_dim if available, otherwise fall back to input_dim
-        self.latent_dim = config["Atomiser"].get("latent_dim", self.input_dim)
+        self.latent_dim = self._get_encoding_dim("pos")*2 #config["Atomiser"].get("latent_dim", self.input_dim)
         self.cross_heads = config["Atomiser"]["cross_heads"]
         self.latent_heads = config["Atomiser"]["latent_heads"]
         self.cross_dim_head = config["Atomiser"]["cross_dim_head"]
@@ -111,11 +111,7 @@ class Atomiser(pl.LightningModule):
         self.latents = nn.Parameter(torch.randn(self.num_latents, self.latent_dim))
         nn.init.trunc_normal_(self.latents, std=0.02, a=-2., b=2.)
         
-        # Add input projection if dimensions don't match
-        if self.input_dim != self.latent_dim:
-            self.input_projection = nn.Linear(self.input_dim, self.latent_dim)
-        else:
-            self.input_projection = nn.Identity()
+        
     
     def _init_encoder_layers(self):
         """Initialize encoder layers with optional weight sharing"""
@@ -153,16 +149,26 @@ class Atomiser(pl.LightningModule):
             self.latent_dim,
             FeedForward(self.latent_dim, dropout=self.ff_dropout)
         ))
+
+        get_post_XQKV_norm = cache_fn(lambda: nn.LayerNorm(self.latent_dim))
+        get_post_XQ_norm = cache_fn(lambda: nn.LayerNorm(self.latent_dim))
+
         
         # Build encoder layers
         self.encoder_layers = nn.ModuleList()
         for i in range(self.depth):
+            
             # Enable caching for weight sharing (except first layer)
             cache_args = {'_cache': (i > 0 and self.weight_tie_layers)}
+
+            
             
             # Cross-attention and feedforward
             cross_attn = get_cross_attn(**cache_args)
             cross_ff = get_cross_ff(**cache_args)
+
+            post_XQKV_norm = get_post_XQKV_norm(**cache_args)
+            post_XQ_norm = get_post_XQ_norm(**cache_args)
             
             # Self-attention blocks
             self_attns = nn.ModuleList()
@@ -172,7 +178,7 @@ class Atomiser(pl.LightningModule):
                     get_latent_ff(**cache_args, key=j)
                 ]))
             
-            self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns]))
+            self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns,post_XQKV_norm,post_XQ_norm]))
     
     def _init_decoder(self):
         """Initialize decoder for reconstruction following Perceiver IO formula"""
@@ -234,6 +240,23 @@ class Atomiser(pl.LightningModule):
         
         return tokens[:, perm], mask[:, perm]
     
+    def bias(self,tokens,latents_pos):
+        """returns bias based on cosine similarity
+        tokens: [B, N, D]
+        latents_pos: [num_latents, D]
+        """
+        tokens_position_dim=self._get_encoding_dim("pos")*2 # x and y
+        tokens_position=tokens[:,:, :tokens_position_dim]
+
+        similarities = torch.tensordot(tokens_position, latents_pos, dims=([1], [1]))
+        dot_products = torch.diag(similarities)
+
+        return dot_products
+
+
+
+
+    
     def encode(self, tokens, mask, training=True):
         """
         Encode tokens through the transformer layers
@@ -246,31 +269,42 @@ class Atomiser(pl.LightningModule):
         Returns:
             latents: [B, num_latents, latent_dim] encoded representations
         """
-        B = tokens.shape[0]
+        #B = tokens.shape[0]
 
         # FIXED: Initialize latents from learnable parameters (not from input tokens!)
-        latents = repeat(self.latents, 'n d -> b n d', b=B)
+        #latents = repeat(self.latents, 'n d -> b n d', b=B)
+
+        latents_s=None
+        
+        self._init_latents()
+        latents_l=latents = repeat(self.latents, 'n d -> b n d', b=tokens.shape[0])
+        latents_pos=None
 
         
         
         # Process through encoder layers
-        for layer_idx, (cross_attn, cross_ff, self_attns) in enumerate(self.encoder_layers):
+        for layer_idx, (cross_attn, cross_ff, self_attns,XQKV_norm,XQ_norm) in enumerate(self.encoder_layers):
             # Subsample tokens if needed
             max_tokens = self.max_tokens_forward if training else self.max_tokens_val
             current_tokens, current_mask = self._subsample_tokens(tokens, mask, max_tokens, training)
             
             # Process tokens through transform
-            processed_tokens, processed_mask = self.transform.process_data(current_tokens, current_mask, query=False)
+            processed_tokens, processed_mask, tmp_latents = self.transform.process_data(current_tokens, current_mask, query=False)
+
+            if layer_idx==0:
+                latents_pos=tmp_latents.clone()
+
             processed_mask = processed_mask.bool()
             
-            # Project input tokens to latent dimension
-            processed_tokens = self.input_projection(processed_tokens)
             
             # Mask invalid tokens
             processed_tokens = processed_tokens.masked_fill_(processed_mask.unsqueeze(-1), 0.0)
             
             # ENCODER: Cross-attention - latents attend to tokens
-            latents = cross_attn(latents, context=processed_tokens, mask=~processed_mask) + latents
+            term_1=XQKV_norm(cross_attn(latents, context=processed_tokens, mask=~processed_mask))
+            term_2=XQ_norm(latents)
+            
+            latents =  term_1 + term_2 
             
             # Cross feedforward with residual connection
             latents = cross_ff(latents) + latents

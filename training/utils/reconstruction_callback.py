@@ -683,11 +683,16 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                 # Reshape to spatial format
                 bandvalues = image# mae_tokens[:, :, :, 0]  # [h, w, channels] - B,G,R,NIR,elevation
                 classes = labels
+
+
+               
                 
+                
+                y_hat = rearrange(y_hat, "(c h w ) l -> c h w l", h=512, w=512 ,c=5)
+                #y_hat = y_hat.mean(dim=0)
+                y_hat  = y_hat[0]
                 y_hat = torch.argmax(y_hat.clone(), dim=-1)
-                
-                y_hat = rearrange(y_hat, "(c h w ) -> c h w", h=512, w=512 ,c=5)
-                y_hat=y_hat[0,:,:]
+                #y_hat=y_hat[0,:,:]
                 labels=rearrange(labels,"c h w -> h w c").squeeze(-1)
                 
                 
@@ -756,7 +761,7 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         # Prepare wandb data
         wandb_data = {
             # Main segmentation visualization
-            f"segmentation/epoch_{epoch}_sample_{sample_idx} {id}": wandb.Image(
+            f"segmentation/sample_{sample_idx} {id}": wandb.Image(
                 segmentation_fig, 
                 caption=f"Segmentation - Epoch {epoch}, Sample {sample_idx}, Accuracy: {accuracy:.3f}"
             ),

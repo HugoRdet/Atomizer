@@ -10,6 +10,7 @@ from training.VIT import*
 from training.ResNet import*
 from collections import defaultdict
 from training import*
+from training.utils.utils_dataset_EUROSAT import EuroSAT_Atomizer
 
 
 from pytorch_lightning import Trainer,seed_everything
@@ -59,4 +60,27 @@ aerial_mtds=d_test["MTD_AERIAL"]
 
 print("images test: ",len(labels))
 create_dataset_flair(images, labels, sentinel_images, centroids,sentinel_products,sentinel_masks,aerial_mtds, name="regular", mode="test", stats=stats,max_samples=150)
+
+
+config_model = read_yaml("./training/configs/config_test-Atomiser_Atos_One.yaml")
+configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_regular.yaml"
+bands_yaml       = "./data/bands_info/bands.yaml"
+lookup_table=Lookup_encoding(read_yaml(configs_dataset),read_yaml(bands_yaml))
+modalities_trans = modalities_transformations_config(configs_dataset,model=config_model["encoder"], name_config="regular")
+test_conf=None
+if config_model["encoder"] == "Atomiser_tradi":
+    test_conf        = transformations_config_tradi(bands_yaml, config_model,lookup_table=lookup_table)
+else:
+    test_conf        = transformations_config(bands_yaml, config_model,lookup_table=lookup_table)
+
+
+dataset = EuroSAT_Atomizer(
+    root="./data/eurosat",
+    download=True,
+    model="Atomiser",
+    config_model=config_model,
+    look_up=lookup_table,
+    transform=test_conf
+)
+
 

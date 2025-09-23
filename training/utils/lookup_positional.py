@@ -11,11 +11,14 @@ class Lookup_encoding(pl.LightningModule):
         self.modalities=None
         self.table=None
         self.table_wave=None
+        self.table_queries=None
+        self.nb_tokens_queries=20
 
 
         self.init_config()
         self.init_lookup_table()
         self.init_lookup_table_wave()
+        self.init_queries_lookup_table()
 
     def init_config(self):
         modalities=[]
@@ -59,6 +62,30 @@ class Lookup_encoding(pl.LightningModule):
                    
         
         self.table=table
+
+    def init_queries_lookup_table(self):
+        table=dict()
+        idx_torch_array=0
+
+        for couple in self.modalities:
+            resolution,size=couple
+            resolution=int(resolution*1000)
+            table[(resolution,size)]=idx_torch_array
+            idx_torch_array+=self.nb_tokens_queries
+            
+                   
+        
+        self.table_queries=table
+
+    def get_grid_pos(self,resolution,size):
+        """Get the positional encoding grid for a given resolution, size in meters anf number of points"""
+        resolution=int(resolution*1000)
+        key=(resolution,size)
+        if not key in self.table:
+            raise ValueError(f"Resolution {resolution} and size {size} not found in the lookup table")
+        
+        idx=self.table[key]
+        return torch.arange(idx,idx+size,dtype=torch.float32)
         
     def init_lookup_table_wave(self):
         table=dict()
