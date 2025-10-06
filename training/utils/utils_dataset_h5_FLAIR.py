@@ -17,7 +17,7 @@ import torch.distributed as dist
 import time
 from .lookup_positional import*
 from .mask_generator import *
-
+import os
 
 def del_file(path):
     if os.path.exists(path):
@@ -674,31 +674,38 @@ class FLAIR_SEG(Dataset):
         self.bandwidths=torch.Tensor(res_band)
         self.wavelengths=torch.Tensor(res_wave)
 
-    def get_position_coordinates(self, image_shape, new_resolution,table=None):
+    def get_position_coordinates(self, image_shape, new_resolution, table=None):
         image_size = image_shape[-1]
         channels_size = image_shape[0]
-
-        tmp_resolution = int(new_resolution*1000)
+        
+        tmp_resolution = int(new_resolution * 1000)
         global_offset = table[(tmp_resolution, image_size)]
         
-        # Create LOCAL pixel indices (0 to image_size-1)
-        y_indices = torch.arange(image_size).unsqueeze(1).expand(image_size, image_size)
-        x_indices = torch.arange(image_size).unsqueeze(0).expand(image_size, image_size)
+        # Create meshgrid - clearer and more standard
+        y_coords = torch.arange(image_size)  # 0 to image_size-1
+        x_coords = torch.arange(image_size)  # 0 to image_size-1
         
+        # meshgrid returns (X, Y) grid
+        x_indices, y_indices = torch.meshgrid(x_coords, y_coords, indexing='xy')
+        
+        # Add global offset
         x_indices = x_indices + global_offset
         y_indices = y_indices + global_offset
+
         
         # Expand for all bands
-        x_indices = einops.repeat(x_indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
-        y_indices = einops.repeat(y_indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
-
+        x_indices = einops.repeat(x_indices, "h w -> r h w", r=channels_size).unsqueeze(-1)
+        y_indices = einops.repeat(y_indices, "h w -> r h w", r=channels_size).unsqueeze(-1)
+        
+      
         return x_indices, y_indices
     
     def get_position_coordinates_queries(self, image_shape, new_resolution,table=None):
         image_size = image_shape[-1]
         channels_size = image_shape[0]
 
-        tmp_resolution = int(new_resolution*1000)
+        resolution_latents=0.2 #m
+        tmp_resolution = int(resolution_latents*1000)
         global_offset = table[(tmp_resolution, image_size)]
         
         # Create LOCAL pixel indices (0 to image_size-1)
@@ -788,6 +795,22 @@ class FLAIR_SEG(Dataset):
         mask = mask - 1
         return mask
 
+    def save_img_aerial_to_pdf(im_aerial, filename="aerial.pdf", tmpdir="/tmp"):
+        img = im_aerial[:3].cpu().numpy()
+        img = img[[2,1,0], :, :]
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        img = (img * 255).astype(np.uint8)
+        img = np.transpose(img, (1,2,0))
+
+        tmp_path = os.path.join(tmpdir, "aerial_tmp.png")
+        plt.imsave(tmp_path, img)
+
+        doc = SimpleDocTemplate(filename, pagesize=letter)
+        story = [Image(tmp_path, width=500, height=500)]
+        doc.build(story)
+
+        os.remove(tmp_path)
+
     def __getitem__(self, idx):
         label = None
         id_img = None
@@ -800,13 +823,15 @@ class FLAIR_SEG(Dataset):
         
 
         im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
+        
+        
         #im_sen = torch.tensor(f[f'img_sen_{idx}'][:], dtype=torch.float32)  # [12,10,40,40]
         #days = torch.tensor(f[f'days_{idx}'][:], dtype=torch.float32)
         #months = torch.tensor(f[f'months_{idx}'][:], dtype=torch.float32)
         #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
 
-        im_aerial,label=random_augment_image_and_label(im_aerial,label)
+        #im_aerial,label=random_augment_image_and_label(im_aerial,label)
 
         label = self.process_mask(label)
         attention_mask=torch.zeros(im_aerial.shape)
@@ -909,8 +934,7 @@ class FLAIR_SEG(Dataset):
         #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
         label = self.process_mask(label)
-        attention_mask=torch.ones(im_aerial.shape)
-        attention_mask[:,128:384,128:384]=0.0
+        attention_mask=torch.zeros(im_aerial.shape)
         
         
         
@@ -935,7 +959,8 @@ class FLAIR_SEG(Dataset):
         
         
         idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
-        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution)
+        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution,table=self.look_up.table)
+        indices_queries = self.get_position_coordinates_queries(im_aerial.shape, new_resolution,table=self.look_up.table_queries)
         
         # Concatenate all token data
         image = torch.cat([
@@ -944,6 +969,7 @@ class FLAIR_SEG(Dataset):
             y_indices.float(),        # Global Y indices  
             idxs_bandwidths.float(),   # Bandwidth indices
             label_segment.float().unsqueeze(-1),
+            indices_queries.float()
         ], dim=-1)
         
         #at this point image shape is [5,512,512,5]

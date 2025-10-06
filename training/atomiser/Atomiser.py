@@ -69,6 +69,7 @@ class Atomiser(pl.LightningModule):
         self._init_encoder_layers()
         self._init_decoder()
         self._init_classifier()
+        self._init_latents()
     
     def _compute_input_dim(self):
         """Compute total input dimension from all encodings"""
@@ -88,6 +89,8 @@ class Atomiser(pl.LightningModule):
         """Get encoding dimension for a specific attribute"""
         encoding_type = self.config["Atomiser"][f"{attribute}_encoding"]
 
+        #if attribute=="pos":
+        #    return 396
         if encoding_type == "NOPE":
             return 0
         elif encoding_type == "NATURAL":
@@ -116,17 +119,19 @@ class Atomiser(pl.LightningModule):
     def _init_encoder_layers(self):
         """Initialize encoder layers with optional weight sharing"""
         # Create cached layer factories for weight sharing
+        
         get_cross_attn = cache_fn(lambda: 
             PreNorm(
                 dim=self.latent_dim,
                 fn=CrossAttention(
                     query_dim=self.latent_dim,
-                    context_dim=self.latent_dim,  # Both are latent_dim after projection
+                    context_dim=self.input_dim,
                     heads=self.cross_heads,
                     dim_head=self.cross_dim_head,
                     dropout=self.attn_dropout,
+                    id=1
                 ),
-                context_dim=self.latent_dim
+                context_dim=self.input_dim
             ))
         
         get_cross_ff = cache_fn(lambda: PreNorm(
@@ -150,8 +155,7 @@ class Atomiser(pl.LightningModule):
             FeedForward(self.latent_dim, dropout=self.ff_dropout)
         ))
 
-        get_post_XQKV_norm = cache_fn(lambda: nn.LayerNorm(self.latent_dim))
-        get_post_XQ_norm = cache_fn(lambda: nn.LayerNorm(self.latent_dim))
+
 
         
         # Build encoder layers
@@ -164,11 +168,24 @@ class Atomiser(pl.LightningModule):
             
             
             # Cross-attention and feedforward
-            cross_attn = get_cross_attn(**cache_args)
+            if i==0:
+                cross_attn = PreNorm(
+                    dim=self._get_encoding_dim("pos")*2,
+                    fn=CrossAttention(
+                        query_dim=self._get_encoding_dim("pos")*2,
+                        context_dim=self._get_encoding_dim("pos")*2,
+                        heads=self.cross_heads,
+                        dim_head=self.cross_dim_head,
+                        dropout=self.attn_dropout,
+                        id=0
+                    ),
+                    context_dim=self._get_encoding_dim("pos")*2
+                )
+
+            else:
+                cross_attn = get_cross_attn(**cache_args)
             cross_ff = get_cross_ff(**cache_args)
 
-            post_XQKV_norm = get_post_XQKV_norm(**cache_args)
-            post_XQ_norm = get_post_XQ_norm(**cache_args)
             
             # Self-attention blocks
             self_attns = nn.ModuleList()
@@ -178,7 +195,7 @@ class Atomiser(pl.LightningModule):
                     get_latent_ff(**cache_args, key=j)
                 ]))
             
-            self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns,post_XQKV_norm,post_XQ_norm]))
+            self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns]))
     
     def _init_decoder(self):
         """Initialize decoder for reconstruction following Perceiver IO formula"""
@@ -193,7 +210,8 @@ class Atomiser(pl.LightningModule):
                 context_dim=self.latent_dim,
                 heads=self.latent_heads,
                 dim_head=self.latent_dim_head,
-                dropout=0.0
+                dropout=0.0,
+                id=0
             ),
             context_dim= self.latent_dim # For normalizing context (latents)
         )
@@ -240,24 +258,93 @@ class Atomiser(pl.LightningModule):
         
         return tokens[:, perm], mask[:, perm]
     
-    def bias(self,tokens,latents_pos):
-        """returns bias based on cosine similarity
-        tokens: [B, N, D]
-        latents_pos: [num_latents, D]
+
+
+    def bias(self, data):
         """
-        tokens_position_dim=self._get_encoding_dim("pos")*2 # x and y
-        tokens_position=tokens[:,:, :tokens_position_dim]
+        Compute the integral of 2D Gaussians over rectangular domains.
+        
+        Args:
+            data: tuple of (tokens_positions, latent_gaussians)
+                tokens_positions: [batch_size, nb_tokens, 2, 2]
+                    - dim 2: axis (0=x, 1=y)
+                    - dim 3: bounds (0=min, 1=max)
+                latent_gaussians: [batch_size, 400, 2, 2]
+                    - dim 2: axis (0=x, 1=y)
+                    - dim 3: parameters (0=center/mu, 1=std/sigma)
+        
+        Returns:
+            torch.Tensor: [batch_size, 400, nb_tokens] - integral values
+        """
+        tokens_positions, latent_gaussians = data
+        
+        batch_size = tokens_positions.shape[0]
+        nb_tokens = tokens_positions.shape[1]
+        nb_gaussians = latent_gaussians.shape[1]
+        
+        # Extract parameters
+        # tokens_positions: [batch_size, nb_tokens, 2, 2]
+        x_min = tokens_positions[:, :, 0, 0]  # [batch_size, nb_tokens]
+        x_max = tokens_positions[:, :, 0, 1]  # [batch_size, nb_tokens]
+        y_min = tokens_positions[:, :, 1, 0]  # [batch_size, nb_tokens]
+        y_max = tokens_positions[:, :, 1, 1]  # [batch_size, nb_tokens]
+        
+        # latent_gaussians: [batch_size, 400, 2, 2]
+        mu_x = latent_gaussians[:, :, 0, 0]  # [batch_size, 400]
+        sigma_x = latent_gaussians[:, :, 0, 1]  # [batch_size, 400]
+        mu_y = latent_gaussians[:, :, 1, 0]  # [batch_size, 400]
+        sigma_y = latent_gaussians[:, :, 1, 1]  # [batch_size, 400]
+        
+        # Reshape for broadcasting: we want to compute all pairs (gaussian, token)
+        # Shape transformations for broadcasting
+        mu_x = mu_x[:, :, None]  # [batch_size, 400, 1]
+        sigma_x = sigma_x[:, :, None]  # [batch_size, 400, 1]
+        mu_y = mu_y[:, :, None]  # [batch_size, 400, 1]
+        sigma_y = sigma_y[:, :, None]  # [batch_size, 400, 1]
+        
+        x_min = x_min[:, None, :]  # [batch_size, 1, nb_tokens]
+        x_max = x_max[:, None, :]  # [batch_size, 1, nb_tokens]
+        y_min = y_min[:, None, :]  # [batch_size, 1, nb_tokens]
+        y_max = y_max[:, None, :]  # [batch_size, 1, nb_tokens]
+        
+        # For a 1D Gaussian N(mu, sigma^2), the integral from a to b is:
+        # (1/2) * [erf((b - mu)/(sigma * sqrt(2))) - erf((a - mu)/(sigma * sqrt(2)))]
+        # This is equivalent to: Phi((b - mu)/sigma) - Phi((a - mu)/sigma)
+        # where Phi is the standard normal CDF
+        
+        sqrt_2 = torch.sqrt(torch.tensor(2.0, device=latent_gaussians.device))
+        
+        # Compute CDF values for x-axis
+        # Using the identity: Phi(z) = 0.5 * (1 + erf(z / sqrt(2)))
+        z_x_min = (x_min - mu_x) / (sigma_x * sqrt_2)
+        z_x_max = (x_max - mu_x) / (sigma_x * sqrt_2)
+        
+        # Integral in x direction
+        integral_x = 0.5 * (torch.erf(z_x_max) - torch.erf(z_x_min))
+        
+        # Compute CDF values for y-axis
+        z_y_min = (y_min - mu_y) / (sigma_y * sqrt_2)
+        z_y_max = (y_max - mu_y) / (sigma_y * sqrt_2)
+        
+        # Integral in y direction
+        integral_y = 0.5 * (torch.erf(z_y_max) - torch.erf(z_y_min))
+        
+        # For a 2D Gaussian with independent components, the integral is the product
+        result =torch.log( integral_x * integral_y + 1e-8 )  # [batch_size, 400, nb_tokens]
+        #result = torch.softmax(result, dim=1)
 
-        similarities = torch.tensordot(tokens_position, latents_pos, dims=([1], [1]))
-        dot_products = torch.diag(similarities)
-
-        return dot_products
+        # For visualization: normalize to [0, 1] per token
+        result_min = result.min(dim=1, keepdim=True)[0]
+        result_max = result.max(dim=1, keepdim=True)[0]
+        result = (result - result_min) / (result_max - result_min + 1e-8)
+        
+        return result
 
 
 
 
     
-    def encode(self, tokens, mask, training=True):
+    def encode(self, tokens, mask, training=True,viz=False):
         """
         Encode tokens through the transformer layers
         
@@ -275,46 +362,110 @@ class Atomiser(pl.LightningModule):
         #latents = repeat(self.latents, 'n d -> b n d', b=B)
 
         latents_s=None
+        matrix_biais=None
         
-        self._init_latents()
-        latents_l=latents = repeat(self.latents, 'n d -> b n d', b=tokens.shape[0])
+        
+        latents_l = repeat(self.latents, 'n d -> b n d', b=tokens.shape[0])
         latents_pos=None
 
         
         
         # Process through encoder layers
-        for layer_idx, (cross_attn, cross_ff, self_attns,XQKV_norm,XQ_norm) in enumerate(self.encoder_layers):
+        for layer_idx, (cross_attn, cross_ff, self_attns) in enumerate(self.encoder_layers):
+
             # Subsample tokens if needed
             max_tokens = self.max_tokens_forward if training else self.max_tokens_val
+            
             current_tokens, current_mask = self._subsample_tokens(tokens, mask, max_tokens, training)
             
             # Process tokens through transform
-            processed_tokens, processed_mask, tmp_latents = self.transform.process_data(current_tokens, current_mask, query=False)
-
-            if layer_idx==0:
-                latents_pos=tmp_latents.clone()
+            processed_tokens, processed_mask, tmp_latents,tmp_bias = self.transform.process_data(current_tokens, current_mask, query=False)
 
             processed_mask = processed_mask.bool()
-            
-            
-            # Mask invalid tokens
             processed_tokens = processed_tokens.masked_fill_(processed_mask.unsqueeze(-1), 0.0)
             
-            # ENCODER: Cross-attention - latents attend to tokens
-            term_1=XQKV_norm(cross_attn(latents, context=processed_tokens, mask=~processed_mask))
-            term_2=XQ_norm(latents)
+            if layer_idx==0:
+                latents_pos=tmp_latents.clone()
+                latents_s= tmp_latents
+                pos_dim=self._get_encoding_dim("pos")*2     
+                term_1=cross_attn(latents_s, context=processed_tokens[:,:,-pos_dim:], mask=~processed_mask,id=layer_idx)
+            else:
+                #current tokens has positions
+                #processed tokens has information
+
+                if viz and layer_idx==1:
+                    max_tokens_b=10000
+                    matrix_biais=[]
+                    matrix_attention=[]
+                    cpt=0
+
+                    for tmp_idx in range(0,tokens.shape[1],max_tokens_b):
+                        tmp_tokens_viz=tokens[:,tmp_idx:tmp_idx+max_tokens_b]
+                        tmp_mask_viz=mask[:,tmp_idx:tmp_idx+max_tokens_b]
+
+                        
+                        
+
+                        processed_tokens_tmp, processed_mask_tmp, tmp_latents,tmp_bias_viz = self.transform.process_data(tmp_tokens_viz, tmp_mask_viz, query=False)
+                        
+                    
+                        processed_mask_tmp = processed_mask_tmp.bool()
+                        processed_tokens_tmp = processed_tokens_tmp.masked_fill_(processed_mask_tmp.unsqueeze(-1), 0.0)
             
-            latents =  term_1 + term_2 
+                        tmp_b=self.bias(tmp_bias_viz)
+                        
+                        cross_attn.fn.viz=True
+                       
+                        aya=cross_attn(latents_s, context=processed_tokens_tmp, mask=~processed_mask_tmp, bias=tmp_b, id=layer_idx)
+                   
+                     
+                        cross_attn.fn.viz=False
+
+                        matrix_biais.append(tmp_b[0])
+                        matrix_attention.append(torch.log(aya[0].mean(dim=0)))
+                    
+                    matrix_biais=torch.cat(matrix_biais,dim=-1)
+                    matrix_biais=einops.rearrange(matrix_biais,"l (c h w) -> l c h w",c=5,h=512,w=512)
+                    matrix_biais=matrix_biais.mean(dim=1)
+
+                    matrix_attention=torch.cat(matrix_attention,dim=-1)
+                    matrix_attention=einops.rearrange(matrix_attention,"l (c h w) -> l c h w",c=5,h=512,w=512)
+                    matrix_attention=matrix_attention.mean(dim=1)
+                    
+                    #matrix of size [400,512,512[]]
+                    #here mat has a shape [400,nb_tokens]
+                    #it's possible to do something like [400,5,512,512]
+                    #then do the average to get someting like [400,512,512]
+
+                    
+
+                
+                b=self.bias(tmp_bias)
+                term_1=cross_attn(latents_s, context=processed_tokens, mask=~processed_mask,bias=b,id=layer_idx)
+           
+            latents_s =  term_1 + latents_s
+            latents = cross_ff(latents_s) + latents_s
+           
+            merged_latents = torch.cat([latents_s, latents_l], dim=1)
             
             # Cross feedforward with residual connection
-            latents = cross_ff(latents) + latents
+            
             
             # Self-attention blocks
             for self_attn, self_ff in self_attns:
-                latents = self_attn(latents) + latents
-                latents = self_ff(latents) + latents
+                latents = self_attn(merged_latents) + merged_latents
+                latents = self_ff(merged_latents) + merged_latents
+            
+            latents_s=latents[:,:400,:]
+            latents_l=latents[:,400:,:]
+            
+        
+        if viz:
+            return latents,(matrix_biais,matrix_attention)
         
         return latents
+    
+    
     
     def reconstruct(self, latents, query_tokens, query_mask):
         """
@@ -356,7 +507,7 @@ class Atomiser(pl.LightningModule):
     
         #predictions = predictions.mean(dim=1)
         
-        return predictions, processed_mask
+        return predictions
     
     def classify(self, latents):
         """
@@ -389,28 +540,44 @@ class Atomiser(pl.LightningModule):
             For encoder: [B, num_latents, latent_dim] latent representations
         """
         # Encode input tokens to latent representations
-        latents = self.encode(data, mask, training=training)
+        latents=None
+        matrix_biais=None
+        if task == "vizualisation":
+            latents,matrix_biais = self.encode(data, mask, training=training,viz=True)
+        else:
+            latents = self.encode(data, mask, training=training)
         
         if task == "encoder":
             return latents
-        elif task == "reconstruction":
+        elif task == "reconstruction" or task == "vizualisation":
             # Handle large token sequences by chunking
             nb_tokens_processed = 100000
             if mae_tokens.shape[1] > nb_tokens_processed:
                 preds_list = []
-                mask_list = []
+                
+               
                 for i in range(0, mae_tokens.shape[1], nb_tokens_processed):
                     chunk_tokens = mae_tokens[:, i:i+nb_tokens_processed]
                     chunk_mask = mae_tokens_mask[:, i:i+nb_tokens_processed]
-                    p, m = self.reconstruct(latents, chunk_tokens, chunk_mask)
+                    p = self.reconstruct(latents, chunk_tokens, chunk_mask)
                     preds_list.append(p)
-                    mask_list.append(m)
+                    
                 
                 preds = torch.cat(preds_list, dim=1)
-                out_mask = torch.cat(mask_list, dim=1)
-                return preds, out_mask
+
+
+                if task=="vizualisation":
+                    return preds,matrix_biais
+                
+                
+                
+                return preds
             else:
                 return self.reconstruct(latents, mae_tokens, mae_tokens_mask)
+            
+
+            
+        #forward_viz(self, x, context, mask=None, bias=None, id=0)
             
         else:  # task == "classification"
             return self.classify(latents)

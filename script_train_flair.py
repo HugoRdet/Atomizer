@@ -120,7 +120,7 @@ checkpoint_val_mod_train = ModelCheckpoint(
     save_top_k=1,
     verbose=True,
 )
-accumulator = GradientAccumulationScheduler(scheduling={0:1,250:64})
+accumulator = GradientAccumulationScheduler(scheduling={0:1})
 #reconstruction_callback,knn_callback_multiclass
 # Trainer
 trainer = Trainer(

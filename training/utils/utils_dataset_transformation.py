@@ -228,7 +228,7 @@ class transformations_config(nn.Module):
         """
 
         # spatial size (assume H == W)
-   
+
         if sampling is None:
             sampling=size
         # -- 1) compute per-sample, per-band new resolution: [B, C]
@@ -237,12 +237,14 @@ class transformations_config(nn.Module):
 
         # -- 2) compute positional scaling per band: [B, C]
         
-        pos_scalings = (size * resolution) / 105
+        pos_scalings = (size * resolution) / 100
         
   
         max_freq  = self.config["Atomiser"]["pos_max_freq"]
         num_bands = self.config["Atomiser"]["pos_num_freq_bands"]
-        cutoff = self.compute_adaptive_cutoff(resolution=resolution,image_size=size,base_norm=105 ,total_bands= num_bands)      # ≈ 20 bands (63%)
+        #cutoff = self.compute_adaptive_cutoff(resolution=resolution,image_size=size,base_norm=100 ,total_bands= num_bands)      # ≈ 20 bands (63%)
+        cutoff = -1
+        
         
         
         
@@ -310,6 +312,60 @@ class transformations_config(nn.Module):
         result = torch.cat([encoding_x, encoding_y], dim=-1)  # [batch, tokens, 2*num_gaussians]
         
         return result
+    
+    def get_gaussian_encoding_latents(
+        self,
+        token_data: torch.Tensor,  # [batch, tokens, data] 
+        num_gaussians: int,        
+        sigma: float,
+        device=None,
+        extremums=None
+    ):
+        """
+        Compute Gaussian encoding for tokens with explicit position information.
+        
+        Args:
+            token_data: [batch, tokens, data] where:
+                - data[..., 1]: global x-axis pixel index 
+                - data[..., 2]: global y-axis pixel index
+                
+        Returns:
+            responses: [batch, tokens, 2 * num_gaussians]
+        """
+        device = device or token_data.device
+        batch, tokens, _ = token_data.shape
+        
+        # Create cache key based on encoding parameters only
+        cache_key = f"positional_encoding_{num_gaussians}_{sigma}_{device}_latents"
+        
+        # Check if we have cached encodings
+        if not hasattr(self, cache_key):
+            self._precompute_global_gaussian_encodings(num_gaussians, sigma, device, cache_key,extremums=extremums,latents=True)
+        
+        cached_encoding = getattr(self, cache_key)  # [total_positions, num_gaussians]
+        
+        # Extract global pixel indices from token_data
+        global_indices = token_data[:,0, 5].long()  # [batch, tokens]
+        
+        
+        
+        global_indices=global_indices.unsqueeze(1) + torch.arange(0,self.lookup_table.nb_tokens_queries,device=device)
+        encoding=cached_encoding[global_indices]
+        
+        B, C, E = encoding.shape
+        idx = torch.arange(C, device=device)
+        i, j = torch.meshgrid(idx, idx, indexing="ij")  # each [C, C]
+        i = i.reshape(-1)  # [C*C]
+        j = j.reshape(-1)  # [C*C]
+        encoding_i = encoding[:, i, :]  # [B, C*C, E]  -> first index of each pair
+        encoding_j = encoding[:, j, :]  # [B, C*C, E]  -> second index of each pair
+        
+        
+        # Concatenate x and y encodings
+        result = torch.cat([encoding_i,encoding_j], dim=-1)  # [batch, tokens, 2*num_gaussians]
+        
+        return result
+
 
     
         
@@ -372,6 +428,98 @@ class transformations_config(nn.Module):
         
         return result
     
+    def get_bias_tokens_encoding(
+        self,
+        token_data: torch.Tensor,  # [batch, tokens, data] 
+        device=None
+    ):
+        """
+        Compute bias encoding for tokens with explicit position information.
+
+        Args:
+            token_data: [batch, tokens, data] where:
+                - data[..., 1]: global x-axis pixel index 
+                - data[..., 2]: global y-axis pixel index
+                
+        Returns:
+            responses: [batch, tokens,2,min_coodinate,max_coordinate]
+            #there is coordinates for each axis
+            #the function get_bias_latents_encoding return the parameters of the gaussians
+        """
+        
+        # Create cache key based on encoding parameters only
+        cache_key = f"bias_tokens_encoding"
+        
+        # Check if we have cached encodings
+        if not hasattr(self, cache_key):
+            self._precompute_global_bias_tokens_encodings(device)
+        
+        cached_encoding = getattr(self, cache_key)  # [total_positions, num_gaussians]
+        
+        # Extract global pixel indices from token_data
+        global_x_indices = token_data[..., 1].long()  # [batch, tokens]
+        global_y_indices = token_data[..., 2].long()  # [batch, tokens]
+        
+        # Direct lookup using global indices
+        encoding_x = cached_encoding[global_x_indices].unsqueeze(-2)  # [batch, tokens, num_gaussians]
+        encoding_y = cached_encoding[global_y_indices].unsqueeze(-2)  # [batch, tokens, num_gaussians]
+
+        
+        
+        # Concatenate x and y encodings
+        result = torch.cat([encoding_x, encoding_y], dim=-2)  # [batch, tokens, 2*num_gaussians]
+  
+        return result
+    
+
+    def get_bias_latents_encoding(
+        self,
+        token_data: torch.Tensor,  # [batch, tokens, data] 
+        device=None
+    ):
+        """
+        Compute bias encoding for tokens with explicit position information.
+
+        Args:
+            token_data: [batch, tokens, data] where:
+                - data[..., 1]: global x-axis pixel index 
+                - data[..., 2]: global y-axis pixel index
+                
+        Returns:
+            responses: [batch, tokens,2,min_coodinate,max_coordinate]
+            #there is coordinates for each axis
+            #the function get_bias_latents_encoding return the parameters of the gaussians
+        """
+        
+        # Create cache key based on encoding parameters only
+        cache_key = f"bias_latents_encoding"
+        
+        # Check if we have cached encodings
+        if not hasattr(self, cache_key):
+            self._precompute_global_bias_latents_encodings(device)
+        
+        cached_encoding = getattr(self, cache_key)  # [total_positions, num_gaussians]
+        
+        global_indices = token_data[:,0, 5].long()  # [batch, tokens]
+        
+        
+        global_indices=global_indices.unsqueeze(1) + torch.arange(0,self.lookup_table.nb_tokens_queries,device=device)
+        encoding=cached_encoding[global_indices]
+        
+        B, C, E = encoding.shape
+        idx = torch.arange(C, device=device)
+        i, j = torch.meshgrid(idx, idx, indexing="ij")  # each [C, C]
+        i = i.reshape(-1)  # [C*C]
+        j = j.reshape(-1)  # [C*C]
+        encoding_i = encoding[:, i, :].unsqueeze(-2)  # [B, C*C, E]  -> first index of each pair
+        encoding_j = encoding[:, j, :].unsqueeze(-2)  # [B, C*C, E]  -> second index of each pair
+        
+        
+        # Concatenate x and y encodings
+        result = torch.cat([encoding_i,encoding_j], dim=-2)  # [batch, tokens, 2*num_gaussians]
+        
+        return result
+    
     def get_fourrier_encoding_queries(
         self,
         token_data: torch.Tensor,  # [batch, tokens, data] 
@@ -421,7 +569,7 @@ class transformations_config(nn.Module):
         return result
     
     
-    def _precompute_global_gaussian_encodings(self, num_gaussians, sigma, device, cache_key,extremums=1200):
+    def _precompute_global_gaussian_encodings(self, num_gaussians, sigma, device, cache_key,extremums=1200,latents=False):
         """
         Precompute Gaussian encodings for ALL possible pixel positions across all modalities.
         This creates a single global lookup table.
@@ -429,8 +577,12 @@ class transformations_config(nn.Module):
         
         # Get total number of positions from lookup table
         max_global_index = sum(size for _, size in self.lookup_table.table.keys())
+
+        if latents:
+            max_global_index = len(self.lookup_table.table_queries.keys())*self.lookup_table.nb_tokens_queries
         
         # Create Gaussian centers (same for all positions)
+        
         centers = torch.linspace(-extremums, extremums, num_gaussians, device=device)
         
         # Initialize global encoding tensor
@@ -441,19 +593,31 @@ class transformations_config(nn.Module):
             resolution, image_size = modality
             
             # Get global offset for this modality
+            # self.lookup_table.nb_tokens_queries
             
             
             
             modality_key = (int(1000 * resolution), image_size)
+
             global_offset = self.lookup_table.table[modality_key]
-            
+            if latents:
+                global_offset = self.lookup_table.table_queries[modality_key]
+                image_size=self.lookup_table.nb_tokens_queries
+                physical_coords = torch.linspace(
+                    (-extremums/2.) * resolution, 
+                    (extremums/2.) * resolution, 
+                    steps=image_size, 
+                    device=device
+                )
+            else:
+
             # Create physical coordinates for this modality's pixels
-            physical_coords = torch.linspace(
-                (-image_size/2.) * resolution, 
-                (image_size/2.) * resolution, 
-                steps=image_size, 
-                device=device
-            )
+                physical_coords = torch.linspace(
+                    (-image_size/2.) * resolution, 
+                    (image_size/2.) * resolution, 
+                    steps=image_size, 
+                    device=device
+                )
             
             # Compute Gaussian encoding for this modality
             modality_encoding = self._compute_1d_gaussian_encoding_vectorized(
@@ -509,11 +673,81 @@ class transformations_config(nn.Module):
             # Place encodings at correct global indices
                 global_encoding[global_offset:global_offset + image_size] = pos
         
-        
         # Store the global encoding
         cache_key = f"positional_encoding_fourrier"
         if queries:
             cache_key = f"positional_encoding_fourrier_queries"
+        setattr(self, cache_key, global_encoding)
+
+    def _precompute_global_bias_tokens_encodings(self, device):
+        """
+        return min_max
+        """
+        
+        # Get total number of positions from lookup table
+        max_global_index = sum(size for _, size in self.lookup_table.table.keys())
+        global_encoding = torch.zeros(max_global_index, 2 , device=device)
+        
+        # Compute encodings for each modality and place them at correct global indices
+        for modality in tqdm(self.lookup_table.modalities, desc="Precomputing Gaussian encodings"):
+            resolution, image_size = modality
+            
+            pos_scalings = (image_size * resolution)
+            axis = torch.linspace(-pos_scalings/2.0, pos_scalings/2.0, steps=image_size,device=device)
+            
+            axis_left=axis.clone()
+            axis_right=axis.clone()
+            axis_left=(axis_left-resolution/2.0).unsqueeze(-1)
+            axis_right=(axis_right+resolution/2.0).unsqueeze(-1)
+
+            axis=torch.cat([axis_left,axis_right],dim=-1)
+            
+            
+
+            modality_key = (int(1000 * resolution), image_size)
+            global_offset = self.lookup_table.table[modality_key]
+            
+            global_encoding[global_offset:global_offset + image_size] = axis
+            
+        
+        # Store the global encoding
+        cache_key = f"bias_tokens_encoding"
+        
+        setattr(self, cache_key, global_encoding)
+
+    def _precompute_global_bias_latents_encodings(self, device):
+        """
+        return parameters for gaussians
+        """
+        
+        # Get total number of positions from lookup table
+        max_global_index = sum(20 for _ in self.lookup_table.table_queries.keys())
+        global_encoding = torch.zeros(max_global_index, 2 , device=device)
+        
+        # Compute encodings for each modality and place them at correct global indices
+        for modality in tqdm(self.lookup_table.modalities, desc="Precomputing Gaussian encodings"):
+            resolution, image_size = modality
+            
+            pos_scalings = (image_size * resolution)
+            #centers of gaussians
+            axis = torch.linspace(-pos_scalings/2.0, pos_scalings/2.0, steps=20,device=device).unsqueeze(-1)
+            centers = torch.full((20,1),resolution*15,device=device)
+            
+            axis=torch.cat([axis,centers],dim=-1)
+
+            
+
+            modality_key = (int(1000 * resolution), image_size)
+
+            
+            global_offset = self.lookup_table.table_queries[modality_key]
+     
+            global_encoding[global_offset:global_offset + 20] = axis
+            
+        
+        # Store the global encoding
+        cache_key = f"bias_latents_encoding"
+        
         setattr(self, cache_key, global_encoding)
         
     def _precompute_global_wavelength_encodings(self, device):
@@ -706,10 +940,15 @@ class transformations_config(nn.Module):
 
 
     def apply_transformations_optique(self, im_sen, mask_sen, mode,query=False):
+        
         if query:
             #value_processed = self.get_bvalue_processing(im_sen[:,:,0])
             central_wavelength_processing = self.get_wavelength_encoding(im_sen[:,:,3],device=im_sen.device)
             p_x=self.get_fourrier_encoding(im_sen,device=im_sen.device)
+            #band_post_proc_2=self.get_gaussian_encoding(im_sen,32,10.0, im_sen.device,extremums=52.5)
+            #band_post_proc_3=self.get_gaussian_encoding(im_sen,64,3.0, im_sen.device,extremums=52.5)
+            #band_post_proc_4=self.get_gaussian_encoding(im_sen,73,1.0, im_sen.device)
+            #band_post_proc_4=self.get_gaussian_encoding(im_sen,300,0.05, im_sen.device,extremums=52.5)
             #band_post_proc_0=self.get_gaussian_encoding(im_sen,8,100, im_sen.device,extremums=600)
             #band_post_proc_1=self.get_gaussian_encoding(im_sen,16,40.0, im_sen.device,extremums=600)
             #band_post_proc_2=self.get_gaussian_encoding(im_sen,32,10.0, im_sen.device,extremums=300)
@@ -720,7 +959,10 @@ class transformations_config(nn.Module):
             tokens = torch.cat([
                 #value_processed,
                 central_wavelength_processing,
-                p_x
+                p_x,
+                #band_post_proc_2,
+                #band_post_proc_3,
+                #band_post_proc_4,
             ], dim=-1)
             
             return tokens, mask_sen
@@ -729,17 +971,24 @@ class transformations_config(nn.Module):
         central_wavelength_processing = self.get_wavelength_encoding(im_sen[:,:,3],device=im_sen.device)
         # 3) Band‑value encoding
         value_processed = self.get_bvalue_processing(im_sen[:,:,0])
-        
+        tokens_bias=self.get_bias_tokens_encoding(im_sen,device=im_sen.device)
+        latents_bias=self.get_bias_latents_encoding(im_sen,device=im_sen.device)
         p_x=self.get_fourrier_encoding(im_sen,device=im_sen.device)
         p_latents=self.get_fourrier_encoding_queries(im_sen,device=im_sen.device)
 
+        #p_latents_2=self.get_gaussian_encoding_latents(im_sen,32,10.0, im_sen.device,extremums=52.5)
+        #p_latents_3=self.get_gaussian_encoding_latents(im_sen,64,3.0, im_sen.device,extremums=52.5)
+        #p_latents_4=self.get_gaussian_encoding_latents(im_sen,300,0.05, im_sen.device,extremums=52.5)
+
+        #p_latents=torch.cat([p_latents_2,p_latents_3,p_latents_4],dim=-1)
+        
         
         #band_post_proc_0=self.get_gaussian_encoding(im_sen,8,100, im_sen.device,extremums=600)
         #band_post_proc_1=self.get_gaussian_encoding(im_sen,16,40.0, im_sen.device,extremums=600)
-        #band_post_proc_2=self.get_gaussian_encoding(im_sen,32,10.0, im_sen.device,extremums=300)
-        #band_post_proc_3=self.get_gaussian_encoding(im_sen,64,3.0, im_sen.device,extremums=150)
-        #band_post_proc_3=self.get_gaussian_encoding(im_sen,73,1.0, im_sen.device)
-        #band_post_proc_4=self.get_gaussian_encoding(im_sen,300,0.2, im_sen.device,extremums=150)
+        #band_post_proc_2=self.get_gaussian_encoding(im_sen,32,10.0, im_sen.device,extremums=52.5)
+        #band_post_proc_3=self.get_gaussian_encoding(im_sen,64,3.0, im_sen.device,extremums=52.5)
+        #band_post_proc_4=self.get_gaussian_encoding(im_sen,73,1.0, im_sen.device)
+        #band_post_proc_4=self.get_gaussian_encoding(im_sen,300,0.05, im_sen.device,extremums=52.5)
         
 
         #with record_function("Atomizer/process_data/get_tokens/cat"):
@@ -758,7 +1007,7 @@ class transformations_config(nn.Module):
         
 
 
-        return tokens, mask_sen, p_latents
+        return tokens, mask_sen, p_latents,(tokens_bias,latents_bias)
     
     
     def get_tokens(self,img,mask,mode="optique",modality="s2",wave_encoding=None,query=False):
@@ -781,9 +1030,13 @@ class transformations_config(nn.Module):
             #    tmp_img,tmp_mask=self.apply_temporal_spatial_transforms(img, mask)
             
             #with record_function("Atomizer/process_data/get_tokens"):
-            tokens_s2,tokens_mask_s2=self.get_tokens(img,mask,mode="optique",modality="s2",query=query)
-            
-            return tokens_s2,tokens_mask_s2
+            if query:
+                tokens_s2,tokens_mask_s2=self.get_tokens(img,mask,mode="optique",modality="s2",query=query)
+                return tokens_s2,tokens_mask_s2
+            else:
+                tokens_s2,tokens_mask_s2,latents,bias=self.get_tokens(img,mask,mode="optique",modality="s2",query=query)
+                return tokens_s2,tokens_mask_s2,latents,bias
+
 
 
   

@@ -319,7 +319,7 @@ class Model_FLAIR(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
 
-        y_hat, y_mask = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
         #labels = mae_tokens[:,::5,4]
         labels = mae_tokens[:,:,4]
 
@@ -368,7 +368,7 @@ class Model_FLAIR(pl.LightningModule):
         
         image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
         
-        y_hat, y_mask = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
         
         #labels = mae_tokens[:,::5,4]
         labels = mae_tokens[:,:,4]
@@ -406,7 +406,7 @@ class Model_FLAIR(pl.LightningModule):
         image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
 
         # Forward pass
-        y_hat, y_mask = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
         
         # Get labels and predictions - keep original format
         labels = mae_tokens[:, 4]

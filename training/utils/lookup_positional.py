@@ -43,6 +43,7 @@ class Lookup_encoding(pl.LightningModule):
         
           
         modalities.append((0.2,512))
+        modalities.append((5,512))
         
         
         

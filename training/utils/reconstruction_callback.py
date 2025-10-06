@@ -117,7 +117,7 @@ class CustomMAEReconstructionCallback(pl.Callback):
                     mae_tokens_batch,
                     mae_tokens_mask_batch,
                     training=False,
-                    task="reconstruction"
+                    task="vizualisation"
                 )
                 
                 # Remove batch dimension for visualization
@@ -373,7 +373,7 @@ class FLAIR_CustomMAEReconstructionCallback(pl.Callback):
                     mae_tokens_batch,
                     mae_tokens_mask_batch,
                     training=False,
-                    task="reconstruction"
+                    task="vizualisation"
                 )
                 
                 # Remove batch dimension for visualization
@@ -665,20 +665,20 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                 mae_tokens_batch = mae_tokens.clone().unsqueeze(0)
                 mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0)
                 
-                y_hat, y_mask = pl_module.forward(
+                y_hat, (bias_matrix,attention_matrix) = pl_module.forward(
                     image_tokens_batch,
                     image_tokens_mask,
                     mae_tokens_batch,
                     mae_tokens_mask_batch,
                     training=False,
-                    task="reconstruction"
+                    task="vizualisation"
                 )
                 
                 # Remove batch dimension for visualization
                 y_hat = y_hat.squeeze(0)
                 mae_tokens=mae_tokens.squeeze(0)
                 labels = label_res
-                mae_tokens = rearrange(mae_tokens, "(c h w) b -> h w c b", h=512, w=512, c=5, b=5)
+                mae_tokens = rearrange(mae_tokens, "(c h w) b -> c h w b", h=512, w=512, c=5, b=6)
                 
                 # Reshape to spatial format
                 bandvalues = image# mae_tokens[:, :, :, 0]  # [h, w, channels] - B,G,R,NIR,elevation
@@ -693,7 +693,8 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                 y_hat  = y_hat[0]
                 y_hat = torch.argmax(y_hat.clone(), dim=-1)
                 #y_hat=y_hat[0,:,:]
-                labels=rearrange(labels,"c h w -> h w c").squeeze(-1)
+                
+                labels= mae_tokens[0,:,:,4]#rearrange(labels,"c h w -> h w c").squeeze(-1)
                 
                 
                 print(f"✓ Successfully reconstructed sample {dataset_idx}")
@@ -706,6 +707,28 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         
         # Create and upload visualization
         try:
+            self._create_and_upload_bias_matrix_slices(
+                bias_matrix,
+                slices=[0,110,378],
+                sample_idx=dataset_idx,
+                viz_idx=viz_idx,
+                epoch=epoch,
+                id=id,
+                title_prefix = "Bias Matrix Slices",
+                title="Bias"
+            )
+
+            self._create_and_upload_bias_matrix_slices(
+                attention_matrix,
+                slices=[0,110,378],
+                sample_idx=dataset_idx,
+                viz_idx=viz_idx,
+                epoch=epoch,
+                id=id,
+                title_prefix = "Attention Matrix Slices",
+                title="Attention"
+            )
+                
             self._create_and_upload_segmentation_visualization(
                 sample_idx=dataset_idx,
                 viz_idx=viz_idx,
@@ -826,6 +849,115 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         normalized = normalize(composite_tensor)  # [3, h, w]
         
         return normalized.permute(1, 2, 0).numpy()  # [h, w, 3]
+
+    def _create_and_upload_bias_matrix_slices(
+        self,
+        bias_matrix: torch.Tensor,
+        slices: list | tuple | None,
+        sample_idx: int,
+        viz_idx: int,
+        epoch: int,
+        id: str,
+        title_prefix: str = "Bias Matrix Slices",
+        title="Bias"
+    ):
+        """
+        Visualize 3 slices from a [S, H, W] bias_matrix (e.g., [400,512,512]) in a single row.
+
+        Args:
+            bias_matrix: torch.Tensor, shape [S,H,W] (or [1,S,H,W]) on any device
+            slices: list/tuple of 3 integers indicating which S indices to plot.
+                    If None/short, we auto-pick evenly spaced valid indices.
+            sample_idx, viz_idx, epoch, id: metadata to show in title & W&B keys.
+            title_prefix: optional figure title prefix.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        # ---- Sanity + shape handling
+        if bias_matrix is None:
+            print("Warning: bias_matrix is None; skipping bias visualization.")
+            return
+
+        # Remove possible batch dim: [1,S,H,W] -> [S,H,W]
+        if bias_matrix.dim() == 4 and bias_matrix.shape[0] == 1:
+            bias_matrix = bias_matrix.squeeze(0)
+
+        if bias_matrix.dim() != 3:
+            print(f"Warning: Expected bias_matrix [S,H,W], got {tuple(bias_matrix.shape)}; skipping.")
+            return
+
+        S, H, W = bias_matrix.shape
+
+        # Move to CPU numpy
+        bm_np = bias_matrix.detach().float().cpu().numpy()  # [S,H,W]
+
+        # ---- Pick/validate slices
+        if not slices:
+            # default: 3 evenly spaced indices across [0..S-1]
+            slices = [0, max(0, S//2), S-1]
+        else:
+            # ensure integers and clamp range
+            slices = [int(max(0, min(S-1, s))) for s in slices]
+
+        # If user passed fewer than 3, pad with evenly spaced unique ones
+        if len(slices) < 3:
+            needed = 3 - len(slices)
+            candidates = [0, max(0, S//2), S-1]
+            for c in candidates:
+                if len(slices) >= 3:
+                    break
+                if c not in slices:
+                    slices.append(c)
+            slices = slices[:3]
+        elif len(slices) > 3:
+            slices = slices[:3]
+
+        # Extract slices
+        imgs = [bm_np[s] for s in slices]  # each [H,W]
+
+        # Robust shared color range (consistent across panels)
+        stacked = np.stack(imgs, axis=0)  # [3,H,W]
+        vmin = np.percentile(stacked, 2.0)
+        vmax = np.percentile(stacked, 98.0)
+        if np.isclose(vmin, vmax):
+            # fallback to min/max if data is near-constant
+            vmin, vmax = float(stacked.min()), float(stacked.max())
+
+        # ---- Plot
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
+        fig.suptitle(
+            f"{title_prefix} – Sample {sample_idx} (viz {viz_idx}) – {id}\n"
+            f"Epoch {epoch} • slices {slices[0]}, {slices[1]}, {slices[2]} • shape [{S},{H},{W}]",
+            fontsize=14, fontweight="bold"
+        )
+
+        ims = []
+        for ax, img, s in zip(axes, imgs, slices):
+            im = ax.imshow(img, vmin=vmin, vmax=vmax, interpolation="nearest")  # cmap defaults to viridis
+            ax.set_title(f"Slice {s}", fontsize=12)
+            ax.axis("off")
+            ims.append(im)
+
+        # Single shared colorbar on the right
+        cbar = fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.9)
+        cbar.set_label("{title} value", rotation=90)
+
+        # ---- Log to W&B
+        try:
+            wandb.log({
+                f"{title}/sample_{sample_idx} {id}": wandb.Image(
+                    fig, caption=f"{title} slices {slices} – epoch={epoch} – sample={sample_idx}"
+                ),
+                f"{title}/epoch": epoch,
+                f"{title}/sample_{viz_idx}_indices": slices,
+            })
+            print(f"✓ Uploaded{title} slices {slices} for sample {sample_idx} at epoch {epoch}")
+        except Exception as e:
+            print(f"✗ Failed to upload {title} slices to wandb: {e}")
+
+        plt.close(fig)
+
     
     def _labels_to_rgb(self, labels):
         """Convert label map to RGB visualization."""

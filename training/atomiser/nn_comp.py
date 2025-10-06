@@ -123,9 +123,18 @@ class SelfAttention(nn.Module):
         # back to (B, N, inner)
         out = rearrange(out, "(b h) n d -> b n (h d)", h=self.heads)
         return self.to_out[0](out)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., use_flash=True,id=0):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., use_flash=True, id=0):
         super().__init__()
         context_dim = context_dim or query_dim
         inner = dim_head * heads
@@ -134,11 +143,8 @@ class CrossAttention(nn.Module):
         self.use_flash = use_flash and hasattr(F, "scaled_dot_product_attention")
         
         self.to_q = nn.Linear(query_dim, inner, bias=False)
-        
-        self.to_k = nn.Linear(context_dim, inner , bias=False)
-     
-        self.to_v = nn.Linear(context_dim, inner , bias=False)
-
+        self.to_k = nn.Linear(context_dim, inner, bias=False)
+        self.to_v = nn.Linear(context_dim, inner, bias=False)
         self.to_out = nn.Sequential(
             nn.Linear(inner, query_dim),
             nn.Dropout(dropout)
@@ -146,56 +152,122 @@ class CrossAttention(nn.Module):
         
         # Store dropout separately for manual attention
         self.dropout = nn.Dropout(dropout)
-        
         # Will hold the last attention weights (manual path only)
         self.last_attn = None
+        self.viz=False
         
-        
-        
-    def forward(self, x, context, mask=None,id=0):
+        # Learned parameter to control bias importance (initialized to 1.0)
+        if id>0:
+            #self.bias_weight = nn.Parameter(torch.randn(1)*10+1)
+            self.bias_weight = nn.Parameter(torch.Tensor([10.0]))
+        else:
+            self.bias_weight = 0
+
+
+    
+    
+
+
+    def forward(self, x, context, mask=None, bias=None, id=0):
+        """
+        Args:
+            x: Query tensor (B, Nq, query_dim)
+            context: Key/Value tensor (B, Nk, context_dim)
+            mask: Optional attention mask (B, Nq, Nk) or (B, Nk)
+            bias: Optional attention bias to add to attention scores
+                  Shape should be (B, heads, Nq, Nk) or broadcastable to it
+            id: Layer identifier
+        """
         B, Nq, _ = x.shape
         Nk = context.shape[1]
         
         # 1) Project Q, K, V
         q = self.to_q(x)  # (B, Nq, inner)
-        #k = self.to_k(context)  # (B, Nk, 2·inner)
-        k=None
-
-        #if id>0:
-        #    context_k=context.clone()
-        #    context_k[:,:,:129]=0.0
-        #    k = self.to_k(context_k)  # each (B, Nk, inner)
-        #else:
-        k=self.to_k(context)
-        v = self.to_v(context)  # each (B, Nk, inner)
+        k = self.to_k(context)  # (B, Nk, inner)
+        v = self.to_v(context)  # (B, Nk, inner)
         
         # 2) Split heads
         q = rearrange(q, "b n (h d) -> b h n d", h=self.heads)
         k = rearrange(k, "b n (h d) -> b h n d", h=self.heads)
         v = rearrange(v, "b n (h d) -> b h n d", h=self.heads)
         
-        # FLASH path: no ability to grab attention weights
-        attn_mask = None
-        if mask is not None:
-            # mask should be (B, Nq, Nk) - True for valid positions
-            if mask.dim() == 2:
-                # If mask is (B, Nk), expand to (B, Nq, Nk)
-                mask = mask.unsqueeze(1).expand(-1, Nq, -1)
-            attn_mask = mask.unsqueeze(1).expand(-1, self.heads, -1, -1)
-        
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False
-        )
-        self.last_attn = None
+        # Handle bias - if provided, we need to use manual attention
+        if bias is not None or not self.use_flash:
+            # Manual attention computation
+            # Compute attention scores
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, heads, Nq, Nk)
             
+            # Add bias if provided
+            if bias is not None:
+                # Create bias_weight parameter lazily on first use
+                
+                #if not self.bias_weight is None:
+                #    print("layer idx:", id,"    bias weight:", self.bias_weight.item(),bias.max().item(),bias.min().item())
+            
+                # Handle bias shape [batch, nb_tokens]
+                if bias.dim() == 2:  # (B, nb_tokens)
+                    # Assuming nb_tokens corresponds to key positions (Nk)
+                    # Reshape to (B, 1, 1, Nk) for broadcasting across heads and queries
+                    bias = bias.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, nb_tokens)
+                elif bias.dim() == 3:  # (B, Nq, Nk)
+                    bias = bias.unsqueeze(1)  # (B, 1, Nq, Nk)
+                elif bias.dim() == 1:  # (nb_tokens,)
+                    bias = bias.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1, 1, 1, nb_tokens)
+                
+                scores = scores*0 + self.bias_weight * bias 
+            
+            # Apply mask if provided
+            if mask is not None:
+                if mask.dim() == 2:  # (B, Nk)
+                    mask = mask.unsqueeze(1).expand(-1, Nq, -1)  # (B, Nq, Nk)
+                if mask.dim() == 3:  # (B, Nq, Nk)
+                    mask = mask.unsqueeze(1)  # (B, 1, Nq, Nk)
+                scores = scores.masked_fill(~mask, float('-inf'))
+            
+            # Apply softmax
+            #print("scores :",scores.shape)
+            
+            attn = F.softmax(scores, dim=-1)
+            #print("scores :",attn.shape)
+
+            if self.viz:
+                return attn
+            
+            
+            attn = self.dropout(attn)
+            self.last_attn = attn.detach()
+
+
+            
+            
+            # Apply attention to values
+            out = torch.matmul(attn, v)  # (B, heads, Nq, dim_head)
+
+            
+        else:
+            # Flash attention path (only when no bias is provided)
+            attn_mask = None
+            if mask is not None:
+                # mask should be (B, Nq, Nk) - True for valid positions
+                if mask.dim() == 2:
+                    # If mask is (B, Nk), expand to (B, Nq, Nk)
+                    mask = mask.unsqueeze(1).expand(-1, Nq, -1)
+                attn_mask = mask.unsqueeze(1).expand(-1, self.heads, -1, -1)
+            
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False
+            )
+            self.last_attn = None
         
         # 3) Recombine heads and project
+        
         out = rearrange(out, "b h n d -> b n (h d)")
+        
         return self.to_out(out)
- 
+    
 class LatentAttentionPooling(nn.Module):
     def __init__(self, dim, heads=4, dim_head=64, dropout=0.):
         super().__init__()
