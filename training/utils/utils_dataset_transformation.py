@@ -731,7 +731,7 @@ class transformations_config(nn.Module):
             pos_scalings = (image_size * resolution)
             #centers of gaussians
             axis = torch.linspace(-pos_scalings/2.0, pos_scalings/2.0, steps=20,device=device).unsqueeze(-1)
-            centers = torch.full((20,1),resolution*15,device=device)
+            centers = torch.full((20,1),resolution*20,device=device)
             
             axis=torch.cat([axis,centers],dim=-1)
 

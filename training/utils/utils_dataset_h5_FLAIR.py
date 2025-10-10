@@ -471,7 +471,7 @@ class FLAIR_MAE(Dataset):
         
         
         # Shuffle tokens
-        im_aerial, mask_MAE = self.shuffle_arrays([image, mask_MAE])
+        #im_aerial, mask_MAE = self.shuffle_arrays([image, mask_MAE])
         
         # Split into input and target tokens
         input_tokens = image[mask_MAE==0.0].clone()
@@ -564,7 +564,7 @@ class FLAIR_MAE(Dataset):
         
         
         # Shuffle tokens
-        im_aerial, mask_MAE = self.shuffle_arrays([image, mask_MAE])
+        #im_aerial, mask_MAE = self.shuffle_arrays([image, mask_MAE])
         
         # Split into input and target tokens
         input_tokens = image[mask_MAE==0.0].clone()

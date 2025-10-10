@@ -23,6 +23,59 @@ def cache_fn(f):
     return cached_fn
 
 
+class GaussianUpdateModule(nn.Module):
+    def __init__(self, embedding_size, initial_lr=0.1):
+        super().__init__()
+        # MLP to predict deltas for each Gaussian
+        self.delta_predictor = nn.Sequential(
+            nn.Linear(embedding_size, embedding_size // 2),
+            nn.GELU(),
+            nn.Linear(embedding_size // 2, 3)  # Δμ_x, Δμ_y, Δσ
+        )
+        # Learnable learning rate (how big the updates should be)
+        self.update_scale = nn.Parameter(torch.tensor(initial_lr))
+        
+    def forward(self, latent_tokens, current_gaussians):
+        """
+        latent_tokens: [batch_size, 400, embedding_size]
+        current_gaussians: [batch_size, 400, 2, 2] where:
+            - dim 2: axis (0=x, 1=y)
+            - dim 3: parameters (0=mu, 1=sigma)
+        
+        Returns:
+            updated_gaussians: [batch_size, 400, 2, 2]
+        """
+        batch_size = latent_tokens.shape[0]
+        
+        # Predict deltas for each Gaussian
+        deltas = self.delta_predictor(latent_tokens)  # [batch_size, 400, 3]
+        
+        # Scale deltas
+        deltas = deltas * self.update_scale
+        
+        # Extract delta components
+        delta_mu_x = deltas[:, :, 0]  # [batch_size, 400]
+        delta_mu_y = deltas[:, :, 1]  # [batch_size, 400]
+        delta_sigma = deltas[:, :, 2]  # [batch_size, 400]
+        
+        # Clone current Gaussians to avoid in-place modification
+        updated_gaussians = current_gaussians.clone()
+        
+        # Update mu_x and mu_y
+        updated_gaussians[:, :, 0, 0] = current_gaussians[:, :, 0, 0] + delta_mu_x
+        updated_gaussians[:, :, 1, 0] = current_gaussians[:, :, 1, 0] + delta_mu_y
+        
+        # Update sigma (same for both x and y, or you could make them independent)
+        updated_gaussians[:, :, 0, 1] = current_gaussians[:, :, 0, 1] + delta_sigma
+        updated_gaussians[:, :, 1, 1] = current_gaussians[:, :, 1, 1] + delta_sigma
+        
+        # Ensure sigma stays positive
+        updated_gaussians[:, :, :, 1] = F.softplus(updated_gaussians[:, :, :, 1])
+        # Or: updated_gaussians[:, :, :, 1] = torch.clamp(updated_gaussians[:, :, :, 1], min=1e-3)
+        
+        return updated_gaussians
+
+
 class Atomiser(pl.LightningModule):
     """
     Clean implementation of the Atomizer model for satellite image processing.
@@ -69,7 +122,7 @@ class Atomiser(pl.LightningModule):
         self._init_encoder_layers()
         self._init_decoder()
         self._init_classifier()
-        self._init_latents()
+        self.Gaussian_update=GaussianUpdateModule(self.latent_dim, initial_lr=0.1)
     
     def _compute_input_dim(self):
         """Compute total input dimension from all encodings"""
@@ -161,29 +214,16 @@ class Atomiser(pl.LightningModule):
         # Build encoder layers
         self.encoder_layers = nn.ModuleList()
         for i in range(self.depth):
+
+            cache_key = f"cross_entropy_bias_std_layer_{i}"
+            tmp_stds = nn.Parameter(torch.rand(400))
+            setattr(self, cache_key, tmp_stds)
             
             # Enable caching for weight sharing (except first layer)
             cache_args = {'_cache': (i > 0 and self.weight_tie_layers)}
 
             
-            
-            # Cross-attention and feedforward
-            if i==0:
-                cross_attn = PreNorm(
-                    dim=self._get_encoding_dim("pos")*2,
-                    fn=CrossAttention(
-                        query_dim=self._get_encoding_dim("pos")*2,
-                        context_dim=self._get_encoding_dim("pos")*2,
-                        heads=self.cross_heads,
-                        dim_head=self.cross_dim_head,
-                        dropout=self.attn_dropout,
-                        id=0
-                    ),
-                    context_dim=self._get_encoding_dim("pos")*2
-                )
-
-            else:
-                cross_attn = get_cross_attn(**cache_args)
+            cross_attn = get_cross_attn(**cache_args)
             cross_ff = get_cross_ff(**cache_args)
 
             
@@ -249,18 +289,18 @@ class Atomiser(pl.LightningModule):
         """Randomly subsample tokens to fit memory constraints"""
         B, N, D = tokens.shape
         
-        if N <= max_tokens:
-            return tokens, mask
+        #if N <= max_tokens:
+        #    return tokens, mask
         
         # Random permutation for subsampling
         device = tokens.device
         perm = torch.randperm(N, device=device)[:max_tokens]
         
-        return tokens[:, perm], mask[:, perm]
+        return tokens[:, perm], mask[:, perm],perm
     
 
 
-    def bias(self, data):
+    def bias(self, data,idx):
         """
         Compute the integral of 2D Gaussians over rectangular domains.
         
@@ -276,7 +316,17 @@ class Atomiser(pl.LightningModule):
         Returns:
             torch.Tensor: [batch_size, 400, nb_tokens] - integral values
         """
+        
+
+
         tokens_positions, latent_gaussians = data
+
+        cache_key = f"cross_entropy_bias_std_layer_{idx}"
+        learned_sigmas = getattr(self, cache_key)
+        learned_sigmas = torch.unsqueeze(learned_sigmas, 0)  # [1, 400]
+        learned_sigmas = torch.unsqueeze(learned_sigmas, -1)
+        learned_sigmas = torch.exp(learned_sigmas)  # Ensure positivity
+        learned_sigmas = einops.repeat(learned_sigmas, 'b n c -> (b b1) n c', b1=tokens_positions.shape[0])
         
         batch_size = tokens_positions.shape[0]
         nb_tokens = tokens_positions.shape[1]
@@ -298,9 +348,10 @@ class Atomiser(pl.LightningModule):
         # Reshape for broadcasting: we want to compute all pairs (gaussian, token)
         # Shape transformations for broadcasting
         mu_x = mu_x[:, :, None]  # [batch_size, 400, 1]
-        sigma_x = sigma_x[:, :, None]  # [batch_size, 400, 1]
+        sigma_x = sigma_x[:, :, None]*learned_sigmas  # [batch_size, 400, 1]
         mu_y = mu_y[:, :, None]  # [batch_size, 400, 1]
-        sigma_y = sigma_y[:, :, None]  # [batch_size, 400, 1]
+        sigma_y = sigma_y[:, :, None]*learned_sigmas  # [batch_size, 400, 1]
+        
         
         x_min = x_min[:, None, :]  # [batch_size, 1, nb_tokens]
         x_max = x_max[:, None, :]  # [batch_size, 1, nb_tokens]
@@ -330,13 +381,19 @@ class Atomiser(pl.LightningModule):
         integral_y = 0.5 * (torch.erf(z_y_max) - torch.erf(z_y_min))
         
         # For a 2D Gaussian with independent components, the integral is the product
-        result =torch.log( integral_x * integral_y + 1e-8 )  # [batch_size, 400, nb_tokens]
+        result =integral_x * integral_y 
+        result = result/result.max(dim=-1, keepdim=True)[0]
+        result/=0.2**2
         #result = torch.softmax(result, dim=1)
 
         # For visualization: normalize to [0, 1] per token
-        result_min = result.min(dim=1, keepdim=True)[0]
-        result_max = result.max(dim=1, keepdim=True)[0]
-        result = (result - result_min) / (result_max - result_min + 1e-8)
+        #result_min = result.min(dim=1, keepdim=True)[0]
+        #result_max = result.max(dim=1, keepdim=True)[0]
+        #result = (result - result_min) / (result_max - result_min + 1e-8)
+
+
+        result =torch.log( result + 1e-8 )  # [batch_size, 400, nb_tokens]
+        
         
         return result
 
@@ -365,8 +422,8 @@ class Atomiser(pl.LightningModule):
         matrix_biais=None
         
         
-        latents_l = repeat(self.latents, 'n d -> b n d', b=tokens.shape[0])
-        latents_pos=None
+        latents = repeat(self.latents, 'n d -> b n d', b=tokens.shape[0])
+        
 
         
         
@@ -376,88 +433,94 @@ class Atomiser(pl.LightningModule):
             # Subsample tokens if needed
             max_tokens = self.max_tokens_forward if training else self.max_tokens_val
             
-            current_tokens, current_mask = self._subsample_tokens(tokens, mask, max_tokens, training)
+            current_tokens, current_mask,_ = self._subsample_tokens(tokens, mask, max_tokens, training)
             
             # Process tokens through transform
             processed_tokens, processed_mask, tmp_latents,tmp_bias = self.transform.process_data(current_tokens, current_mask, query=False)
 
             processed_mask = processed_mask.bool()
             processed_tokens = processed_tokens.masked_fill_(processed_mask.unsqueeze(-1), 0.0)
+
             
-            if layer_idx==0:
-                latents_pos=tmp_latents.clone()
-                latents_s= tmp_latents
-                pos_dim=self._get_encoding_dim("pos")*2     
-                term_1=cross_attn(latents_s, context=processed_tokens[:,:,-pos_dim:], mask=~processed_mask,id=layer_idx)
-            else:
-                #current tokens has positions
-                #processed tokens has information
-
-                if viz and layer_idx==1:
-                    max_tokens_b=10000
-                    matrix_biais=[]
-                    matrix_attention=[]
-                    cpt=0
-
-                    for tmp_idx in range(0,tokens.shape[1],max_tokens_b):
-                        tmp_tokens_viz=tokens[:,tmp_idx:tmp_idx+max_tokens_b]
-                        tmp_mask_viz=mask[:,tmp_idx:tmp_idx+max_tokens_b]
-
-                        
-                        
-
-                        processed_tokens_tmp, processed_mask_tmp, tmp_latents,tmp_bias_viz = self.transform.process_data(tmp_tokens_viz, tmp_mask_viz, query=False)
-                        
-                    
-                        processed_mask_tmp = processed_mask_tmp.bool()
-                        processed_tokens_tmp = processed_tokens_tmp.masked_fill_(processed_mask_tmp.unsqueeze(-1), 0.0)
+            latents_s=latents[:,:400,:]
+            latents_l=latents[:,400:,:]
             
-                        tmp_b=self.bias(tmp_bias_viz)
-                        
-                        cross_attn.fn.viz=True
-                       
-                        aya=cross_attn(latents_s, context=processed_tokens_tmp, mask=~processed_mask_tmp, bias=tmp_b, id=layer_idx)
-                   
-                     
-                        cross_attn.fn.viz=False
+        
 
-                        matrix_biais.append(tmp_b[0])
-                        matrix_attention.append(torch.log(aya[0].mean(dim=0)))
-                    
-                    matrix_biais=torch.cat(matrix_biais,dim=-1)
-                    matrix_biais=einops.rearrange(matrix_biais,"l (c h w) -> l c h w",c=5,h=512,w=512)
-                    matrix_biais=matrix_biais.mean(dim=1)
-
-                    matrix_attention=torch.cat(matrix_attention,dim=-1)
-                    matrix_attention=einops.rearrange(matrix_attention,"l (c h w) -> l c h w",c=5,h=512,w=512)
-                    matrix_attention=matrix_attention.mean(dim=1)
-                    
-                    #matrix of size [400,512,512[]]
-                    #here mat has a shape [400,nb_tokens]
-                    #it's possible to do something like [400,5,512,512]
-                    #then do the average to get someting like [400,512,512]
-
-                    
-
+            if viz and layer_idx==1:
+                max_tokens_b=75000
+                matrix_biais=[]
+                matrix_attention=[]
                 
-                b=self.bias(tmp_bias)
-                term_1=cross_attn(latents_s, context=processed_tokens, mask=~processed_mask,bias=b,id=layer_idx)
+                
+                tokens_viz, mask_viz,perm_viz = self._subsample_tokens(tokens, mask, tokens.shape[1], training)
+
+                for tmp_idx in range(0,tokens.shape[1],max_tokens_b):
+                    tmp_tokens_viz=tokens_viz[:,tmp_idx:tmp_idx+max_tokens_b]
+                    tmp_mask_viz=mask_viz[:,tmp_idx:tmp_idx+max_tokens_b]
+
+                    
+                    
+
+                    processed_tokens_tmp, processed_mask_tmp, tmp_latents,tmp_bias_viz = self.transform.process_data(tmp_tokens_viz, tmp_mask_viz, query=False)
+                    
+                
+                    processed_mask_tmp = processed_mask_tmp.bool()
+                    processed_tokens_tmp = processed_tokens_tmp.masked_fill_(processed_mask_tmp.unsqueeze(-1), 0.0)
+        
+                    tmp_b=self.bias(tmp_bias_viz,layer_idx)
+                    
+                    cross_attn.fn.viz=True
+                    
+                    aya=cross_attn(latents_s, context=processed_tokens_tmp, mask=~processed_mask_tmp, bias=tmp_b, id=layer_idx)
+                    
+                    cross_attn.fn.viz=False
+
+                    matrix_biais.append(tmp_b[0])
+                    matrix_attention.append(aya[0].mean(dim=0))
+                
+                matrix_biais=torch.cat(matrix_biais,dim=-1)
+                inv_perm = torch.argsort(perm_viz)
+                matrix_biais = matrix_biais[:, inv_perm]
+                
+                #matrix_biais+=torch.abs(matrix_biais.min(dim=-1, keepdim=True)[0])
+                #matrix_biais = matrix_biais/matrix_biais.max(dim=-1, keepdim=True)[0]
+                matrix_biais=einops.rearrange(matrix_biais,"l (c h w) -> l c h w",c=5,h=512,w=512)
+                matrix_biais=matrix_biais.mean(dim=1)
+
+                matrix_attention=torch.cat(matrix_attention,dim=-1)
+                matrix_attention=matrix_attention[:, inv_perm]
+                #matrix_attention=F.softmax(matrix_attention, dim=-1)
+                matrix_attention=einops.rearrange(matrix_attention,"l (c h w) -> l c h w",c=5,h=512,w=512)
+                matrix_attention=matrix_attention.mean(dim=1)
+                print("scores test",matrix_attention[0,30:,30:].sum()," ayou: ",matrix_attention[0,:30,:30].sum())
+                
+                #matrix of size [400,512,512[]]
+                #here mat has a shape [400,nb_tokens]
+                #it's possible to do something like [400,5,512,512]
+                #then do the average to get someting like [400,512,512]
+
+                    
+
+            
+            b=self.bias(tmp_bias,layer_idx)
+            
+            term_1=cross_attn(latents_s, context=processed_tokens, mask=~processed_mask,bias=b,id=layer_idx)
            
             latents_s =  term_1 + latents_s
-            latents = cross_ff(latents_s) + latents_s
-           
-            merged_latents = torch.cat([latents_s, latents_l], dim=1)
+            latents_s = cross_ff(latents_s) + latents_s
+            
+            latents = torch.cat([latents_s, latents_l], dim=1)
             
             # Cross feedforward with residual connection
             
             
             # Self-attention blocks
             for self_attn, self_ff in self_attns:
-                latents = self_attn(merged_latents) + merged_latents
-                latents = self_ff(merged_latents) + merged_latents
+                latents = self_attn(latents) + latents
+                latents = self_ff(latents) +latents
             
-            latents_s=latents[:,:400,:]
-            latents_l=latents[:,400:,:]
+  
             
         
         if viz:

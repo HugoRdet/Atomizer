@@ -214,7 +214,7 @@ class CrossAttention(nn.Module):
                 elif bias.dim() == 1:  # (nb_tokens,)
                     bias = bias.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1, 1, 1, nb_tokens)
                 
-                scores = scores*0 + self.bias_weight * bias 
+                scores = scores + self.bias_weight * bias 
             
             # Apply mask if provided
             if mask is not None:
@@ -226,12 +226,16 @@ class CrossAttention(nn.Module):
             
             # Apply softmax
             #print("scores :",scores.shape)
+
             
             attn = F.softmax(scores, dim=-1)
             #print("scores :",attn.shape)
 
             if self.viz:
                 return attn
+            
+
+            
             
             
             attn = self.dropout(attn)

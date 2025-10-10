@@ -10,7 +10,6 @@ from typing import Optional, Union, List
 from .image_utils import*
 
 
-
 class CustomMAEReconstructionCallback(pl.Callback):
 
     def __init__(
@@ -859,10 +858,11 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         epoch: int,
         id: str,
         title_prefix: str = "Bias Matrix Slices",
-        title="Bias"
+        title: str = "Bias",
     ):
         """
-        Visualize 3 slices from a [S, H, W] bias_matrix (e.g., [400,512,512]) in a single row.
+        Visualize 3 slices from a [S, H, W] bias_matrix (e.g., [400,512,512]) in a single row,
+        with each subplot independently normalized and its own aligned colorbar.
 
         Args:
             bias_matrix: torch.Tensor, shape [S,H,W] (or [1,S,H,W]) on any device
@@ -870,6 +870,7 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                     If None/short, we auto-pick evenly spaced valid indices.
             sample_idx, viz_idx, epoch, id: metadata to show in title & W&B keys.
             title_prefix: optional figure title prefix.
+            title: series name for W&B logging / colorbar labels.
         """
         import numpy as np
         import matplotlib.pyplot as plt
@@ -894,16 +895,13 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
 
         # ---- Pick/validate slices
         if not slices:
-            # default: 3 evenly spaced indices across [0..S-1]
-            slices = [0, max(0, S//2), S-1]
+            slices = [0, max(0, S // 2), S - 1]
         else:
-            # ensure integers and clamp range
-            slices = [int(max(0, min(S-1, s))) for s in slices]
+            slices = [int(max(0, min(S - 1, s))) for s in slices]
 
-        # If user passed fewer than 3, pad with evenly spaced unique ones
         if len(slices) < 3:
             needed = 3 - len(slices)
-            candidates = [0, max(0, S//2), S-1]
+            candidates = [0, max(0, S // 2), S - 1]
             for c in candidates:
                 if len(slices) >= 3:
                     break
@@ -913,50 +911,64 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         elif len(slices) > 3:
             slices = slices[:3]
 
-        # Extract slices
-        imgs = [bm_np[s] for s in slices]  # each [H,W]
+        # Extract images
+        imgs = [bm_np[s] for s in slices]  # list of [H,W]
 
-        # Robust shared color range (consistent across panels)
-        stacked = np.stack(imgs, axis=0)  # [3,H,W]
-        vmin = np.percentile(stacked, 2.0)
-        vmax = np.percentile(stacked, 98.0)
-        if np.isclose(vmin, vmax):
-            # fallback to min/max if data is near-constant
-            vmin, vmax = float(stacked.min()), float(stacked.max())
+        # ---- Plot: per-slice normalization + one colorbar per axes
+        # constrained_layout keeps a tight layout and aligns colorbars
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+        if not isinstance(axes, (list, np.ndarray)):
+            axes = [axes]
 
-        # ---- Plot
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
         fig.suptitle(
             f"{title_prefix} – Sample {sample_idx} (viz {viz_idx}) – {id}\n"
             f"Epoch {epoch} • slices {slices[0]}, {slices[1]}, {slices[2]} • shape [{S},{H},{W}]",
-            fontsize=14, fontweight="bold"
+            fontsize=14,
+            fontweight="bold",
         )
 
         ims = []
         for ax, img, s in zip(axes, imgs, slices):
-            im = ax.imshow(img, vmin=vmin, vmax=vmax, interpolation="nearest")  # cmap defaults to viridis
+            # Robust local normalization (per slice)
+            vmin = np.percentile(img, 2.0)
+            vmax = np.percentile(img, 98.0)
+
+            # Fallback if near-constant
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or np.isclose(vmin, vmax):
+                img_min = float(np.nanmin(img))
+                img_max = float(np.nanmax(img))
+                if np.isclose(img_min, img_max):
+                    # Degenerate image: expand a touch to avoid singular colormap
+                    vmin, vmax = img_min - 1e-6, img_max + 1e-6
+                else:
+                    vmin, vmax = img_min, img_max
+
+            im = ax.imshow(img, vmin=vmin, vmax=vmax, interpolation="nearest")
             ax.set_title(f"Slice {s}", fontsize=12)
             ax.axis("off")
             ims.append(im)
 
-        # Single shared colorbar on the right
-        cbar = fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.9)
-        cbar.set_label("{title} value", rotation=90)
+            # Individual colorbar (aligned via constrained_layout)
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.set_label(f"{title} value", rotation=90)
 
         # ---- Log to W&B
         try:
+            import wandb  # local import in case environment varies
             wandb.log({
                 f"{title}/sample_{sample_idx} {id}": wandb.Image(
-                    fig, caption=f"{title} slices {slices} – epoch={epoch} – sample={sample_idx}"
+                    fig,
+                    caption=f"{title} slices {slices} – epoch={epoch} – sample={sample_idx}",
                 ),
                 f"{title}/epoch": epoch,
                 f"{title}/sample_{viz_idx}_indices": slices,
             })
-            print(f"✓ Uploaded{title} slices {slices} for sample {sample_idx} at epoch {epoch}")
+            print(f"✓ Uploaded {title} slices {slices} for sample {sample_idx} at epoch {epoch}")
         except Exception as e:
             print(f"✗ Failed to upload {title} slices to wandb: {e}")
 
         plt.close(fig)
+
 
     
     def _labels_to_rgb(self, labels):
