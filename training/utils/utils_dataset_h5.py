@@ -293,6 +293,7 @@ class Tiny_BigEarthNet_MAE(Dataset):
 
     def _initialize_file(self):
         """Initialize file and get number of samples."""
+        print("self file_path:", self.file_path)
         with h5py.File(self.file_path, 'r') as f:
             self.num_samples = len(f.keys()) // 6  # Number of samples
 

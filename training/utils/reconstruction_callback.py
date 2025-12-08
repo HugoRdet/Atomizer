@@ -260,52 +260,42 @@ class CustomMAEReconstructionCallback(pl.Callback):
         
         return normalized.permute(1, 2, 0).numpy()  # [120, 120, 3]
     
-    
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import pytorch_lightning as pl
+from einops import rearrange
+import wandb
 
 
+def normalize(img, min_val=0, max_val=1):
+    """Normalize image to [0, 1] range."""
+    img_min = img.min()
+    img_max = img.max()
+    if img_max - img_min > 1e-6:
+        return (img - img_min) / (img_max - img_min) * (max_val - min_val) + min_val
+    return img
 
 
+class MAE_CustomVisualizationCallback(pl.Callback):
 
-class FLAIR_CustomMAEReconstructionCallback(pl.Callback):
-
-    def __init__(
-        self,
-        config,
-    ):
+    def __init__(self, config):
         """
         Args:
             config: Configuration dict containing visualization parameters
         """
         super().__init__()
-        self.config=config
+        self.config = config
         
         self.log_every_n_epochs = config["debug"]["viz_every_n_epochs"]
         self.sample_indices = config["debug"]["idxs_to_viz"]
         self.num_samples = len(self.sample_indices)
         
-        
-        # Sentinel-2 band definitions (12 bands)
-        self.sentinel2_bands = {
-            'B01': 0,   # Coastal aerosol (443 nm)
-            'B02': 1,   # Blue (490 nm)
-            'B03': 2,   # Green (560 nm)
-            'B04': 3,   # Red (665 nm)
-            'B05': 4,   # Vegetation Red Edge (705 nm)
-            'B06': 5,   # Vegetation Red Edge (740 nm)
-            'B07': 6,   # Vegetation Red Edge (783 nm)
-            'B08': 7,   # NIR (842 nm)
-            'B8A': 8,   # Vegetation Red Edge (865 nm)
-            'B09': 9,   # Water vapour (945 nm)
-            'B11': 10,  # SWIR (1610 nm)
-            'B12': 11,  # SWIR (2190 nm)
-        }
-        
-        # Band combinations for visualization
-        self.rgb_bands = [2, 1, 0]  # Red, Green, Blue
-        self.infrared_bands = [4,4,4]  # NIR, SWIR1, SWIR2
+        # Band definitions for RGB visualization
+        self.rgb_bands = [2, 1, 0]  # Red, Green, Blue indices (assuming BGR order)
         
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        """Perform reconstruction visualization at the end of validation epoch."""
+        """Perform MAE reconstruction visualization at the end of validation epoch."""
         
         # Only log every N epochs and skip first few epochs
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0 or trainer.current_epoch < 2:
@@ -326,36 +316,49 @@ class FLAIR_CustomMAEReconstructionCallback(pl.Callback):
             if wandb.run is not None:
                 self._perform_custom_reconstruction(trainer, pl_module)
             else:
-                print("Warning: wandb not active, skipping reconstruction logging")
+                print("Warning: wandb not active, skipping MAE reconstruction logging")
         except Exception as e:
-            print(f"Error in custom reconstruction callback: {e}")
+            print(f"Error in MAE visualization callback: {e}")
             import traceback
             traceback.print_exc()
         
         pl_module.train()
     
     def _perform_custom_reconstruction(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        """Perform reconstruction using your custom data loading."""
+        """Perform MAE reconstruction visualization using custom data loading."""
         
         # Get the dataset from the trainer
-        dataset = trainer.datamodule.val_dataset
+        dataset_val = trainer.datamodule.val_dataset
         
         for i, sample_idx in enumerate(self.sample_indices):
-            self._process_single_sample(sample_idx, i, dataset, pl_module, trainer.current_epoch)
+            self._process_single_sample(
+                sample_idx, i, dataset_val, pl_module, 
+                trainer.current_epoch, id="validation"
+            )
             
-    def _process_single_sample(self, dataset_idx: int, viz_idx: int, dataset, pl_module, epoch: int):
-        """Process a single sample using your get_samples_to_viz function."""
+        dataset_train = trainer.datamodule.train_dataset
+        
+        for i, sample_idx in enumerate(self.sample_indices):
+            self._process_single_sample(
+                sample_idx, i, dataset_train, pl_module, 
+                trainer.current_epoch, id="train"
+            )
+    
+    def _process_single_sample(self, dataset_idx: int, viz_idx: int, dataset, 
+                               pl_module, epoch: int, id="val"):
+        """Process a single sample for MAE reconstruction visualization."""
         
         # Get data from your custom method
-        image_tokens, attention_mask, mae_tokens, mask_MAE_res = dataset.get_samples_to_viz(dataset_idx)
+        # Assuming get_samples_to_viz returns:
+        # image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, label_res
+        image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, _ = dataset.get_samples_to_viz(dataset_idx)
         
         # Move to device
-        mae_tokens_mask = torch.ones(mae_tokens.shape[0])
         device = pl_module.device
         image_tokens = image_tokens.to(device)
         attention_mask = attention_mask.to(device) if attention_mask is not None else None
         mae_tokens = mae_tokens.to(device)
-        mask_MAE_res = mask_MAE_res.to(device)
+        mae_tokens_mask = torch.ones(mae_tokens.shape[0]).to(device)
         
         with torch.no_grad():
             try:
@@ -365,26 +368,26 @@ class FLAIR_CustomMAEReconstructionCallback(pl.Callback):
                 mae_tokens_batch = mae_tokens.clone().unsqueeze(0)
                 mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0)
                 
-                # Perform reconstruction
-                y_hat, y_mask = pl_module.forward(
+                # Forward pass
+                y_hat = pl_module.forward(
                     image_tokens_batch,
                     image_tokens_mask,
                     mae_tokens_batch,
                     mae_tokens_mask_batch,
-                    training=False,
-                    task="vizualisation"
+                    training=False
                 )
                 
                 # Remove batch dimension for visualization
-                y_hat = y_hat.squeeze(0)
+                y_hat = y_hat.squeeze(0)  # [num_tokens, num_channels]
                 
-                # Reshape to spatial format
-                ground_truth = mae_tokens[:,0]
-                ground_truth = rearrange(ground_truth, "(b h w) -> b h w", b=5, h=512, w=512)
+                # Get original values (target)
+                target = mae_tokens[:, 0]  # [num_tokens] - reflectance values
                 
-                y_hat = rearrange(y_hat, "(b h w) c -> b h w c", b=5, h=512, w=512, c=1).squeeze(-1)
+                # Get reconstruction
+                reconstruction = y_hat.squeeze(-1) if y_hat.dim() > 1 else y_hat  # [num_tokens]
                 
                 print(f"✓ Successfully reconstructed sample {dataset_idx}")
+                print(f"  Target shape: {target.shape}, Reconstruction shape: {reconstruction.shape}")
                 
             except Exception as e:
                 print(f"Error in model forward pass for sample {dataset_idx}: {e}")
@@ -394,143 +397,201 @@ class FLAIR_CustomMAEReconstructionCallback(pl.Callback):
         
         # Create and upload visualization
         try:
-            self._create_and_upload_spatial_visualization(
+            self._create_and_upload_mae_visualization(
                 sample_idx=dataset_idx,
                 viz_idx=viz_idx,
-                ground_truth=ground_truth,      # [12, 120, 120]
-                prediction=y_hat,               # [12, 120, 120]
-                spatial_mask=mask_MAE_res,      # [120, 120]
-                epoch=epoch
+                original_image=image,           # Original image data
+                target=target,                  # Original reflectance values
+                reconstruction=reconstruction,  # Reconstructed values
+                mask=mask_MAE_res,             # Mask showing which tokens were masked
+                epoch=epoch,
+                id=id
             )
         except Exception as e:
-            print(f"Error creating spatial visualization for sample {dataset_idx}: {e}")
+            print(f"Error creating MAE visualization for sample {dataset_idx}: {e}")
             import traceback
             traceback.print_exc()
     
-    def _create_and_upload_spatial_visualization(self, sample_idx, viz_idx, ground_truth, prediction, spatial_mask, epoch):
-        """Create and upload spatial reconstruction visualization to wandb."""
+    def _create_and_upload_mae_visualization(self, sample_idx, viz_idx, original_image,
+                                            target, reconstruction, mask, epoch, id):
+        """Create and upload MAE reconstruction visualization to wandb."""
         
-        # Convert to numpy for visualization
-        gt_np = ground_truth.cpu().numpy()          # [12, 120, 120]
-        pred_np = prediction.cpu().numpy()          # [12, 120, 120]
-        mask_np = spatial_mask.cpu().numpy()        # [120, 120]
+        # Keep as tensors, don't convert to numpy yet
+        # Calculate reconstruction metrics (these need numpy)
+        target_np = target.cpu().numpy()
+        reconstruction_np = reconstruction.cpu().numpy()
+        mse = np.mean((target_np - reconstruction_np) ** 2)
+        mae = np.mean(np.abs(target_np - reconstruction_np))
         
-        # Calculate basic metrics for logging
-        mse = np.mean((gt_np - pred_np) ** 2)
-        mae = np.mean(np.abs(gt_np - pred_np))
-        correlation = np.corrcoef(gt_np.flatten(), pred_np.flatten())[0, 1]
-        
-        # Create the main spatial visualization
-        spatial_fig = self._create_spatial_reconstruction_figure(
-            gt_np, pred_np, mask_np, sample_idx, epoch, mse, mae, correlation
+        # Create the main MAE visualization - pass tensors
+        mae_fig = self._create_mae_figure(
+            original_image, target, reconstruction, mask,
+            sample_idx, epoch, mse, mae
         )
         
         # Prepare wandb data
         wandb_data = {
-            # Main spatial visualization
-            f"spatial_reconstruction/epoch_{epoch}_sample_{sample_idx}": wandb.Image(
-                spatial_fig, 
-                caption=f"Spatial MAE Reconstruction - Epoch {epoch}, Sample {sample_idx}, MSE: {mse:.6f}"
+            # Main MAE visualization
+            f"mae_reconstruction/sample_{sample_idx}_{id}": wandb.Image(
+                mae_fig, 
+                caption=f"MAE Reconstruction - Epoch {epoch}, Sample {sample_idx}, MSE: {mse:.6f}, MAE: {mae:.6f}"
             ),
             
-            # Basic metrics
-            f"reconstruction_metrics/epoch": epoch,
-            f"reconstruction_metrics/sample_{viz_idx}_mse": mse,
-            f"reconstruction_metrics/sample_{viz_idx}_mae": mae,
-            f"reconstruction_metrics/sample_{viz_idx}_correlation": correlation,
+            # Reconstruction metrics
+            f"mae_metrics/epoch": epoch,
+            f"mae_metrics/sample_{viz_idx}_mse_{id}": mse,
+            f"mae_metrics/sample_{viz_idx}_mae_{id}": mae,
         }
         
         # Upload to wandb
         try:
             wandb.log(wandb_data)
-            print(f"✓ Successfully uploaded spatial reconstruction for sample {sample_idx} at epoch {epoch}")
+            print(f"✓ Successfully uploaded MAE reconstruction for sample {sample_idx} at epoch {epoch}")
         except Exception as e:
             print(f"✗ Failed to upload to wandb: {e}")
         
-        plt.close(spatial_fig)
+        plt.close(mae_fig)
     
-    def _create_spatial_reconstruction_figure(self, ground_truth, prediction, spatial_mask, 
-                                            sample_idx, epoch, mse, mae, correlation):
-        """Create clean spatial reconstruction visualization with RGB and Infrared bands."""
+    def _create_mae_figure(self, original_image, target, reconstruction, mask,
+                          sample_idx, epoch, mse, mae):
+        """Create MAE reconstruction visualization figure with RGB, NIR, and Elevation."""
         
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle(f'MAE Reconstruction - Sample {sample_idx}, Epoch {epoch}\n'
-                    f'MSE: {mse:.6f}, MAE: {mae:.6f}, Correlation: {correlation:.4f}', 
-                    fontsize=16, fontweight='bold')
+        # Spatial dimensions
+        h, w, c = 512, 512, 5
         
-        # Row 1: RGB bands (Red, Green, Blue)
-        rgb_gt = self._create_rgb_composite(ground_truth, self.rgb_bands)
-        rgb_pred = self._create_rgb_composite(prediction, self.rgb_bands)
+        # Reshape target and reconstruction using einops rearrange
+        # target and reconstruction are TENSORS [num_tokens] where num_tokens = c*h*w
+        try:
+            # Reshape to [c, h, w] format - KEEP AS TENSORS
+            target_spatial = rearrange(target, "(c h w) -> c h w", h=h, w=w, c=c)
+            reconstruction_spatial = rearrange(reconstruction, "(c h w) -> c h w", h=h, w=w, c=c)
+            
+        except Exception as e:
+            print(f"Warning: Could not reshape target/reconstruction: {e}")
+            print(f"Target shape: {target.shape}, Reconstruction shape: {reconstruction.shape}")
+            # Create dummy data as tensors
+            device = target.device if hasattr(target, 'device') else 'cpu'
+            target_spatial = torch.zeros((c, h, w), device=device)
+            reconstruction_spatial = torch.zeros((c, h, w), device=device)
         
-        # Ground Truth RGB
-        axes[0, 0].imshow(rgb_gt)
-        axes[0, 0].set_title('Ground Truth\n(RGB: B04-B03-B02)', fontsize=14, fontweight='bold')
+        # Create figure with 8 subplots (2 rows x 4 columns)
+        fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+        fig.suptitle(
+            f'MAE Reconstruction - Sample {sample_idx}, Epoch {epoch}\n'
+            f'MSE: {mse:.6f}, MAE: {mae:.6f}', 
+            fontsize=16, fontweight='bold'
+        )
+        
+        # 1. Original RGB composite (original_image is already numpy from dataset)
+        rgb_composite = self._create_rgb_from_image(original_image)
+        axes[0, 0].imshow(rgb_composite)
+        axes[0, 0].set_title('Original RGB Image', fontsize=14, fontweight='bold')
         axes[0, 0].axis('off')
         
-        # Prediction RGB
-        axes[0, 1].imshow(rgb_pred)
-        axes[0, 1].set_title('Prediction\n(RGB: B04-B03-B02)', fontsize=14, fontweight='bold')
+        # 2. NIR channel (index 3) - Original
+        nir_original = original_image[:, :, 3]
+        nir_vmin, nir_vmax = nir_original.min(), nir_original.max()
+        im1 = axes[0, 1].imshow(nir_original, cmap='RdYlGn', vmin=nir_vmin, vmax=nir_vmax)
+        axes[0, 1].set_title('Original NIR Channel', fontsize=14, fontweight='bold')
         axes[0, 1].axis('off')
+        plt.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
         
-        # Spatial Mask
-        axes[0, 2].imshow(spatial_mask, cmap='RdYlBu_r', alpha=0.9)
-        axes[0, 2].set_title(f'Spatial Mask\n(Masked: {np.mean(spatial_mask):.1%})', fontsize=14, fontweight='bold')
+        # 3. Elevation channel (index 4) - Original
+        elevation_original = original_image[:, :, 4]
+        elevation_vmin, elevation_vmax = elevation_original.min(), elevation_original.max()
+        im2 = axes[0, 2].imshow(elevation_original, cmap='gray', vmin=elevation_vmin, vmax=elevation_vmax)
+        axes[0, 2].set_title('Original Elevation', fontsize=14, fontweight='bold')
         axes[0, 2].axis('off')
+        plt.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
         
-        # Row 2: Infrared bands (NIR, SWIR1, SWIR2)
-        infrared_gt = self._create_elevation_composite(ground_truth, self.infrared_bands)
-        infrared_pred = self._create_elevation_composite(prediction, self.infrared_bands)
+        # 4. Combined Error (average across all channels)
+        # target_spatial and reconstruction_spatial are [c, h, w] tensors
+        error_all = torch.abs(target_spatial - reconstruction_spatial)  # [c, h, w]
+        error_mean = torch.mean(error_all, dim=0)  # Average over channels: [h, w]
+        im3 = axes[0, 3].imshow(error_mean.cpu().numpy(), cmap='hot')  # Convert to numpy ONLY here
+        axes[0, 3].set_title('Mean Absolute Error (All Channels)', fontsize=14, fontweight='bold')
+        axes[0, 3].axis('off')
+        plt.colorbar(im3, ax=axes[0, 3], fraction=0.046, pad=0.04)
         
-        # Ground Truth Infrared
-        axes[1, 0].imshow(infrared_gt)
-        axes[1, 0].set_title('Ground Truth\n(False Color: B08-B11-B12)', fontsize=14, fontweight='bold')
+        # 5. Reconstructed RGB composite
+        # Create RGB from reconstructed channels (B=0, G=1, R=2)
+        reconstructed_rgb = self._create_rgb_from_reconstruction(reconstruction_spatial)
+        axes[1, 0].imshow(reconstructed_rgb)
+        axes[1, 0].set_title('Reconstructed RGB Image', fontsize=14, fontweight='bold')
         axes[1, 0].axis('off')
         
-        # Prediction Infrared
-        axes[1, 1].imshow(infrared_pred)
-        axes[1, 1].set_title('Prediction\n(Elevation)', fontsize=14, fontweight='bold')
+        # 6. NIR channel - Reconstruction (channel index 3)
+        # Use the same vmin/vmax as the original NIR
+        nir_reconstruction = reconstruction_spatial[3]  # Shape: [h, w] tensor
+        im4 = axes[1, 1].imshow(nir_reconstruction.cpu().numpy(), cmap='RdYlGn', vmin=nir_vmin, vmax=nir_vmax)  # Convert to numpy ONLY here
+        axes[1, 1].set_title('Reconstructed NIR Channel', fontsize=14, fontweight='bold')
         axes[1, 1].axis('off')
+        plt.colorbar(im4, ax=axes[1, 1], fraction=0.046, pad=0.04)
         
-        # Error Map (using RGB bands)
-        rgb_error = np.abs(rgb_gt.astype(float) - rgb_pred.astype(float))
-        rgb_error = rgb_error / rgb_error.max() if rgb_error.max() > 0 else rgb_error
-        axes[1, 2].imshow(rgb_error)
-        axes[1, 2].set_title('RGB Error Map\n(Absolute Difference)', fontsize=14, fontweight='bold')
+        # 7. Elevation channel - Reconstruction (channel index 4)
+        # Use the same vmin/vmax as the original elevation
+        elevation_reconstruction = reconstruction_spatial[4]  # Shape: [h, w] tensor
+        im5 = axes[1, 2].imshow(elevation_reconstruction.cpu().numpy(), cmap='gray', vmin=elevation_vmin, vmax=elevation_vmax)  # Convert to numpy ONLY here
+        axes[1, 2].set_title('Reconstructed Elevation', fontsize=14, fontweight='bold')
         axes[1, 2].axis('off')
+        plt.colorbar(im5, ax=axes[1, 2], fraction=0.046, pad=0.04)
+        
+        # 8. RGB Error (difference between original and reconstructed RGB)
+        rgb_error = np.abs(rgb_composite - reconstructed_rgb)
+        rgb_error_magnitude = np.mean(rgb_error, axis=-1)  # Average across RGB channels
+        im6 = axes[1, 3].imshow(rgb_error_magnitude, cmap='hot')
+        axes[1, 3].set_title('RGB Reconstruction Error', fontsize=14, fontweight='bold')
+        axes[1, 3].axis('off')
+        plt.colorbar(im6, ax=axes[1, 3], fraction=0.046, pad=0.04)
         
         plt.tight_layout()
         return fig
     
-    def _create_rgb_composite(self, data, band_indices):
-        """Create RGB composite from selected bands."""
-        # data: [12, 120, 120], band_indices: [R_idx, G_idx, B_idx]
-        composite = np.stack([
-            data[band_indices[0]],  # Red channel
-            data[band_indices[1]],  # Green channel  
-            data[band_indices[2]]   # Blue channel
-        ], axis=-1)  # [120, 120, 3]
+    def _create_rgb_from_image(self, image):
+        """Create RGB composite from image array."""
+        # image: [h, w, channels] where channels might be B,G,R,NIR,elevation
+        
+        if len(image.shape) == 3 and image.shape[2] >= 3:
+            # Extract RGB channels (assuming BGR order, so reverse to RGB)
+            rgb_composite = np.stack([
+                image[:, :, 2],  # Red channel
+                image[:, :, 1],  # Green channel  
+                image[:, :, 0]   # Blue channel
+            ], axis=-1)  # [h, w, 3]
+        else:
+            # Fallback: use first channel repeated
+            print(f"Warning: Cannot create RGB from image shape {image.shape}")
+            single_channel = image[:, :, 0] if len(image.shape) == 3 else image
+            rgb_composite = np.stack([single_channel] * 3, axis=-1)
         
         # Normalize using the provided function
-        composite_tensor = torch.from_numpy(composite).permute(2, 0, 1)  # [3, 120, 120]
-        normalized = normalize(composite_tensor)  # [3, 120, 120]
+        composite_tensor = torch.from_numpy(rgb_composite).permute(2, 0, 1)  # [3, h, w]
+        normalized = normalize(composite_tensor)  # [3, h, w]
         
-        return normalized.permute(1, 2, 0).numpy()  # [120, 120, 3]
+        return normalized.permute(1, 2, 0).numpy()  # [h, w, 3]
     
-    def _create_elevation_composite(self, data, band_indices):
-        """Create RGB composite from selected bands."""
-        # data: [12, 120, 120], band_indices: [R_idx, G_idx, B_idx]
-        composite = np.stack([
-            data[band_indices[-1]],  # Red channel
-            data[band_indices[-1]],  # Green channel  
-            data[band_indices[-1]]   # Blue channel
-        ], axis=-1)  # [120, 120, 3]
+    def _create_rgb_from_reconstruction(self, reconstruction_spatial):
+        """Create RGB composite from reconstructed channels.
+        
+        Args:
+            reconstruction_spatial: torch.Tensor of shape [c, h, w] where c=5 (B,G,R,NIR,elevation)
+        
+        Returns:
+            numpy array of shape [h, w, 3] with normalized RGB values
+        """
+        # reconstruction_spatial is [c, h, w] format on GPU, channels are B,G,R,NIR,elevation
+        # Extract RGB channels (indices 2,1,0 for R,G,B from BGR order)
+        rgb_composite = torch.stack([
+            reconstruction_spatial[2],  # Red channel (index 2)
+            reconstruction_spatial[1],  # Green channel (index 1)
+            reconstruction_spatial[0]   # Blue channel (index 0)
+        ], dim=0)  # [3, h, w]
         
         # Normalize using the provided function
-        composite_tensor = torch.from_numpy(composite).permute(2, 0, 1)  # [3, 120, 120]
-        normalized = normalize(composite_tensor)  # [3, 120, 120]
+        normalized = normalize(rgb_composite)  # [3, h, w]
         
-        return normalized.permute(1, 2, 0).numpy()  # [120, 120, 3]
-
+        return normalized.permute(1, 2, 0).cpu().numpy()  # [h, w, 3]
+    
 import pytorch_lightning as pl
 import torch
 import numpy as np
@@ -672,6 +733,8 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                     training=False,
                     task="vizualisation"
                 )
+
+
                 
                 # Remove batch dimension for visualization
                 y_hat = y_hat.squeeze(0)

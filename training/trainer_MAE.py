@@ -29,6 +29,16 @@ from transformers import get_cosine_schedule_with_warmup
 import seaborn as sns
 from pytorch_optimizer import Lamb
 
+
+def print_memory(label=""):
+    """Print current GPU memory usage."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"[{label}] Allocated: {allocated:.2f}GB | Reserved: {reserved:.2f}GB | Max: {max_allocated:.2f}GB")
+
+
 #BigEarthNet...
 warnings.filterwarnings("ignore", message="No positive samples found in target, recall is undefined. Setting recall to one for all thresholds.")
 
@@ -50,13 +60,13 @@ class Model_MAE(pl.LightningModule):
         self.table=False
         self.comment_log=""
         
-        # Add manual loss tracking to avoid NaN/inf issues
-        self.train_losses = []
-        self.val_losses = []
+    
         
-        self.metric_MSE_train = torchmetrics.MeanSquaredError(squared=False)
-        self.metric_MSE_val_mod_val = torchmetrics.MeanSquaredError(squared=False)
-        self.metric_MSE_val_mod_train = torchmetrics.MeanSquaredError(squared=False)
+        #self.metric_MSE_train = torchmetrics.MeanSquaredError(squared=False)
+        #self.metric_MSE_val = torchmetrics.MeanSquaredError(squared=False)
+
+        
+        
         
         self.tmp_val_loss = 0
         self.tmp_val_ap = 0
@@ -64,141 +74,92 @@ class Model_MAE(pl.LightningModule):
         if config["encoder"] == "Atomiser":
             self.encoder = Atomiser(config=self.config,transform=self.transform)
 
-        self.loss = nn.MSELoss(reduction='mean')  # Explicitly set reduction
+        self.loss = nn.L1Loss()#nn.MSELoss(reduction='mean')  # Explicitly set reduction
         self.lr = float(config["trainer"]["lr"])
         
-    def forward(self, image, attention_mask,mae_tokens,mae_tokens_mask, training=False,task="reconstruction"):
-        return self.encoder(image, attention_mask,mae_tokens,mae_tokens_mask, training=training,task=task)
+    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask, training=False, task="reconstruction"):
+        return self.encoder(image, attention_mask, mae_tokens, mae_tokens_mask, training=training, task=task)
 
-    def training_step(self, batch, batch_idx):
-        image, attention_mask, mae_tokens, mae_tokens_mask, labels = batch
+    
+
+    
+
+    def training_step(self, batch, batch_idx, dataloader_idx=0):
+        profiler=False
+        if profiler and batch_idx == 0:
+            torch.cuda.reset_peak_memory_stats()
+            print_memory("A. Start of step")
         
-        y_hat, y_mask = self.forward(image.clone(), attention_mask.clone(), mae_tokens.clone(), mae_tokens_mask.clone(), training=True)
+        image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
         
-        y_hat_masked = y_hat.clone()
-        mae_tokens_masked = mae_tokens.clone()
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=True)
+        if profiler and batch_idx == 0:
+            print_memory("B. After forward")
         
-        # Apply masking
-        y_hat_masked[y_mask == 1.0] = 0.0
-        mae_tokens_masked[y_mask == 1.0] = 0.0
+        #labels = mae_tokens[:,::5,4]
+        target = mae_tokens[:,:,0]
+
+        target=rearrange(target,"b p -> (b p)")
+        y_hat =rearrange(y_hat.clone() ,"b t c -> (b t) c").squeeze(-1)
+
+        loss = self.loss(y_hat, target)
+        if profiler and batch_idx == 0:
+            print_memory("C. After loss")
         
-        # Compute loss
-        loss = self.loss(y_hat_masked[:, :, 0], mae_tokens_masked[:, :, 0])
+        #self.metric_MSE_val.update(y_hat.detach(), target.detach())
         
-        # Update metrics
-        self.metric_MSE_train.update(y_hat_masked[:, :, 0].detach(), mae_tokens_masked[:,:,0].detach())
+        # Log the loss directly here instead of manually tracking
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
         
-        # Store loss for epoch-end logging
-        self.train_losses.append(loss.detach().cpu().item())
-        
-        # IMPORTANT: Return the loss so PyTorch Lightning can call backward()
-        return loss   
+        return loss
+    
+    #def on_after_backward(self):
+       
+        #print_memory("D. After backward")  # <-- Likely big jump here!
     
     def on_fit_start(self):
         # if starting with MAE
+        return
         self.encoder.unfreeze_encoder()
         self.encoder.unfreeze_decoder()
         self.encoder.freeze_classifier()
     
     def on_train_epoch_start(self):
+        return
         self.encoder.unfreeze_encoder()    
         self.encoder.unfreeze_decoder()
         self.encoder.freeze_classifier()
         self.train_losses = []  # Reset for new epoch
         
-    def on_train_epoch_end(self):
-                
-        # Calculate average training loss manually
-        if len(self.train_losses) > 0:
-            avg_train_loss = np.mean(self.train_losses)
-            # Check for NaN/inf
-            if np.isnan(avg_train_loss) or np.isinf(avg_train_loss):
-                avg_train_loss = 0.0
-        else:
-            avg_train_loss = 0.0
-            
-        self.log("train_reconstruction_loss", avg_train_loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        #self.check_gradients()
-        # Compute MSE metric
-        try:
-            train_mse = self.metric_MSE_train.compute()
-            if torch.isnan(train_mse) or torch.isinf(train_mse):
-                train_mse = torch.tensor(0.0)
-        except:
-            train_mse = torch.tensor(0.0)
-            
-        self.log("train_MSE", train_mse, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.metric_MSE_train.reset()
-        
-        return {"train_reconstruction_loss": avg_train_loss}
+    def on_train_epoch_end(self):    
+        pass
     
     def on_validation_epoch_start(self):
-
-        self.trainer.datamodule.val_dataset.set_modality_mode("validation")
-        self.val_losses = []  # Reset for new epoch
+        pass
         
     
         
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        image, attention_mask, mae_tokens, mae_tokens_mask, labels = batch
+        
+        image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
+        
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
+        target = mae_tokens[:,:,0]
 
-        y_hat, y_mask = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
-        
-        # Create copies to avoid in-place operations
-        y_hat_masked = y_hat.clone()
-        mae_tokens_masked = mae_tokens.clone()
-        
-        # Apply masking
-        y_hat_masked[y_mask == 1.0] = 0.0
-        mae_tokens_masked[mae_tokens_mask == 1.0] = 0.0
+        target=rearrange(target,"b p -> (b p)")
+        y_hat =rearrange(y_hat.clone() ,"b t c -> (b t) c").squeeze(-1)
 
-        # Only compute loss on non-masked tokens to avoid NaN
-        valid_mask = (mae_tokens_mask == 0.0)
+        loss = self.loss(y_hat, target)
         
-        if valid_mask.sum() == 0:
-            # If no valid tokens, return a small loss to avoid NaN
-            loss = torch.tensor(0.0, device=self.device)
-        else:
-            # Only compute loss on valid (non-masked) tokens
-            y_hat_valid = y_hat_masked[:, :, 0][valid_mask]
-            mae_tokens_valid = mae_tokens_masked[:, :, 0][valid_mask]
-            
-            loss = self.loss(y_hat_valid, mae_tokens_valid)
+        #self.metric_MSE_val.update(y_hat.detach(), target.detach())
         
-        # Check for NaN/inf and handle gracefully
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: Invalid loss detected in validation step {batch_idx}")
-            loss = torch.tensor(0.0, device=self.device)
+        # Log the loss directly here instead of manually tracking
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
         
-        # Update metrics only with valid data
-        if valid_mask.sum() > 0:
-            if dataloader_idx == 0:  # Validation set
-                self.metric_MSE_val_mod_val.update(y_hat_valid.detach(), mae_tokens_valid.detach())
-            elif dataloader_idx == 1:  # Training set
-                self.metric_MSE_val_mod_train.update(y_hat_valid.detach(), mae_tokens_valid.detach())
-
-        # Store loss for epoch-end logging
-        self.val_losses.append(loss.detach().cpu().item())
-        
-        # Log step-wise (optional, can remove if too verbose)
-        self.log("val_reconstruction_loss_step", loss, on_step=True, on_epoch=False, logger=True, sync_dist=False)
-
-        return loss    
+        return loss
 
     def on_validation_epoch_end(self):
-        
-
-        # Compute MSE metric
-        val_mse_val = self.metric_MSE_val_mod_val.compute()
-        self.log("val mod val MSE", val_mse_val, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.log("val_reconstruction_loss", val_mse_val, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.metric_MSE_val_mod_val.reset()
-
-        val_mse_train = self.metric_MSE_val_mod_train.compute()
-        self.log("val mod train MSE", val_mse_train, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        self.metric_MSE_val_mod_train.reset()
-
-        return {"val_reconstruction_loss": val_mse_val}
+        pass
 
     def test_step(self, batch, batch_idx):
         pass

@@ -4,7 +4,7 @@ import pytorch_lightning as pl
 class Lookup_encoding(pl.LightningModule):
 
 
-    def __init__(self, modalities_config,bands_info):
+    def __init__(self, modalities_config,bands_info,config_model):
         super().__init__()
         self.config= modalities_config
         self.bands_info=bands_info
@@ -12,7 +12,7 @@ class Lookup_encoding(pl.LightningModule):
         self.table=None
         self.table_wave=None
         self.table_queries=None
-        self.nb_tokens_queries=20
+        self.nb_tokens_queries= config_model["Atomiser"]["spatial_latents"]
 
 
         self.init_config()
