@@ -105,9 +105,12 @@ class transformations_config(nn.Module):
         self.sqrt_num_latents = lookup_table.nb_tokens_queries  # 20
         self.num_latents = self.sqrt_num_latents ** 2  # 400
 
-    # =========================================================================
-    # EXISTING HELPER METHODS (unchanged)
-    # =========================================================================
+        self.spatial_latents_per_row = config["Atomiser"]["spatial_latents"]  # e.g., 35
+        self.num_spatial_latents = self.spatial_latents_per_row ** 2          # e.g., 1225$
+
+        self.latent_surface = config["Atomiser"].get("latent_surface", 103)  # meters
+        self.physical_scale = self.latent_surface / (self.spatial_latents_per_row - 1)
+        self.gsd = config["Atomiser"].get("gsd", 0.2)  # meters (constant for now)
 
     def _get_encoding_dim(self, attribute):
         """Get encoding dimension for a specific attribute"""
@@ -328,61 +331,26 @@ class transformations_config(nn.Module):
         setattr(self, cache_key, global_gsd)
         return global_gsd
 
-    def _precompute_latent_physical_positions(self, device):
+    def _precompute_latent_physical_positions(self, device=None):
         """
-        Precompute physical positions of latent centers for each modality.
-        
-        Latents are arranged on a sqrt_L × sqrt_L grid covering the image.
-        
-        Lookup: [modality_index * L + latent_index] → (x_center, y_center)
+        Latent grid spanning [-latent_surface/2, +latent_surface/2].
         """
-        cache_key = "latent_physical_positions"
-        if hasattr(self, cache_key) and getattr(self, cache_key) is not None:
-            cached = getattr(self, cache_key)
-            if cached.device == device:
-                return cached
-            else:
-                return cached.to(device)
-
-        L = self.num_latents  # 400
-        sqrt_L = self.sqrt_num_latents  # 20
-        num_modalities = len(self.lookup_table.modalities)
-
-        # [num_modalities * L, 2] where 2 = (x, y)
-        global_positions = torch.zeros(num_modalities * L, 2, device=device)
-
-        for mod_idx, modality in enumerate(tqdm(self.lookup_table.modalities, desc="Precomputing latent positions")):
-            resolution, image_size = modality
-
-            # Physical extent
-            pos_scaling = image_size * resolution
-            half_extent = pos_scaling / 2.0
-
-            # Latent grid: evenly spaced within the image
-            latent_spacing = pos_scaling / sqrt_L
-            
-            # Centers of the sqrt_L × sqrt_L grid
-            latent_coords_1d = torch.linspace(
-                -half_extent + latent_spacing / 2.0,
-                half_extent - latent_spacing / 2.0,
-                steps=sqrt_L,  # This is now 20, creating 20 positions per axis
-                device=device
-            )
-
-            # Create 2D grid (row-major order)
-            grid_y, grid_x = torch.meshgrid(latent_coords_1d, latent_coords_1d, indexing='ij')
-            
-            # Flatten to [L] = [400] in row-major order
-            latent_x = grid_x.flatten()  # [400]
-            latent_y = grid_y.flatten()  # [400]
-
-            # Store at correct offset
-            start_idx = mod_idx * L
-            global_positions[start_idx:start_idx + L, 0] = latent_x
-            global_positions[start_idx:start_idx + L, 1] = latent_y
-
-        setattr(self, cache_key, global_positions)
-        return global_positions
+        cache_key = "_latent_positions_cache"
+        if hasattr(self, cache_key):
+            return getattr(self, cache_key).to(device)
+        
+        half_extent = self.latent_surface / 2.0
+        
+        coords = torch.linspace(-half_extent, half_extent, self.spatial_latents_per_row)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
+        
+        positions = torch.stack([
+            grid_x.flatten(),
+            grid_y.flatten(),
+        ], dim=-1)  # [L, 2]
+        
+        setattr(self, cache_key, positions)
+        return positions.to(device)
 
     def _precompute_modality_mapping(self, device):
         """
@@ -477,101 +445,57 @@ class transformations_config(nn.Module):
         cached_gsds = getattr(self, cache_key).to(device)
         return cached_gsds[modality_indices]
     
+    
 
-    def _compute_polar_encoding(
-        self,
-        delta_x: torch.Tensor,         # [...] physical displacement in meters
-        delta_y: torch.Tensor,         # [...] physical displacement in meters
-        physical_scale: torch.Tensor,  # Broadcastable to delta shape
-        gsd: torch.Tensor,             # Same shape as delta_x/delta_y
-        device=None
-    ) -> torch.Tensor:
-        """
-        Unified polar encoding computation for both encoder and decoder.
+    def _compute_polar_encoding(self, delta_x, delta_y, device=None):
         
-        Encodes:
-        1. Spatial position (r, θ) - normalized by physical_scale, NOT by GSD
-        2. Resolution context (gsd_ratio) - encoded separately, PER TOKEN
-        
-        Args:
-            delta_x: Physical displacement in meters [...shape]
-            delta_y: Physical displacement in meters [...shape]
-            physical_scale: Latent spacing in meters (broadcastable)
-            gsd: Ground sampling distance in meters, SAME SHAPE as delta_x/delta_y
-            
-        Returns:
-            encoding: [..., D_pe]
-        """
         device = device or delta_x.device
         
-        # =========================================================================
-        # 1. SPATIAL ENCODING: Normalize by physical_scale (NOT by GSD!)
-        # =========================================================================
-        delta_x_norm = delta_x / physical_scale
-        delta_y_norm = delta_y / physical_scale
+        # Normalize by physical_scale (constant)
+        delta_x_norm = delta_x / self.physical_scale
+        delta_y_norm = delta_y / self.physical_scale
         
         # Polar coordinates
         r = torch.sqrt(delta_x_norm**2 + delta_y_norm**2 + 1e-8)
-        theta = torch.atan2(delta_y_norm, delta_x_norm)  # [-π, π]
+        theta = torch.atan2(delta_y_norm, delta_x_norm)
         
-        # Angular fadeout when very close (r < 0.1 latent spacings)
         r_min = 0.1
         theta_weight = torch.tanh(r / r_min)
         
-        # =========================================================================
-        # 2. FOURIER ENCODING for spatial position
-        # =========================================================================
-        r_expanded = r.unsqueeze(-1)              # [..., 1]
-        theta_expanded = theta.unsqueeze(-1)      # [..., 1]
-        theta_weight_expanded = theta_weight.unsqueeze(-1)  # [..., 1]
+        # Fourier encoding
+        r_expanded = r.unsqueeze(-1)
+        theta_expanded = theta.unsqueeze(-1)
+        theta_weight_expanded = theta_weight.unsqueeze(-1)
         
-        freq_r = self.polar_r_frequencies.to(device)      # [K_r]
-        freq_theta = self.polar_theta_frequencies.to(device)  # [K_theta]
+        freq_r = self.polar_r_frequencies.to(device)
+        freq_theta = self.polar_theta_frequencies.to(device)
         
-        # Reshape frequencies for broadcasting: [1, 1, ..., K]
         for _ in range(r_expanded.dim() - 1):
             freq_r = freq_r.unsqueeze(0)
             freq_theta = freq_theta.unsqueeze(0)
         
-        # Radial Fourier
-        r_sin = torch.sin(freq_r * r_expanded)    # [..., K_r]
-        r_cos = torch.cos(freq_r * r_expanded)    # [..., K_r]
+        r_sin = torch.sin(freq_r * r_expanded)
+        r_cos = torch.cos(freq_r * r_expanded)
+        theta_sin = torch.sin(freq_theta * theta_expanded) * theta_weight_expanded
+        theta_cos = torch.cos(freq_theta * theta_expanded) * theta_weight_expanded
         
-        # Angular Fourier
-        theta_sin = torch.sin(freq_theta * theta_expanded) * theta_weight_expanded  # [..., K_theta]
-        theta_cos = torch.cos(freq_theta * theta_expanded) * theta_weight_expanded  # [..., K_theta]
+        # GSD encoding (constant for now)
+        G_ref = 0.2
+        gsd_ratio = self.gsd / G_ref
+        log_gsd = np.log(gsd_ratio)
         
-        # =========================================================================
-        # 3. RESOLUTION ENCODING: GSD ratio PER TOKEN (separate from spatial!)
-        # =========================================================================
-        G_ref = 10.0  # Reference GSD in meters
-        gsd_ratio = gsd / G_ref  # Same shape as delta_x: [...]
+        gsd_ratio_expanded = torch.full_like(r_expanded, gsd_ratio)
+        log_gsd_expanded = torch.full_like(r_expanded, log_gsd)
         
-        # Add feature dimension
-        gsd_ratio_expanded = gsd_ratio.unsqueeze(-1)  # [..., 1]
+        gsd_sin = torch.sin(freq_r * log_gsd_expanded)
+        gsd_cos = torch.cos(freq_r * log_gsd_expanded)
         
-        # Log-scale encoding for wide GSD range
-        log_gsd = torch.log(gsd_ratio + 1e-8)  # [...]
-        log_gsd_expanded = log_gsd.unsqueeze(-1)  # [..., 1]
-        
-        # Fourier encoding of log(gsd_ratio)
-        gsd_sin = torch.sin(freq_r * log_gsd_expanded)  # [..., K_r]
-        gsd_cos = torch.cos(freq_r * log_gsd_expanded)  # [..., K_r]
-        
-        # =========================================================================
-        # 4. Concatenate all components
-        # =========================================================================
         encoding = torch.cat([
-            # Spatial encoding
-            r.unsqueeze(-1),       # [..., 1]
-            r_sin,                 # [..., K_r]
-            r_cos,                 # [..., K_r]
-            theta_sin,             # [..., K_theta]
-            theta_cos,             # [..., K_theta]
-            # Resolution encoding (per token!)
-            gsd_ratio_expanded,    # [..., 1]
-            gsd_sin,               # [..., K_r]
-            gsd_cos,               # [..., K_r]
+            r.unsqueeze(-1),
+            r_sin, r_cos,
+            theta_sin, theta_cos,
+            gsd_ratio_expanded,
+            gsd_sin, gsd_cos,
         ], dim=-1)
         
         return encoding
@@ -616,45 +540,30 @@ class transformations_config(nn.Module):
     ) -> torch.Tensor:
         """
         Compute polar relative positional encoding for encoder.
+        Simplified: latent positions are fixed, no modality lookup needed.
         """
         device = device or token_data.device
         B, L, m, _ = token_data.shape
-
+        
         # 1. Get token physical positions
         token_centers = self._precompute_token_physical_centers(device)
         x_indices = token_data[..., 1].long()  # [B, L, m]
         y_indices = token_data[..., 2].long()  # [B, L, m]
-        
         token_x = token_centers[x_indices]  # [B, L, m]
         token_y = token_centers[y_indices]  # [B, L, m]
-
-        # 2. Get latent physical positions
-        latent_positions = self._precompute_latent_physical_positions(device)
-        modality_indices = self._get_modality_indices_from_tokens(token_data, device)  # [B]
-
-        latent_start_indices = modality_indices * L  # [B]
-        latent_idx = latent_start_indices.unsqueeze(1) + torch.arange(L, device=device).unsqueeze(0)  # [B, L]
-        batch_latent_pos = latent_positions[latent_idx]  # [B, L, 2]
-
-        latent_x = batch_latent_pos[:, :, 0].unsqueeze(-1)  # [B, L, 1]
-        latent_y = batch_latent_pos[:, :, 1].unsqueeze(-1)  # [B, L, 1]
-
+        
+        # 2. Get latent physical positions (FIXED - same for all batches!)
+        latent_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
+        latent_x = latent_positions[:, 0].view(1, L, 1)  # [1, L, 1]
+        latent_y = latent_positions[:, 1].view(1, L, 1)  # [1, L, 1]
+        
         # 3. Compute relative displacement
         delta_x = token_x - latent_x  # [B, L, m]
         delta_y = token_y - latent_y  # [B, L, m]
-
-        # 4. Get physical scale (per batch) and GSD (per token!)
-        physical_scale = self._get_physical_scale_for_modality(modality_indices, device)  # [B]
-        physical_scale = physical_scale.view(B, 1, 1)  # [B, 1, 1]
         
-        # GSD per token via lookup!
-        gsd = self._get_gsd_for_tokens(token_data, device)  # [B, L, m]
-
-        # 5. Compute unified polar encoding
-        encoding = self._compute_polar_encoding(
-            delta_x, delta_y, physical_scale, gsd, device
-        )  # [B, L, m, D_pe]
-
+        # 4. Compute polar encoding (physical_scale and gsd are constants now)
+        encoding = self._compute_polar_encoding(delta_x, delta_y, device)  # [B, L, m, D_pe]
+        
         return encoding
 
     def get_polar_encoding_dimension(self) -> int:
@@ -680,29 +589,13 @@ class transformations_config(nn.Module):
     ) -> torch.Tensor:
         """
         Get GSD for each individual token.
-        
-        In Sentinel-2:
-        - Bands 2,3,4,8 are 10m
-        - Bands 5,6,7,8A,11,12 are 20m  
-        - Bands 1,9,10 are 60m
-        
-        Args:
-            token_data: Token tensor with band/resolution info
-            
-        Returns:
-            gsd: Same shape as token_data[..., 0] (without last dim)
+        Currently all tokens have 0.2m GSD.
         """
         device = device or token_data.device
         
-        # Option 1: If GSD is stored directly in a column (e.g., column 4)
-        # Check your data format - adjust column index as needed
-        gsd = token_data[..., 4].float()  # [B, L, m] or [B, N]
-        
-        # Option 2: If column 4 contains band index, lookup GSD from band
-        # This requires a mapping from band index to GSD
-        # band_to_gsd = torch.tensor([60, 10, 10, 10, 20, 20, 20, 10, 20, 60, 60, 20, 20], device=device)
-        # band_idx = token_data[..., 4].long()
-        # gsd = band_to_gsd[band_idx]
+        # Return constant GSD of 0.2m for all tokens
+        # Shape: same as token_data without the last dimension
+        gsd = torch.full(token_data.shape[:-1], 0.2, device=device, dtype=token_data.dtype)
         
         return gsd
 
@@ -754,56 +647,38 @@ class transformations_config(nn.Module):
 
     def get_topk_latents_for_decoder(
         self,
-        query_tokens: torch.Tensor,  # [B, N, 6] - tokens to reconstruct
-        k: int = 16,                  # Number of latents per query
+        query_tokens: torch.Tensor,  # [B, N, 6]
+        k: int = 16,
         device=None
     ) -> tuple:
         """
         For each query token, select the k nearest spatial latents.
-        
-        Args:
-            query_tokens: [B, N, 6] - query tokens with position info
-            k: number of latents to select per query
-            
-        Returns:
-            selected_indices: [B, N, k] - indices of selected latents
-            selected_distances: [B, N, k] - distances (for optional soft weighting)
         """
         device = device or query_tokens.device
         B, N, _ = query_tokens.shape
-        L = self.num_latents  # 400
+        L = self.num_spatial_latents  # e.g., 1225
         
-        # Get token physical positions
+        # Safety check
+        k = min(k, L)
+        
+        # 1. Get token physical positions
         token_centers = self._precompute_token_physical_centers(device)
         x_indices = query_tokens[..., 1].long()  # [B, N]
         y_indices = query_tokens[..., 2].long()  # [B, N]
-        
         token_x = token_centers[x_indices]  # [B, N]
         token_y = token_centers[y_indices]  # [B, N]
         
-        # Get latent positions
-        latent_positions = self._precompute_latent_physical_positions(device)
-        modality_indices = self._get_modality_indices_from_tokens(
-            query_tokens.unsqueeze(2), device  # Add dummy dim to match expected shape
-        )  # [B]
+        # 2. Get latent positions (FIXED - same for all batches!)
+        latent_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
+        latent_x = latent_positions[:, 0]  # [L]
+        latent_y = latent_positions[:, 1]  # [L]
         
-        latent_start_indices = modality_indices * L  # [B]
-        latent_idx = latent_start_indices.unsqueeze(1) + torch.arange(L, device=device)  # [B, L]
-        batch_latent_pos = latent_positions[latent_idx]  # [B, L, 2]
-        
-        latent_x = batch_latent_pos[:, :, 0]  # [B, L]
-        latent_y = batch_latent_pos[:, :, 1]  # [B, L]
-        
-        # Compute distances: [B, N, L]
-        # token positions: [B, N] -> [B, N, 1]
-        # latent positions: [B, L] -> [B, 1, L]
-        delta_x = token_x.unsqueeze(-1) - latent_x.unsqueeze(1)  # [B, N, L]
-        delta_y = token_y.unsqueeze(-1) - latent_y.unsqueeze(1)  # [B, N, L]
-        
+        # 3. Compute distances: [B, N, L] #we're using euclidean distance
+        delta_x = token_x.unsqueeze(-1) - latent_x.view(1, 1, L)  # [B, N, L]
+        delta_y = token_y.unsqueeze(-1) - latent_y.view(1, 1, L)  # [B, N, L]
         distances = torch.sqrt(delta_x**2 + delta_y**2 + 1e-8)  # [B, N, L]
         
-        # Select k nearest latents (smallest distances)
-        # Note: we want smallest, so negate for topk or use torch.topk with largest=False
+        # 4. Select k nearest latents
         topk_distances, topk_indices = torch.topk(
             distances, k=k, dim=-1, largest=False
         )  # [B, N, k] each
@@ -822,44 +697,25 @@ class transformations_config(nn.Module):
         device = device or query_tokens.device
         B, N, _ = query_tokens.shape
         k = latent_indices.shape[-1]
-        L = self.num_latents
-
+        
         # 1. Get token physical positions
         token_centers = self._precompute_token_physical_centers(device)
         token_x = token_centers[query_tokens[..., 1].long()]  # [B, N]
         token_y = token_centers[query_tokens[..., 2].long()]  # [B, N]
-
-        # 2. Get latent physical positions for selected latents
-        latent_positions = self._precompute_latent_physical_positions(device)
-        modality_indices = self._get_modality_indices_from_tokens(
-            query_tokens.unsqueeze(2), device
-        )  # [B]
-
-        latent_start_indices = modality_indices * L  # [B]
-        global_latent_indices = latent_start_indices.unsqueeze(1).unsqueeze(2) + latent_indices  # [B, N, k]
         
-        selected_latent_pos = latent_positions[global_latent_indices]  # [B, N, k, 2]
+        # 2. Get latent physical positions (FIXED - direct indexing!)
+        latent_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
+        selected_latent_pos = latent_positions[latent_indices]  # [B, N, k, 2]
         latent_x = selected_latent_pos[..., 0]  # [B, N, k]
         latent_y = selected_latent_pos[..., 1]  # [B, N, k]
-
+        
         # 3. Compute relative displacement
         delta_x = latent_x - token_x.unsqueeze(-1)  # [B, N, k]
         delta_y = latent_y - token_y.unsqueeze(-1)  # [B, N, k]
-
-        # 4. Get physical scale and GSD
-        physical_scale = self._get_physical_scale_for_modality(modality_indices, device)  # [B]
-        physical_scale = physical_scale.view(B, 1, 1)  # [B, 1, 1]
         
-        # GSD per token via lookup! [B, N]
-        gsd = self._get_gsd_for_tokens(query_tokens, device)  # [B, N]
-        # Expand to match delta shape [B, N, k]
-        gsd = gsd.unsqueeze(-1).expand(-1, -1, k)  # [B, N, k]
-
-        # 5. Compute unified polar encoding
-        encoding = self._compute_polar_encoding(
-            delta_x, delta_y, physical_scale, gsd, device
-        )  # [B, N, k, D_pe]
-
+        # 4. Compute polar encoding (physical_scale and gsd are constants)
+        encoding = self._compute_polar_encoding(delta_x, delta_y, device)  # [B, N, k, D_pe]
+        
         return encoding
 
     def get_gaussian_encoding(
@@ -870,7 +726,7 @@ class transformations_config(nn.Module):
         device=None,
         extremums=None
     ):
-        """Existing method - unchanged"""
+        
         device = device or token_data.device
         batch, tokens, _ = token_data.shape
 
@@ -892,7 +748,7 @@ class transformations_config(nn.Module):
         return result
 
     def get_wavelength_encoding(self, token_data: torch.Tensor, device=None):
-        """Existing method - unchanged"""
+        
         cache_key = f"wavelength_encoding_gaussian"
         if not hasattr(self, cache_key):
             self._precompute_global_wavelength_encodings(device)
@@ -931,7 +787,6 @@ class transformations_config(nn.Module):
         return result
 
     def get_bias_tokens_encoding(self, token_data: torch.Tensor, device=None):
-        """Existing method - unchanged"""
         cache_key = f"bias_tokens_encoding"
 
         if not hasattr(self, cache_key):
@@ -950,7 +805,7 @@ class transformations_config(nn.Module):
         return result
 
     def get_bias_latents_encoding(self, token_data: torch.Tensor, device=None):
-        """Existing method - unchanged"""
+        
         cache_key = f"bias_latents_encoding"
 
         if not hasattr(self, cache_key):
@@ -977,7 +832,7 @@ class transformations_config(nn.Module):
         return result
 
     def get_bvalue_processing(self, img):
-        """Existing method - unchanged"""
+        
         if self.config["Atomiser"]["bandvalue_encoding"] == "NATURAL":
             return img.unsqueeze(-1)
 
@@ -993,7 +848,7 @@ class transformations_config(nn.Module):
     # =========================================================================
 
     def _precompute_global_fourrier_encodings(self, device, queries=False):
-        """Existing method - unchanged"""
+        
         max_global_index = sum(size for _, size in self.lookup_table.table.keys())
 
         if queries:
@@ -1027,7 +882,7 @@ class transformations_config(nn.Module):
         setattr(self, cache_key, global_encoding)
 
     def _precompute_global_bias_tokens_encodings(self, device):
-        """Existing method - unchanged"""
+        
         max_global_index = sum(size for _, size in self.lookup_table.table.keys())
         global_encoding = torch.zeros(max_global_index, 2, device=device)
 
@@ -1052,7 +907,7 @@ class transformations_config(nn.Module):
         setattr(self, cache_key, global_encoding)
 
     def _precompute_global_bias_latents_encodings(self, device):
-        """Existing method - unchanged"""
+        
         max_global_index = sum(self.spatial_latents_per_row  for _ in self.lookup_table.table_queries.keys())
         global_encoding = torch.zeros(max_global_index, 2, device=device)
 
@@ -1075,7 +930,7 @@ class transformations_config(nn.Module):
         setattr(self, cache_key, global_encoding)
 
     def _precompute_global_wavelength_encodings(self, device):
-        """Existing method - unchanged"""
+        
         max_global_index = len(self.lookup_table.table_wave.keys())
         global_encoding = torch.zeros(max_global_index, 19, device=device)
 
@@ -1097,7 +952,7 @@ class transformations_config(nn.Module):
         setattr(self, cache_key, global_encoding)
 
     def compute_gaussian_band_max_encoding(self, lambda_centers, bandwidths, num_points=50, modality="S2"):
-        """Existing method - unchanged"""
+        
         device = self.gaussian_means.device
 
         lambda_centers = torch.as_tensor(lambda_centers, dtype=torch.float32, device=device)
@@ -1126,35 +981,28 @@ class transformations_config(nn.Module):
     # =========================================================================
 
     def apply_transformations_optique(self, im_sen, mask_sen, mode, query=False):
-        """Existing method - used for decoder queries"""
-        if query:
-            central_wavelength_processing = self.get_wavelength_encoding(im_sen[:, :, 3], device=im_sen.device)
-            #p_x = self.get_fourrier_encoding(im_sen, device=im_sen.device)
+        
+        central_wavelength_processing = self.get_wavelength_encoding(im_sen[:, :, 3], device=im_sen.device)
+        #p_x = self.get_fourrier_encoding(im_sen, device=im_sen.device)
 
-            tokens = torch.cat([
-                central_wavelength_processing
-            ], dim=-1)
+        tokens = torch.cat([
+            central_wavelength_processing
+        ], dim=-1)
 
-            tokens_bias = self.get_bias_tokens_encoding(im_sen, device=im_sen.device)
-            latents_bias = self.get_bias_latents_encoding(im_sen, device=im_sen.device)
+        tokens_bias = self.get_bias_tokens_encoding(im_sen, device=im_sen.device)
+        latents_bias = self.get_bias_latents_encoding(im_sen, device=im_sen.device)
 
-            return tokens, mask_sen, (tokens_bias, latents_bias)
-
-        # For encoder - this path is now deprecated in favor of process_data_for_encoder
-        tokens=self.process_data_for_encoder(tokens,mask_sen,device=tokens.device)
-        p_latents = self.get_fourrier_encoding_queries(im_sen, device=im_sen.device)
+        return tokens, mask_sen, (tokens_bias, latents_bias)
 
         
 
-        return tokens, mask_sen, p_latents, (tokens_bias, latents_bias)
-
     def get_tokens(self, img, mask, mode="optique", modality="s2", wave_encoding=None, query=False):
-        """Existing method - unchanged"""
+        
         if mode == "optique":
             return self.apply_transformations_optique(img, mask, modality, query=query)
 
     def get_bias_data(self, img):
-        """Existing method - unchanged"""
+        
         tokens_bias = self.get_bias_tokens_encoding(img, device=img.device)
         latents_bias = self.get_bias_latents_encoding(img, device=img.device)
 
@@ -1166,7 +1014,4 @@ class transformations_config(nn.Module):
             if query:
                 tokens_s2, tokens_mask_s2, bias = self.get_tokens(img, mask, mode="optique", modality="s2", query=query)
                 return tokens_s2, tokens_mask_s2, bias
-            else:
-                tokens_s2, tokens_mask_s2, latents, bias = self.get_tokens(img, mask, mode="optique", modality="s2",
-                                                                            query=query)
-                return tokens_s2, tokens_mask_s2, latents, bias
+            

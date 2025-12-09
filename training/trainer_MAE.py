@@ -74,7 +74,7 @@ class Model_MAE(pl.LightningModule):
         if config["encoder"] == "Atomiser":
             self.encoder = Atomiser(config=self.config,transform=self.transform)
 
-        self.loss = nn.L1Loss()#nn.MSELoss(reduction='mean')  # Explicitly set reduction
+        self.loss = nn.MSELoss(reduction='mean')  
         self.lr = float(config["trainer"]["lr"])
         
     def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask, training=False, task="reconstruction"):
