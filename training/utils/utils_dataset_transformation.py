@@ -86,7 +86,10 @@ class transformations_config(nn.Module):
         # =====================================================================
         self.polar_num_r_bands = config["Atomiser"].get("polar_num_r_bands", 8)
         self.polar_num_theta_bands = config["Atomiser"].get("polar_num_theta_bands", 8)
-        self.G_ref = config["Atomiser"].get("G_ref", 50.0)  # Reference GSD in meters
+        self.G_ref = config["Atomiser"].get("G_ref", 0.2)  # Reference GSD in meters
+
+        self.cartesian_max_freq = config["Atomiser"].get("cartesian_max_freq", 32)
+        self.cartesian_num_bands = config["Atomiser"].get("cartesian_num_bands", 32)
 
         # Precompute frequencies (constant, tiny memory)
         self.register_buffer(
@@ -445,60 +448,116 @@ class transformations_config(nn.Module):
         cached_gsds = getattr(self, cache_key).to(device)
         return cached_gsds[modality_indices]
     
-    
-
-    def _compute_polar_encoding(self, delta_x, delta_y, device=None):
-        
+    def _compute_cartesian_encoding(self, delta_x, delta_y, device=None):
+        """
+        Encode relative position in Cartesian coordinates with Fourier features.
+        Uses fourier_encode for consistency.
+        """
         device = device or delta_x.device
         
-        # Normalize by physical_scale (constant)
+        # Normalize by physical_scale
+        delta_x_norm = delta_x / self.physical_scale
+        delta_y_norm = delta_y / self.physical_scale
+        
+        # Fourier encode x and y positions
+        # fourier_encode returns [sin, cos, orig] with shape [..., num_bands*2 + 1]
+        x_encoded = fourier_encode(
+            delta_x_norm, 
+            max_freq=self.cartesian_max_freq,
+            num_bands=self.cartesian_num_bands
+        )  # [..., num_bands*2 + 1]
+        
+        y_encoded = fourier_encode(
+            delta_y_norm,
+            max_freq=self.cartesian_max_freq,
+            num_bands=self.cartesian_num_bands
+        )  # [..., num_bands*2 + 1]
+        
+        # GSD encoding (constant for now)
+        G_ref = 0.2
+        gsd_ratio = self.gsd / G_ref
+        log_gsd = np.log(gsd_ratio + 1e-8)
+        
+        # Create tensor matching delta shape
+        log_gsd_tensor = torch.full_like(delta_x_norm, log_gsd)
+        
+        gsd_encoded = fourier_encode(
+            log_gsd_tensor,
+            max_freq=self.cartesian_max_freq,
+            num_bands=self.cartesian_num_bands
+        )  # [..., num_bands*2 + 1]
+        
+        # Concatenate all encodings
+        encoding = torch.cat([
+            x_encoded,    # [..., num_bands*2 + 1]
+            y_encoded,    # [..., num_bands*2 + 1]
+            gsd_encoded,  # [..., num_bands*2 + 1]
+        ], dim=-1)
+        
+        return encoding
+
+
+    def get_cartesian_encoding_dimension(self):
+        """Return the dimension of cartesian positional encoding."""
+        # fourier_encode returns: num_bands*2 (sin+cos) + 1 (original)
+        per_component = self.cartesian_num_bands * 2 + 1
+        # x, y, gsd
+        return per_component * 3
+
+    def _compute_polar_encoding(self, delta_x, delta_y, device=None):
+        """
+        Encode relative position in polar coordinates with Fourier features.
+        Uses fourier_encode for consistency.
+        """
+        device = device or delta_x.device
+        
+        # Normalize by physical_scale
         delta_x_norm = delta_x / self.physical_scale
         delta_y_norm = delta_y / self.physical_scale
         
         # Polar coordinates
         r = torch.sqrt(delta_x_norm**2 + delta_y_norm**2 + 1e-8)
-        theta = torch.atan2(delta_y_norm, delta_x_norm)
+        theta = torch.atan2(delta_y_norm, delta_x_norm)  # [-π, π]
         
-        r_min = 0.1
-        theta_weight = torch.tanh(r / r_min)
+        # Normalize theta to [-1, 1] for fourier_encode (which multiplies by π)
+        theta_norm = theta / torch.pi  # [-1, 1]
         
-        # Fourier encoding
-        r_expanded = r.unsqueeze(-1)
-        theta_expanded = theta.unsqueeze(-1)
-        theta_weight_expanded = theta_weight.unsqueeze(-1)
+        # Fourier encode r (radial distance)
+        r_encoded = fourier_encode(
+            r,
+            max_freq=self.cartesian_max_freq,
+            num_bands=self.cartesian_num_bands
+        )  # [..., num_bands*2 + 1]
         
-        freq_r = self.polar_r_frequencies.to(device)
-        freq_theta = self.polar_theta_frequencies.to(device)
-        
-        for _ in range(r_expanded.dim() - 1):
-            freq_r = freq_r.unsqueeze(0)
-            freq_theta = freq_theta.unsqueeze(0)
-        
-        r_sin = torch.sin(freq_r * r_expanded)
-        r_cos = torch.cos(freq_r * r_expanded)
-        theta_sin = torch.sin(freq_theta * theta_expanded) * theta_weight_expanded
-        theta_cos = torch.cos(freq_theta * theta_expanded) * theta_weight_expanded
+        # Fourier encode theta (angle)
+        theta_encoded = fourier_encode(
+            theta_norm,
+            max_freq=self.cartesian_max_freq,
+            num_bands=self.cartesian_num_bands
+        )  # [..., num_bands*2 + 1]
         
         # GSD encoding (constant for now)
         G_ref = 0.2
         gsd_ratio = self.gsd / G_ref
-        log_gsd = np.log(gsd_ratio)
+        log_gsd = np.log(gsd_ratio + 1e-8)
         
-        gsd_ratio_expanded = torch.full_like(r_expanded, gsd_ratio)
-        log_gsd_expanded = torch.full_like(r_expanded, log_gsd)
+        log_gsd_tensor = torch.full_like(r, log_gsd)
         
-        gsd_sin = torch.sin(freq_r * log_gsd_expanded)
-        gsd_cos = torch.cos(freq_r * log_gsd_expanded)
+        gsd_encoded = fourier_encode(
+            log_gsd_tensor,
+            max_freq=self.cartesian_max_freq,
+            num_bands=self.cartesian_num_bands
+        )  # [..., num_bands*2 + 1]
         
+        # Concatenate all encodings
         encoding = torch.cat([
-            r.unsqueeze(-1),
-            r_sin, r_cos,
-            theta_sin, theta_cos,
-            gsd_ratio_expanded,
-            gsd_sin, gsd_cos,
+            r_encoded,      # [..., num_bands*2 + 1]
+            theta_encoded,  # [..., num_bands*2 + 1]
+            gsd_encoded,    # [..., num_bands*2 + 1]
         ], dim=-1)
         
         return encoding
+
 
     def _get_modality_indices_from_tokens(self, token_data: torch.Tensor, device) -> torch.Tensor:
         """
@@ -562,20 +621,17 @@ class transformations_config(nn.Module):
         delta_y = token_y - latent_y  # [B, L, m]
         
         # 4. Compute polar encoding (physical_scale and gsd are constants now)
+        #encoding = self._compute_cartesian_encoding(delta_x, delta_y, device) #
         encoding = self._compute_polar_encoding(delta_x, delta_y, device)  # [B, L, m, D_pe]
-        
         return encoding
 
-    def get_polar_encoding_dimension(self) -> int:
-        """
-        Return the dimension of the polar + GSD encoding.
-        
-        D_pe = 1 + 2*K_r + 2*K_theta + 1 + 2*K_r
-            = 2 + 4*K_r + 2*K_theta
-        """
-        K_r = self.polar_num_r_bands
-        K_theta = self.polar_num_theta_bands
-        return 2 + 4 * K_r + 2 * K_theta  # e.g., 2 + 32 + 16 = 50 for K_r=8, K_theta=8
+    def get_polar_encoding_dimension(self):
+        """Return the dimension of polar positional encoding."""
+        # fourier_encode returns: num_bands*2 (sin+cos) + 1 (original)
+        r_dim = self.cartesian_num_bands * 2 + 1
+        theta_dim = self.cartesian_num_bands * 2 + 1
+        gsd_dim = self.cartesian_num_bands * 2 + 1
+        return r_dim + theta_dim + gsd_dim
 
 
     # =========================================================================
@@ -621,7 +677,7 @@ class transformations_config(nn.Module):
         B, L, m, _ = token_data.shape
 
         # 1. Polar positional encoding (unified formula)
-        polar_encoding = self.get_polar_positional_encoding(token_data, device)
+        polar_encoding = self.get_polar_positional_encoding(token_data, device)#self.get_polar_positional_encoding(token_data, device)
         # [B, L, m, D_pe]
 
         # 2. Wavelength encoding
@@ -688,7 +744,7 @@ class transformations_config(nn.Module):
     def get_decoder_relative_pe(
         self,
         query_tokens: torch.Tensor,  # [B, N, 6]
-        latent_indices: torch.Tensor,  # [B, N, k]
+        latent_indices: torch.Tensor,  # [B, L , k]
         device=None
     ) -> torch.Tensor:
         """
@@ -714,7 +770,7 @@ class transformations_config(nn.Module):
         delta_y = latent_y - token_y.unsqueeze(-1)  # [B, N, k]
         
         # 4. Compute polar encoding (physical_scale and gsd are constants)
-        encoding = self._compute_polar_encoding(delta_x, delta_y, device)  # [B, N, k, D_pe]
+        encoding = self._compute_cartesian_encoding(delta_x, delta_y, device)#self._compute_polar_encoding(delta_x, delta_y, device)  # [B, N, k, D_pe]
         
         return encoding
 

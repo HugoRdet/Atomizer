@@ -68,6 +68,7 @@ class Atomiser(pl.LightningModule):
         self.input_dim = self._compute_input_dim()
         self.query_dim_recon = self._compute_query_dim_recon()
         
+        
         # =====================================================================
         # Model architecture parameters
         # =====================================================================
@@ -90,12 +91,12 @@ class Atomiser(pl.LightningModule):
         self.max_tokens_val = config["trainer"]["max_tokens_val"]
         
         # Geographic attention parameters
-        self.geo_k = config["Atomiser"].get("geo_k", 500)
+        self.geo_k = config["Atomiser"].get("geo_k", 1500)
         self.geo_m_train = config["Atomiser"].get("geo_m_train", 500)
         self.geo_m_val = config["Atomiser"].get("geo_m_val", 500)
         
         # Decoder parameters
-        self.decoder_k_spatial = config["Atomiser"].get("decoder_k_spatial", 4)
+        self.decoder_k_spatial = config["Atomiser"].get("decoder_k_spatial", 1)
         
         # Initialize components
         self._init_latents()
@@ -108,7 +109,7 @@ class Atomiser(pl.LightningModule):
         pos_dim = self._get_encoding_dim("pos")
         wavelength_dim = self._get_encoding_dim("wavelength") 
         bandvalue_dim = self._get_encoding_dim("bandvalue")
-        return 198  # 2 * pos_dim + wavelength_dim + bandvalue_dim
+        return 343  # 2 * pos_dim + wavelength_dim + bandvalue_dim
     
     def _compute_query_dim_recon(self):
         """Compute query dimension for reconstruction (no band values)"""
@@ -206,21 +207,25 @@ class Atomiser(pl.LightningModule):
     
     
     def _init_decoder(self):
-        """Initialize decoder for reconstruction (spatial latents only)."""
         D_pe = self.transform.get_polar_encoding_dimension()
+    
+        cross_attn_out_dim = self.latent_dim
         
         self.decoder_cross_attn = LocalCrossAttention(
             dim_query=self.query_dim_recon,
             dim_context=self.latent_dim + D_pe,
-            dim_out=self.query_dim_recon,
+            dim_out=cross_attn_out_dim,
             heads=self.cross_heads,
             dim_head=self.cross_dim_head,
             dropout=self.attn_dropout
         )
         
-        hidden_dim = self.query_dim_recon * 2
+        # MLP input = cross_attn output + query (wavelength)
+        hidden_dim = cross_attn_out_dim * 2
+        mlp_input_dim = cross_attn_out_dim + self.query_dim_recon  # ← Added query!
+        
         self.output_head = nn.Sequential(
-            nn.Linear(self.query_dim_recon, hidden_dim),
+            nn.Linear(mlp_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -644,7 +649,7 @@ class Atomiser(pl.LightningModule):
         L_spatial = self.num_spatial_latents
         device = latents.device
         D = latents.shape[-1]
-        D_pe = self.transform.get_polar_encoding_dimension()
+        D_pe = self.transform.get_cartesian_encoding_dimension()#self.transform.get_polar_encoding_dimension()
         k_spatial = self.decoder_k_spatial
         
         if diagnose:
@@ -699,8 +704,10 @@ class Atomiser(pl.LightningModule):
         if diagnose:
             print_memory("3b. After concat spatial_context")
             print(f"   spatial_context: {spatial_context.shape} | {spatial_context.numel() * 4 / 1024**2:.2f} MB")
+
         
-        del selected_spatial, relative_pe
+        
+        #del selected_spatial, relative_pe
         
         # =========================================================================
         # 4. Process queries
@@ -741,7 +748,9 @@ class Atomiser(pl.LightningModule):
         # =========================================================================
         # 6. Output head
         # =========================================================================
-        result = self.output_head(output)
+        #output_with_pe = torch.cat([output, pe_for_mlp], dim=-1)
+        output_with_query = torch.cat([output, processed_queries], dim=-1)
+        result = self.output_head(output_with_query)
         if diagnose:
             print_memory("6. After output_head")
             print(f"   result: {result.shape}")
