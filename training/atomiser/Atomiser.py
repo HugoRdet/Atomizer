@@ -115,7 +115,7 @@ class Atomiser(pl.LightningModule):
         """Compute query dimension for reconstruction (no band values)"""
         pos_dim = self._get_encoding_dim("pos")
         wavelength_dim = self._get_encoding_dim("wavelength")
-        return   wavelength_dim #2 * pos_dim
+        return wavelength_dim
     
     def _get_encoding_dim(self, attribute):
         """Get encoding dimension for a specific attribute"""
@@ -222,7 +222,7 @@ class Atomiser(pl.LightningModule):
         
         # MLP input = cross_attn output + query (wavelength)
         hidden_dim = cross_attn_out_dim * 2
-        mlp_input_dim = cross_attn_out_dim + self.query_dim_recon  # ← Added query!
+        mlp_input_dim = cross_attn_out_dim + self.query_dim_recon
         
         self.output_head = nn.Sequential(
             nn.Linear(mlp_input_dim, hidden_dim),
@@ -251,11 +251,15 @@ class Atomiser(pl.LightningModule):
             self.to_logits = nn.Identity()
 
 
-
-    def geographic_pruning(self, tokens, mask):
+    def geographic_pruning(self, tokens, mask, latents_coords=None):
         """
         Memory-efficient geographic pruning for spatial latents.
         Only applies to spatial latents (which have positions).
+        
+        Args:
+            tokens: [B, N, D]
+            mask: [B, N]
+            latents_coords: [B, L, 2] or None for default grid
         """
         k = self.geo_k
         chunk_size = 50
@@ -266,19 +270,26 @@ class Atomiser(pl.LightningModule):
         SIGMA = 0.5
         
         with torch.no_grad():
-            #bias data returns the coordinates of the surface 
-            #represented by each pixel in space (x_min,y_max,x_max,y_min)
-            #it also returns the position (mu) (x,y) of each latent
-            bias_data = self.transform.get_bias_data(tokens)
-            tokens_positions, latent_gaussians = bias_data
+            # Get bias data (pass latent positions)
+            bias_data = self.transform.get_bias_data(tokens, latent_positions=latents_coords)
+            tokens_positions, latent_positions = bias_data
             
             x_min = tokens_positions[:, :, 0, 0]
             x_max = tokens_positions[:, :, 0, 1]
             y_min = tokens_positions[:, :, 1, 0]
             y_max = tokens_positions[:, :, 1, 1]
             
-            mu_x_all = latent_gaussians[:, :, 0, 0]
-            mu_y_all = latent_gaussians[:, :, 1, 0]
+            # Handle both formats:
+            # - Custom positions: [B, L, 2]
+            # - Default grid returns complex encoding from get_bias_latents_encoding
+            if latents_coords is not None:
+                # Simple format: [B, L, 2]
+                mu_x_all = latent_positions[:, :, 0]  # [B, L]
+                mu_y_all = latent_positions[:, :, 1]  # [B, L]
+            else:
+                # Old format from get_bias_latents_encoding
+                mu_x_all = latent_positions[:, :, 0, 0]
+                mu_y_all = latent_positions[:, :, 1, 0]
             
             sqrt_2 = torch.sqrt(torch.tensor(2.0, device=tokens.device))
             
@@ -288,8 +299,8 @@ class Atomiser(pl.LightningModule):
             for chunk_start in range(0, L, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, L)
                 
-                mu_x = mu_x_all[:, chunk_start:chunk_end, None]
-                mu_y = mu_y_all[:, chunk_start:chunk_end, None]
+                mu_x = mu_x_all[:, chunk_start:chunk_end, None]  # [B, chunk, 1]
+                mu_y = mu_y_all[:, chunk_start:chunk_end, None]  # [B, chunk, 1]
                 
                 z_x_min = (x_min[:, None, :] - mu_x) / (SIGMA * sqrt_2)
                 z_x_max = (x_max[:, None, :] - mu_x) / (SIGMA * sqrt_2)
@@ -310,7 +321,7 @@ class Atomiser(pl.LightningModule):
             selected_indices = torch.cat(all_indices, dim=1)
             selected_bias = torch.cat(all_bias_values, dim=1)
 
-        debug_overlap=False
+        debug_overlap = False
 
         if debug_overlap:
             # 1. Find problematic latents
@@ -333,8 +344,6 @@ class Atomiser(pl.LightningModule):
         tokens_per_latent = self._gather_tokens_efficient(tokens, selected_indices)
         masks_per_latent = self._gather_masks_efficient(mask, selected_indices)
 
-            
-    
         return tokens_per_latent, masks_per_latent, selected_bias
 
     def _gather_tokens_efficient(self, tokens, indices):
@@ -358,15 +367,21 @@ class Atomiser(pl.LightningModule):
         
         return gathered.reshape(B, L, k).bool()
 
-    def encode(self, tokens, mask, training=True):
+    def encode(self, tokens, mask, latents_coords=None, training=True):
         """
         Encode tokens into latent representations.
         Spatial latents: Use geographic cross-attention (local)
         Global latents: Skip cross-attention, only participate in self-attention
         All latents: Participate in self-attention together
+        
+        Args:
+            tokens: [B, N, 6]
+            mask: [B, N]
+            latents_coords: [B, L, 2] or None for default grid
+            training: bool
         """
 
-        diagnose=False
+        diagnose = False
         if diagnose:
             reset_memory_stats()
             print("=" * 80)
@@ -388,9 +403,12 @@ class Atomiser(pl.LightningModule):
             print_memory("1. After latents init")
             print(f"   latents: {latents.shape} | {latents.numel() * 4 / 1024**2:.2f} MB")
         
-        # Geographic pruning (only for spatial latents)
-        geographic_tokens, geographic_masks, geographic_bias = self.geographic_pruning(tokens, mask)
+        # Geographic pruning (pass latent positions)
+        geographic_tokens, geographic_masks, geographic_bias = self.geographic_pruning(
+            tokens, mask, latents_coords
+        )
         k = geographic_tokens.shape[2]
+        
         if diagnose:
             print_memory(f"2. After geographic_pruning (k={k})")
             print(f"   geographic_tokens: {geographic_tokens.shape} | {geographic_tokens.numel() * 4 / 1024**2:.2f} MB")
@@ -410,22 +428,20 @@ class Atomiser(pl.LightningModule):
             m = min(m, k)
             
             # Sample tokens from geographic pool
-            #here maybe we can do something more efficient like a for loop
             perm = torch.randperm(k, device=tokens.device)[:m]
             sampled_tokens = geographic_tokens[:, :, perm, :]
             sampled_masks = geographic_masks[:, :, perm]
-            #sampled_bias = geographic_bias[:, :, perm]
-            
             
             if diagnose:
                 print_memory(f"Layer {layer_idx} after sampling (m={m})")
                 print(f"   sampled_tokens: {sampled_tokens.shape} | {sampled_tokens.numel() * 4 / 1024**2:.2f} MB")
             
-            # Process tokens with polar positional encoding
+            # Process tokens with polar positional encoding (pass latent positions)
             processed_tokens = self.transform.process_data_for_encoder(
                 sampled_tokens,
                 sampled_masks,
-                device=tokens.device
+                device=tokens.device,
+                latent_positions=latents_coords
             )
             
             if diagnose:
@@ -450,7 +466,6 @@ class Atomiser(pl.LightningModule):
                 latents_spatial,
                 context=processed_tokens,
                 mask=~sampled_masks,
-                #bias=sampled_bias no bias, it's redundant with the geographic sampler
             )
             
             if diagnose:
@@ -513,130 +528,19 @@ class Atomiser(pl.LightningModule):
         
         return latents
 
-    def debug_gsd_encoding(self, tokens, mask):
-        """Check why GSD encoding differs on/off diagonal."""
-        import numpy as np
-        
-        device = tokens.device
-        
-        print("="*60)
-        print("GSD ENCODING DEBUG")
-        print("="*60)
-        
-        # Get positions
-        token_centers = self.transform._precompute_token_physical_centers(device)
-        token_x = token_centers[tokens[0, :, 1].long()].float().cpu().numpy()
-        token_y = token_centers[tokens[0, :, 2].long()].float().cpu().numpy()
-        diag_distance = np.abs(token_x - token_y) / np.sqrt(2)
-        
-        # Get GSD values from tokens
-        # Token format: [value, x_idx, y_idx, band_idx, modality_idx, gsd_idx]
-        gsd_indices = tokens[0, :, 5].long()  # Assuming GSD is at index 5
-        
-        print(f"GSD index range: [{gsd_indices.min()}, {gsd_indices.max()}]")
-        print(f"Unique GSD indices: {torch.unique(gsd_indices).cpu().numpy()}")
-        
-        # Check if GSD varies by diagonal
-        on_diag = diag_distance < 3
-        off_diag = diag_distance > 20
-        
-        gsd_on = gsd_indices[torch.from_numpy(on_diag)].float().cpu().numpy()
-        gsd_off = gsd_indices[torch.from_numpy(off_diag)].float().cpu().numpy()
-        
-        print(f"\nGSD index ON diagonal:  mean={gsd_on.mean():.4f}, unique={np.unique(gsd_on)}")
-        print(f"GSD index OFF diagonal: mean={gsd_off.mean():.4f}, unique={np.unique(gsd_off)}")
-        
-        # =========================================================================
-        # Check PE structure
-        # =========================================================================
-        K_r = len(self.transform.polar_r_frequencies)
-        K_theta = len(self.transform.polar_theta_frequencies)
-        
-        print(f"\n--- PE STRUCTURE ---")
-        print(f"K_r = {K_r}, K_theta = {K_theta}")
-        print(f"PE[0]: r")
-        print(f"PE[1:{1+K_r}]: sin(freq * r)")
-        print(f"PE[{1+K_r}:{1+2*K_r}]: cos(freq * r)")
-        print(f"PE[{1+2*K_r}:{1+2*K_r+K_theta}]: sin(freq * θ)")
-        print(f"PE[{1+2*K_r+K_theta}:{1+2*K_r+2*K_theta}]: cos(freq * θ)")
-        gsd_start = 1 + 2*K_r + 2*K_theta
-        print(f"PE[{gsd_start}]: gsd_ratio")
-        print(f"PE[{gsd_start+1}:{gsd_start+1+K_r}]: sin(freq * log_gsd)")
-        print(f"PE[{gsd_start+1+K_r}:{gsd_start+1+2*K_r}]: cos(freq * log_gsd)")
-        
-        # =========================================================================
-        # Get actual PE values
-        # =========================================================================
-        k_spatial = self.decoder_k_spatial
-        spatial_indices, _ = self.transform.get_topk_latents_for_decoder(
-            tokens, k=k_spatial, device=device
-        )
-        
-        with torch.no_grad():
-            relative_pe = self.transform.get_decoder_relative_pe(
-                tokens, spatial_indices, device
-            )
-        
-        pe = relative_pe[0, :, 0, :].float().cpu().numpy()  # [N, D_pe]
-        
-        # Check GSD-related dimensions
-        print(f"\n--- GSD PE DIMENSIONS ---")
-        
-        for d in range(gsd_start, min(gsd_start + 2*K_r + 1, pe.shape[1])):
-            pe_on = pe[on_diag, d]
-            pe_off = pe[off_diag, d]
-            diff = pe_on.mean() - pe_off.mean()
-            
-            if abs(diff) > 0.01:
-                print(f"  PE[{d}]: ON={pe_on.mean():.4f}, OFF={pe_off.mean():.4f}, diff={diff:+.4f} ⚠️")
-            else:
-                print(f"  PE[{d}]: ON={pe_on.mean():.4f}, OFF={pe_off.mean():.4f}, diff={diff:+.4f}")
-        
-        # =========================================================================
-        # Check radial distance (r) - this SHOULD differ on/off diagonal
-        # =========================================================================
-        print(f"\n--- RADIAL DISTANCE (PE[0]) ---")
-        r_on = pe[on_diag, 0]
-        r_off = pe[off_diag, 0]
-        print(f"r ON diagonal:  mean={r_on.mean():.4f}, std={r_on.std():.4f}")
-        print(f"r OFF diagonal: mean={r_off.mean():.4f}, std={r_off.std():.4f}")
-        
-        # =========================================================================
-        # KEY CHECK: Is the GSD lookup using the wrong index?
-        # =========================================================================
-        print(f"\n--- CHECKING _get_gsd_for_tokens ---")
-        
-        gsd_values = self.transform._get_gsd_for_tokens(tokens, device)
-        gsd_np = gsd_values[0].float().cpu().numpy()
-        
-        print(f"GSD values range: [{gsd_np.min():.4f}, {gsd_np.max():.4f}]")
-        print(f"Unique GSD values: {np.unique(gsd_np)}")
-        
-        gsd_on_vals = gsd_np[on_diag]
-        gsd_off_vals = gsd_np[off_diag]
-        
-        print(f"GSD ON diagonal:  mean={gsd_on_vals.mean():.4f}")
-        print(f"GSD OFF diagonal: mean={gsd_off_vals.mean():.4f}")
-        
-        if np.abs(gsd_on_vals.mean() - gsd_off_vals.mean()) > 0.01:
-            print("⚠️ GSD differs ON vs OFF diagonal! This is wrong!")
-        else:
-            print("✅ GSD is same ON vs OFF diagonal (correct)")
-        
-        return {
-            'pe': pe,
-            'gsd_np': gsd_np,
-        }
-
-    def reconstruct(self, latents, query_tokens, query_mask):
+    def reconstruct(self, latents, latents_coords, query_tokens, query_mask):
         """
         Reconstruct query tokens using spatial latents only.
         Global latents are only used in encoder self-attention.
+        
+        Args:
+            latents: [B, L_total, D]
+            latents_coords: [B, L, 2] or None for default grid
+            query_tokens: [B, N, 6]
+            query_mask: [B, N]
         """
 
-        
-
-        diagnose=False
+        diagnose = False
     
         if diagnose:
             reset_memory_stats()
@@ -649,7 +553,7 @@ class Atomiser(pl.LightningModule):
         L_spatial = self.num_spatial_latents
         device = latents.device
         D = latents.shape[-1]
-        D_pe = self.transform.get_cartesian_encoding_dimension()#self.transform.get_polar_encoding_dimension()
+        D_pe = self.transform.get_polar_encoding_dimension()
         k_spatial = self.decoder_k_spatial
         
         if diagnose:
@@ -658,10 +562,10 @@ class Atomiser(pl.LightningModule):
             print(f"[SHAPES] latents: {latents.shape}")
         
         # =========================================================================
-        # 1. Select top-k spatial latents per query
+        # 1. Select top-k spatial latents per query (pass positions)
         # =========================================================================
         spatial_indices, _ = self.transform.get_topk_latents_for_decoder(
-            query_tokens, k=k_spatial, device=device
+            query_tokens, k=k_spatial, device=device, latent_positions=latents_coords
         )
         
         if diagnose:
@@ -672,7 +576,6 @@ class Atomiser(pl.LightningModule):
         # 2. Gather spatial latents (MEMORY OPTIMIZED)
         # =========================================================================
         spatial_latents = latents[:, :L_spatial, :]  # [B, L_spatial, D]
-        
         
         flat_indices = spatial_indices.reshape(B, N * k_spatial)
         flat_indices_expanded = flat_indices.unsqueeze(-1).expand(-1, -1, D)
@@ -691,23 +594,21 @@ class Atomiser(pl.LightningModule):
         del flat_indices, flat_indices_expanded, flat_gathered
         
         # =========================================================================
-        # 3. Compute relative PE and concat
+        # 3. Compute relative PE and concat (pass positions)
         # =========================================================================
         relative_pe = self.transform.get_decoder_relative_pe(
-            query_tokens, spatial_indices, device
+            query_tokens, spatial_indices, device, latent_positions=latents_coords
         )
+        
         if diagnose:
             print_memory("3a. After get_decoder_relative_pe")
             print(f"   relative_pe: {relative_pe.shape} | {relative_pe.numel() * 4 / 1024**2:.2f} MB")
         
         spatial_context = torch.cat([selected_spatial, relative_pe], dim=-1)
+        
         if diagnose:
             print_memory("3b. After concat spatial_context")
             print(f"   spatial_context: {spatial_context.shape} | {spatial_context.numel() * 4 / 1024**2:.2f} MB")
-
-        
-        
-        #del selected_spatial, relative_pe
         
         # =========================================================================
         # 4. Process queries
@@ -715,6 +616,7 @@ class Atomiser(pl.LightningModule):
         processed_queries, _, _ = self.transform.process_data(
             query_tokens, query_mask, query=True
         )
+        
         if diagnose:
             print_memory("4. After process_data (queries)")
             print(f"   processed_queries: {processed_queries.shape} | {processed_queries.numel() * 4 / 1024**2:.2f} MB")
@@ -748,9 +650,9 @@ class Atomiser(pl.LightningModule):
         # =========================================================================
         # 6. Output head
         # =========================================================================
-        #output_with_pe = torch.cat([output, pe_for_mlp], dim=-1)
         output_with_query = torch.cat([output, processed_queries], dim=-1)
         result = self.output_head(output_with_query)
+        
         if diagnose:
             print_memory("6. After output_head")
             print(f"   result: {result.shape}")
@@ -763,21 +665,27 @@ class Atomiser(pl.LightningModule):
         return self.to_logits(latents)
     
     
+    def forward(self, data, mask, mae_tokens=None, mae_tokens_mask=None, latents_coords=None,
+                training=True, task="reconstruction"):
+        """
+        Forward pass of the Atomizer
         
-    def forward(self, data, mask, mae_tokens=None, mae_tokens_mask=None, 
-            training=True, task="reconstruction"):
-        """Forward pass of the Atomizer"""
-        #print_memory("before encoder ")
-
+        Args:
+            data: [B, N, 6] input tokens
+            mask: [B, N] attention mask
+            mae_tokens: [B, M, 6] query tokens for reconstruction
+            latents_coords: [B, L, 2] custom latent positions or None for default grid
+            mae_tokens_mask: [B, M] query mask
+            training: bool
+            task: "reconstruction", "vizualisation", "encoder", or "classification"
+        """
+        latents = self.encode(data, mask, latents_coords, training=training)
         
-    
-        latents = self.encode(data, mask, training=training)
-        #print_memory("after encode ")
         if task == "encoder":
             return latents
         
         elif task == "reconstruction" or task == "vizualisation":
-            # Chunked reconstruction (already implemented!)
+            # Chunked reconstruction
             chunk_size = 100000
             N = mae_tokens.shape[1]
             
@@ -787,17 +695,16 @@ class Atomiser(pl.LightningModule):
                     chunk_tokens = mae_tokens[:, i:i + chunk_size]
                     chunk_mask = mae_tokens_mask[:, i:i + chunk_size]
                     
-                    p = self.reconstruct(latents, chunk_tokens, chunk_mask)
+                    p = self.reconstruct(latents, latents_coords, chunk_tokens, chunk_mask)
                     preds_list.append(p)
                 return torch.cat(preds_list, dim=1)
             else:
-                return self.reconstruct(latents, mae_tokens, mae_tokens_mask)
+                return self.reconstruct(latents, latents_coords, mae_tokens, mae_tokens_mask)
         
         else:
             return self.classify(latents)
         
   
-    
     def _set_requires_grad(self, module, flag):
         """Set requires_grad for all parameters in a module"""
         for param in module.parameters():

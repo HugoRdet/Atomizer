@@ -595,11 +595,19 @@ class transformations_config(nn.Module):
     def get_polar_positional_encoding(
         self,
         token_data: torch.Tensor,  # [B, L, m, 6]
-        device=None
+        device=None,
+        latent_positions=None,     # NEW: [B, L, 2] or None
     ) -> torch.Tensor:
         """
         Compute polar relative positional encoding for encoder.
-        Simplified: latent positions are fixed, no modality lookup needed.
+        
+        Args:
+            token_data: [B, L, m, 6]
+            device: torch device
+            latent_positions: [B, L, 2] with (x, y) in meters, or None for default grid
+        
+        Returns:
+            encoding: [B, L, m, D_pe]
         """
         device = device or token_data.device
         B, L, m, _ = token_data.shape
@@ -611,18 +619,24 @@ class transformations_config(nn.Module):
         token_x = token_centers[x_indices]  # [B, L, m]
         token_y = token_centers[y_indices]  # [B, L, m]
         
-        # 2. Get latent physical positions (FIXED - same for all batches!)
-        latent_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
-        latent_x = latent_positions[:, 0].view(1, L, 1)  # [1, L, 1]
-        latent_y = latent_positions[:, 1].view(1, L, 1)  # [1, L, 1]
+        # 2. Get latent physical positions
+        if latent_positions is not None:
+            # Use provided positions [B, L, 2]
+            latent_x = latent_positions[:, :, 0].unsqueeze(-1)  # [B, L, 1]
+            latent_y = latent_positions[:, :, 1].unsqueeze(-1)  # [B, L, 1]
+        else:
+            # Fall back to precomputed grid (same for all batches)
+            grid_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
+            latent_x = grid_positions[:, 0].view(1, L, 1)  # [1, L, 1]
+            latent_y = grid_positions[:, 1].view(1, L, 1)  # [1, L, 1]
         
         # 3. Compute relative displacement
         delta_x = token_x - latent_x  # [B, L, m]
         delta_y = token_y - latent_y  # [B, L, m]
         
-        # 4. Compute polar encoding (physical_scale and gsd are constants now)
-        #encoding = self._compute_cartesian_encoding(delta_x, delta_y, device) #
+        # 4. Compute polar encoding
         encoding = self._compute_polar_encoding(delta_x, delta_y, device)  # [B, L, m, D_pe]
+        
         return encoding
 
     def get_polar_encoding_dimension(self):
@@ -659,45 +673,49 @@ class transformations_config(nn.Module):
         self,
         token_data: torch.Tensor,  # [B, L, m, 6]
         mask: torch.Tensor,        # [B, L, m]
-        device=None
+        device=None,
+        latent_positions=None,     # NEW: [B, L, 2] or None
     ) -> torch.Tensor:
         """
         Process tokens grouped by latent for the encoder.
-        
         Uses unified polar relative positional encoding.
         
         Args:
             token_data: [B, L, m, 6] - tokens grouped by geographic pruning
             mask: [B, L, m] - attention mask
-            
+            device: torch device
+            latent_positions: [B, L, 2] with (x, y) in meters, or None for default grid
+        
         Returns:
             processed_tokens: [B, L, m, D_total]
         """
         device = device or token_data.device
         B, L, m, _ = token_data.shape
-
+        
         # 1. Polar positional encoding (unified formula)
-        polar_encoding = self.get_polar_positional_encoding(token_data, device)#self.get_polar_positional_encoding(token_data, device)
+        polar_encoding = self.get_polar_positional_encoding(
+            token_data, device, latent_positions=latent_positions
+        )
         # [B, L, m, D_pe]
-
+        
         # 2. Wavelength encoding
         wavelength_indices = token_data[..., 3].reshape(B, L * m)
         wavelength_encoding = self.get_wavelength_encoding(wavelength_indices, device=device)
         wavelength_encoding = wavelength_encoding.view(B, L, m, -1)
         # [B, L, m, D_wavelength]
-
+        
         # 3. Reflectance encoding
         reflectance = token_data[..., 0]  # [B, L, m]
         reflectance_encoding = self.get_bvalue_processing(reflectance)
         # [B, L, m, D_refl]
-
+        
         # 4. Concatenate all encodings
         processed = torch.cat([
             polar_encoding,       # [B, L, m, D_pe]
             wavelength_encoding,  # [B, L, m, D_wavelength]
             reflectance_encoding  # [B, L, m, D_refl]
         ], dim=-1)
-
+        
         return processed
     
 
@@ -705,14 +723,25 @@ class transformations_config(nn.Module):
         self,
         query_tokens: torch.Tensor,  # [B, N, 6]
         k: int = 16,
-        device=None
+        device=None,
+        latent_positions=None,  # NEW: [B, L, 2] or None
     ) -> tuple:
         """
         For each query token, select the k nearest spatial latents.
+        
+        Args:
+            query_tokens: [B, N, 6]
+            k: number of nearest latents
+            device: torch device
+            latent_positions: [B, L, 2] with (x, y) in meters, or None for default grid
+        
+        Returns:
+            topk_indices: [B, N, k]
+            topk_distances: [B, N, k]
         """
         device = device or query_tokens.device
         B, N, _ = query_tokens.shape
-        L = self.num_spatial_latents  # e.g., 1225
+        L = self.num_spatial_latents
         
         # Safety check
         k = min(k, L)
@@ -724,14 +753,20 @@ class transformations_config(nn.Module):
         token_x = token_centers[x_indices]  # [B, N]
         token_y = token_centers[y_indices]  # [B, N]
         
-        # 2. Get latent positions (FIXED - same for all batches!)
-        latent_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
-        latent_x = latent_positions[:, 0]  # [L]
-        latent_y = latent_positions[:, 1]  # [L]
+        # 2. Get latent positions
+        if latent_positions is not None:
+            # Use provided positions [B, L, 2]
+            latent_x = latent_positions[:, :, 0]  # [B, L]
+            latent_y = latent_positions[:, :, 1]  # [B, L]
+        else:
+            # Fall back to precomputed grid (same for all batches)
+            grid_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
+            latent_x = grid_positions[:, 0].unsqueeze(0).expand(B, -1)  # [B, L]
+            latent_y = grid_positions[:, 1].unsqueeze(0).expand(B, -1)  # [B, L]
         
-        # 3. Compute distances: [B, N, L] #we're using euclidean distance
-        delta_x = token_x.unsqueeze(-1) - latent_x.view(1, 1, L)  # [B, N, L]
-        delta_y = token_y.unsqueeze(-1) - latent_y.view(1, 1, L)  # [B, N, L]
+        # 3. Compute distances: [B, N, L]
+        delta_x = token_x.unsqueeze(-1) - latent_x.unsqueeze(1)  # [B, N, L]
+        delta_y = token_y.unsqueeze(-1) - latent_y.unsqueeze(1)  # [B, N, L]
         distances = torch.sqrt(delta_x**2 + delta_y**2 + 1e-8)  # [B, N, L]
         
         # 4. Select k nearest latents
@@ -744,11 +779,21 @@ class transformations_config(nn.Module):
     def get_decoder_relative_pe(
         self,
         query_tokens: torch.Tensor,  # [B, N, 6]
-        latent_indices: torch.Tensor,  # [B, L , k]
-        device=None
+        latent_indices: torch.Tensor,  # [B, N, k]
+        device=None,
+        latent_positions=None,  # NEW: [B, L, 2] or None
     ) -> torch.Tensor:
         """
         Compute relative polar PE from each query token to its selected latents.
+        
+        Args:
+            query_tokens: [B, N, 6]
+            latent_indices: [B, N, k]
+            device: torch device
+            latent_positions: [B, L, 2] with (x, y) in meters, or None for default grid
+        
+        Returns:
+            encoding: [B, N, k, D_pe]
         """
         device = device or query_tokens.device
         B, N, _ = query_tokens.shape
@@ -759,9 +804,20 @@ class transformations_config(nn.Module):
         token_x = token_centers[query_tokens[..., 1].long()]  # [B, N]
         token_y = token_centers[query_tokens[..., 2].long()]  # [B, N]
         
-        # 2. Get latent physical positions (FIXED - direct indexing!)
-        latent_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
-        selected_latent_pos = latent_positions[latent_indices]  # [B, N, k, 2]
+        # 2. Get latent physical positions
+        if latent_positions is not None:
+            # Use provided positions [B, L, 2]
+            # Gather selected latents per batch
+            # latent_indices: [B, N, k] -> need to gather from [B, L, 2]
+            
+            indices_expanded = latent_indices.unsqueeze(-1).expand(-1, -1, -1, 2)  # [B, N, k, 2]
+            latent_positions_expanded = latent_positions.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, L, 2]
+            selected_latent_pos = torch.gather(latent_positions_expanded, dim=2, index=indices_expanded)  # [B, N, k, 2]
+        else:
+            # Fall back to precomputed grid (same for all batches)
+            grid_positions = self._precompute_latent_physical_positions(device)  # [L, 2]
+            selected_latent_pos = grid_positions[latent_indices]  # [B, N, k, 2]
+        
         latent_x = selected_latent_pos[..., 0]  # [B, N, k]
         latent_y = selected_latent_pos[..., 1]  # [B, N, k]
         
@@ -769,10 +825,12 @@ class transformations_config(nn.Module):
         delta_x = latent_x - token_x.unsqueeze(-1)  # [B, N, k]
         delta_y = latent_y - token_y.unsqueeze(-1)  # [B, N, k]
         
-        # 4. Compute polar encoding (physical_scale and gsd are constants)
-        encoding = self._compute_cartesian_encoding(delta_x, delta_y, device)#self._compute_polar_encoding(delta_x, delta_y, device)  # [B, N, k, D_pe]
+        # 4. Compute polar encoding
+        encoding = self._compute_polar_encoding(delta_x, delta_y, device)  # [B, N, k, D_pe]
         
         return encoding
+    
+    
 
     def get_gaussian_encoding(
         self,
@@ -1057,11 +1115,25 @@ class transformations_config(nn.Module):
         if mode == "optique":
             return self.apply_transformations_optique(img, mask, modality, query=query)
 
-    def get_bias_data(self, img):
+    def get_bias_data(self, img, latent_positions=None):
+        """
+        Args:
+            img: token data
+            latent_positions: [B, L, 2] with (x, y) in meters, or None for default grid
         
+        Returns:
+            (tokens_bias, latents_bias)
+        """
         tokens_bias = self.get_bias_tokens_encoding(img, device=img.device)
-        latents_bias = self.get_bias_latents_encoding(img, device=img.device)
-
+        
+        if latent_positions is not None:
+            # latent_positions already has (x, y) in meters
+            # Shape: [B, L, 2]
+            latents_bias = latent_positions
+        else:
+            # Fall back to precomputed grid
+            latents_bias = self.get_bias_latents_encoding(img, device=img.device)
+        
         return (tokens_bias, latents_bias)
 
     def process_data(self, img, mask, query=False):

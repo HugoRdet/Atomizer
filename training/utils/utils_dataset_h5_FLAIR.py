@@ -19,6 +19,567 @@ from .lookup_positional import*
 from .mask_generator import *
 import os
 
+
+"""
+Visualize oracle (complexity-based) latent placement on an image.
+PyTorch implementation.
+"""
+
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import os
+
+os.makedirs("./figures", exist_ok=True)
+
+
+"""
+Visualize oracle (complexity-based) latent placement on an image.
+PyTorch implementation with gradient emphasis options.
+"""
+
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import os
+
+os.makedirs("./figures", exist_ok=True)
+
+
+def visualize_oracle_placement(
+    image,
+    num_latents,
+    save_path="./figures/oracle_placement.png",
+    figsize=(15, 5),
+    sigma=None,
+    gradient_power=2.0,
+    min_threshold=0.1,
+):
+    """
+    Plot optimal latent placement based on image complexity.
+    
+    Args:
+        image: RGB image [H, W, 3] or [3, H, W] or grayscale [H, W], torch tensor
+        num_latents: Number of latents to place
+        save_path: Where to save
+        sigma: Smoothing sigma (default: H/20)
+        gradient_power: Exponent for edge magnitude (1=linear, 2=quadratic, etc.)
+                        Higher = more latents concentrated on strongest edges
+        min_threshold: Fraction of max edge to ignore (0-1)
+                       Higher = ignore more flat regions
+    """
+    device = image.device if isinstance(image, torch.Tensor) else 'cpu'
+    
+    # Convert to tensor if needed
+    if not isinstance(image, torch.Tensor):
+        image = torch.from_numpy(image).float()
+    
+    # Normalize to [0, 1]
+    if image.max() > 1.0:
+        image = image / 255.0
+    
+    # Ensure [H, W, 3] format for display
+    if image.ndim == 3 and image.shape[0] in [1, 3]:
+        image = image.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
+    
+    # Convert to grayscale for complexity computation
+    if image.ndim == 3:
+        gray = image.mean(dim=2)  # [H, W]
+    else:
+        gray = image
+    
+    H, W = gray.shape
+    
+    # =========================================================================
+    # Compute complexity map (edge magnitude)
+    # =========================================================================
+    
+    # Sobel kernels
+    sobel_x = torch.tensor([[-1, 0, 1],
+                            [-2, 0, 2],
+                            [-1, 0, 1]], dtype=torch.float32, device=device)
+    
+    sobel_y = torch.tensor([[-1, -2, -1],
+                            [ 0,  0,  0],
+                            [ 1,  2,  1]], dtype=torch.float32, device=device)
+    
+    # Reshape for conv2d: [1, 1, 3, 3]
+    sobel_x = sobel_x.view(1, 1, 3, 3)
+    sobel_y = sobel_y.view(1, 1, 3, 3)
+    
+    # Reshape image for conv2d: [1, 1, H, W]
+    gray_4d = gray.view(1, 1, H, W)
+    
+    # Apply Sobel filters
+    edges_x = F.conv2d(gray_4d, sobel_x, padding=1)
+    edges_y = F.conv2d(gray_4d, sobel_y, padding=1)
+    
+    # Edge magnitude
+    edges = torch.sqrt(edges_x**2 + edges_y**2).squeeze()  # [H, W]
+    
+    # =========================================================================
+    # Emphasize high gradients
+    # =========================================================================
+    
+    # 1. Threshold: ignore weak gradients
+    edge_max = edges.max()
+    threshold = min_threshold * edge_max
+    edges = torch.clamp(edges - threshold, min=0)  # Zero out weak edges
+    
+    # 2. Non-linear scaling: emphasize strong edges
+    edges = edges ** gradient_power
+    
+    # =========================================================================
+    # Smooth with Gaussian
+    # =========================================================================
+    if sigma is None:
+        sigma = max(H, W) / 20
+    
+    # Create Gaussian kernel
+    kernel_size = int(6 * sigma) | 1  # Ensure odd
+    x = torch.arange(kernel_size, device=device, dtype=torch.float32) - kernel_size // 2
+    gaussian_1d = torch.exp(-x**2 / (2 * sigma**2))
+    gaussian_1d = gaussian_1d / gaussian_1d.sum()
+    
+    # Separable 2D Gaussian
+    gaussian_2d = gaussian_1d.view(1, 1, -1, 1) @ gaussian_1d.view(1, 1, 1, -1)
+    
+    # Apply Gaussian smoothing
+    edges_4d = edges.view(1, 1, H, W)
+    padding = kernel_size // 2
+    complexity = F.conv2d(edges_4d, gaussian_2d, padding=padding).squeeze()  # [H, W]
+    
+    # =========================================================================
+    # Normalize to probability distribution
+    # =========================================================================
+    # Add small epsilon to avoid zero probability everywhere
+    complexity = complexity + 1e-8
+    complexity = complexity / complexity.sum()
+    
+    # =========================================================================
+    # Sample latent positions proportional to complexity
+    # =========================================================================
+    flat_complexity = complexity.flatten()  # [H * W]
+    
+    # Sample without replacement using multinomial
+    sampled_indices = torch.multinomial(
+        flat_complexity,
+        num_samples=num_latents,
+        replacement=False
+    )
+    
+    # Convert to (row, col) coordinates
+    rows = sampled_indices // W
+    cols = sampled_indices % W
+    
+    # =========================================================================
+    # Plot
+    # =========================================================================
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    
+    # Convert to numpy for plotting
+    image_np = image.cpu().numpy()
+    complexity_np = complexity.cpu().numpy()
+    rows_np = rows.cpu().numpy()
+    cols_np = cols.cpu().numpy()
+    
+    # Panel 1: Original image
+    ax1 = axes[0]
+    ax1.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
+    ax1.set_title("Original Image")
+    ax1.axis('off')
+    
+    # Panel 2: Complexity map
+    ax2 = axes[1]
+    ax2.imshow(complexity_np, cmap='hot')
+    ax2.set_title(f"Complexity Map\n(power={gradient_power}, threshold={min_threshold})")
+    ax2.axis('off')
+    
+    # Panel 3: Image with oracle latents
+    ax3 = axes[2]
+    ax3.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
+    ax3.scatter(
+        cols_np, rows_np,
+        c='lime', s=50, marker='o', edgecolors='black', linewidths=1,
+        zorder=10
+    )
+    ax3.set_title(f"Oracle Placement ({num_latents} latents)")
+    ax3.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved: {save_path}")
+    
+    return rows, cols, complexity
+
+
+
+def compute_oracle_latent_positions(
+    image,
+    num_latents,
+    gradient_power=2.0,
+    min_threshold=0.1,
+    sigma=None,
+    return_complexity=False,
+):
+    """
+    Compute oracle latent positions based on image complexity (edges).
+    
+    Args:
+        image: RGB image [H, W, 3] or [3, H, W] or grayscale [H, W], torch tensor
+        num_latents: Number of latents to place
+        gradient_power: Exponent for edge magnitude (higher = more focus on strong edges)
+        min_threshold: Fraction of max edge to ignore (0-1)
+        sigma: Smoothing sigma (default: max(H,W)/20)
+        return_complexity: If True, also return the complexity map
+    
+    Returns:
+        positions: [num_latents, 2] tensor with (x, y) coordinates in pixels
+        complexity: [H, W] tensor (only if return_complexity=True)
+    """
+    device = image.device if isinstance(image, torch.Tensor) else 'cpu'
+    
+    # Convert to tensor if needed
+    if not isinstance(image, torch.Tensor):
+        image = torch.from_numpy(image).float().to(device)
+    
+    # Normalize to [0, 1]
+    if image.max() > 1.0:
+        image = image / 255.0
+    
+    # Ensure [H, W, C] or [H, W] format
+    if image.ndim == 3 and image.shape[0] in [1, 3]:
+        image = image.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
+    
+    # Convert to grayscale
+    if image.ndim == 3:
+        gray = image.mean(dim=2)  # [H, W]
+    else:
+        gray = image
+    
+    H, W = gray.shape
+    
+    # =========================================================================
+    # Compute edge magnitude (Sobel)
+    # =========================================================================
+    sobel_x = torch.tensor([[-1, 0, 1],
+                            [-2, 0, 2],
+                            [-1, 0, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    
+    sobel_y = torch.tensor([[-1, -2, -1],
+                            [ 0,  0,  0],
+                            [ 1,  2,  1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    
+    gray_4d = gray.view(1, 1, H, W)
+    edges_x = F.conv2d(gray_4d, sobel_x, padding=1)
+    edges_y = F.conv2d(gray_4d, sobel_y, padding=1)
+    edges = torch.sqrt(edges_x**2 + edges_y**2).squeeze()  # [H, W]
+    
+    # =========================================================================
+    # Emphasize high gradients
+    # =========================================================================
+    edge_max = edges.max()
+    threshold = min_threshold * edge_max
+    edges = torch.clamp(edges - threshold, min=0)
+    edges = edges ** gradient_power
+    
+    # =========================================================================
+    # Smooth with Gaussian
+    # =========================================================================
+    if sigma is None:
+        sigma = max(H, W) / 20
+    
+    kernel_size = int(6 * sigma) | 1  # Ensure odd
+    x = torch.arange(kernel_size, device=device, dtype=torch.float32) - kernel_size // 2
+    gaussian_1d = torch.exp(-x**2 / (2 * sigma**2))
+    gaussian_1d = gaussian_1d / gaussian_1d.sum()
+    gaussian_2d = gaussian_1d.view(1, 1, -1, 1) @ gaussian_1d.view(1, 1, 1, -1)
+    
+    edges_4d = edges.view(1, 1, H, W)
+    padding = kernel_size // 2
+    complexity = F.conv2d(edges_4d, gaussian_2d, padding=padding).squeeze()  # [H, W]
+    
+    # =========================================================================
+    # Normalize to probability distribution
+    # =========================================================================
+    complexity = complexity + 1e-8
+    complexity = complexity / complexity.sum()
+    
+    # =========================================================================
+    # Sample positions
+    # =========================================================================
+    flat_complexity = complexity.flatten()  # [H * W]
+    
+    sampled_indices = torch.multinomial(
+        flat_complexity,
+        num_samples=num_latents,
+        replacement=False
+    )
+    
+    # Convert to (x, y) coordinates
+    rows = sampled_indices // W  # y
+    cols = sampled_indices % W   # x
+    
+    # Stack as [num_latents, 2] with (x, y)
+    positions = torch.stack([cols, rows], dim=1).float()  # [num_latents, 2]
+    
+    if return_complexity:
+        return positions, complexity
+    return positions
+
+
+def compute_oracle_latent_positions_meters(
+    image,
+    num_latents,
+    gsd,
+    gradient_power=2.0,
+    min_threshold=0.1,
+    sigma=None,
+):
+    """
+    Compute oracle latent positions in physical coordinates (meters).
+    Image is centered at (0, 0).
+    
+    Args:
+        image: RGB image [H, W, 3] or [3, H, W] or grayscale [H, W]
+        num_latents: Number of latents to place
+        gsd: Ground sample distance (meters per pixel)
+        gradient_power: Exponent for edge magnitude
+        min_threshold: Fraction of max edge to ignore
+        sigma: Smoothing sigma
+    
+    Returns:
+        positions: [num_latents, 2] tensor with (x, y) coordinates in meters
+                   centered at (0, 0)
+    """
+    device = image.device if isinstance(image, torch.Tensor) else 'cpu'
+    
+    # Get image dimensions
+    if image.ndim == 3 and image.shape[0] in [1, 3]:
+        H, W = image.shape[1], image.shape[2]
+    else:
+        H, W = image.shape[0], image.shape[1]
+    
+    # Get pixel positions [num_latents, 2] with (x, y) in pixels
+    positions_px = compute_oracle_latent_positions(
+        image, num_latents, gradient_power, min_threshold, sigma
+    )
+    
+    # Image physical dimensions
+    width_m = W * gsd
+    height_m = H * gsd
+    
+    # Convert to meters, centered at (0, 0)
+    # Pixel (0, 0) -> (-width/2, -height/2)
+    # Pixel (W, H) -> (+width/2, +height/2)
+    positions_m = positions_px.clone()
+    positions_m[:, 0] = (positions_px[:, 0] - W / 2) * gsd  # x
+    positions_m[:, 1] = (positions_px[:, 1] - H / 2) * gsd  # y
+    
+    return positions_m
+
+
+
+
+
+def compare_placements(
+    image,
+    num_latents,
+    save_path="./figures/placement_comparison.png",
+    figsize=(20, 10),
+):
+    """
+    Compare different placement strategies side by side.
+    """
+    device = image.device if isinstance(image, torch.Tensor) else 'cpu'
+    
+    if not isinstance(image, torch.Tensor):
+        image = torch.from_numpy(image).float()
+    
+    if image.max() > 1.0:
+        image = image / 255.0
+    
+    if image.ndim == 3 and image.shape[0] in [1, 3]:
+        image = image.permute(1, 2, 0)
+    
+    H, W = image.shape[:2]
+    image_np = image.cpu().numpy()
+    
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    
+    # Row 1: Different gradient powers
+    powers = [1.0, 2.0, 3.0]
+    for idx, power in enumerate(powers):
+        rows, cols, complexity = visualize_oracle_placement(
+            image.clone(), num_latents,
+            save_path="/tmp/temp.png",  # Dummy
+            gradient_power=power,
+            min_threshold=0.1,
+        )
+        
+        ax = axes[0, idx]
+        ax.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
+        ax.scatter(
+            cols.cpu().numpy(), rows.cpu().numpy(),
+            c='lime', s=30, marker='o', edgecolors='black', linewidths=0.5,
+            zorder=10
+        )
+        ax.set_title(f"Power = {power}")
+        ax.axis('off')
+    
+    # Row 2: Different thresholds
+    thresholds = [0.0, 0.2, 0.4]
+    for idx, thresh in enumerate(thresholds):
+        rows, cols, complexity = visualize_oracle_placement(
+            image.clone(), num_latents,
+            save_path="/tmp/temp.png",
+            gradient_power=2.0,
+            min_threshold=thresh,
+        )
+        
+        ax = axes[1, idx]
+        ax.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
+        ax.scatter(
+            cols.cpu().numpy(), rows.cpu().numpy(),
+            c='cyan', s=30, marker='o', edgecolors='black', linewidths=0.5,
+            zorder=10
+        )
+        ax.set_title(f"Threshold = {thresh}")
+        ax.axis('off')
+    
+    axes[0, 0].set_ylabel("Varying Power\n(threshold=0.1)", fontsize=12)
+    axes[1, 0].set_ylabel("Varying Threshold\n(power=2.0)", fontsize=12)
+    
+    plt.suptitle(f"Oracle Placement Comparison ({num_latents} latents)", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved: {save_path}")
+
+
+def visualize_uniform_vs_oracle(
+    image,
+    num_latents,
+    save_path="./figures/uniform_vs_oracle.png",
+    figsize=(15, 5),
+    gradient_power=2.0,
+    min_threshold=0.1,
+):
+    """
+    Side-by-side comparison of uniform grid vs oracle placement.
+    """
+    device = image.device if isinstance(image, torch.Tensor) else 'cpu'
+    
+    if not isinstance(image, torch.Tensor):
+        image = torch.from_numpy(image).float()
+    
+    if image.max() > 1.0:
+        image = image / 255.0
+    
+    if image.ndim == 3 and image.shape[0] in [1, 3]:
+        image = image.permute(1, 2, 0)
+    
+    H, W = image.shape[:2]
+    image_np = image.cpu().numpy()
+    
+    # Compute oracle placement
+    rows_oracle, cols_oracle, complexity = visualize_oracle_placement(
+        image.clone(), num_latents,
+        save_path="/tmp/temp.png",
+        gradient_power=gradient_power,
+        min_threshold=min_threshold,
+    )
+    
+    # Compute uniform grid
+    grid_size = int(num_latents ** 0.5)
+    rows_uniform = torch.linspace(H / (2 * grid_size), H - H / (2 * grid_size), grid_size, device=device)
+    cols_uniform = torch.linspace(W / (2 * grid_size), W - W / (2 * grid_size), grid_size, device=device)
+    rows_uniform, cols_uniform = torch.meshgrid(rows_uniform, cols_uniform, indexing='ij')
+    rows_uniform = rows_uniform.flatten()
+    cols_uniform = cols_uniform.flatten()
+    
+    # Plot
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    
+    # Panel 1: Original
+    ax1 = axes[0]
+    ax1.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
+    ax1.set_title("Original Image")
+    ax1.axis('off')
+    
+    # Panel 2: Uniform
+    ax2 = axes[1]
+    ax2.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
+    ax2.scatter(
+        cols_uniform.cpu().numpy(), rows_uniform.cpu().numpy(),
+        c='red', s=50, marker='o', edgecolors='white', linewidths=1,
+        zorder=10
+    )
+    ax2.set_title(f"Uniform Grid ({grid_size}×{grid_size} = {grid_size**2})")
+    ax2.axis('off')
+    
+    # Panel 3: Oracle
+    ax3 = axes[2]
+    ax3.imshow(image_np, cmap='gray' if image_np.ndim == 2 else None)
+    ax3.scatter(
+        cols_oracle.cpu().numpy(), rows_oracle.cpu().numpy(),
+        c='lime', s=50, marker='o', edgecolors='black', linewidths=1,
+        zorder=10
+    )
+    ax3.set_title(f"Oracle Adaptive ({num_latents})")
+    ax3.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved: {save_path}")
+    
+    return (rows_uniform, cols_uniform), (rows_oracle, cols_oracle)
+
+
+# =============================================================================
+# Example usage
+# =============================================================================
+if __name__ == "__main__":
+    # Create a test image with clear structure
+    H, W = 256, 256
+    image = torch.zeros((H, W, 3))
+    
+    # Sky (flat)
+    image[:80, :, :] = torch.tensor([0.5, 0.7, 0.9])
+    
+    # Building (structured)
+    image[80:200, 50:200, :] = torch.tensor([0.4, 0.3, 0.3])
+    
+    # Windows (high detail)
+    for i in range(3):
+        for j in range(4):
+            image[100+i*30:120+i*30, 70+j*35:90+j*35, :] = torch.tensor([0.8, 0.8, 0.2])
+    
+    # Ground (medium)
+    image[200:, :, :] = torch.tensor([0.3, 0.5, 0.3])
+    
+    # Test different functions
+    print("Testing oracle placement...")
+    rows, cols, complexity = visualize_oracle_placement(
+        image, num_latents=64,
+        gradient_power=2.0,
+        min_threshold=0.1
+    )
+    
+    print("\nTesting placement comparison...")
+    compare_placements(image, num_latents=64)
+    
+    print("\nTesting uniform vs oracle...")
+    visualize_uniform_vs_oracle(image, num_latents=64)
+    
+    print(f"\nPlaced {len(rows)} latents")
+
+
 def del_file(path):
     if os.path.exists(path):
         os.remove(path)
@@ -316,7 +877,6 @@ from torchvision.transforms.functional import rotate, hflip, vflip
 
 class FLAIR_MAE(Dataset):
 
-#class FLAIR_SEG(Dataset):
     def __init__(self, file_path, 
                  transform,
                  transform_tokens=None,
@@ -367,12 +927,69 @@ class FLAIR_MAE(Dataset):
 
         # Initialize h5 to None - will be opened when needed
         self.h5 = None
+        
+        # Oracle latent positions config
+        self.num_spatial_latents = config_model["Atomiser"]["spatial_latents"] ** 2  # e.g., 35*35
+        self.gsd = 0.2  # meters per pixel
+        self.gradient_power = 2.0
+        self.min_threshold = 0.1
+        
+        # Precompute oracle positions for all images
+        self.oracle_positions = self._precompute_oracle_positions()
 
     def _initialize_file(self):
         """Initialize file and get number of samples."""
         with h5py.File(self.file_path, 'r') as f:
             self.num_samples = len(f.keys()) // 8  # Number of samples
-            
+
+    def _precompute_oracle_positions(self):
+        """Precompute oracle latent positions for all images, or load from cache."""
+        import os
+        
+        # Cache file path
+        cache_dir = os.path.dirname(self.file_path)
+        cache_file = os.path.join(cache_dir, f"precomputed_oracle_{self.mode}.pt")
+        
+        # Check if cache exists
+        if os.path.exists(cache_file):
+            print(f"Loading precomputed oracle positions from {cache_file}")
+            positions = torch.load(cache_file)
+            print(f"Loaded {len(positions)} oracle positions")
+            return positions
+        
+        # Compute if cache doesn't exist
+        print(f"Precomputing oracle latent positions for {self.num_samples} images...")
+        positions = {}
+        
+        with h5py.File(self.file_path, 'r') as f:
+            for idx in tqdm(range(self.num_samples), desc="Oracle positions"):
+                # Load image
+                im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5, 512, 512]
+                
+                # Convert to RGB [H, W, 3]
+                rgb_image = im_aerial[[2, 1, 0]].permute(1, 2, 0)
+                normalized = normalize(rgb_image)
+                
+                # Compute oracle positions
+                pos = compute_oracle_latent_positions_meters(
+                    normalized,
+                    num_latents=self.num_spatial_latents,
+                    gsd=self.gsd,
+                    gradient_power=self.gradient_power,
+                    min_threshold=self.min_threshold,
+                    sigma=None,
+                )
+                positions[idx] = pos  # [L, 2]
+        
+        # Save to cache
+        torch.save(positions, cache_file)
+        
+        # Memory usage
+        total_bytes = self.num_samples * self.num_spatial_latents * 2 * 4
+        print(f"Precomputed {len(positions)} oracle positions ({total_bytes / 1e6:.2f} MB)")
+        print(f"Saved to {cache_file}")
+        
+        return positions
 
     def _ensure_h5_open(self):
         """Ensure HDF5 file is open. Open it if it's None."""
@@ -417,33 +1034,27 @@ class FLAIR_MAE(Dataset):
         x_indices = x_indices + global_offset
         y_indices = y_indices + global_offset
 
-        
         # Expand for all bands
         x_indices = einops.repeat(x_indices, "h w -> r h w", r=channels_size).unsqueeze(-1)
         y_indices = einops.repeat(y_indices, "h w -> r h w", r=channels_size).unsqueeze(-1)
         
-      
         return x_indices, y_indices
     
-    def get_position_coordinates_queries(self, image_shape, new_resolution,table=None):
+    def get_position_coordinates_queries(self, image_shape, new_resolution, table=None):
         image_size = image_shape[-1]
         channels_size = image_shape[0]
 
-        resolution_latents=0.2 #m
-        tmp_resolution = int(resolution_latents*1000)
+        resolution_latents = 0.2  # m
+        tmp_resolution = int(resolution_latents * 1000)
         global_offset = table[(tmp_resolution, image_size)]
         
         # Create LOCAL pixel indices (0 to image_size-1)
-        indices = torch.full((image_size, image_size),global_offset)
-        
-        
+        indices = torch.full((image_size, image_size), global_offset)
         
         # Expand for all bands
         indices = einops.repeat(indices.unsqueeze(0), "u h w -> (u r) h w", r=channels_size).unsqueeze(-1)
 
         return indices
-    
-
     
     def get_wavelengths_coordinates(self, image_shape):
         image_size = image_shape[-1]
@@ -497,9 +1108,9 @@ class FLAIR_MAE(Dataset):
             repeat_factor = target_len // current_len
             remainder = target_len % current_len
 
-            repeated_image = image.repeat((repeat_factor, 1))  # [repeat_factor * d, 4]
+            repeated_image = image.repeat((repeat_factor, 1))
             if remainder > 0:
-                remainder_image = image[:remainder]            # [remainder, 4]
+                remainder_image = image[:remainder]
                 image = torch.cat([repeated_image, remainder_image], dim=0)
             else:
                 image = repeated_image
@@ -519,184 +1130,107 @@ class FLAIR_MAE(Dataset):
         mask[mask > 13] = 13
         mask = mask - 1
         return mask
-    
-    
 
     def __getitem__(self, idx):
         label = None
         id_img = None
-        
-
 
         # Ensure HDF5 file is open
         f = self._ensure_h5_open()
 
-        
-
         im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
         
-        
-        #im_sen = torch.tensor(f[f'img_sen_{idx}'][:], dtype=torch.float32)  # [12,10,40,40]
-        #days = torch.tensor(f[f'days_{idx}'][:], dtype=torch.float32)
-        #months = torch.tensor(f[f'months_{idx}'][:], dtype=torch.float32)
-        #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
+        # Get precomputed oracle positions (fast lookup!)
+        latent_pos = self.oracle_positions[idx].clone()  # [L, 2]
+
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
-
-        #im_aerial,label=random_augment_image_and_label(im_aerial,label)
-
         label = self.process_mask(label)
-        attention_mask=torch.zeros(im_aerial.shape)
+        attention_mask = torch.zeros(im_aerial.shape)
 
-        new_resolution=0.2 #m/px
-        label_segment=label.clone()
-        
-        label_segment=label_segment.repeat(im_aerial.shape[0],1,1)
-        
+        new_resolution = 0.2  # m/px
+        label_segment = label.clone()
+        label_segment = label_segment.repeat(im_aerial.shape[0], 1, 1)
         
         idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
-        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution,table=self.look_up.table)
-        indices_queries = self.get_position_coordinates_queries(im_aerial.shape, new_resolution,table=self.look_up.table_queries)
-        
+        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution, table=self.look_up.table)
+        indices_queries = self.get_position_coordinates_queries(im_aerial.shape, new_resolution, table=self.look_up.table_queries)
         
         # Concatenate all token data
         image = torch.cat([
             im_aerial.unsqueeze(-1),      # Band values
-            x_indices.float(),        # Global X indices
-            y_indices.float(),        # Global Y indices  
-            idxs_bandwidths.float(),   # Bandwidth indices
+            x_indices.float(),            # Global X indices
+            y_indices.float(),            # Global Y indices  
+            idxs_bandwidths.float(),      # Bandwidth indices
             label_segment.float().unsqueeze(-1),
             indices_queries.float()
         ], dim=-1)
         
-        #at this point image shape is [5,512,512,6]
-        # 5 -> channels
-        # 512 512 -> H W
-        # 5 -> meta data
-        
-        
-        
-        queries=image.clone()
-        
+        queries = image.clone()
         
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
-        queries= einops.rearrange(queries,"b h w c -> (b h w) c")
+        queries = einops.rearrange(queries, "b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
-        image= image[attention_mask==0.0]          # image get resized and invalid bands removed
-        #queries= queries[attention_mask==0.0]    # same for mask
+        image = image[attention_mask == 0.0]
 
-        #image,attention_mask = self.shuffle_arrays([image,attention_mask])
-        queries= self.shuffle_arrays([queries])[0]
+        queries = self.shuffle_arrays([queries])[0]
       
-        nb_queries=self.config_model["trainer"]["max_tokens_reconstruction"]
-        queries=queries[:nb_queries]
-        queries_mask=torch.zeros(queries.shape[0])
+        nb_queries = self.config_model["trainer"]["max_tokens_reconstruction"]
+        queries = queries[:nb_queries]
+        queries_mask = torch.zeros(queries.shape[0])
 
-        
-
-      
-        return image, attention_mask, queries,queries_mask,label
+        return image, attention_mask, queries, queries_mask, label, latent_pos
  
     def get_samples_to_viz(self, idx):
         label = None
         id_img = None
-        
-
 
         # Ensure HDF5 file is open
         f = self._ensure_h5_open()
 
-        
-
         im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
-        image_to_return=im_aerial.clone()
-        image_to_return=einops.rearrange(image_to_return,"c h w -> h w c")
-        #im_sen = torch.tensor(f[f'img_sen_{idx}'][:], dtype=torch.float32)  # [12,10,40,40]
-        #days = torch.tensor(f[f'days_{idx}'][:], dtype=torch.float32)
-        #months = torch.tensor(f[f'months_{idx}'][:], dtype=torch.float32)
-        #years = torch.tensor(f[f'years_{idx}'][:], dtype=torch.float32)
+
+        # Get precomputed oracle positions (fast lookup!)
+        latent_pos = self.oracle_positions[idx].clone()  # [L, 2]
+
+        image_to_return = im_aerial.clone()
+        image_to_return = einops.rearrange(image_to_return, "c h w -> h w c")
+
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
         label = self.process_mask(label)
-        attention_mask=torch.zeros(im_aerial.shape)
-        
-        
-        
-        
-        #sen_mask = f[f'sen_mask_{idx}'][:]
-        #aerial_date = f[f'aerial_mtd_{idx}'].asstr()[()]
+        attention_mask = torch.zeros(im_aerial.shape)
 
-
-
-
-
-        
-
-        #image, attention_mask, new_resolution = self.transform.apply_transformations(
-        #    image, attention_mask, id_img, mode=self.mode, modality_mode=self.modality_mode, 
-        #    f_s=self.fixed_size, f_r=self.fixed_resolution
-        #)
-        new_resolution=0.2 #m/px
-        label_segment=label.clone()
-        
-        label_segment=label_segment.repeat(im_aerial.shape[0],1,1)
-        
+        new_resolution = 0.2  # m/px
+        label_segment = label.clone()
+        label_segment = label_segment.repeat(im_aerial.shape[0], 1, 1)
         
         idxs_bandwidths = self.get_wavelengths_coordinates(im_aerial.shape)
-        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution,table=self.look_up.table)
-        indices_queries = self.get_position_coordinates_queries(im_aerial.shape, new_resolution,table=self.look_up.table_queries)
+        x_indices, y_indices = self.get_position_coordinates(im_aerial.shape, new_resolution, table=self.look_up.table)
+        indices_queries = self.get_position_coordinates_queries(im_aerial.shape, new_resolution, table=self.look_up.table_queries)
         
         # Concatenate all token data
         image = torch.cat([
             im_aerial.unsqueeze(-1),      # Band values
-            x_indices.float(),        # Global X indices
-            y_indices.float(),        # Global Y indices  
-            idxs_bandwidths.float(),   # Bandwidth indices
+            x_indices.float(),            # Global X indices
+            y_indices.float(),            # Global Y indices  
+            idxs_bandwidths.float(),      # Bandwidth indices
             label_segment.float().unsqueeze(-1),
             indices_queries.float()
         ], dim=-1)
         
-        #at this point image shape is [5,512,512,5]
-        # 5 -> channels
-        # 512 512 -> H W
-        # 5 -> meta data
-        
-        
-        queries=image.clone()
+        queries = image.clone()
 
-        
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
-        queries= einops.rearrange(queries,"b h w c -> (b h w) c")
+        queries = einops.rearrange(queries, "b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
 
-        image= image[attention_mask==0.0]          # image get resized and invalid bands removed
+        image = image[attention_mask == 0.0]
 
+        queries_mask = torch.zeros(queries.shape[0])
 
-        
-        
-        
-        
-        
-        
-        
-        # Shuffle tokens
-        #image = self.shuffle_arrays([image])[0]
-        
-     
-        queries_mask=torch.zeros(queries.shape[0])
+        return image_to_return, image, attention_mask, queries, queries_mask, label, latent_pos
 
-        
-        return image_to_return,image, attention_mask, queries,queries_mask,label
-
-    def close(self):
-        """Close HDF5 file if it's open."""
-        if self.h5 is not None:
-            self.h5.close()
-            self.h5 = None
-
-    def __del__(self):
-        """Ensure HDF5 file is closed when dataset is deleted."""
-        self.close()
 
 class FLAIR_SEG(Dataset):
     def __init__(self, file_path, 

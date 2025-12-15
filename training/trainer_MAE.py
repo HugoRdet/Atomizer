@@ -77,8 +77,8 @@ class Model_MAE(pl.LightningModule):
         self.loss = nn.MSELoss(reduction='mean')  
         self.lr = float(config["trainer"]["lr"])
         
-    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask, training=False, task="reconstruction"):
-        return self.encoder(image, attention_mask, mae_tokens, mae_tokens_mask, training=training, task=task)
+    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=False, task="reconstruction"):
+        return self.encoder(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=training, task=task)
 
     
 
@@ -90,9 +90,9 @@ class Model_MAE(pl.LightningModule):
             torch.cuda.reset_peak_memory_stats()
             print_memory("A. Start of step")
         
-        image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
+        image, attention_mask, mae_tokens, mae_tokens_mask, _ , latents_pos = batch
         
-        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=True)
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=True)
         if profiler and batch_idx == 0:
             print_memory("B. After forward")
         
@@ -141,9 +141,9 @@ class Model_MAE(pl.LightningModule):
         
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         
-        image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
+        image, attention_mask, mae_tokens, mae_tokens_mask, _ , latents_pos = batch
         
-        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos,training=False)
         target = mae_tokens[:,:,0]
 
         target=rearrange(target,"b p -> (b p)")

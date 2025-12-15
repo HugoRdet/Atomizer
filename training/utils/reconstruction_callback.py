@@ -351,7 +351,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         # Get data from your custom method
         # Assuming get_samples_to_viz returns:
         # image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, label_res
-        image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, _ = dataset.get_samples_to_viz(dataset_idx)
+        image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, _ , latent_pos= dataset.get_samples_to_viz(dataset_idx)
         
         # Move to device
         device = pl_module.device
@@ -359,6 +359,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         attention_mask = attention_mask.to(device) if attention_mask is not None else None
         mae_tokens = mae_tokens.to(device)
         mae_tokens_mask = torch.ones(mae_tokens.shape[0]).to(device)
+        latent_pos=latent_pos.to(device)
         
         with torch.no_grad():
             try:
@@ -367,6 +368,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
                 image_tokens_mask = attention_mask.unsqueeze(0)
                 mae_tokens_batch = mae_tokens.clone().unsqueeze(0)
                 mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0)
+                latent_pos=latent_pos.unsqueeze(0)
                 
                 # Forward pass
                 y_hat = pl_module.forward(
@@ -374,6 +376,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
                     image_tokens_mask,
                     mae_tokens_batch,
                     mae_tokens_mask_batch,
+                    latent_pos,
                     training=False
                 )
                 
