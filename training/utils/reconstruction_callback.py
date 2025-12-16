@@ -277,6 +277,8 @@ def normalize(img, min_val=0, max_val=1):
     return img
 
 
+
+
 class MAE_CustomVisualizationCallback(pl.Callback):
 
     def __init__(self, config):
@@ -293,6 +295,18 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         
         # Band definitions for RGB visualization
         self.rgb_bands = [2, 1, 0]  # Red, Green, Blue indices (assuming BGR order)
+        
+        # Colors for trajectory visualization (layer by layer)
+        self.trajectory_colors = [
+            "#000000",  # Layer 0 (initial) - black
+            "#3a86ff",  # Layer 1 - blue
+            "#8338ec",  # Layer 2 - purple
+            "#ff006e",  # Layer 3 - pink
+            "#fb5607",  # Layer 4 - orange
+            "#ffbe0b",  # Layer 5 - yellow (extra)
+            "#06d6a0",  # Layer 6 - teal (extra)
+            "#118ab2",  # Layer 7 - dark blue (extra)
+        ]
         
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Perform MAE reconstruction visualization at the end of validation epoch."""
@@ -349,9 +363,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         """Process a single sample for MAE reconstruction visualization."""
         
         # Get data from your custom method
-        # Assuming get_samples_to_viz returns:
-        # image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, label_res
-        image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, _ , latent_pos= dataset.get_samples_to_viz(dataset_idx)
+        image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, _, latent_pos = dataset.get_samples_to_viz(dataset_idx)
         
         # Move to device
         device = pl_module.device
@@ -359,7 +371,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         attention_mask = attention_mask.to(device) if attention_mask is not None else None
         mae_tokens = mae_tokens.to(device)
         mae_tokens_mask = torch.ones(mae_tokens.shape[0]).to(device)
-        latent_pos=latent_pos.to(device)
+        latent_pos = latent_pos.to(device)
         
         with torch.no_grad():
             try:
@@ -368,17 +380,25 @@ class MAE_CustomVisualizationCallback(pl.Callback):
                 image_tokens_mask = attention_mask.unsqueeze(0)
                 mae_tokens_batch = mae_tokens.clone().unsqueeze(0)
                 mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0)
-                latent_pos=latent_pos.unsqueeze(0)
+                latent_pos_batch = latent_pos.unsqueeze(0)
                 
-                # Forward pass
-                y_hat = pl_module.forward(
+                # Forward pass with trajectory (single call)
+                result = pl_module.forward(
                     image_tokens_batch,
                     image_tokens_mask,
                     mae_tokens_batch,
                     mae_tokens_mask_batch,
-                    latent_pos,
-                    training=False
+                    latent_pos_batch,
+                    training=False,
+                    task="vizualisation",
                 )
+                
+                # Unpack result
+                if isinstance(result, tuple):
+                    y_hat, trajectory = result
+                else:
+                    y_hat = result
+                    trajectory = None
                 
                 # Remove batch dimension for visualization
                 y_hat = y_hat.squeeze(0)  # [num_tokens, num_channels]
@@ -391,6 +411,8 @@ class MAE_CustomVisualizationCallback(pl.Callback):
                 
                 print(f"✓ Successfully reconstructed sample {dataset_idx}")
                 print(f"  Target shape: {target.shape}, Reconstruction shape: {reconstruction.shape}")
+                if trajectory is not None:
+                    print(f"  Trajectory: {len(trajectory)} layers, shape {trajectory[0].shape}")
                 
             except Exception as e:
                 print(f"Error in model forward pass for sample {dataset_idx}: {e}")
@@ -403,10 +425,11 @@ class MAE_CustomVisualizationCallback(pl.Callback):
             self._create_and_upload_mae_visualization(
                 sample_idx=dataset_idx,
                 viz_idx=viz_idx,
-                original_image=image,           # Original image data
-                target=target,                  # Original reflectance values
-                reconstruction=reconstruction,  # Reconstructed values
-                mask=mask_MAE_res,             # Mask showing which tokens were masked
+                original_image=image,
+                target=target,
+                reconstruction=reconstruction,
+                mask=mask_MAE_res,
+                trajectory=trajectory,
                 epoch=epoch,
                 id=id
             )
@@ -416,17 +439,16 @@ class MAE_CustomVisualizationCallback(pl.Callback):
             traceback.print_exc()
     
     def _create_and_upload_mae_visualization(self, sample_idx, viz_idx, original_image,
-                                            target, reconstruction, mask, epoch, id):
+                                            target, reconstruction, mask, trajectory, epoch, id):
         """Create and upload MAE reconstruction visualization to wandb."""
         
-        # Keep as tensors, don't convert to numpy yet
-        # Calculate reconstruction metrics (these need numpy)
+        # Calculate reconstruction metrics
         target_np = target.cpu().numpy()
         reconstruction_np = reconstruction.cpu().numpy()
         mse = np.mean((target_np - reconstruction_np) ** 2)
         mae = np.mean(np.abs(target_np - reconstruction_np))
         
-        # Create the main MAE visualization - pass tensors
+        # Create the main MAE visualization
         mae_fig = self._create_mae_figure(
             original_image, target, reconstruction, mask,
             sample_idx, epoch, mse, mae
@@ -446,6 +468,31 @@ class MAE_CustomVisualizationCallback(pl.Callback):
             f"mae_metrics/sample_{viz_idx}_mae_{id}": mae,
         }
         
+        # Create trajectory visualization if available
+        if trajectory is not None and len(trajectory) > 1:
+            try:
+                trajectory_fig = self._create_latent_trajectory_figure(
+                    trajectory, sample_idx, epoch, original_image=original_image
+                )
+                wandb_data[f"latent_trajectory/sample_{sample_idx}_{id}"] = wandb.Image(
+                    trajectory_fig,
+                    caption=f"Latent Trajectories - Epoch {epoch}, Sample {sample_idx}"
+                )
+
+               
+                traj_stats = self._compute_trajectory_stats(trajectory)
+                wandb_data[f"trajectory_stats/sample_{viz_idx}_mean_displacement_{id}"] = traj_stats['mean_total']
+                wandb_data[f"trajectory_stats/sample_{viz_idx}_max_displacement_{id}"] = traj_stats['max_total']
+                
+
+                
+               
+                plt.close(trajectory_fig)
+            except Exception as e:
+                print(f"Error creating trajectory visualization: {e}")
+                import traceback
+                traceback.print_exc()
+        
         # Upload to wandb
         try:
             wandb.log(wandb_data)
@@ -455,6 +502,169 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         
         plt.close(mae_fig)
     
+    def _create_latent_trajectory_figure(
+        self, 
+        trajectory: list, 
+        sample_idx: int, 
+        epoch: int,
+        original_image: np.ndarray = None,
+        num_latents: int = None,
+        figsize: tuple = (12, 12)
+    ) -> plt.Figure:
+        """
+        Create visualization of latent position trajectories.
+        
+        Each layer gets a different color:
+        - Layer 0 (initial): black dots
+        - Layer 1: blue (#3a86ff)
+        - Layer 2: purple (#8338ec)
+        - Layer 3: pink (#ff006e)
+        - Layer 4: orange (#fb5607)
+        
+        Args:
+            trajectory: List of [B, L, 2] tensors (one per layer)
+            sample_idx: Sample index for title
+            epoch: Current epoch for title
+            original_image: Optional RGB image to show as background [H, W, C]
+            num_latents: Number of latents to plot (None = all)
+            figsize: Figure size
+            
+        Returns:
+            matplotlib Figure
+        """
+        # Extract positions for batch 0
+        traj_np = [t[0].detach().cpu().numpy() for t in trajectory]
+        num_layers = len(traj_np)
+        L = traj_np[0].shape[0]
+        
+        # Select subset of latents if needed
+        if num_latents is not None and num_latents < L:
+            indices = np.linspace(0, L - 1, num_latents, dtype=int)
+        else:
+            indices = np.arange(L)
+            num_latents = L
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Get coordinate bounds from trajectory
+        all_coords = np.concatenate(traj_np, axis=0)
+        x_min, x_max = all_coords[:, 0].min(), all_coords[:, 0].max()
+        y_min, y_max = all_coords[:, 1].min(), all_coords[:, 1].max()
+        
+        # Add margin
+        margin = max(x_max - x_min, y_max - y_min) * 0.05
+        extent = [x_min - margin, x_max + margin, y_min - margin, y_max + margin]
+        
+        # Show RGB background if provided
+        if original_image is not None:
+            try:
+                rgb_background = self._create_rgb_from_image(original_image)
+                # Display image with extent matching latent coordinate system
+                ax.imshow(
+                    rgb_background, 
+                    extent=extent,
+                    aspect='auto',
+                    alpha=0.5,
+                    origin='lower',
+                    zorder=1
+                )
+            except Exception as e:
+                print(f"Warning: Could not display RGB background: {e}")
+        
+        # Plot each latent's trajectory
+        for lat_idx in indices:
+            # Get path for this latent
+            path = np.array([traj_np[layer][lat_idx] for layer in range(num_layers)])
+            
+            # Plot initial position (black dot)
+            ax.scatter(
+                path[0, 0], path[0, 1],
+                c=self.trajectory_colors[0],
+                s=15,
+                zorder=10,
+                alpha=0.8
+            )
+            
+            # Plot each subsequent layer
+            for layer in range(1, num_layers):
+                color = self.trajectory_colors[min(layer, len(self.trajectory_colors) - 1)]
+                
+                # Draw line from previous position to current
+                ax.plot(
+                    [path[layer - 1, 0], path[layer, 0]],
+                    [path[layer - 1, 1], path[layer, 1]],
+                    color=color,
+                    linewidth=1.0,
+                    alpha=0.7,
+                    zorder=5
+                )
+                
+                # Draw dot at current position
+                ax.scatter(
+                    path[layer, 0], path[layer, 1],
+                    c=color,
+                    s=12,
+                    zorder=10,
+                    alpha=0.9
+                )
+        
+        # Create legend
+        legend_elements = []
+        layer_names = ['Initial (L0)', 'Layer 1', 'Layer 2', 'Layer 3', 'Layer 4', 
+                       'Layer 5', 'Layer 6', 'Layer 7']
+        for layer in range(min(num_layers, len(self.trajectory_colors))):
+            color = self.trajectory_colors[layer]
+            name = layer_names[layer] if layer < len(layer_names) else f'Layer {layer}'
+            legend_elements.append(
+                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color,
+                          markersize=8, label=name)
+            )
+        
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+        
+        # Compute stats for title
+        total_disp = traj_np[-1] - traj_np[0]
+        mean_disp = np.mean(np.linalg.norm(total_disp, axis=-1))
+        max_disp = np.max(np.linalg.norm(total_disp, axis=-1))
+        
+        ax.set_xlabel('X (meters)', fontsize=12)
+        ax.set_ylabel('Y (meters)', fontsize=12)
+        ax.set_title(
+            f'Latent Trajectories - Sample {sample_idx}, Epoch {epoch}\n'
+            f'{num_latents} latents, {num_layers} layers | '
+            f'Mean Δ: {mean_disp:.3f}m, Max Δ: {max_disp:.3f}m',
+            fontsize=14,
+            fontweight='bold'
+        )
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return fig
+    
+    def _compute_trajectory_stats(self, trajectory: list) -> dict:
+        """Compute statistics about latent trajectories."""
+        traj = [t[0].detach().cpu() for t in trajectory]
+        
+        # Total displacement
+        total_delta = traj[-1] - traj[0]
+        total_magnitude = torch.norm(total_delta, dim=-1)
+        
+        stats = {
+            'mean_total': total_magnitude.mean().item(),
+            'max_total': total_magnitude.max().item(),
+            'min_total': total_magnitude.min().item(),
+            'std_total': total_magnitude.std().item(),
+        }
+        
+        # Per-layer stats
+        for layer in range(1, len(traj)):
+            delta = traj[layer] - traj[layer - 1]
+            magnitude = torch.norm(delta, dim=-1)
+            stats[f'mean_layer_{layer}'] = magnitude.mean().item()
+        
+        return stats
+    
     def _create_mae_figure(self, original_image, target, reconstruction, mask,
                           sample_idx, epoch, mse, mae):
         """Create MAE reconstruction visualization figure with RGB, NIR, and Elevation."""
@@ -463,16 +673,13 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         h, w, c = 512, 512, 5
         
         # Reshape target and reconstruction using einops rearrange
-        # target and reconstruction are TENSORS [num_tokens] where num_tokens = c*h*w
         try:
-            # Reshape to [c, h, w] format - KEEP AS TENSORS
             target_spatial = rearrange(target, "(c h w) -> c h w", h=h, w=w, c=c)
             reconstruction_spatial = rearrange(reconstruction, "(c h w) -> c h w", h=h, w=w, c=c)
             
         except Exception as e:
             print(f"Warning: Could not reshape target/reconstruction: {e}")
             print(f"Target shape: {target.shape}, Reconstruction shape: {reconstruction.shape}")
-            # Create dummy data as tensors
             device = target.device if hasattr(target, 'device') else 'cpu'
             target_spatial = torch.zeros((c, h, w), device=device)
             reconstruction_spatial = torch.zeros((c, h, w), device=device)
@@ -485,7 +692,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
             fontsize=16, fontweight='bold'
         )
         
-        # 1. Original RGB composite (original_image is already numpy from dataset)
+        # 1. Original RGB composite
         rgb_composite = self._create_rgb_from_image(original_image)
         axes[0, 0].imshow(rgb_composite)
         axes[0, 0].set_title('Original RGB Image', fontsize=14, fontweight='bold')
@@ -507,41 +714,37 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         axes[0, 2].axis('off')
         plt.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
         
-        # 4. Combined Error (average across all channels)
-        # target_spatial and reconstruction_spatial are [c, h, w] tensors
-        error_all = torch.abs(target_spatial - reconstruction_spatial)  # [c, h, w]
-        error_mean = torch.mean(error_all, dim=0)  # Average over channels: [h, w]
-        im3 = axes[0, 3].imshow(error_mean.cpu().numpy(), cmap='hot')  # Convert to numpy ONLY here
+        # 4. Combined Error
+        error_all = torch.abs(target_spatial - reconstruction_spatial)
+        error_mean = torch.mean(error_all, dim=0)
+        im3 = axes[0, 3].imshow(error_mean.cpu().numpy(), cmap='hot')
         axes[0, 3].set_title('Mean Absolute Error (All Channels)', fontsize=14, fontweight='bold')
         axes[0, 3].axis('off')
         plt.colorbar(im3, ax=axes[0, 3], fraction=0.046, pad=0.04)
         
         # 5. Reconstructed RGB composite
-        # Create RGB from reconstructed channels (B=0, G=1, R=2)
         reconstructed_rgb = self._create_rgb_from_reconstruction(reconstruction_spatial)
         axes[1, 0].imshow(reconstructed_rgb)
         axes[1, 0].set_title('Reconstructed RGB Image', fontsize=14, fontweight='bold')
         axes[1, 0].axis('off')
         
-        # 6. NIR channel - Reconstruction (channel index 3)
-        # Use the same vmin/vmax as the original NIR
-        nir_reconstruction = reconstruction_spatial[3]  # Shape: [h, w] tensor
-        im4 = axes[1, 1].imshow(nir_reconstruction.cpu().numpy(), cmap='RdYlGn', vmin=nir_vmin, vmax=nir_vmax)  # Convert to numpy ONLY here
+        # 6. NIR channel - Reconstruction
+        nir_reconstruction = reconstruction_spatial[3]
+        im4 = axes[1, 1].imshow(nir_reconstruction.cpu().numpy(), cmap='RdYlGn', vmin=nir_vmin, vmax=nir_vmax)
         axes[1, 1].set_title('Reconstructed NIR Channel', fontsize=14, fontweight='bold')
         axes[1, 1].axis('off')
         plt.colorbar(im4, ax=axes[1, 1], fraction=0.046, pad=0.04)
         
-        # 7. Elevation channel - Reconstruction (channel index 4)
-        # Use the same vmin/vmax as the original elevation
-        elevation_reconstruction = reconstruction_spatial[4]  # Shape: [h, w] tensor
-        im5 = axes[1, 2].imshow(elevation_reconstruction.cpu().numpy(), cmap='gray', vmin=elevation_vmin, vmax=elevation_vmax)  # Convert to numpy ONLY here
+        # 7. Elevation channel - Reconstruction
+        elevation_reconstruction = reconstruction_spatial[4]
+        im5 = axes[1, 2].imshow(elevation_reconstruction.cpu().numpy(), cmap='gray', vmin=elevation_vmin, vmax=elevation_vmax)
         axes[1, 2].set_title('Reconstructed Elevation', fontsize=14, fontweight='bold')
         axes[1, 2].axis('off')
         plt.colorbar(im5, ax=axes[1, 2], fraction=0.046, pad=0.04)
         
-        # 8. RGB Error (difference between original and reconstructed RGB)
+        # 8. RGB Error
         rgb_error = np.abs(rgb_composite - reconstructed_rgb)
-        rgb_error_magnitude = np.mean(rgb_error, axis=-1)  # Average across RGB channels
+        rgb_error_magnitude = np.mean(rgb_error, axis=-1)
         im6 = axes[1, 3].imshow(rgb_error_magnitude, cmap='hot')
         axes[1, 3].set_title('RGB Reconstruction Error', fontsize=14, fontweight='bold')
         axes[1, 3].axis('off')
@@ -552,49 +755,34 @@ class MAE_CustomVisualizationCallback(pl.Callback):
     
     def _create_rgb_from_image(self, image):
         """Create RGB composite from image array."""
-        # image: [h, w, channels] where channels might be B,G,R,NIR,elevation
-        
         if len(image.shape) == 3 and image.shape[2] >= 3:
-            # Extract RGB channels (assuming BGR order, so reverse to RGB)
             rgb_composite = np.stack([
                 image[:, :, 2],  # Red channel
                 image[:, :, 1],  # Green channel  
                 image[:, :, 0]   # Blue channel
-            ], axis=-1)  # [h, w, 3]
+            ], axis=-1)
         else:
-            # Fallback: use first channel repeated
             print(f"Warning: Cannot create RGB from image shape {image.shape}")
             single_channel = image[:, :, 0] if len(image.shape) == 3 else image
             rgb_composite = np.stack([single_channel] * 3, axis=-1)
         
-        # Normalize using the provided function
-        composite_tensor = torch.from_numpy(rgb_composite).permute(2, 0, 1)  # [3, h, w]
-        normalized = normalize(composite_tensor)  # [3, h, w]
+        composite_tensor = torch.from_numpy(rgb_composite).permute(2, 0, 1)
+        normalized = normalize(composite_tensor)
         
-        return normalized.permute(1, 2, 0).numpy()  # [h, w, 3]
+        return normalized.permute(1, 2, 0).numpy()
     
     def _create_rgb_from_reconstruction(self, reconstruction_spatial):
-        """Create RGB composite from reconstructed channels.
-        
-        Args:
-            reconstruction_spatial: torch.Tensor of shape [c, h, w] where c=5 (B,G,R,NIR,elevation)
-        
-        Returns:
-            numpy array of shape [h, w, 3] with normalized RGB values
-        """
-        # reconstruction_spatial is [c, h, w] format on GPU, channels are B,G,R,NIR,elevation
-        # Extract RGB channels (indices 2,1,0 for R,G,B from BGR order)
+        """Create RGB composite from reconstructed channels."""
         rgb_composite = torch.stack([
-            reconstruction_spatial[2],  # Red channel (index 2)
-            reconstruction_spatial[1],  # Green channel (index 1)
-            reconstruction_spatial[0]   # Blue channel (index 0)
-        ], dim=0)  # [3, h, w]
+            reconstruction_spatial[2],  # Red
+            reconstruction_spatial[1],  # Green
+            reconstruction_spatial[0]   # Blue
+        ], dim=0)
         
-        # Normalize using the provided function
-        normalized = normalize(rgb_composite)  # [3, h, w]
+        normalized = normalize(rgb_composite)
         
-        return normalized.permute(1, 2, 0).cpu().numpy()  # [h, w, 3]
-    
+        return normalized.permute(1, 2, 0).cpu().numpy()
+
 import pytorch_lightning as pl
 import torch
 import numpy as np

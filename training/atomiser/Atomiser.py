@@ -1,30 +1,52 @@
+"""
+Atomiser Model with Learnable Latent Positions
+
+This module contains the Atomiser model for satellite image processing.
+Position update strategies are imported from displacement.py.
+
+Usage:
+    from atomiser import Atomiser
+    
+    model = Atomiser(config=config, transform=transform)
+    output = model(data, mask, mae_tokens, mae_tokens_mask, task="reconstruction")
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from functools import wraps
 from einops import repeat
-from .nn_comp import PreNorm, CrossAttention, SelfAttention, FeedForward, LatentAttentionPooling, LocalCrossAttention
-import einops as einops
+from typing import Optional, Tuple, List, Dict, Any
 import time
 
-def print_memory(label=""):
-    """Print current GPU memory usage."""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"[{label}] Allocated: {allocated:.2f}GB | Reserved: {reserved:.2f}GB | Max: {max_allocated:.2f}GB")
+# Import from your codebase
+from .nn_comp import (
+    PreNorm, 
+    SelfAttention, 
+    FeedForward, 
+    LatentAttentionPooling, 
+    LocalCrossAttention,
+    SelfAttentionWithRelativePosition
+)
+
+# Import displacement strategies
+from .displacement import (
+    PositionUpdateStrategy,
+    NoPositionUpdate,
+    MLPDisplacementUpdate,
+    DeformableOffsetUpdate,
+    create_position_updater,
+    compute_displacement_stats,
+)
 
 
-def reset_memory_stats():
-    """Reset peak memory tracking."""
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-
+# =============================================================================
+# Utilities
+# =============================================================================
 
 def cache_fn(f):
-    """Cache function results for weight sharing across layers"""
+    """Cache function results for weight sharing across layers."""
     cache = dict()
     @wraps(f)
     def cached_fn(*args, _cache=True, key=None, **kwargs):
@@ -39,12 +61,18 @@ def cache_fn(f):
     return cached_fn
 
 
+# =============================================================================
+# Atomiser Model
+# =============================================================================
+
 class Atomiser(pl.LightningModule):
     """
-    Atomizer model for satellite image processing.
+    Atomizer model for satellite image processing with learnable latent positions.
     
     Spatial latents: Arranged on a grid, use geographic attention (local)
     Global latents: No spatial position, participate in self-attention only
+    
+    Position updates allow spatial latents to move through encoder layers.
     """
     
     def __init__(self, *, config, transform):
@@ -57,17 +85,16 @@ class Atomiser(pl.LightningModule):
         # =====================================================================
         # Latent configuration
         # =====================================================================
-        self.spatial_latents_per_row = config["Atomiser"]["spatial_latents"]  # e.g., 20
-        self.num_spatial_latents = self.spatial_latents_per_row ** 2          # e.g., 400
-        self.num_global_latents = config["Atomiser"]["global_latents"]        # e.g., 16
-        self.num_latents = self.num_spatial_latents + self.num_global_latents # e.g., 416
+        self.spatial_latents_per_row = config["Atomiser"]["spatial_latents"]
+        self.num_spatial_latents = self.spatial_latents_per_row ** 2
+        self.num_global_latents = config["Atomiser"]["global_latents"]
+        self.num_latents = self.num_spatial_latents + self.num_global_latents
         
         # =====================================================================
         # Compute dimensions
         # =====================================================================
         self.input_dim = self._compute_input_dim()
         self.query_dim_recon = self._compute_query_dim_recon()
-        
         
         # =====================================================================
         # Model architecture parameters
@@ -104,22 +131,22 @@ class Atomiser(pl.LightningModule):
         self._init_encoder_layers()
         self._init_decoder()
         self._init_classifier()
+        self._init_position_updater()
+
+    # =========================================================================
+    # Initialization Methods
+    # =========================================================================
 
     def _compute_input_dim(self):
-        """Compute total input dimension from all encodings"""
-        pos_dim = self._get_encoding_dim("pos")
-        wavelength_dim = self._get_encoding_dim("wavelength") 
-        bandvalue_dim = self._get_encoding_dim("bandvalue")
-        return 343  # 2 * pos_dim + wavelength_dim + bandvalue_dim
-    
+        """Compute total input dimension from all encodings."""
+        return 343
+
     def _compute_query_dim_recon(self):
-        """Compute query dimension for reconstruction (no band values)"""
-        pos_dim = self._get_encoding_dim("pos")
-        wavelength_dim = self._get_encoding_dim("wavelength")
-        return wavelength_dim
+        """Compute query dimension for reconstruction (no band values)."""
+        return self._get_encoding_dim("wavelength")
     
     def _get_encoding_dim(self, attribute):
-        """Get encoding dimension for a specific attribute"""
+        """Get encoding dimension for a specific attribute."""
         encoding_type = self.config["Atomiser"][f"{attribute}_encoding"]
 
         if encoding_type == "NOPE":
@@ -141,16 +168,12 @@ class Atomiser(pl.LightningModule):
             raise ValueError(f"Unknown encoding type: {encoding_type}")
     
     def _init_latents(self):
-        """Initialize learnable latent vectors (spatial + global)"""
-        # All latents have same dimension, but different roles
+        """Initialize learnable latent vectors (spatial + global)."""
         self.latents = nn.Parameter(torch.randn(self.num_latents, self.latent_dim))
         nn.init.trunc_normal_(self.latents, std=0.02, a=-2., b=2.)
-        
-        # Note: latents[:num_spatial_latents] are spatial (have positions)
-        #       latents[num_spatial_latents:] are global (no positions)
     
     def _init_encoder_layers(self):
-        """Initialize encoder layers with optional weight sharing"""
+        """Initialize encoder layers with optional weight sharing."""
         
         get_cross_attn = cache_fn(lambda: 
             PreNorm(
@@ -188,7 +211,6 @@ class Atomiser(pl.LightningModule):
             FeedForward(self.latent_dim, dropout=self.ff_dropout)
         ))
 
-        # Build encoder layers
         self.encoder_layers = nn.ModuleList()
         for i in range(self.depth):
             cache_args = {'_cache': (i > 0 and self.weight_tie_layers)}
@@ -205,11 +227,9 @@ class Atomiser(pl.LightningModule):
             
             self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns]))
 
-    
-    
     def _init_decoder(self):
+        """Initialize decoder cross-attention and output head."""
         D_pe = self.transform.get_polar_encoding_dimension()
-    
         cross_attn_out_dim = self.latent_dim
         
         self.decoder_cross_attn = LocalCrossAttention(
@@ -221,7 +241,6 @@ class Atomiser(pl.LightningModule):
             dropout=self.attn_dropout
         )
         
-        # MLP input = cross_attn output + query (wavelength)
         hidden_dim = cross_attn_out_dim * 2
         mlp_input_dim = cross_attn_out_dim + self.query_dim_recon
         
@@ -236,7 +255,7 @@ class Atomiser(pl.LightningModule):
         )
         
     def _init_classifier(self):
-        """Initialize classification head"""
+        """Initialize classification head."""
         if self.final_classifier_head:
             self.to_logits = nn.Sequential(
                 LatentAttentionPooling(
@@ -251,185 +270,92 @@ class Atomiser(pl.LightningModule):
         else:
             self.to_logits = nn.Identity()
 
-
-    def geographic_pruning_v2(self, tokens, mask, latents_coords=None, k_latents=4, topk_tokens=500):
-        """
-        Token-centric geographic pruning using Gaussian affinity.
+    def _init_position_updater(self):
+        """Initialize the position update strategy."""
+        self.use_displacement = bool(self.config["Atomiser"].get("use_displacement", False))
         
-        Step 1: Each token finds its k_latents with highest affinity
-        Step 2: For each latent, randomly sample topk_tokens from assigned tokens
-        
-        Args:
-            tokens: [B, N, D]
-            mask: [B, N]
-            latents_coords: [B, L, 2] or None for default grid
-            k_latents: Number of latents each token can belong to
-            topk_tokens: Number of tokens to sample per latent
+        if self.use_displacement:
+            updater_config = {
+                "use_displacement": True,
+                "position_strategy": self.config["Atomiser"].get("position_strategy", "mlp"),
+                "latent_dim": self.latent_dim,
+                "depth": self.depth,
+                "max_displacement": self.config["Atomiser"].get("max_displacement", 10.0),
+                "displacement_hidden_dim": self.config["Atomiser"].get("displacement_hidden_dim", None),
+                "share_displacement_weights": self.config["Atomiser"].get("share_displacement_weights", True),
+                "deformable_heads": self.config["Atomiser"].get("deformable_heads", 4),
+                "deformable_points": self.config["Atomiser"].get("deformable_points", 4),
+            }
             
+            self.position_updater = create_position_updater(updater_config)
+            
+            strategy = self.config["Atomiser"].get("position_strategy", "mlp")
+            max_disp = self.config["Atomiser"].get("max_displacement",10.0)
+            print(f"[Atomiser] Position updates ENABLED: strategy={strategy}, max_displacement={max_disp}")
+        else:
+            # Use NoPositionUpdate strategy (fixed grid)
+            self.position_updater = NoPositionUpdate()
+            print("[Atomiser] Position updates DISABLED (fixed grid)")
+
+    # =========================================================================
+    # Coordinate Utilities
+    # =========================================================================
+
+    def _get_default_latent_coords(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Get default grid coordinates for spatial latents.
+        
+        Uses transform._precompute_latent_physical_positions() which returns [L, 2]
+        and expands to [B, L, 2].
+        
         Returns:
-            tokens_per_latent: [B, L, topk_tokens, D]
-            masks_per_latent: [B, L, topk_tokens]
-            selected_bias: [B, L, topk_tokens]
+            coords: [B, L_spatial, 2] grid coordinates in physical space (meters)
         """
-        B, N, D = tokens.shape
-        L = self.num_spatial_latents
-        device = tokens.device
+        # Get [L, 2] positions from transform (cached)
+        positions = self.transform._precompute_latent_physical_positions(device)
         
-        with torch.no_grad():
-            # =================================================================
-            # 1. Compute affinity: [B, L, N]
-            # =================================================================
-            affinity = self.compute_token_latent_affinity(
-                tokens, latents_coords, sigma=0.5
-            )
-            
-            # Transpose to [B, N, L] for token-centric selection
-            affinity_NL = affinity.permute(0, 2, 1)  # [B, N, L]
-            
-            # =================================================================
-            # 2. For each token, find k_latents with highest affinity
-            # =================================================================
-            # Top-k latents per token: [B, N, k_latents]
-            _, token_to_latent = torch.topk(affinity_NL, k=k_latents, dim=-1, largest=True)
-            
-            # Build assignment mask: [B, L, N]
-            assignment_mask = torch.zeros(B, L, N, dtype=torch.bool, device=device)
-            
-            b_idx = torch.arange(B, device=device)[:, None, None].expand(-1, N, k_latents)
-            n_idx = torch.arange(N, device=device)[None, :, None].expand(B, -1, k_latents)
-            assignment_mask[b_idx, token_to_latent, n_idx] = True
-            
-            del affinity_NL, token_to_latent
-            
-            # =================================================================
-            # 3. For each latent, randomly sample topk_tokens from assigned
-            # =================================================================
-            selected_indices = torch.zeros(B, L, topk_tokens, dtype=torch.long, device=device)
-            selected_affinity = torch.zeros(B, L, topk_tokens, device=device)
-            
-            # Process latents in chunks
-            latent_chunk_size = 100
-            
-            for l_start in range(0, L, latent_chunk_size):
-                l_end = min(l_start + latent_chunk_size, L)
-                chunk_L = l_end - l_start
-                
-                # Get assignment for this chunk: [B, chunk_L, N]
-                chunk_assignment = assignment_mask[:, l_start:l_end, :]
-                
-                # Get affinity for this chunk: [B, chunk_L, N]
-                chunk_affinity = affinity[:, l_start:l_end, :]
-                
-                # Create scores: assigned tokens get (affinity + noise), others get -inf
-                # Small noise for random selection among similar affinities
-                noise = torch.rand(B, chunk_L, N, device=device) * 1e-6
-                scores = torch.where(
-                    chunk_assignment,
-                    chunk_affinity + noise,
-                    torch.tensor(float('-inf'), device=device)
-                )
-                
-                # Top-k tokens per latent
-                chunk_selected_affinity, chunk_selected = torch.topk(
-                    scores, k=topk_tokens, dim=-1, largest=True
-                )
-                
-                # Handle empty latents (no assignments)
-                num_assigned = chunk_assignment.sum(dim=-1)  # [B, chunk_L]
-                empty_mask = num_assigned == 0
-                
-                if empty_mask.any():
-                    # Fallback: use top-k by affinity directly (no assignment constraint)
-                    fallback_affinity, fallback_indices = torch.topk(
-                        chunk_affinity, k=topk_tokens, dim=-1, largest=True
-                    )
-                    
-                    # Replace empty latent selections with fallback
-                    empty_expanded = empty_mask.unsqueeze(-1).expand(-1, -1, topk_tokens)
-                    chunk_selected = torch.where(empty_expanded, fallback_indices, chunk_selected)
-                    chunk_selected_affinity = torch.where(empty_expanded, fallback_affinity, chunk_selected_affinity)
-                
-                selected_indices[:, l_start:l_end, :] = chunk_selected
-                selected_affinity[:, l_start:l_end, :] = chunk_selected_affinity
-                
-                del chunk_assignment, chunk_affinity, scores, chunk_selected, chunk_selected_affinity
-        
-        # =================================================================
-        # 4. Gather tokens
-        # =================================================================
-        tokens_per_latent = self._gather_tokens_efficient(tokens, selected_indices)
-        masks_per_latent = self._gather_masks_efficient(mask, selected_indices)
-        
-        # Log-transform affinity for bias (consistent with v1)
-        selected_bias = torch.log(selected_affinity + 1e-8)
-        
-        return tokens_per_latent, masks_per_latent, selected_bias
+        # Expand to batch: [L, 2] -> [B, L, 2]
+        return positions.unsqueeze(0).expand(batch_size, -1, -1).clone()
 
+    # =========================================================================
+    # Geographic Pruning
+    # =========================================================================
 
     def compute_token_latent_affinity(self, tokens, latents_coords=None, sigma=0.5):
-        """
-        Fast affinity computation using lookup tables.
-        
-        Instead of computing N×L Gaussian integrals:
-        1. Precompute integral_x for all (x_index, latent) pairs: [num_x_positions, L]
-        2. Precompute integral_y for all (y_index, latent) pairs: [num_y_positions, L]
-        3. Gather and multiply: affinity[n, l] = integral_x[x_idx[n], l] * integral_y[y_idx[n], l]
-        
-        Complexity: O(positions × L) instead of O(N × L)
-        """
+        """Fast affinity computation using lookup tables."""
         B, N, D = tokens.shape
         L = self.num_spatial_latents
         device = tokens.device
         
-        # =================================================================
-        # 1. Get token indices and latent positions
-        # =================================================================
-        x_indices = tokens[:, :, 1].long()  # [B, N]
-        y_indices = tokens[:, :, 2].long()  # [B, N]
+        x_indices = tokens[:, :, 1].long()
+        y_indices = tokens[:, :, 2].long()
         
         if latents_coords is not None:
-            mu_x = latents_coords[:, :, 0]  # [B, L]
-            mu_y = latents_coords[:, :, 1]  # [B, L]
+            mu_x = latents_coords[:, :, 0]
+            mu_y = latents_coords[:, :, 1]
         else:
             bias_data = self.transform.get_bias_data(tokens, latent_positions=None)
             _, latent_positions = bias_data
             mu_x = latent_positions[:, :, 0, 0]
             mu_y = latent_positions[:, :, 1, 0]
         
-        # =================================================================
-        # 2. Precompute lookup tables for x and y integrals
-        # =================================================================
         integral_x_lut, integral_y_lut = self._precompute_integral_lut(
             x_indices, y_indices, mu_x, mu_y, sigma, device
         )
-        # integral_x_lut: [B, num_x_positions, L]
-        # integral_y_lut: [B, num_y_positions, L]
         
-        # =================================================================
-        # 3. Gather integrals for each token using indices
-        # =================================================================
-        # x_indices: [B, N] → expand to [B, N, L] for gathering
-        x_indices_exp = x_indices.unsqueeze(-1).expand(-1, -1, L)  # [B, N, L]
-        integral_x = torch.gather(integral_x_lut, dim=1, index=x_indices_exp)  # [B, N, L]
+        x_indices_exp = x_indices.unsqueeze(-1).expand(-1, -1, L)
+        integral_x = torch.gather(integral_x_lut, dim=1, index=x_indices_exp)
         
-        y_indices_exp = y_indices.unsqueeze(-1).expand(-1, -1, L)  # [B, N, L]
-        integral_y = torch.gather(integral_y_lut, dim=1, index=y_indices_exp)  # [B, N, L]
+        y_indices_exp = y_indices.unsqueeze(-1).expand(-1, -1, L)
+        integral_y = torch.gather(integral_y_lut, dim=1, index=y_indices_exp)
         
-        # =================================================================
-        # 4. Combine: affinity = integral_x * integral_y
-        # =================================================================
-        affinity = integral_x * integral_y  # [B, N, L]
-        
-        # Transpose to [B, L, N] to match expected output format
+        affinity = integral_x * integral_y
         affinity = affinity.permute(0, 2, 1)
         
         return affinity
 
-
     def _precompute_integral_lut(self, x_indices, y_indices, mu_x, mu_y, sigma, device, normalize=True):
-        """
-        Precompute 1D Gaussian integrals with optional independent normalization.
-        """
+        """Precompute 1D Gaussian integrals."""
         B, L = mu_x.shape
         
         num_x_positions = x_indices.max().item() + 1
@@ -445,7 +371,7 @@ class Atomiser(pl.LightningModule):
         half_width = token_width / 2
         sqrt_2 = torch.sqrt(torch.tensor(2.0, device=device))
         
-        # X integral LUT: [B, num_x_positions, L]
+        # X integral LUT
         x_pos_indices = torch.arange(num_x_positions, device=device)
         x_centers = token_centers[x_pos_indices]
         x_min = (x_centers - half_width).view(1, -1, 1)
@@ -456,7 +382,7 @@ class Atomiser(pl.LightningModule):
         z_x_max = (x_max - mu_x_exp) / (sigma * sqrt_2)
         integral_x_lut = 0.5 * (torch.erf(z_x_max) - torch.erf(z_x_min))
         
-        # Y integral LUT: [B, num_y_positions, L]
+        # Y integral LUT
         y_pos_indices = torch.arange(num_y_positions, device=device)
         y_centers = token_centers[y_pos_indices]
         y_min = (y_centers - half_width).view(1, -1, 1)
@@ -467,35 +393,24 @@ class Atomiser(pl.LightningModule):
         z_y_max = (y_max - mu_y_exp) / (sigma * sqrt_2)
         integral_y_lut = 0.5 * (torch.erf(z_y_max) - torch.erf(z_y_min))
         
-        # Independent normalization per position across latents
         if normalize:
             integral_x_lut = integral_x_lut / (integral_x_lut.sum(dim=-1, keepdim=True) + 1e-8)
             integral_y_lut = integral_y_lut / (integral_y_lut.sum(dim=-1, keepdim=True) + 1e-8)
         
         return integral_x_lut, integral_y_lut
 
-
     def geographic_pruning(self, tokens, mask, latents_coords=None):
-        """
-        Chunked geographic pruning using pre-normalized LUTs.
-        Never materializes [B, L, N] matrix.
-        """
+        """Chunked geographic pruning using pre-normalized LUTs."""
         k = self.geo_k
         B, N, D = tokens.shape
         L = self.num_spatial_latents
         device = tokens.device
-        chunk_size = 50  # Process 50 latents at a time
+        chunk_size = 50
         
         with torch.no_grad():
-            # =================================================================
-            # 1. Get token indices
-            # =================================================================
-            x_indices = tokens[:, :, 1].long()  # [B, N]
-            y_indices = tokens[:, :, 2].long()  # [B, N]
+            x_indices = tokens[:, :, 1].long()
+            y_indices = tokens[:, :, 2].long()
             
-            # =================================================================
-            # 2. Precompute normalized LUTs (once)
-            # =================================================================
             if latents_coords is not None:
                 mu_x = latents_coords[:, :, 0]
                 mu_y = latents_coords[:, :, 1]
@@ -508,12 +423,7 @@ class Atomiser(pl.LightningModule):
             integral_x_lut, integral_y_lut = self._precompute_integral_lut(
                 x_indices, y_indices, mu_x, mu_y, sigma=0.5, device=device, normalize=True
             )
-            # integral_x_lut: [B, num_x, L] (normalized over L)
-            # integral_y_lut: [B, num_y, L] (normalized over L)
             
-            # =================================================================
-            # 3. Process latents in chunks
-            # =================================================================
             all_indices = []
             all_bias_values = []
             
@@ -521,7 +431,6 @@ class Atomiser(pl.LightningModule):
                 chunk_end = min(chunk_start + chunk_size, L)
                 chunk_L = chunk_end - chunk_start
                 
-                # Gather LUT values for this chunk of latents: [B, N, chunk_L]
                 x_idx_exp = x_indices.unsqueeze(-1).expand(-1, -1, chunk_L)
                 y_idx_exp = y_indices.unsqueeze(-1).expand(-1, -1, chunk_L)
                 
@@ -529,43 +438,31 @@ class Atomiser(pl.LightningModule):
                     integral_x_lut[:, :, chunk_start:chunk_end], 
                     dim=1, 
                     index=x_idx_exp
-                )  # [B, N, chunk_L]
+                )
                 
                 integral_y_chunk = torch.gather(
                     integral_y_lut[:, :, chunk_start:chunk_end], 
                     dim=1, 
                     index=y_idx_exp
-                )  # [B, N, chunk_L]
+                )
                 
-                # Affinity for this chunk (already approximately normalized!)
-                chunk_affinity = integral_x_chunk * integral_y_chunk  # [B, N, chunk_L]
-                
-                # Transpose to [B, chunk_L, N] for top-k over tokens
-                chunk_affinity = chunk_affinity.permute(0, 2, 1)  # [B, chunk_L, N]
-                
-                # Log transform for numerical stability
+                chunk_affinity = integral_x_chunk * integral_y_chunk
+                chunk_affinity = chunk_affinity.permute(0, 2, 1)
                 chunk_affinity = torch.log(chunk_affinity + 1e-8)
                 
-                # Top-k tokens per latent in this chunk
                 topk_result = torch.topk(chunk_affinity, k=k, dim=-1, largest=True, sorted=False)
                 all_indices.append(topk_result.indices)
                 all_bias_values.append(topk_result.values)
                 
                 del integral_x_chunk, integral_y_chunk, chunk_affinity
             
-            # =================================================================
-            # 4. Concatenate results
-            # =================================================================
-            selected_indices = torch.cat(all_indices, dim=1)  # [B, L, k]
-            selected_bias = torch.cat(all_bias_values, dim=1)  # [B, L, k]
+            selected_indices = torch.cat(all_indices, dim=1)
+            selected_bias = torch.cat(all_bias_values, dim=1)
         
-        # Gather tokens
         tokens_per_latent = self._gather_tokens_efficient(tokens, selected_indices)
         masks_per_latent = self._gather_masks_efficient(mask, selected_indices)
         
         return tokens_per_latent, masks_per_latent, selected_bias
-    
-    
 
     def _gather_tokens_efficient(self, tokens, indices):
         """Gather tokens without expanding the full tensor."""
@@ -588,328 +485,218 @@ class Atomiser(pl.LightningModule):
         
         return gathered.reshape(B, L, k).bool()
 
-    def encode(self, tokens, mask, latents_coords=None, training=True):
+    # =========================================================================
+    # Encoder
+    # =========================================================================
+
+    def encode(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+        latents_coords: torch.Tensor = None,
+        training: bool = True,
+        return_trajectory: bool = False
+    ):
         """
         Encode tokens into latent representations.
-        Spatial latents: Use geographic cross-attention (local)
-        Global latents: Skip cross-attention, only participate in self-attention
-        All latents: Participate in self-attention together
+        
+        Position updates are controlled by the position_updater strategy:
+        - NoPositionUpdate: fixed grid (baseline)
+        - MLPDisplacementUpdate: learnable displacements
+        - DeformableOffsetUpdate: multi-point sampling
         
         Args:
-            tokens: [B, N, 6]
+            tokens: [B, N, D]
             mask: [B, N]
-            latents_coords: [B, L, 2] or None for default grid
+            latents_coords: [B, L_spatial, 2] initial positions or None for grid
             training: bool
+            return_trajectory: If True, return position history
+            
+        Returns:
+            If return_trajectory:
+                (latents, final_coords, trajectory)
+            Else:
+                (latents, final_coords)
         """
-
-        diagnose = False
-        if diagnose:
-            reset_memory_stats()
-            print("=" * 80)
-            print("ENCODER MEMORY DIAGNOSIS")
-            print("=" * 80)
-            print(f"[INPUT] tokens: {tokens.shape}, mask: {mask.shape}")
-            print(f"[CONFIG] L_spatial={self.num_spatial_latents}, L_global={self.num_global_latents}")
-            print(f"[CONFIG] geo_k={self.geo_k}, geo_m_train={self.geo_m_train}")
-            print_memory("0. START")
-        
         B = tokens.shape[0]
         L_spatial = self.num_spatial_latents
         L_global = self.num_global_latents
+        device = tokens.device
         
-        # Initialize all latents
+        # Initialize latents
         latents = repeat(self.latents, 'n d -> b n d', b=B)
         
-        if diagnose:
-            print_memory("1. After latents init")
-            print(f"   latents: {latents.shape} | {latents.numel() * 4 / 1024**2:.2f} MB")
+        # Initialize coordinates
+        if latents_coords is not None:
+            current_coords = latents_coords.clone()
+        else:
+            current_coords = self._get_default_latent_coords(B, device)
         
-        # Geographic pruning (pass latent positions)
-        start = time.perf_counter()
-        geographic_tokens, geographic_masks, geographic_bias = self.geographic_pruning(
-            tokens, mask, latents_coords
+        # Track trajectory
+        trajectory = [current_coords.clone()] if return_trajectory else None
+        
+        # Initial geographic pruning
+        geographic_tokens, geographic_masks, _ = self.geographic_pruning(
+            tokens, mask, current_coords
         )
-        end = time.perf_counter()
-        print(f"Execution time: {end - start:.6f} seconds")
         k = geographic_tokens.shape[2]
-        
-        if diagnose:
-            print_memory(f"2. After geographic_pruning (k={k})")
-            print(f"   geographic_tokens: {geographic_tokens.shape} | {geographic_tokens.numel() * 4 / 1024**2:.2f} MB")
-            print(f"   geographic_masks: {geographic_masks.shape} | {geographic_masks.numel() / 1024**2:.2f} MB")
-            print(f"   geographic_bias: {geographic_bias.shape} | {geographic_bias.numel() * 4 / 1024**2:.2f} MB")
         
         num_layers = len(self.encoder_layers)
         
         for layer_idx, (cross_attn, cross_ff, self_attns) in enumerate(self.encoder_layers):
-            if diagnose:
-                print(f"\n{'─' * 60}")
-                print(f"LAYER {layer_idx}/{num_layers-1}")
-                print(f"{'─' * 60}")
-                print_memory(f"Layer {layer_idx} START")
             
+            # Sample tokens from geographic pool
             m = self.geo_m_train if training else self.geo_m_val
             m = min(m, k)
             
-            # Sample tokens from geographic pool
-            perm = torch.randperm(k, device=tokens.device)[:m]
+            perm = torch.randperm(k, device=device)[:m]
             sampled_tokens = geographic_tokens[:, :, perm, :]
             sampled_masks = geographic_masks[:, :, perm]
             
-            if diagnose:
-                print_memory(f"Layer {layer_idx} after sampling (m={m})")
-                print(f"   sampled_tokens: {sampled_tokens.shape} | {sampled_tokens.numel() * 4 / 1024**2:.2f} MB")
-            
-            # Process tokens with polar positional encoding (pass latent positions)
+            # Process tokens with current positions
             processed_tokens = self.transform.process_data_for_encoder(
                 sampled_tokens,
                 sampled_masks,
-                device=tokens.device,
-                latent_positions=latents_coords
+                device=device,
+                latent_positions=current_coords
             )
             
-            if diagnose:
-                print_memory(f"Layer {layer_idx} after process_data_for_encoder")
-                print(f"   processed_tokens: {processed_tokens.shape} | {processed_tokens.numel() * 4 / 1024**2:.2f} MB")
-            
-            # Split latents
+            # Cross attention (spatial latents only)
             latents_spatial = latents[:, :L_spatial, :]
             latents_global = latents[:, L_spatial:, :]
             
-            if diagnose:
-                print_memory(f"Layer {layer_idx} before cross_attn")
-                print(f"   latents_spatial: {latents_spatial.shape}")
-                print(f"   context (processed_tokens): {processed_tokens.shape}")
-                # Estimate attention matrix size
-                heads = cross_attn.heads if hasattr(cross_attn, 'heads') else 8
-                attn_size_mb = B * L_spatial * heads * m * 4 / 1024**2
-                print(f"   [ESTIMATE] attention matrix: {B}×{L_spatial}×{heads}×{m} = {attn_size_mb:.2f} MB")
-            
-            # Cross attention: ONLY spatial latents attend to tokens
             spatial_out = cross_attn(
                 latents_spatial,
                 context=processed_tokens,
                 mask=~sampled_masks,
             )
             
-            if diagnose:
-                print_memory(f"Layer {layer_idx} AFTER cross_attn ← CRITICAL")
-                
-            # Residual + FF for spatial latents
             latents_spatial = spatial_out + latents_spatial
-            
-            if diagnose:
-                print_memory(f"Layer {layer_idx} after residual")
-            
             latents_spatial = cross_ff(latents_spatial) + latents_spatial
             
-            if diagnose:
-                print_memory(f"Layer {layer_idx} after cross_ff")
-            
-            # Recombine all latents
+            # Recombine
             latents = torch.cat([latents_spatial, latents_global], dim=1)
             
-            if diagnose:
-                print_memory(f"Layer {layer_idx} after concat")
-            
-            # Self-attention: ALL latents interact (spatial + global)
-            for j, (self_attn, self_ff) in enumerate(self_attns):
-                if diagnose:
-                    L_total = L_spatial + L_global
-                    heads = self_attn.heads if hasattr(self_attn, 'heads') else 8
-                    self_attn_size_mb = B * L_total * heads * L_total * 4 / 1024**2
-                    print(f"   [ESTIMATE] self_attn[{j}] matrix: {B}×{L_total}×{heads}×{L_total} = {self_attn_size_mb:.2f} MB")
-                
+            # Self-attention (all latents)
+            for self_attn, self_ff in self_attns:
                 latents = self_attn(latents) + latents
-                
-                if diagnose:
-                    print_memory(f"Layer {layer_idx} after self_attn[{j}]")
-                
                 latents = self_ff(latents) + latents
-                
-                if diagnose:
-                    print_memory(f"Layer {layer_idx} after self_ff[{j}]")
             
-            if diagnose:
-                print_memory(f"Layer {layer_idx} END")
-        
-        if diagnose:
-            print(f"\n{'=' * 80}")
-            print("ENCODER COMPLETE")
-            print(f"{'=' * 80}")
-            print_memory("FINAL")
-            print(f"   output latents: {latents.shape} | {latents.numel() * 4 / 1024**2:.2f} MB")
+            # Position update (NoPositionUpdate returns same coords if disabled)
+            latents_spatial = latents[:, :L_spatial, :]
+            current_coords, _ = self.position_updater(latents_spatial, current_coords, layer_idx)
             
-            # Summary
-            final_mem = torch.cuda.memory_allocated() / 1024**3
-            peak_mem = torch.cuda.max_memory_allocated() / 1024**3
-            print(f"\n{'─' * 40}")
-            print(f"SUMMARY")
-            print(f"{'─' * 40}")
-            print(f"Final allocated: {final_mem:.2f} GB")
-            print(f"Peak allocated:  {peak_mem:.2f} GB")
-            print(f"{'=' * 80}\n")
+            if return_trajectory:
+                trajectory.append(current_coords.clone())
+            
+            # Re-compute geographic pruning for next layer
+            if layer_idx < num_layers - 1:
+                geographic_tokens, geographic_masks, _ = self.geographic_pruning(
+                    tokens, mask, current_coords
+                )
         
-        return latents
+        if return_trajectory:
+            return latents, current_coords, trajectory
+        return latents, current_coords
+
+    # =========================================================================
+    # Decoder
+    # =========================================================================
 
     def reconstruct(self, latents, latents_coords, query_tokens, query_mask):
-        """
-        Reconstruct query tokens using spatial latents only.
-        Global latents are only used in encoder self-attention.
-        
-        Args:
-            latents: [B, L_total, D]
-            latents_coords: [B, L, 2] or None for default grid
-            query_tokens: [B, N, 6]
-            query_mask: [B, N]
-        """
-
-        diagnose = False
-    
-        if diagnose:
-            reset_memory_stats()
-            print("=" * 80)
-            print("DECODER MEMORY DIAGNOSIS")
-            print("=" * 80)
-            print_memory("0. START")
-        
+        """Reconstruct query tokens using spatial latents."""
         B, N, _ = query_tokens.shape
         L_spatial = self.num_spatial_latents
         device = latents.device
         D = latents.shape[-1]
-        D_pe = self.transform.get_polar_encoding_dimension()
         k_spatial = self.decoder_k_spatial
         
-        if diagnose:
-            print(f"[SHAPES] B={B}, N={N}, L_spatial={L_spatial}")
-            print(f"[SHAPES] D={D}, D_pe={D_pe}, k_spatial={k_spatial}")
-            print(f"[SHAPES] latents: {latents.shape}")
-        
-        # =========================================================================
-        # 1. Select top-k spatial latents per query (pass positions)
-        # =========================================================================
         spatial_indices, _ = self.transform.get_topk_latents_for_decoder(
             query_tokens, k=k_spatial, device=device, latent_positions=latents_coords
         )
         
-        if diagnose:
-            print_memory("1. After get_topk_latents_for_decoder")
-            print(f"   spatial_indices: {spatial_indices.shape} | {spatial_indices.numel() * 4 / 1024**2:.2f} MB")
-        
-        # =========================================================================
-        # 2. Gather spatial latents (MEMORY OPTIMIZED)
-        # =========================================================================
-        spatial_latents = latents[:, :L_spatial, :]  # [B, L_spatial, D]
+        spatial_latents = latents[:, :L_spatial, :]
         
         flat_indices = spatial_indices.reshape(B, N * k_spatial)
         flat_indices_expanded = flat_indices.unsqueeze(-1).expand(-1, -1, D)
         
-        if diagnose:
-            print_memory("2a. After flat_indices_expanded")
-            print(f"   flat_indices_expanded: {flat_indices_expanded.shape} | {flat_indices_expanded.numel() * 4 / 1024**2:.2f} MB")
-        
         flat_gathered = torch.gather(spatial_latents, dim=1, index=flat_indices_expanded)
         selected_spatial = flat_gathered.reshape(B, N, k_spatial, D)
         
-        if diagnose:
-            print_memory("2b. After gather")
-            print(f"   selected_spatial: {selected_spatial.shape} | {selected_spatial.numel() * 4 / 1024**2:.2f} MB")
-        
         del flat_indices, flat_indices_expanded, flat_gathered
         
-        # =========================================================================
-        # 3. Compute relative PE and concat (pass positions)
-        # =========================================================================
         relative_pe = self.transform.get_decoder_relative_pe(
             query_tokens, spatial_indices, device, latent_positions=latents_coords
         )
         
-        if diagnose:
-            print_memory("3a. After get_decoder_relative_pe")
-            print(f"   relative_pe: {relative_pe.shape} | {relative_pe.numel() * 4 / 1024**2:.2f} MB")
-        
         spatial_context = torch.cat([selected_spatial, relative_pe], dim=-1)
         
-        if diagnose:
-            print_memory("3b. After concat spatial_context")
-            print(f"   spatial_context: {spatial_context.shape} | {spatial_context.numel() * 4 / 1024**2:.2f} MB")
-        
-        # =========================================================================
-        # 4. Process queries
-        # =========================================================================
         processed_queries, _, _ = self.transform.process_data(
             query_tokens, query_mask, query=True
         )
         
-        if diagnose:
-            print_memory("4. After process_data (queries)")
-            print(f"   processed_queries: {processed_queries.shape} | {processed_queries.numel() * 4 / 1024**2:.2f} MB")
-        
-        # =========================================================================
-        # 5. Cross-attention (spatial only)
-        # =========================================================================
-        if diagnose:
-            print_memory("5a. BEFORE decoder_cross_attn")
-            print(f"   Query: {processed_queries.shape}")
-            print(f"   Spatial context: {spatial_context.shape}")
-            
-            # Estimate attention sizes
-            heads = self.decoder_cross_attn.heads if hasattr(self.decoder_cross_attn, 'heads') else 8
-            
-            # Spatial attention: [B, N, heads, k_spatial]
-            spatial_attn_mb = B * N * heads * k_spatial * 4 / 1024**2
-            print(f"   [ESTIMATE] attention matrix: {B}×{N}×{heads}×{k_spatial} = {spatial_attn_mb:.2f} MB")
-            
-            # K, V projections: [B, N, k_spatial, heads, dim_head]
-            dim_head = self.decoder_cross_attn.dim_head if hasattr(self.decoder_cross_attn, 'dim_head') else 64
-            kv_spatial_mb = 2 * B * N * k_spatial * heads * dim_head * 4 / 1024**2
-            print(f"   [ESTIMATE] K+V: 2×{B}×{N}×{k_spatial}×{heads}×{dim_head} = {kv_spatial_mb:.2f} MB")
-        
         output = self.decoder_cross_attn(processed_queries, spatial_context)
         
-        if diagnose:
-            print_memory("5b. AFTER decoder_cross_attn")
-            print(f"   output: {output.shape} | {output.numel() * 4 / 1024**2:.2f} MB")
-        
-        # =========================================================================
-        # 6. Output head
-        # =========================================================================
         output_with_query = torch.cat([output, processed_queries], dim=-1)
         result = self.output_head(output_with_query)
-        
-        if diagnose:
-            print_memory("6. After output_head")
-            print(f"   result: {result.shape}")
-            print("=" * 80)
         
         return result
     
     def classify(self, latents):
-        """Classify from latent representations"""
+        """Classify from latent representations."""
         return self.to_logits(latents)
-    
-    
-    def forward(self, data, mask, mae_tokens=None, mae_tokens_mask=None, latents_coords=None,
-                training=True, task="reconstruction"):
+
+    # =========================================================================
+    # Forward
+    # =========================================================================
+
+    def forward(
+        self, 
+        data, 
+        mask, 
+        mae_tokens=None, 
+        mae_tokens_mask=None, 
+        latents_coords=None,
+        training=True, 
+        task="reconstruction"
+    ):
         """
-        Forward pass of the Atomizer
+        Forward pass of the Atomizer.
         
         Args:
             data: [B, N, 6] input tokens
             mask: [B, N] attention mask
             mae_tokens: [B, M, 6] query tokens for reconstruction
-            latents_coords: [B, L, 2] custom latent positions or None for default grid
             mae_tokens_mask: [B, M] query mask
+            latents_coords: [B, L, 2] initial positions or None for grid
             training: bool
-            task: "reconstruction", "vizualisation", "encoder", or "classification"
+            task: "reconstruction", "visualization", "encoder", or "classification"
+            return_trajectory: If True, return position history
+            
+        Returns:
+            For task="encoder":
+                dict with 'latents', 'final_coords', and optionally 'trajectory'
+            For task="reconstruction"/"vizualisation":
+                If return_trajectory: (predictions, trajectory)
+                Else: predictions
+            For task="classification":
+                logits
         """
-        latents = self.encode(data, mask, latents_coords, training=training)
+        # Encode
+        if task == "vizualisation":
+            latents, final_coords, trajectory = self.encode(
+                data, mask, latents_coords, training, return_trajectory=True
+            )
+        else:
+            latents, final_coords = self.encode(
+                data, mask, latents_coords, training, return_trajectory=False
+            )
+            trajectory = None
         
         if task == "encoder":
             return latents
         
         elif task == "reconstruction" or task == "vizualisation":
-            # Chunked reconstruction
             chunk_size = 100000
             N = mae_tokens.shape[1]
             
@@ -918,29 +705,36 @@ class Atomiser(pl.LightningModule):
                 for i in range(0, N, chunk_size):
                     chunk_tokens = mae_tokens[:, i:i + chunk_size]
                     chunk_mask = mae_tokens_mask[:, i:i + chunk_size]
-                    
-                    p = self.reconstruct(latents, latents_coords, chunk_tokens, chunk_mask)
+                    p = self.reconstruct(latents, final_coords, chunk_tokens, chunk_mask)
                     preds_list.append(p)
-                return torch.cat(preds_list, dim=1)
+                predictions = torch.cat(preds_list, dim=1)
             else:
-                return self.reconstruct(latents, latents_coords, mae_tokens, mae_tokens_mask)
+                predictions = self.reconstruct(latents, final_coords, mae_tokens, mae_tokens_mask)
+            
+            if task == "vizualisation":
+                return predictions, trajectory
+            return predictions
         
-        else:
+        else:  # classification
             return self.classify(latents)
-        
-  
+
+    # =========================================================================
+    # Utilities
+    # =========================================================================
+    
     def _set_requires_grad(self, module, flag):
-        """Set requires_grad for all parameters in a module"""
         for param in module.parameters():
             param.requires_grad = flag
     
     def freeze_encoder(self):
         self._set_requires_grad(self.encoder_layers, False)
         self.latents.requires_grad = False
+        self._set_requires_grad(self.position_updater, False)
     
     def unfreeze_encoder(self):
         self._set_requires_grad(self.encoder_layers, True)
         self.latents.requires_grad = True
+        self._set_requires_grad(self.position_updater, True)
     
     def freeze_decoder(self):
         self._set_requires_grad(self.decoder_cross_attn, False)
@@ -955,3 +749,13 @@ class Atomiser(pl.LightningModule):
     
     def unfreeze_classifier(self):
         self._set_requires_grad(self.to_logits, True)
+    
+    def freeze_position_updater(self):
+        self._set_requires_grad(self.position_updater, False)
+    
+    def unfreeze_position_updater(self):
+        self._set_requires_grad(self.position_updater, True)
+    
+    def get_displacement_stats(self, trajectory: List[torch.Tensor]) -> Dict[str, Any]:
+        """Compute statistics about latent movement from trajectory."""
+        return compute_displacement_stats(trajectory)

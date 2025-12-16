@@ -378,3 +378,138 @@ class LinearAttention(nn.Module):
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
 
         return self.to_out(out)
+    
+
+
+class SelfAttentionWithRelativePosition(nn.Module):
+    """
+    Self-attention with relative positional encoding concatenated to keys/values.
+    
+    For each query latent i, the keys/values are augmented with relative
+    position encodings (polar: distance + angle) from latent i to latent j.
+    
+    This matches the encoder/decoder cross-attention approach.
+    """
+    
+    def __init__(
+        self, 
+        dim, 
+        heads=8, 
+        dim_head=64, 
+        pos_dim=32,
+        scale_factor=10.0,
+        dropout=0.0
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.pos_dim = pos_dim
+        self.scale_factor = scale_factor
+        
+        inner_dim = heads * dim_head
+        
+        # Q projection: just from latent embedding
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        
+        # K, V projection: from latent embedding + relative position encoding
+        self.to_k = nn.Linear(dim + pos_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(dim + pos_dim, inner_dim, bias=False)
+        
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        # Fourier frequencies for position encoding
+        self.num_freq = pos_dim // 4  # 4 values per freq (sin/cos for dist and angle)
+        freqs = torch.linspace(1.0, 10.0, self.num_freq)
+        self.register_buffer('freqs', freqs)
+    
+    def encode_relative_position(self, rel_pos):
+        """
+        Encode relative positions using polar coordinates + Fourier features.
+        
+        Args:
+            rel_pos: [B, L_q, L_k, 2] relative positions (dx, dy)
+            
+        Returns:
+            [B, L_q, L_k, pos_dim] position encodings
+        """
+        # Convert to polar: distance and angle
+        dx, dy = rel_pos[..., 0], rel_pos[..., 1]
+        
+        # Distance with sigmoid compression for numerical stability
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        dist_normalized = dist / self.scale_factor
+        dist_compressed = dist_normalized / (1 + dist_normalized)  # [0, 1)
+        
+        # Angle in [0, 1] range
+        angle = torch.atan2(dy, dx)  # [-pi, pi]
+        angle_normalized = (angle + torch.pi) / (2 * torch.pi)  # [0, 1]
+        
+        # Fourier features
+        dist_expanded = dist_compressed.unsqueeze(-1) * self.freqs * torch.pi
+        angle_expanded = angle_normalized.unsqueeze(-1) * self.freqs * torch.pi
+        
+        # [B, L_q, L_k, num_freq] each
+        encoding = torch.cat([
+            torch.sin(dist_expanded),
+            torch.cos(dist_expanded),
+            torch.sin(angle_expanded),
+            torch.cos(angle_expanded),
+        ], dim=-1)  # [B, L_q, L_k, pos_dim]
+        
+        return encoding
+    
+    def forward(self, x, positions):
+        """
+        Args:
+            x: [B, L, D] latent embeddings
+            positions: [B, L, 2] latent positions in meters
+            
+        Returns:
+            [B, L, D] output embeddings
+        """
+        B, L, D = x.shape
+        
+        # Compute queries (no position info needed)
+        q = self.to_q(x)  # [B, L, inner_dim]
+        q = rearrange(q, 'b l (h d) -> b h l d', h=self.heads)
+        
+        # Compute pairwise relative positions: [B, L, L, 2]
+        # rel_pos[b, i, j] = positions[b, j] - positions[b, i]
+        # (position of key j relative to query i)
+        rel_pos = positions.unsqueeze(1) - positions.unsqueeze(2)  # [B, L, L, 2]
+        
+        # Encode relative positions: [B, L, L, pos_dim]
+        pos_encoding = self.encode_relative_position(rel_pos)
+        
+        # Expand latent embeddings for concatenation: [B, L, L, D]
+        x_expanded = x.unsqueeze(1).expand(B, L, L, D)
+        
+        # Concatenate: [B, L, L, D + pos_dim]
+        x_with_pos = torch.cat([x_expanded, pos_encoding], dim=-1)
+        
+        # Compute keys and values with position info
+        # For query i, key j uses relative position from i to j
+        k = self.to_k(x_with_pos)  # [B, L_q, L_k, inner_dim]
+        v = self.to_v(x_with_pos)  # [B, L_q, L_k, inner_dim]
+        
+        k = rearrange(k, 'b lq lk (h d) -> b h lq lk d', h=self.heads)
+        v = rearrange(v, 'b lq lk (h d) -> b h lq lk d', h=self.heads)
+        
+        # Attention: q[i] attends to k[i, :] (keys specific to query i)
+        # q: [B, H, L, D], k: [B, H, L, L, D]
+        # For each query i: attn[i] = softmax(q[i] @ k[i].T)
+        q_expanded = q.unsqueeze(3)  # [B, H, L, 1, D]
+        
+        attn_scores = (q_expanded * k).sum(dim=-1) * self.scale  # [B, H, L, L]
+        attn = attn_scores.softmax(dim=-1)
+        
+        # Apply attention to values
+        # attn: [B, H, L, L], v: [B, H, L, L, D]
+        out = torch.einsum('bhij,bhijd->bhid', attn, v)  # [B, H, L, D]
+        
+        out = rearrange(out, 'b h l d -> b l (h d)')
+        return self.to_out(out)
