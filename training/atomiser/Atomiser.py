@@ -6,7 +6,7 @@ from functools import wraps
 from einops import repeat
 from .nn_comp import PreNorm, CrossAttention, SelfAttention, FeedForward, LatentAttentionPooling, LocalCrossAttention
 import einops as einops
-
+import time
 
 def print_memory(label=""):
     """Print current GPU memory usage."""
@@ -94,6 +94,7 @@ class Atomiser(pl.LightningModule):
         self.geo_k = config["Atomiser"].get("geo_k", 1500)
         self.geo_m_train = config["Atomiser"].get("geo_m_train", 500)
         self.geo_m_val = config["Atomiser"].get("geo_m_val", 500)
+        self.k_latents = config["Atomiser"].get("k_latents", 4)
         
         # Decoder parameters
         self.decoder_k_spatial = config["Atomiser"].get("decoder_k_spatial", 1)
@@ -251,100 +252,320 @@ class Atomiser(pl.LightningModule):
             self.to_logits = nn.Identity()
 
 
-    def geographic_pruning(self, tokens, mask, latents_coords=None):
+    def geographic_pruning_v2(self, tokens, mask, latents_coords=None, k_latents=4, topk_tokens=500):
         """
-        Memory-efficient geographic pruning for spatial latents.
-        Only applies to spatial latents (which have positions).
+        Token-centric geographic pruning using Gaussian affinity.
+        
+        Step 1: Each token finds its k_latents with highest affinity
+        Step 2: For each latent, randomly sample topk_tokens from assigned tokens
         
         Args:
             tokens: [B, N, D]
             mask: [B, N]
             latents_coords: [B, L, 2] or None for default grid
+            k_latents: Number of latents each token can belong to
+            topk_tokens: Number of tokens to sample per latent
+            
+        Returns:
+            tokens_per_latent: [B, L, topk_tokens, D]
+            masks_per_latent: [B, L, topk_tokens]
+            selected_bias: [B, L, topk_tokens]
         """
-        k = self.geo_k
-        chunk_size = 50
-        
         B, N, D = tokens.shape
-        L = self.num_spatial_latents  
-        
-        SIGMA = 0.5
+        L = self.num_spatial_latents
+        device = tokens.device
         
         with torch.no_grad():
-            # Get bias data (pass latent positions)
-            bias_data = self.transform.get_bias_data(tokens, latent_positions=latents_coords)
-            tokens_positions, latent_positions = bias_data
+            # =================================================================
+            # 1. Compute affinity: [B, L, N]
+            # =================================================================
+            affinity = self.compute_token_latent_affinity(
+                tokens, latents_coords, sigma=0.5
+            )
             
-            x_min = tokens_positions[:, :, 0, 0]
-            x_max = tokens_positions[:, :, 0, 1]
-            y_min = tokens_positions[:, :, 1, 0]
-            y_max = tokens_positions[:, :, 1, 1]
+            # Transpose to [B, N, L] for token-centric selection
+            affinity_NL = affinity.permute(0, 2, 1)  # [B, N, L]
             
-            # Handle both formats:
-            # - Custom positions: [B, L, 2]
-            # - Default grid returns complex encoding from get_bias_latents_encoding
+            # =================================================================
+            # 2. For each token, find k_latents with highest affinity
+            # =================================================================
+            # Top-k latents per token: [B, N, k_latents]
+            _, token_to_latent = torch.topk(affinity_NL, k=k_latents, dim=-1, largest=True)
+            
+            # Build assignment mask: [B, L, N]
+            assignment_mask = torch.zeros(B, L, N, dtype=torch.bool, device=device)
+            
+            b_idx = torch.arange(B, device=device)[:, None, None].expand(-1, N, k_latents)
+            n_idx = torch.arange(N, device=device)[None, :, None].expand(B, -1, k_latents)
+            assignment_mask[b_idx, token_to_latent, n_idx] = True
+            
+            del affinity_NL, token_to_latent
+            
+            # =================================================================
+            # 3. For each latent, randomly sample topk_tokens from assigned
+            # =================================================================
+            selected_indices = torch.zeros(B, L, topk_tokens, dtype=torch.long, device=device)
+            selected_affinity = torch.zeros(B, L, topk_tokens, device=device)
+            
+            # Process latents in chunks
+            latent_chunk_size = 100
+            
+            for l_start in range(0, L, latent_chunk_size):
+                l_end = min(l_start + latent_chunk_size, L)
+                chunk_L = l_end - l_start
+                
+                # Get assignment for this chunk: [B, chunk_L, N]
+                chunk_assignment = assignment_mask[:, l_start:l_end, :]
+                
+                # Get affinity for this chunk: [B, chunk_L, N]
+                chunk_affinity = affinity[:, l_start:l_end, :]
+                
+                # Create scores: assigned tokens get (affinity + noise), others get -inf
+                # Small noise for random selection among similar affinities
+                noise = torch.rand(B, chunk_L, N, device=device) * 1e-6
+                scores = torch.where(
+                    chunk_assignment,
+                    chunk_affinity + noise,
+                    torch.tensor(float('-inf'), device=device)
+                )
+                
+                # Top-k tokens per latent
+                chunk_selected_affinity, chunk_selected = torch.topk(
+                    scores, k=topk_tokens, dim=-1, largest=True
+                )
+                
+                # Handle empty latents (no assignments)
+                num_assigned = chunk_assignment.sum(dim=-1)  # [B, chunk_L]
+                empty_mask = num_assigned == 0
+                
+                if empty_mask.any():
+                    # Fallback: use top-k by affinity directly (no assignment constraint)
+                    fallback_affinity, fallback_indices = torch.topk(
+                        chunk_affinity, k=topk_tokens, dim=-1, largest=True
+                    )
+                    
+                    # Replace empty latent selections with fallback
+                    empty_expanded = empty_mask.unsqueeze(-1).expand(-1, -1, topk_tokens)
+                    chunk_selected = torch.where(empty_expanded, fallback_indices, chunk_selected)
+                    chunk_selected_affinity = torch.where(empty_expanded, fallback_affinity, chunk_selected_affinity)
+                
+                selected_indices[:, l_start:l_end, :] = chunk_selected
+                selected_affinity[:, l_start:l_end, :] = chunk_selected_affinity
+                
+                del chunk_assignment, chunk_affinity, scores, chunk_selected, chunk_selected_affinity
+        
+        # =================================================================
+        # 4. Gather tokens
+        # =================================================================
+        tokens_per_latent = self._gather_tokens_efficient(tokens, selected_indices)
+        masks_per_latent = self._gather_masks_efficient(mask, selected_indices)
+        
+        # Log-transform affinity for bias (consistent with v1)
+        selected_bias = torch.log(selected_affinity + 1e-8)
+        
+        return tokens_per_latent, masks_per_latent, selected_bias
+
+
+    def compute_token_latent_affinity(self, tokens, latents_coords=None, sigma=0.5):
+        """
+        Fast affinity computation using lookup tables.
+        
+        Instead of computing N×L Gaussian integrals:
+        1. Precompute integral_x for all (x_index, latent) pairs: [num_x_positions, L]
+        2. Precompute integral_y for all (y_index, latent) pairs: [num_y_positions, L]
+        3. Gather and multiply: affinity[n, l] = integral_x[x_idx[n], l] * integral_y[y_idx[n], l]
+        
+        Complexity: O(positions × L) instead of O(N × L)
+        """
+        B, N, D = tokens.shape
+        L = self.num_spatial_latents
+        device = tokens.device
+        
+        # =================================================================
+        # 1. Get token indices and latent positions
+        # =================================================================
+        x_indices = tokens[:, :, 1].long()  # [B, N]
+        y_indices = tokens[:, :, 2].long()  # [B, N]
+        
+        if latents_coords is not None:
+            mu_x = latents_coords[:, :, 0]  # [B, L]
+            mu_y = latents_coords[:, :, 1]  # [B, L]
+        else:
+            bias_data = self.transform.get_bias_data(tokens, latent_positions=None)
+            _, latent_positions = bias_data
+            mu_x = latent_positions[:, :, 0, 0]
+            mu_y = latent_positions[:, :, 1, 0]
+        
+        # =================================================================
+        # 2. Precompute lookup tables for x and y integrals
+        # =================================================================
+        integral_x_lut, integral_y_lut = self._precompute_integral_lut(
+            x_indices, y_indices, mu_x, mu_y, sigma, device
+        )
+        # integral_x_lut: [B, num_x_positions, L]
+        # integral_y_lut: [B, num_y_positions, L]
+        
+        # =================================================================
+        # 3. Gather integrals for each token using indices
+        # =================================================================
+        # x_indices: [B, N] → expand to [B, N, L] for gathering
+        x_indices_exp = x_indices.unsqueeze(-1).expand(-1, -1, L)  # [B, N, L]
+        integral_x = torch.gather(integral_x_lut, dim=1, index=x_indices_exp)  # [B, N, L]
+        
+        y_indices_exp = y_indices.unsqueeze(-1).expand(-1, -1, L)  # [B, N, L]
+        integral_y = torch.gather(integral_y_lut, dim=1, index=y_indices_exp)  # [B, N, L]
+        
+        # =================================================================
+        # 4. Combine: affinity = integral_x * integral_y
+        # =================================================================
+        affinity = integral_x * integral_y  # [B, N, L]
+        
+        # Transpose to [B, L, N] to match expected output format
+        affinity = affinity.permute(0, 2, 1)
+        
+        return affinity
+
+
+    def _precompute_integral_lut(self, x_indices, y_indices, mu_x, mu_y, sigma, device, normalize=True):
+        """
+        Precompute 1D Gaussian integrals with optional independent normalization.
+        """
+        B, L = mu_x.shape
+        
+        num_x_positions = x_indices.max().item() + 1
+        num_y_positions = y_indices.max().item() + 1
+        
+        token_centers = self.transform._precompute_token_physical_centers(device)
+        
+        if len(token_centers) > 1:
+            token_width = (token_centers[1] - token_centers[0]).abs()
+        else:
+            token_width = torch.tensor(1.0, device=device)
+        
+        half_width = token_width / 2
+        sqrt_2 = torch.sqrt(torch.tensor(2.0, device=device))
+        
+        # X integral LUT: [B, num_x_positions, L]
+        x_pos_indices = torch.arange(num_x_positions, device=device)
+        x_centers = token_centers[x_pos_indices]
+        x_min = (x_centers - half_width).view(1, -1, 1)
+        x_max = (x_centers + half_width).view(1, -1, 1)
+        mu_x_exp = mu_x.unsqueeze(1)
+        
+        z_x_min = (x_min - mu_x_exp) / (sigma * sqrt_2)
+        z_x_max = (x_max - mu_x_exp) / (sigma * sqrt_2)
+        integral_x_lut = 0.5 * (torch.erf(z_x_max) - torch.erf(z_x_min))
+        
+        # Y integral LUT: [B, num_y_positions, L]
+        y_pos_indices = torch.arange(num_y_positions, device=device)
+        y_centers = token_centers[y_pos_indices]
+        y_min = (y_centers - half_width).view(1, -1, 1)
+        y_max = (y_centers + half_width).view(1, -1, 1)
+        mu_y_exp = mu_y.unsqueeze(1)
+        
+        z_y_min = (y_min - mu_y_exp) / (sigma * sqrt_2)
+        z_y_max = (y_max - mu_y_exp) / (sigma * sqrt_2)
+        integral_y_lut = 0.5 * (torch.erf(z_y_max) - torch.erf(z_y_min))
+        
+        # Independent normalization per position across latents
+        if normalize:
+            integral_x_lut = integral_x_lut / (integral_x_lut.sum(dim=-1, keepdim=True) + 1e-8)
+            integral_y_lut = integral_y_lut / (integral_y_lut.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        return integral_x_lut, integral_y_lut
+
+
+    def geographic_pruning(self, tokens, mask, latents_coords=None):
+        """
+        Chunked geographic pruning using pre-normalized LUTs.
+        Never materializes [B, L, N] matrix.
+        """
+        k = self.geo_k
+        B, N, D = tokens.shape
+        L = self.num_spatial_latents
+        device = tokens.device
+        chunk_size = 50  # Process 50 latents at a time
+        
+        with torch.no_grad():
+            # =================================================================
+            # 1. Get token indices
+            # =================================================================
+            x_indices = tokens[:, :, 1].long()  # [B, N]
+            y_indices = tokens[:, :, 2].long()  # [B, N]
+            
+            # =================================================================
+            # 2. Precompute normalized LUTs (once)
+            # =================================================================
             if latents_coords is not None:
-                # Simple format: [B, L, 2]
-                mu_x_all = latent_positions[:, :, 0]  # [B, L]
-                mu_y_all = latent_positions[:, :, 1]  # [B, L]
+                mu_x = latents_coords[:, :, 0]
+                mu_y = latents_coords[:, :, 1]
             else:
-                # Old format from get_bias_latents_encoding
-                mu_x_all = latent_positions[:, :, 0, 0]
-                mu_y_all = latent_positions[:, :, 1, 0]
+                bias_data = self.transform.get_bias_data(tokens, latent_positions=None)
+                _, latent_positions = bias_data
+                mu_x = latent_positions[:, :, 0, 0]
+                mu_y = latent_positions[:, :, 1, 0]
             
-            sqrt_2 = torch.sqrt(torch.tensor(2.0, device=tokens.device))
+            integral_x_lut, integral_y_lut = self._precompute_integral_lut(
+                x_indices, y_indices, mu_x, mu_y, sigma=0.5, device=device, normalize=True
+            )
+            # integral_x_lut: [B, num_x, L] (normalized over L)
+            # integral_y_lut: [B, num_y, L] (normalized over L)
             
+            # =================================================================
+            # 3. Process latents in chunks
+            # =================================================================
             all_indices = []
             all_bias_values = []
             
             for chunk_start in range(0, L, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, L)
+                chunk_L = chunk_end - chunk_start
                 
-                mu_x = mu_x_all[:, chunk_start:chunk_end, None]  # [B, chunk, 1]
-                mu_y = mu_y_all[:, chunk_start:chunk_end, None]  # [B, chunk, 1]
+                # Gather LUT values for this chunk of latents: [B, N, chunk_L]
+                x_idx_exp = x_indices.unsqueeze(-1).expand(-1, -1, chunk_L)
+                y_idx_exp = y_indices.unsqueeze(-1).expand(-1, -1, chunk_L)
                 
-                z_x_min = (x_min[:, None, :] - mu_x) / (SIGMA * sqrt_2)
-                z_x_max = (x_max[:, None, :] - mu_x) / (SIGMA * sqrt_2)
-                integral_x = 0.5 * (torch.erf(z_x_max) - torch.erf(z_x_min))
+                integral_x_chunk = torch.gather(
+                    integral_x_lut[:, :, chunk_start:chunk_end], 
+                    dim=1, 
+                    index=x_idx_exp
+                )  # [B, N, chunk_L]
                 
-                z_y_min = (y_min[:, None, :] - mu_y) / (SIGMA * sqrt_2)
-                z_y_max = (y_max[:, None, :] - mu_y) / (SIGMA * sqrt_2)
-                integral_y = 0.5 * (torch.erf(z_y_max) - torch.erf(z_y_min))
+                integral_y_chunk = torch.gather(
+                    integral_y_lut[:, :, chunk_start:chunk_end], 
+                    dim=1, 
+                    index=y_idx_exp
+                )  # [B, N, chunk_L]
                 
-                chunk_bias = integral_x * integral_y
-                chunk_bias = chunk_bias / (chunk_bias.max(dim=-1, keepdim=True)[0] + 1e-8)
-                chunk_bias = torch.log(chunk_bias + 1e-8)
+                # Affinity for this chunk (already approximately normalized!)
+                chunk_affinity = integral_x_chunk * integral_y_chunk  # [B, N, chunk_L]
                 
-                topk_result = torch.topk(chunk_bias, k=k, dim=2, largest=True, sorted=False)
+                # Transpose to [B, chunk_L, N] for top-k over tokens
+                chunk_affinity = chunk_affinity.permute(0, 2, 1)  # [B, chunk_L, N]
+                
+                # Log transform for numerical stability
+                chunk_affinity = torch.log(chunk_affinity + 1e-8)
+                
+                # Top-k tokens per latent in this chunk
+                topk_result = torch.topk(chunk_affinity, k=k, dim=-1, largest=True, sorted=False)
                 all_indices.append(topk_result.indices)
                 all_bias_values.append(topk_result.values)
+                
+                del integral_x_chunk, integral_y_chunk, chunk_affinity
             
-            selected_indices = torch.cat(all_indices, dim=1)
-            selected_bias = torch.cat(all_bias_values, dim=1)
-
-        debug_overlap = False
-
-        if debug_overlap:
-            # 1. Find problematic latents
-            stats = self.diagnose_problematic_latents(selected_indices, tokens)
-    
-            # 2. Visualize a normal latent (center)
-            center = self.num_spatial_latents // 2
-            self.visualize_latent_token_selection(selected_indices, tokens, center, 
-                                                save_path='./figures/latent_center.png')
-            
-            # 3. Visualize the worst latent (highest avg distance)
-            worst_latent = stats[0]['latent']
-            self.visualize_latent_token_selection(selected_indices, tokens, worst_latent,
-                                                save_path='./figures/latent_worst.png')
-            
-            # 4. Visualize one from the red bands (~600)
-            self.visualize_latent_token_selection(selected_indices, tokens, 600,
-                                                save_path='./figures/latent_600.png')
-            
+            # =================================================================
+            # 4. Concatenate results
+            # =================================================================
+            selected_indices = torch.cat(all_indices, dim=1)  # [B, L, k]
+            selected_bias = torch.cat(all_bias_values, dim=1)  # [B, L, k]
+        
+        # Gather tokens
         tokens_per_latent = self._gather_tokens_efficient(tokens, selected_indices)
         masks_per_latent = self._gather_masks_efficient(mask, selected_indices)
-
+        
         return tokens_per_latent, masks_per_latent, selected_bias
+    
+    
 
     def _gather_tokens_efficient(self, tokens, indices):
         """Gather tokens without expanding the full tensor."""
@@ -404,9 +625,12 @@ class Atomiser(pl.LightningModule):
             print(f"   latents: {latents.shape} | {latents.numel() * 4 / 1024**2:.2f} MB")
         
         # Geographic pruning (pass latent positions)
+        start = time.perf_counter()
         geographic_tokens, geographic_masks, geographic_bias = self.geographic_pruning(
             tokens, mask, latents_coords
         )
+        end = time.perf_counter()
+        print(f"Execution time: {end - start:.6f} seconds")
         k = geographic_tokens.shape[2]
         
         if diagnose:

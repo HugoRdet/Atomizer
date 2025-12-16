@@ -125,7 +125,7 @@ accumulator = GradientAccumulationScheduler(scheduling={0:1})
 # Trainer
 trainer = Trainer(
     strategy="ddp_find_unused_parameters_true",#,
-    devices=[0],
+    devices=-1,
     max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu",
     precision="bf16-mixed",

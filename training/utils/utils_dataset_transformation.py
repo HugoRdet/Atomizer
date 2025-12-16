@@ -448,27 +448,37 @@ class transformations_config(nn.Module):
         cached_gsds = getattr(self, cache_key).to(device)
         return cached_gsds[modality_indices]
     
-    def _compute_cartesian_encoding(self, delta_x, delta_y, device=None):
+    def _compute_cartesian_encoding(self, delta_x, delta_y, latents_coords=None, device=None):
         """
         Encode relative position in Cartesian coordinates with Fourier features.
-        Uses fourier_encode for consistency.
+        Uses sigmoid-like compression to handle large distances without aliasing.
         """
         device = device or delta_x.device
         
-        # Normalize by physical_scale
-        delta_x_norm = delta_x / self.physical_scale
-        delta_y_norm = delta_y / self.physical_scale
+        # Adaptive scale from latent distribution
+        #if latents_coords is not None:
+        #    scale = self._compute_latent_spacing(latents_coords)
+        #else:
+        scale = self.physical_scale
+        
+        # Normalize by scale
+        delta_x_norm = delta_x / (scale + 1e-8)
+        delta_y_norm = delta_y / (scale + 1e-8)
+        
+        # Signed sigmoid compression: (-∞, ∞) → (-1, 1)
+        # x / (1 + |x|) preserves sign, linear near 0, compressed at extremes
+        delta_x_compressed = delta_x_norm / (1.0 + torch.abs(delta_x_norm))
+        delta_y_compressed = delta_y_norm / (1.0 + torch.abs(delta_y_norm))
         
         # Fourier encode x and y positions
-        # fourier_encode returns [sin, cos, orig] with shape [..., num_bands*2 + 1]
         x_encoded = fourier_encode(
-            delta_x_norm, 
+            delta_x_compressed, 
             max_freq=self.cartesian_max_freq,
             num_bands=self.cartesian_num_bands
         )  # [..., num_bands*2 + 1]
         
         y_encoded = fourier_encode(
-            delta_y_norm,
+            delta_y_compressed,
             max_freq=self.cartesian_max_freq,
             num_bands=self.cartesian_num_bands
         )  # [..., num_bands*2 + 1]
@@ -479,8 +489,7 @@ class transformations_config(nn.Module):
         log_gsd = np.log(gsd_ratio + 1e-8)
         
         # Create tensor matching delta shape
-        log_gsd_tensor = torch.full_like(delta_x_norm, log_gsd)
-        
+        log_gsd_tensor = torch.full_like(delta_x_compressed, log_gsd)
         gsd_encoded = fourier_encode(
             log_gsd_tensor,
             max_freq=self.cartesian_max_freq,
@@ -504,57 +513,39 @@ class transformations_config(nn.Module):
         # x, y, gsd
         return per_component * 3
 
-    def _compute_polar_encoding(self, delta_x, delta_y, device=None):
-        """
-        Encode relative position in polar coordinates with Fourier features.
-        Uses fourier_encode for consistency.
-        """
+    def _compute_polar_encoding(self, delta_x, delta_y, latents_coords=None, device=None):
         device = device or delta_x.device
         
-        # Normalize by physical_scale
-        delta_x_norm = delta_x / self.physical_scale
-        delta_y_norm = delta_y / self.physical_scale
+        # Adaptive scale from latent distribution
+        #if latents_coords is not None:
+        #    scale = self._compute_latent_spacing(latents_coords)
+        #else:
+        scale = self.physical_scale
         
         # Polar coordinates
-        r = torch.sqrt(delta_x_norm**2 + delta_y_norm**2 + 1e-8)
-        theta = torch.atan2(delta_y_norm, delta_x_norm)  # [-π, π]
+        r = torch.sqrt(delta_x**2 + delta_y**2 + 1e-8)
+        theta = torch.atan2(delta_y, delta_x)
         
-        # Normalize theta to [-1, 1] for fourier_encode (which multiplies by π)
-        theta_norm = theta / torch.pi  # [-1, 1]
+        # Sigmoid-like compression: [0, ∞) → [0, 1)
+        # Linear near 0, compressed at large distances
+        r_norm = r / (scale + 1e-8)
+        r_compressed = r_norm / (1.0 + r_norm)
         
-        # Fourier encode r (radial distance)
-        r_encoded = fourier_encode(
-            r,
-            max_freq=self.cartesian_max_freq,
-            num_bands=self.cartesian_num_bands
-        )  # [..., num_bands*2 + 1]
+        # Theta already bounded [-π, π] → normalize to [-1, 1]
+        theta_norm = theta / torch.pi
         
-        # Fourier encode theta (angle)
-        theta_encoded = fourier_encode(
-            theta_norm,
-            max_freq=self.cartesian_max_freq,
-            num_bands=self.cartesian_num_bands
-        )  # [..., num_bands*2 + 1]
+        # Fourier encode
+        r_encoded = fourier_encode(r_compressed, max_freq=self.cartesian_max_freq, num_bands=self.cartesian_num_bands)
+        theta_encoded = fourier_encode(theta_norm, max_freq=self.cartesian_max_freq, num_bands=self.cartesian_num_bands)
         
-        # GSD encoding (constant for now)
+        # GSD encoding
         G_ref = 0.2
         gsd_ratio = self.gsd / G_ref
         log_gsd = np.log(gsd_ratio + 1e-8)
-        
         log_gsd_tensor = torch.full_like(r, log_gsd)
+        gsd_encoded = fourier_encode(log_gsd_tensor, max_freq=self.cartesian_max_freq, num_bands=self.cartesian_num_bands)
         
-        gsd_encoded = fourier_encode(
-            log_gsd_tensor,
-            max_freq=self.cartesian_max_freq,
-            num_bands=self.cartesian_num_bands
-        )  # [..., num_bands*2 + 1]
-        
-        # Concatenate all encodings
-        encoding = torch.cat([
-            r_encoded,      # [..., num_bands*2 + 1]
-            theta_encoded,  # [..., num_bands*2 + 1]
-            gsd_encoded,    # [..., num_bands*2 + 1]
-        ], dim=-1)
+        encoding = torch.cat([r_encoded, theta_encoded, gsd_encoded], dim=-1)
         
         return encoding
 
