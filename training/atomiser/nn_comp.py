@@ -380,136 +380,113 @@ class LinearAttention(nn.Module):
         return self.to_out(out)
     
 
-
-class SelfAttentionWithRelativePosition(nn.Module):
+class SelfAttentionWithGaussianBias(nn.Module):
     """
-    Self-attention with relative positional encoding concatenated to keys/values.
+    Standard self-attention + Gaussian distance bias for spatial latents.
     
-    For each query latent i, the keys/values are augmented with relative
-    position encodings (polar: distance + angle) from latent i to latent j.
+    Attention bias matrix:
+                    spatial    global
+        spatial   [Gaussian]   [0]
+        global       [0]       [0]
     
-    This matches the encoder/decoder cross-attention approach.
+    Global latents attend freely everywhere, spatial latents have locality prior.
     """
     
     def __init__(
-        self, 
-        dim, 
-        heads=8, 
-        dim_head=64, 
-        pos_dim=32,
-        scale_factor=10.0,
-        dropout=0.0
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        sigma: float = 3.0,
+        learnable_sigma: bool = False,
     ):
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
         self.scale = dim_head ** -0.5
-        self.pos_dim = pos_dim
-        self.scale_factor = scale_factor
         
         inner_dim = heads * dim_head
         
-        # Q projection: just from latent embedding
-        self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        
-        # K, V projection: from latent embedding + relative position encoding
-        self.to_k = nn.Linear(dim + pos_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(dim + pos_dim, inner_dim, bias=False)
-        
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
         )
         
-        # Fourier frequencies for position encoding
-        self.num_freq = pos_dim // 4  # 4 values per freq (sin/cos for dist and angle)
-        freqs = torch.linspace(1.0, 10.0, self.num_freq)
-        self.register_buffer('freqs', freqs)
+        if learnable_sigma:
+            self.log_sigma = nn.Parameter(torch.full((heads,), math.log(sigma)))
+        else:
+            self.register_buffer('log_sigma', torch.full((heads,), math.log(sigma)))
     
-    def encode_relative_position(self, rel_pos):
+    @property
+    def sigma(self):
+        return self.log_sigma.exp()
+    
+    def compute_position_bias(
+        self, 
+        positions: torch.Tensor, 
+        num_spatial: int,
+        total_latents: int
+    ) -> torch.Tensor:
         """
-        Encode relative positions using polar coordinates + Fourier features.
+        Compute Gaussian bias for spatial latents, 0 for global.
         
         Args:
-            rel_pos: [B, L_q, L_k, 2] relative positions (dx, dy)
+            positions: [B, L_spatial, 2] spatial latent positions
+            num_spatial: L_spatial
+            total_latents: L_spatial + L_global
             
         Returns:
-            [B, L_q, L_k, pos_dim] position encodings
+            [B, H, L_total, L_total] attention bias
         """
-        # Convert to polar: distance and angle
-        dx, dy = rel_pos[..., 0], rel_pos[..., 1]
+        B = positions.shape[0]
+        L_spatial = num_spatial
+        L_total = total_latents
+        L_global = L_total - L_spatial
+        device = positions.device
         
-        # Distance with sigmoid compression for numerical stability
-        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
-        dist_normalized = dist / self.scale_factor
-        dist_compressed = dist_normalized / (1 + dist_normalized)  # [0, 1)
+        # Spatial-spatial: Gaussian bias
+        diff = positions.unsqueeze(2) - positions.unsqueeze(1)  # [B, Ls, Ls, 2]
+        dist_sq = (diff ** 2).sum(dim=-1)  # [B, Ls, Ls]
         
-        # Angle in [0, 1] range
-        angle = torch.atan2(dy, dx)  # [-pi, pi]
-        angle_normalized = (angle + torch.pi) / (2 * torch.pi)  # [0, 1]
+        sigma_sq = (self.sigma ** 2).view(1, -1, 1, 1)  # [1, H, 1, 1]
+        spatial_bias = -dist_sq.unsqueeze(1) / (2 * sigma_sq)  # [B, H, Ls, Ls]
         
-        # Fourier features
-        dist_expanded = dist_compressed.unsqueeze(-1) * self.freqs * torch.pi
-        angle_expanded = angle_normalized.unsqueeze(-1) * self.freqs * torch.pi
+        # Build full bias matrix with zeros for global
+        # [B, H, L_total, L_total]
+        full_bias = torch.zeros(B, self.heads, L_total, L_total, device=device)
+        full_bias[:, :, :L_spatial, :L_spatial] = spatial_bias
         
-        # [B, L_q, L_k, num_freq] each
-        encoding = torch.cat([
-            torch.sin(dist_expanded),
-            torch.cos(dist_expanded),
-            torch.sin(angle_expanded),
-            torch.cos(angle_expanded),
-        ], dim=-1)  # [B, L_q, L_k, pos_dim]
-        
-        return encoding
+        return full_bias
     
-    def forward(self, x, positions):
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        positions: torch.Tensor = None,
+        num_spatial: int = None
+    ) -> torch.Tensor:
         """
         Args:
-            x: [B, L, D] latent embeddings
-            positions: [B, L, 2] latent positions in meters
-            
-        Returns:
-            [B, L, D] output embeddings
+            x: [B, L, D] all latents (spatial + global)
+            positions: [B, L_spatial, 2] spatial latent positions
+            num_spatial: number of spatial latents (first num_spatial are spatial)
         """
-        B, L, D = x.shape
+        B, L, _ = x.shape
         
-        # Compute queries (no position info needed)
-        q = self.to_q(x)  # [B, L, inner_dim]
-        q = rearrange(q, 'b l (h d) -> b h l d', h=self.heads)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = [t.view(B, L, self.heads, self.dim_head).transpose(1, 2) for t in qkv]
         
-        # Compute pairwise relative positions: [B, L, L, 2]
-        # rel_pos[b, i, j] = positions[b, j] - positions[b, i]
-        # (position of key j relative to query i)
-        rel_pos = positions.unsqueeze(1) - positions.unsqueeze(2)  # [B, L, L, 2]
+        # Attention scores
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B, H, L, L]
         
-        # Encode relative positions: [B, L, L, pos_dim]
-        pos_encoding = self.encode_relative_position(rel_pos)
+        # Add position bias if provided
+        if positions is not None and num_spatial is not None:
+            pos_bias = self.compute_position_bias(positions, num_spatial, L)
+            attn = attn + pos_bias
         
-        # Expand latent embeddings for concatenation: [B, L, L, D]
-        x_expanded = x.unsqueeze(1).expand(B, L, L, D)
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
         
-        # Concatenate: [B, L, L, D + pos_dim]
-        x_with_pos = torch.cat([x_expanded, pos_encoding], dim=-1)
-        
-        # Compute keys and values with position info
-        # For query i, key j uses relative position from i to j
-        k = self.to_k(x_with_pos)  # [B, L_q, L_k, inner_dim]
-        v = self.to_v(x_with_pos)  # [B, L_q, L_k, inner_dim]
-        
-        k = rearrange(k, 'b lq lk (h d) -> b h lq lk d', h=self.heads)
-        v = rearrange(v, 'b lq lk (h d) -> b h lq lk d', h=self.heads)
-        
-        # Attention: q[i] attends to k[i, :] (keys specific to query i)
-        # q: [B, H, L, D], k: [B, H, L, L, D]
-        # For each query i: attn[i] = softmax(q[i] @ k[i].T)
-        q_expanded = q.unsqueeze(3)  # [B, H, L, 1, D]
-        
-        attn_scores = (q_expanded * k).sum(dim=-1) * self.scale  # [B, H, L, L]
-        attn = attn_scores.softmax(dim=-1)
-        
-        # Apply attention to values
-        # attn: [B, H, L, L], v: [B, H, L, L, D]
-        out = torch.einsum('bhij,bhijd->bhid', attn, v)  # [B, H, L, D]
-        
-        out = rearrange(out, 'b h l d -> b l (h d)')
+        out = out.transpose(1, 2).reshape(B, L, -1)
         return self.to_out(out)

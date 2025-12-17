@@ -134,8 +134,8 @@ trainer = Trainer(
     callbacks=[ accumulator,lr_monitor,reconstruction_callback], #checkpoint_val_mod_train,LR_finder
     default_root_dir="./checkpoints/",
     #profiler=profiler,           # ← attach the PyTorchProfiler here
-    limit_train_batches=50,
-    limit_val_batches=16,
+    #limit_train_batches=3,
+    #limit_val_batches=3,
 )
 
 # Fit the model

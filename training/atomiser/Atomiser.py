@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import math
 from functools import wraps
 from einops import repeat
 from typing import Optional, Tuple, List, Dict, Any
@@ -26,8 +27,7 @@ from .nn_comp import (
     SelfAttention, 
     FeedForward, 
     LatentAttentionPooling, 
-    LocalCrossAttention,
-    SelfAttentionWithRelativePosition
+    LocalCrossAttention
 )
 
 # Import displacement strategies
@@ -39,6 +39,157 @@ from .displacement import (
     create_position_updater,
     compute_displacement_stats,
 )
+
+
+# =============================================================================
+# Self-Attention with Gaussian Position Bias
+# =============================================================================
+
+class SelfAttentionWithGaussianBias(nn.Module):
+    """
+    Standard self-attention + Gaussian distance bias for spatial latents.
+    
+    Attention bias matrix:
+                    spatial    global
+        spatial   [Gaussian]   [0]
+        global       [0]       [0]
+    
+    Global latents attend freely everywhere, spatial latents have locality prior.
+    
+    Bias = -dist² / (2σ²) in log-space (additive before softmax).
+    
+    Memory: O(L² × H) - very light (~48 MB for L=1225, H=8, B=1)
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        sigma: float = 3.0,
+        learnable_sigma: bool = False,
+    ):
+        """
+        Args:
+            dim: Latent dimension
+            heads: Number of attention heads
+            dim_head: Dimension per head
+            dropout: Attention dropout
+            sigma: Gaussian width in meters (default ~latent spacing)
+            learnable_sigma: If True, learn per-head sigma
+        """
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        
+        inner_dim = heads * dim_head
+        
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+        self.global_bias = nn.Parameter(torch.tensor(0.0))
+        
+        # Gaussian sigma (one per head)
+        if learnable_sigma:
+            self.log_sigma = nn.Parameter(torch.full((heads,), math.log(sigma)))
+        else:
+            self.register_buffer('log_sigma', torch.full((heads,), math.log(sigma)))
+    
+    @property
+    def sigma(self):
+        # Clamp to a safe minimum (e.g., 0.1 meters)
+        return self.log_sigma.exp().clamp(min=1e-2)
+    
+    def compute_position_bias(
+        self, 
+        positions: torch.Tensor, 
+        num_spatial: int,
+        total_latents: int
+    ) -> torch.Tensor:
+        """
+        Compute Gaussian bias for spatial latents, 0 for global.
+        
+        Args:
+            positions: [B, L_spatial, 2] spatial latent positions in meters
+            num_spatial: L_spatial
+            total_latents: L_spatial + L_global
+            
+        Returns:
+            [B, H, L_total, L_total] attention bias
+        """
+        B = positions.shape[0]
+        L_spatial = num_spatial
+        L_total = total_latents
+        device = positions.device
+        
+        # Spatial-spatial: Gaussian bias
+        # diff[i,j] = pos[j] - pos[i]
+        diff = positions.unsqueeze(2) - positions.unsqueeze(1)  # [B, Ls, Ls, 2]
+        dist_sq = (diff ** 2).sum(dim=-1)  # [B, Ls, Ls]
+        
+        # Gaussian in log-space: -dist² / (2σ²)
+        sigma_sq = (self.sigma ** 2).view(1, -1, 1, 1)  # [1, H, 1, 1]
+        spatial_bias = -dist_sq.unsqueeze(1) / (2 * sigma_sq)  # [B, H, Ls, Ls]
+        
+        # Build full bias matrix with zeros for global
+        full_bias = torch.zeros(B, self.heads, L_total, L_total, device=device)
+        full_bias[:, :, :L_spatial, :L_spatial] = spatial_bias
+
+        full_bias[:, :, L_spatial:, :] = self.global_bias
+        full_bias[:, :, :, L_spatial:] = self.global_bias
+        
+        return full_bias
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        positions: torch.Tensor = None,
+        num_spatial: int = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, L, D] all latents (spatial + global concatenated)
+            positions: [B, L_spatial, 2] spatial latent positions in meters
+            num_spatial: number of spatial latents (first num_spatial are spatial)
+        """
+        B, L, _ = x.shape
+        
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = [t.view(B, L, self.heads, self.dim_head).transpose(1, 2) for t in qkv]
+        
+        # Attention scores
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B, H, L, L]
+        
+        # Add position bias if provided
+        if positions is not None and num_spatial is not None:
+            pos_bias = self.compute_position_bias(positions, num_spatial, L)
+            attn = attn + pos_bias
+        
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+        
+        out = out.transpose(1, 2).reshape(B, L, -1)
+        return self.to_out(out)
+
+
+class PreNormWithPositions(nn.Module):
+    """PreNorm wrapper that passes positions and num_spatial to the inner function."""
+    
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    
+    def forward(self, x, positions=None, num_spatial=None, **kwargs):
+        x = self.norm(x)
+        if positions is not None:
+            return self.fn(x, positions=positions, num_spatial=num_spatial, **kwargs)
+        return self.fn(x, **kwargs)
 
 
 # =============================================================================
@@ -175,6 +326,15 @@ class Atomiser(pl.LightningModule):
     def _init_encoder_layers(self):
         """Initialize encoder layers with optional weight sharing."""
         
+        # Check if we should use Gaussian position bias in self-attention
+        self.use_gaussian_bias = self.config["Atomiser"].get("use_gaussian_bias", False)
+        self.gaussian_sigma = self.config["Atomiser"].get("gaussian_sigma", 9.0)
+        self.learnable_sigma = self.config["Atomiser"].get("learnable_sigma", False)
+        
+        if self.use_gaussian_bias:
+            print(f"[Atomiser] Self-attention with Gaussian position bias ENABLED")
+            print(f"           sigma={self.gaussian_sigma}m, learnable={self.learnable_sigma}")
+        
         get_cross_attn = cache_fn(lambda: 
             PreNorm(
                 dim=self.latent_dim,
@@ -195,16 +355,32 @@ class Atomiser(pl.LightningModule):
             FeedForward(self.latent_dim, dropout=self.ff_dropout)
         ))
         
-        get_latent_attn = cache_fn(lambda: PreNorm(
-            self.latent_dim,
-            SelfAttention(
-                dim=self.latent_dim,
-                heads=self.latent_heads,
-                dim_head=self.latent_dim_head,
-                dropout=self.attn_dropout,
-                use_flash=True
-            )
-        ))
+        if self.use_gaussian_bias:
+            print("aya")
+            # Self-attention with Gaussian distance bias for spatial latents
+            get_latent_attn = cache_fn(lambda: PreNormWithPositions(
+                self.latent_dim,
+                SelfAttentionWithGaussianBias(
+                    dim=self.latent_dim,
+                    heads=self.latent_heads,
+                    dim_head=self.latent_dim_head,
+                    dropout=self.attn_dropout,
+                    sigma=self.gaussian_sigma,
+                    learnable_sigma=self.learnable_sigma
+                )
+            ))
+        else:
+            # Standard self-attention (no position bias)
+            get_latent_attn = cache_fn(lambda: PreNorm(
+                self.latent_dim,
+                SelfAttention(
+                    dim=self.latent_dim,
+                    heads=self.latent_heads,
+                    dim_head=self.latent_dim_head,
+                    dropout=self.attn_dropout,
+                    use_flash=True
+                )
+            ))
         
         get_latent_ff = cache_fn(lambda: PreNorm(
             self.latent_dim,
@@ -272,7 +448,7 @@ class Atomiser(pl.LightningModule):
 
     def _init_position_updater(self):
         """Initialize the position update strategy."""
-        self.use_displacement = bool(self.config["Atomiser"].get("use_displacement", False))
+        self.use_displacement = self.config["Atomiser"].get("use_displacement", False)
         
         if self.use_displacement:
             updater_config = {
@@ -280,8 +456,7 @@ class Atomiser(pl.LightningModule):
                 "position_strategy": self.config["Atomiser"].get("position_strategy", "mlp"),
                 "latent_dim": self.latent_dim,
                 "depth": self.depth,
-                "max_displacement": self.config["Atomiser"].get("max_displacement", 10.0),
-                "displacement_hidden_dim": self.config["Atomiser"].get("displacement_hidden_dim", None),
+                "max_displacement": self.config["Atomiser"].get("max_displacement", 5.0),
                 "share_displacement_weights": self.config["Atomiser"].get("share_displacement_weights", True),
                 "deformable_heads": self.config["Atomiser"].get("deformable_heads", 4),
                 "deformable_points": self.config["Atomiser"].get("deformable_points", 4),
@@ -290,8 +465,8 @@ class Atomiser(pl.LightningModule):
             self.position_updater = create_position_updater(updater_config)
             
             strategy = self.config["Atomiser"].get("position_strategy", "mlp")
-            max_disp = self.config["Atomiser"].get("max_displacement",10.0)
-            print(f"[Atomiser] Position updates ENABLED: strategy={strategy}, max_displacement={max_disp}")
+            max_disp = self.config["Atomiser"].get("max_displacement", 5.0)
+            print(f"[Atomiser] Position updates ENABLED: strategy={strategy}, max_displacement={max_disp}m")
         else:
             # Use NoPositionUpdate strategy (fixed grid)
             self.position_updater = NoPositionUpdate()
@@ -577,9 +752,18 @@ class Atomiser(pl.LightningModule):
             # Recombine
             latents = torch.cat([latents_spatial, latents_global], dim=1)
             
-            # Self-attention (all latents)
+            # Self-attention (all latents together)
             for self_attn, self_ff in self_attns:
-                latents = self_attn(latents) + latents
+                if self.use_gaussian_bias:
+                    # Pass positions for Gaussian bias (only affects spatial-spatial attention)
+                    latents = self_attn(
+                        latents, 
+                        positions=current_coords,
+                        num_spatial=L_spatial
+                    ) + latents
+                else:
+                    # Standard self-attention
+                    latents = self_attn(latents) + latents
                 latents = self_ff(latents) + latents
             
             # Position update (NoPositionUpdate returns same coords if disabled)
@@ -658,7 +842,8 @@ class Atomiser(pl.LightningModule):
         mae_tokens_mask=None, 
         latents_coords=None,
         training=True, 
-        task="reconstruction"
+        task="reconstruction",
+        return_trajectory=False
     ):
         """
         Forward pass of the Atomizer.
@@ -694,7 +879,10 @@ class Atomiser(pl.LightningModule):
             trajectory = None
         
         if task == "encoder":
-            return latents
+            result = {'latents': latents, 'final_coords': final_coords}
+            if task == "vizualisation":
+                result['trajectory'] = trajectory
+            return result
         
         elif task == "reconstruction" or task == "vizualisation":
             chunk_size = 100000

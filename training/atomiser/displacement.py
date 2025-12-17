@@ -133,7 +133,7 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
         raw_displacement = self.predictors[pred_idx](latents)
         
         # Bound with tanh
-        displacement = raw_displacement * 1000#torch.tanh() * self.max_displacement
+        displacement = raw_displacement * 10#torch.tanh() * self.max_displacement
         
         # Apply displacement
         new_coords = current_coords + displacement
