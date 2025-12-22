@@ -110,6 +110,7 @@ reconstruction_callback = MAE_CustomVisualizationCallback(
     config=config_model
 )
 
+LR_finder=LearningRateFinder(min_lr=1e-05, max_lr=1, num_training_steps=450, mode='exponential', early_stop_threshold=4.0, update_attr=True, attr_name='')
 
 
 lr_monitor = LearningRateMonitor(logging_interval="step")

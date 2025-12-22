@@ -1,10 +1,15 @@
 """
-Atomiser Model with Learnable Latent Positions
+Atomiser Model with Attention-Guided Latent Displacement
 
 Supports three self-attention modes:
-1. use_local_attention=True: Local k-NN + RPE + Gaussian bias + bidirectional global cross-attention
+1. use_local_attention=True: Local k-NN + RPE + Gaussian bias + attention-guided displacement
 2. use_gaussian_bias=True: Global self-attention with Gaussian distance bias (O(L²))
 3. Both False: Standard self-attention (no position info)
+
+Key innovation: Displacement is predicted FROM attention patterns, not separately.
+- Attention provides base signal (never collapses to zero)
+- MLP learns corrections/refinements
+- Directional RPE enables "move LEFT" vs "move RIGHT" signals
 
 Usage:
     from atomiser import Atomiser
@@ -38,20 +43,10 @@ from .nn_comp import (
     LocalCrossAttention,
 )
 
-# Hybrid self-attention (local k-NN + RPE + Gaussian bias)
-from .hybrid_self_attention import (
-    HybridSelfAttention,
-    create_hybrid_self_attention,
-)
-
-# Displacement strategies
-from .displacement import (
-    PositionUpdateStrategy,
-    NoPositionUpdate,
-    MLPDisplacementUpdate,
-    DeformableOffsetUpdate,
-    create_position_updater,
-    compute_displacement_stats,
+# Hybrid self-attention with integrated displacement
+from .hybrid_displacement import (
+    HybridSelfAttentionWithDisplacement,
+    create_hybrid_self_attention_with_displacement,
 )
 
 
@@ -84,7 +79,7 @@ class SelfAttentionWithGaussianBias(nn.Module):
     Self-attention with Gaussian distance bias for spatial latents.
     
     This is the FULL L×L version - use only when you need global attention.
-    For memory-efficient local attention, use HybridSelfAttention instead.
+    For memory-efficient local attention, use HybridSelfAttentionWithDisplacement instead.
     
     Bias formula: bias[i,j] = -dist(i,j)² / (2σ²)
     
@@ -107,7 +102,6 @@ class SelfAttentionWithGaussianBias(nn.Module):
         
         inner_dim = heads * dim_head
         
-        # Fused QKV projection (memory efficient)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         
         self.to_out = nn.Sequential(
@@ -115,18 +109,15 @@ class SelfAttentionWithGaussianBias(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Learnable sigma per head (in log space for numerical stability)
         if learnable_sigma:
             self.log_sigma = nn.Parameter(torch.full((heads,), math.log(sigma)))
         else:
             self.register_buffer('log_sigma', torch.full((heads,), math.log(sigma)))
         
-        # Learnable bias for global latents (they have no position)
         self.global_bias = nn.Parameter(torch.tensor(0.0))
     
     @property
     def sigma(self):
-        """Get sigma values (exponentiated from log space)."""
         return self.log_sigma.exp()
     
     def compute_distance_bias(
@@ -135,40 +126,21 @@ class SelfAttentionWithGaussianBias(nn.Module):
         num_spatial: int,
         total_latents: int,
     ) -> torch.Tensor:
-        """
-        Compute Gaussian distance bias matrix.
-        
-        Args:
-            positions: [B, L_spatial, 2] spatial latent positions in meters
-            num_spatial: Number of spatial latents
-            total_latents: Total number of latents (spatial + global)
-            
-        Returns:
-            bias: [B, H, L_total, L_total] attention bias
-        """
         B = positions.shape[0]
         L_spatial = num_spatial
         L_total = total_latents
         device = positions.device
         dtype = positions.dtype
         
-        # Compute pairwise squared distances for spatial latents
-        diff = positions.unsqueeze(2) - positions.unsqueeze(1)  # [B, Ls, Ls, 2]
-        dist_sq = (diff ** 2).sum(dim=-1)  # [B, Ls, Ls]
+        diff = positions.unsqueeze(2) - positions.unsqueeze(1)
+        dist_sq = (diff ** 2).sum(dim=-1)
         
-        # Gaussian bias: -dist² / (2σ²)
         sigma_sq = (self.sigma ** 2).view(1, -1, 1, 1)
-        
-        # Spatial-spatial bias: [B, H, Ls, Ls]
         spatial_bias = -dist_sq.unsqueeze(1) / (2 * sigma_sq)
         
-        # Build full bias matrix including global latents
         full_bias = torch.zeros(B, self.heads, L_total, L_total, device=device, dtype=dtype)
-        
-        # Fill spatial-spatial block
         full_bias[:, :, :L_spatial, :L_spatial] = spatial_bias
         
-        # Global latents get a learnable constant bias
         if L_total > L_spatial:
             full_bias[:, :, L_spatial:, :] = self.global_bias
             full_bias[:, :, :, L_spatial:] = self.global_bias
@@ -181,36 +153,20 @@ class SelfAttentionWithGaussianBias(nn.Module):
         positions: torch.Tensor = None,
         num_spatial: int = None,
     ) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            x: [B, L, D] all latents (spatial + global)
-            positions: [B, L_spatial, 2] positions for spatial latents
-            num_spatial: Number of spatial latents
-            
-        Returns:
-            out: [B, L, D] output features
-        """
         B, L, D = x.shape
         
-        # Fused QKV projection
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = [t.view(B, L, self.heads, self.dim_head).transpose(1, 2) for t in qkv]
         
-        # Standard attention scores
         attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         
-        # Add distance bias if positions provided
         if positions is not None and num_spatial is not None:
             bias = self.compute_distance_bias(positions, num_spatial, L)
             attn = attn + bias
         
-        # Softmax and value aggregation
         attn = F.softmax(attn, dim=-1)
         out = torch.matmul(attn, v)
         
-        # Reshape and project output
         out = out.transpose(1, 2).reshape(B, L, -1)
         return self.to_out(out)
 
@@ -236,16 +192,16 @@ class PreNormWithPositions(nn.Module):
 
 class Atomiser(pl.LightningModule):
     """
-    Atomizer model for satellite image processing with learnable latent positions.
+    Atomizer model with attention-guided latent displacement.
     
     Spatial latents: Arranged on a grid, use geographic attention (local)
     Global latents: No spatial position, participate in self-attention only
     
     Self-attention modes:
-    1. use_local_attention=True: Local k-NN + RPE + Gaussian bias + bidirectional global cross-attention
+    1. use_local_attention=True: Local k-NN + RPE + Gaussian bias + attention-guided displacement
        - Memory efficient: O(Lk) instead of O(L²)
-       - Full directional info via polar RPE
-       - Multi-scale via learnable per-head σ
+       - Direction-aware via polar RPE (enabled by default)
+       - Displacement predicted from attention patterns + MLP correction
     2. use_gaussian_bias=True: Global attention with Gaussian distance bias (O(L²))
     3. Both False: Standard self-attention
     """
@@ -256,7 +212,7 @@ class Atomiser(pl.LightningModule):
         self.config = config
         
         # =====================================================================
-        # 1. INPUT PROCESSOR (Replaces self.transform)
+        # 1. INPUT PROCESSOR
         # =====================================================================
         self.input_processor = TokenProcessor(config, lookup_table)
         
@@ -269,14 +225,13 @@ class Atomiser(pl.LightningModule):
         self.num_latents = self.num_spatial_latents + self.num_global_latents
         
         # =====================================================================
-        # 3. DIMENSIONS (from processor)
+        # 3. DIMENSIONS
         # =====================================================================
         self.input_dim = self.input_processor.get_encoder_output_dim()
         self.query_dim_recon = self.input_processor.get_decoder_output_dim()
         self.latent_dim = config["Atomiser"].get("latent_dim", self.input_dim)
         
-        # Positional encoding dimension (for decoder context)
-        self.decoder_pe_dim = self.input_processor.pos_encoder.get_output_dim(include_gsd=False)
+        self.decoder_pe_dim = self.input_processor.pos_encoder.get_output_dim(include_gsd=True)
         
         # =====================================================================
         # 4. MODEL ARCHITECTURE PARAMETERS
@@ -293,7 +248,7 @@ class Atomiser(pl.LightningModule):
         self.num_classes = config["trainer"]["num_classes"]
         
         # Geographic attention parameters
-        self.geo_k = config["Atomiser"].get("geo_k", 2000)
+        self.geo_k = config["Atomiser"].get("geo_k", 1500)
         self.geo_m_train = config["Atomiser"].get("geo_m_train", 500)
         self.geo_m_val = config["Atomiser"].get("geo_m_val", 500)
         
@@ -303,17 +258,24 @@ class Atomiser(pl.LightningModule):
         # =====================================================================
         # 5. SELF-ATTENTION MODE SELECTION
         # =====================================================================
-        # Priority: use_local_attention > use_gaussian_bias > standard
         self.use_local_attention = config["Atomiser"].get("use_local_attention", False)
         self.use_gaussian_bias = config["Atomiser"].get("use_gaussian_bias", False)
         
-        # Local attention parameters (k-NN + RPE + Gaussian bias)
+        # Local attention parameters
         self.self_attn_k = config["Atomiser"].get("self_attn_k", 128)
         self.latent_spacing = config["Atomiser"].get("latent_spacing", 3.0)
         self.sigma_init = config["Atomiser"].get("sigma_init", 3.0)
         self.learnable_sigma = config["Atomiser"].get("learnable_sigma", True)
         
-        # Gaussian bias parameters (only used if use_gaussian_bias=True and use_local_attention=False)
+        # Displacement parameters (NEW - integrated into attention)
+        self.enable_displacement = config["Atomiser"].get("enable_displacement", True)
+        self.max_displacement = config["Atomiser"].get("max_displacement", 5.0)
+        self.displacement_mode = config["Atomiser"].get("displacement_mode", "per_block")
+        
+        # RPE is now enabled by default for directional awareness
+        self.use_rpe = config["Atomiser"].get("use_rpe", True)
+        
+        # Gaussian bias parameters (for mode 2)
         self.gaussian_sigma = config["Atomiser"].get("gaussian_sigma", 9.0)
         
         # =====================================================================
@@ -323,7 +285,6 @@ class Atomiser(pl.LightningModule):
         self._init_encoder_layers()
         self._init_decoder()
         self._init_classifier()
-        self._init_position_updater()
         
         # Log configuration
         self._log_config()
@@ -335,13 +296,13 @@ class Atomiser(pl.LightningModule):
         print(f"[Atomiser] Depth: {self.depth}, self_per_cross_attn: {self.self_per_cross_attn}")
         
         if self.use_local_attention:
-            print(f"[Atomiser] Local Self-Attention ENABLED (k-NN + RPE + Gaussian bias)")
+            print(f"[Atomiser] Local Self-Attention with Displacement ENABLED")
             print(f"[Atomiser]   k={self.self_attn_k}, σ_init={self.sigma_init}m, learnable_σ={self.learnable_sigma}")
-            print(f"[Atomiser]   latent_spacing={self.latent_spacing}m")
-            print(f"[Atomiser]   RPE: using same pos_encoder as cross-attention")
+            print(f"[Atomiser]   RPE (directional): {self.use_rpe}")
+            print(f"[Atomiser]   Displacement: {self.enable_displacement}, mode={self.displacement_mode}, max={self.max_displacement}m")
             print(f"[Atomiser]   Memory: O(L×k) = O({self.num_spatial_latents}×{self.self_attn_k}) = {self.num_spatial_latents * self.self_attn_k // 1000}K pairs")
         elif self.use_gaussian_bias:
-            print(f"[Atomiser] Gaussian bias ENABLED (full L×L): sigma={self.gaussian_sigma}m, learnable={self.learnable_sigma}")
+            print(f"[Atomiser] Gaussian bias ENABLED (full L×L): sigma={self.gaussian_sigma}m")
             print(f"[Atomiser]   Memory: O(L²) = O({self.num_spatial_latents}²) = {self.num_spatial_latents ** 2 // 1000}K pairs")
         else:
             print(f"[Atomiser] Standard self-attention (no position info)")
@@ -354,9 +315,7 @@ class Atomiser(pl.LightningModule):
     def _init_encoder_layers(self):
         """Initialize encoder layers with optional weight sharing."""
         
-        # =====================================================================
-        # Cross-attention factory (spatial latents attending to tokens)
-        # =====================================================================
+        # Cross-attention factory
         get_cross_attn = cache_fn(lambda: PreNorm(
             self.latent_dim,
             LocalCrossAttention(
@@ -379,34 +338,36 @@ class Atomiser(pl.LightningModule):
         # =====================================================================
         
         if self.use_local_attention:
-            # MODE 1: Local k-NN + RPE + Gaussian bias + bidirectional global cross-attention
-            # Memory efficient: O(Lk) instead of O(L²)
-            # Uses same pos_encoder as cross-attention for consistency
+            # MODE 1: Local k-NN + RPE + Gaussian bias + INTEGRATED DISPLACEMENT
             self.hybrid_self_attns = nn.ModuleList()
             
             for layer_idx in range(self.depth):
                 if self.weight_tie_layers and layer_idx > 0:
-                    # Share weights with first layer
                     self.hybrid_self_attns.append(self.hybrid_self_attns[0])
                 else:
-                    hybrid = HybridSelfAttention(
+                    hybrid = HybridSelfAttentionWithDisplacement(
                         dim=self.latent_dim,
-                        pos_encoder=self.input_processor.pos_encoder,  # Use same encoder!
+                        pos_encoder=self.input_processor.pos_encoder,
                         k=self.self_attn_k,
                         latent_spacing=self.latent_spacing,
                         heads=self.latent_heads,
                         dim_head=self.latent_dim_head,
                         ff_mult=4,
                         dropout=self.attn_dropout,
+                        use_rpe=self.use_rpe,  # Enabled by default for directional info
+                        use_gaussian_bias=True,
                         sigma_init=self.sigma_init,
                         learnable_sigma=self.learnable_sigma,
                         num_blocks=self.self_per_cross_attn,
                         has_global=self.num_global_latents > 0,
                         share_weights=False,
+                        enable_displacement=self.enable_displacement,
+                        max_displacement=self.max_displacement,
+                        displacement_mode=self.displacement_mode,
                     )
                     self.hybrid_self_attns.append(hybrid)
             
-            # Build encoder layers (cross-attention only, self-attention handled by hybrid)
+            # Build encoder layers (cross-attention only)
             self.encoder_layers = nn.ModuleList([])
             for layer_idx in range(self.depth):
                 should_cache = self.weight_tie_layers and layer_idx > 0
@@ -415,13 +376,14 @@ class Atomiser(pl.LightningModule):
                 cross_attn = get_cross_attn(_cache=should_cache, key=f"cross_attn_{cache_key}")
                 cross_ff = get_cross_ff(_cache=should_cache, key=f"cross_ff_{cache_key}")
                 
-                # Empty self_attns (handled by hybrid_self_attns)
-                self_attns = nn.ModuleList([])
+                self_attns = nn.ModuleList([])  # Handled by hybrid_self_attns
                 
                 self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns]))
         
         else:
-            # MODE 2 or 3: Gaussian bias or standard self-attention (full L×L)
+            # MODE 2 or 3: Gaussian bias or standard self-attention
+            self.hybrid_self_attns = None
+            
             if self.use_gaussian_bias:
                 get_latent_attn = cache_fn(lambda: PreNormWithPositions(
                     self.latent_dim,
@@ -450,9 +412,7 @@ class Atomiser(pl.LightningModule):
                 FeedForward(self.latent_dim, dropout=self.ff_dropout)
             ))
             
-            # Build layers
             self.encoder_layers = nn.ModuleList([])
-            self.hybrid_self_attns = None  # Not used
             
             for layer_idx in range(self.depth):
                 should_cache = self.weight_tie_layers and layer_idx > 0
@@ -461,7 +421,6 @@ class Atomiser(pl.LightningModule):
                 cross_attn = get_cross_attn(_cache=should_cache, key=f"cross_attn_{cache_key}")
                 cross_ff = get_cross_ff(_cache=should_cache, key=f"cross_ff_{cache_key}")
                 
-                # Self-attention blocks
                 self_attns = nn.ModuleList([])
                 for sa_idx in range(self.self_per_cross_attn):
                     sa_cache_key = f"{cache_key}_{sa_idx}" if should_cache else f"{layer_idx}_{sa_idx}"
@@ -473,8 +432,6 @@ class Atomiser(pl.LightningModule):
 
     def _init_decoder(self):
         """Initialize decoder cross-attention and output head."""
-        
-        # Context = latent features + relative PE
         decoder_context_dim = self.latent_dim + self.decoder_pe_dim
         
         self.decoder_cross_attn = LocalCrossAttention(
@@ -486,7 +443,6 @@ class Atomiser(pl.LightningModule):
             dropout=self.attn_dropout
         )
         
-        # Output MLP
         hidden_dim = self.latent_dim * 2
         mlp_input_dim = self.latent_dim + self.query_dim_recon
         
@@ -516,24 +472,6 @@ class Atomiser(pl.LightningModule):
         else:
             self.to_logits = nn.Identity()
 
-    def _init_position_updater(self):
-        """Initialize the position update strategy."""
-        use_displacement = self.config["Atomiser"].get("use_displacement", False)
-        
-        if use_displacement:
-            updater_config = {
-                "use_displacement": True,
-                "position_strategy": self.config["Atomiser"].get("position_strategy", "mlp"),
-                "latent_dim": self.latent_dim,
-                "depth": self.depth,
-                "max_displacement": self.config["Atomiser"].get("max_displacement", 5.0),
-                "share_displacement_weights": self.config["Atomiser"].get("share_displacement_weights", True),
-            }
-            self.position_updater = create_position_updater(updater_config)
-            print(f"[Atomiser] Position updates ENABLED: {updater_config['position_strategy']}")
-        else:
-            self.position_updater = NoPositionUpdate()
-
     # =========================================================================
     # Coordinate Utilities
     # =========================================================================
@@ -544,7 +482,7 @@ class Atomiser(pl.LightningModule):
         return grid.unsqueeze(0).expand(batch_size, -1, -1).clone()
 
     # =========================================================================
-    # Geographic Pruning (Gaussian Affinity with Chunking)
+    # Geographic Pruning
     # =========================================================================
     
     def compute_token_latent_affinity(
@@ -553,9 +491,7 @@ class Atomiser(pl.LightningModule):
         latents_coords: torch.Tensor = None, 
         sigma: float = 0.5
     ) -> torch.Tensor:
-        """
-        Compute affinity between tokens and latents using 2D Gaussian integrals.
-        """
+        """Compute affinity between tokens and latents using 2D Gaussian integrals."""
         B, N, D = tokens.shape
         L = self.num_spatial_latents
         device = tokens.device
@@ -598,7 +534,6 @@ class Atomiser(pl.LightningModule):
         
         sqrt_2, half_width, token_centers = self.input_processor.geometry.get_integral_constants()
         
-        # X-axis integral LUT
         x_pos_indices = torch.arange(num_x_positions, device=device)
         x_centers = token_centers[x_pos_indices]
         
@@ -612,7 +547,6 @@ class Atomiser(pl.LightningModule):
         
         integral_x_lut = 0.5 * (torch.erf(z_x_max) - torch.erf(z_x_min))
         
-        # Y-axis integral LUT
         y_pos_indices = torch.arange(num_y_positions, device=device)
         y_centers = token_centers[y_pos_indices]
         
@@ -625,7 +559,6 @@ class Atomiser(pl.LightningModule):
         
         integral_y_lut = 0.5 * (torch.erf(z_y_max) - torch.erf(z_y_min))
         
-        # Optional normalization
         if normalize:
             integral_x_lut = integral_x_lut / (integral_x_lut.sum(dim=1, keepdim=True) + 1e-8)
             integral_y_lut = integral_y_lut / (integral_y_lut.sum(dim=1, keepdim=True) + 1e-8)
@@ -645,8 +578,6 @@ class Atomiser(pl.LightningModule):
         B, N, D = tokens.shape
         L = self.num_spatial_latents
         device = tokens.device
-
-        
         
         with torch.no_grad():
             x_indices = tokens[:, :, 1].long()
@@ -703,7 +634,6 @@ class Atomiser(pl.LightningModule):
         return tokens_per_latent, masks_per_latent, selected_bias
 
     def _gather_tokens(self, tokens: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """Efficiently gather tokens by indices."""
         B, N, D = tokens.shape
         L, k = indices.shape[1], indices.shape[2]
         
@@ -714,7 +644,6 @@ class Atomiser(pl.LightningModule):
         return gathered.reshape(B, L, k, D)
 
     def _gather_masks(self, mask: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """Efficiently gather masks by indices."""
         B, N = mask.shape
         L, k = indices.shape[1], indices.shape[2]
         
@@ -733,8 +662,9 @@ class Atomiser(pl.LightningModule):
         mask: torch.Tensor,
         latents_coords: Optional[torch.Tensor] = None,
         training: bool = True,
-        return_trajectory: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]]]:
+        return_trajectory: bool = False,
+        return_displacement_stats: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]], Optional[Dict[str, Any]]]:
         """
         Encode tokens into latent representations.
         
@@ -744,11 +674,13 @@ class Atomiser(pl.LightningModule):
             latents_coords: [B, L_spatial, 2] initial positions or None for grid
             training: bool
             return_trajectory: If True, return position history
+            return_displacement_stats: If True, return displacement statistics
             
         Returns:
             latents: [B, L_total, D]
             final_coords: [B, L_spatial, 2]
             trajectory: List of coords if return_trajectory else None
+            displacement_stats: Dict if return_displacement_stats else None
         """
         B = tokens.shape[0]
         L_spatial = self.num_spatial_latents
@@ -768,6 +700,7 @@ class Atomiser(pl.LightningModule):
             current_coords = self._get_default_latent_coords(B, device)
         
         trajectory = [current_coords.clone()] if return_trajectory else None
+        all_displacement_stats = [] if return_displacement_stats else None
         
         # Initial geographic pruning
         geo_tokens, geo_masks, _ = self.geographic_pruning(tokens, mask, current_coords)
@@ -781,7 +714,6 @@ class Atomiser(pl.LightningModule):
             # CROSS-ATTENTION (latents ← tokens)
             # =================================================================
             
-            # Sample tokens from geographic pool
             m = self.geo_m_train if training else self.geo_m_val
             m = min(m, k)
             
@@ -793,14 +725,12 @@ class Atomiser(pl.LightningModule):
                 sampled_tokens = geo_tokens
                 sampled_masks = geo_masks
             
-            # Process tokens with TokenProcessor
             processed_tokens = self.input_processor.process_data_for_encoder(
                 sampled_tokens,
                 sampled_masks,
                 latent_positions=current_coords
             )
             
-            # Cross attention (spatial latents only)
             latents_spatial = latents[:, :L_spatial, :]
             latents_global = latents[:, L_spatial:, :] if self.num_global_latents > 0 else None
             
@@ -813,27 +743,36 @@ class Atomiser(pl.LightningModule):
             latents_spatial = spatial_out + latents_spatial
             latents_spatial = cross_ff(latents_spatial) + latents_spatial
             
-            # Recombine
             if latents_global is not None:
                 latents = torch.cat([latents_spatial, latents_global], dim=1)
             else:
                 latents = latents_spatial
             
             # =================================================================
-            # SELF-ATTENTION (three modes)
+            # SELF-ATTENTION + DISPLACEMENT (integrated)
             # =================================================================
             
             if self.use_local_attention:
-                # MODE 1: Local k-NN + RPE + Gaussian bias + bidirectional global
-                # Compute cache ONCE per layer (k-NN indices, RPE, distances)
+                # MODE 1: Local k-NN + RPE + Gaussian bias + INTEGRATED DISPLACEMENT
                 cache = self.hybrid_self_attns[layer_idx].compute_cache(current_coords)
                 
-                # Apply all self_per_cross_attn blocks (cache is reused!)
-                latents = self.hybrid_self_attns[layer_idx](
+                latents, displacement, disp_stats = self.hybrid_self_attns[layer_idx](
                     latents, 
                     cache, 
-                    num_spatial=L_spatial
+                    num_spatial=L_spatial,
+                    current_positions=current_coords,
                 )
+
+                
+                
+                # Apply displacement
+                if displacement is not None:
+                    current_coords = current_coords + displacement
+                
+                # Collect stats
+                if return_displacement_stats:
+                    disp_stats['layer'] = layer_idx
+                    all_displacement_stats.append(disp_stats)
                 
             elif self.use_gaussian_bias:
                 # MODE 2: Gaussian bias self-attention (full L×L)
@@ -851,12 +790,7 @@ class Atomiser(pl.LightningModule):
                     latents = self_attn(latents) + latents
                     latents = self_ff(latents) + latents
             
-            # =================================================================
-            # POSITION UPDATE
-            # =================================================================
-            latents_spatial = latents[:, :L_spatial, :]
-            current_coords, _ = self.position_updater(latents_spatial, current_coords, layer_idx)
-            
+            # Record trajectory
             if return_trajectory:
                 trajectory.append(current_coords.clone())
             
@@ -866,9 +800,37 @@ class Atomiser(pl.LightningModule):
                     tokens, mask, current_coords
                 )
         
-        if return_trajectory:
-            return latents, current_coords, trajectory
-        return latents, current_coords, None
+        # Aggregate displacement stats
+        final_disp_stats = None
+        if return_displacement_stats and all_displacement_stats:
+            final_disp_stats = self._aggregate_displacement_stats(all_displacement_stats)
+        
+        return latents, current_coords, trajectory, final_disp_stats
+    
+    def _aggregate_displacement_stats(self, stats_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Aggregate displacement statistics across layers."""
+        aggregated = {
+            'per_layer': stats_list,
+        }
+        
+        # Extract key metrics
+        total_displacements = []
+        attn_fractions = []
+        
+        for stats in stats_list:
+            if 'total_displacement_magnitude' in stats:
+                total_displacements.append(stats['total_displacement_magnitude'])
+            if 'mean_w_attn_fraction' in stats:
+                attn_fractions.append(stats['mean_w_attn_fraction'])
+        
+        if total_displacements:
+            aggregated['mean_displacement'] = sum(total_displacements) / len(total_displacements)
+            aggregated['max_displacement'] = max(total_displacements)
+        
+        if attn_fractions:
+            aggregated['mean_attn_fraction'] = sum(attn_fractions) / len(attn_fractions)
+        
+        return aggregated
 
     # =========================================================================
     # Decoder
@@ -883,15 +845,6 @@ class Atomiser(pl.LightningModule):
     ) -> torch.Tensor:
         """
         Reconstruct query tokens using spatial latents.
-        
-        Args:
-            latents: [B, L_total, D]
-            latents_coords: [B, L_spatial, 2]
-            query_tokens: [B, N, 6]
-            query_mask: [B, N]
-            
-        Returns:
-            predictions: [B, N, 1]
         """
         B, N, _ = query_tokens.shape
         L_spatial = self.num_spatial_latents
@@ -899,12 +852,10 @@ class Atomiser(pl.LightningModule):
         D = latents.shape[-1]
         k = self.decoder_k_spatial
         
-        # 1. Get query content features
         query_features, _, _ = self.input_processor.process_data_for_decoder(
             query_tokens, query_mask
         )
         
-        # 2. Find k-nearest latents for each query
         query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
         
         dists_sq = (
@@ -913,7 +864,6 @@ class Atomiser(pl.LightningModule):
         
         _, topk_indices = torch.topk(dists_sq, k=k, dim=-1, largest=False)
         
-        # 3. Gather selected latents
         spatial_latents = latents[:, :L_spatial, :]
         
         flat_indices = topk_indices.reshape(B, N * k)
@@ -921,7 +871,6 @@ class Atomiser(pl.LightningModule):
         gathered = torch.gather(spatial_latents, dim=1, index=flat_indices_exp)
         selected_latents = gathered.reshape(B, N, k, D)
         
-        # 4. Compute relative positional encoding
         flat_coord_indices = flat_indices.unsqueeze(-1).expand(-1, -1, 2)
         gathered_coords = torch.gather(latents_coords, dim=1, index=flat_coord_indices)
         selected_coords = gathered_coords.reshape(B, N, k, 2)
@@ -929,17 +878,16 @@ class Atomiser(pl.LightningModule):
         delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
         delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
         
-        scale = self.input_processor.geometry.get_physical_scale(query_tokens)
+        self.latent_surface = 103
+        scale = self.latent_surface / (self.spatial_latents_per_row - 1)
         
         relative_pe = self.input_processor.pos_encoder(
-            delta_x, delta_y, scale, gsd=None
+            delta_x, delta_y, scale, gsd=0.2
         )
         
-        # 5. Cross-attend
         context = torch.cat([selected_latents, relative_pe], dim=-1)
         output = self.decoder_cross_attn(query_features, context)
         
-        # 6. Output head
         output_with_query = torch.cat([output, query_features], dim=-1)
         predictions = self.output_head(output_with_query)
         
@@ -962,7 +910,8 @@ class Atomiser(pl.LightningModule):
         latents_coords: Optional[torch.Tensor] = None,
         training: bool = True, 
         task: str = "reconstruction",
-        return_trajectory: bool = False
+        return_trajectory: bool = False,
+        return_displacement_stats: bool = False,
     ):
         """
         Forward pass.
@@ -976,17 +925,23 @@ class Atomiser(pl.LightningModule):
             training: bool
             task: "reconstruction", "visualization", "encoder", or "classification"
             return_trajectory: If True, return position history
+            return_displacement_stats: If True, return displacement statistics
         """
         need_trajectory = return_trajectory or task == "visualization"
+        need_disp_stats = return_displacement_stats or task == "visualization"
         
-        latents, final_coords, trajectory = self.encode(
-            data, mask, latents_coords, training, return_trajectory=need_trajectory
+        latents, final_coords, trajectory, disp_stats = self.encode(
+            data, mask, latents_coords, training, 
+            return_trajectory=need_trajectory,
+            return_displacement_stats=need_disp_stats,
         )
         
         if task == "encoder":
             result = {'latents': latents, 'final_coords': final_coords}
             if trajectory is not None:
                 result['trajectory'] = trajectory
+            if disp_stats is not None:
+                result['displacement_stats'] = disp_stats
             return result
         
         if task == "reconstruction" or task == "visualization":
@@ -1008,28 +963,36 @@ class Atomiser(pl.LightningModule):
                 )
             
             if task == "visualization":
-                return predictions, trajectory
+                return {
+                    'predictions': predictions,
+                    'trajectory': trajectory,
+                    'displacement_stats': disp_stats,
+                    'final_coords': final_coords,
+                }
             return predictions
         
         else:  # classification
             return self.classify(latents)
 
     # =========================================================================
-    # Sigma Statistics (for local attention mode)
+    # Statistics and Diagnostics
     # =========================================================================
     
     def get_sigma_stats(self) -> Optional[Dict[str, Any]]:
-        """Get statistics about learned sigma values (only for local attention mode)."""
+        """Get statistics about learned sigma values."""
         if not self.use_local_attention or self.hybrid_self_attns is None:
             return None
         
         all_stats = []
         for layer_idx, hybrid in enumerate(self.hybrid_self_attns):
             stats = hybrid.get_sigma_stats()
-            stats['layer'] = layer_idx
-            all_stats.append(stats)
+            if stats:
+                stats['layer'] = layer_idx
+                all_stats.append(stats)
         
-        # Aggregate
+        if not all_stats:
+            return None
+        
         all_sigmas = []
         for stats in all_stats:
             all_sigmas.extend([s for block in stats['per_block'] for s in block])
@@ -1043,13 +1006,25 @@ class Atomiser(pl.LightningModule):
             'global_max': all_sigmas.max().item(),
             'global_std': all_sigmas.std().item(),
         }
+    
+    def get_displacement_predictor_stats(self) -> Optional[Dict[str, Any]]:
+        """Get statistics about displacement predictors (attention vs MLP weights)."""
+        if not self.use_local_attention or self.hybrid_self_attns is None:
+            return None
+        
+        all_stats = {}
+        for layer_idx, hybrid in enumerate(self.hybrid_self_attns):
+            stats = hybrid.get_displacement_stats()
+            if stats:
+                all_stats[f'layer_{layer_idx}'] = stats
+        
+        return all_stats if all_stats else None
 
     # =========================================================================
     # Freeze/Unfreeze Utilities
     # =========================================================================
     
     def _set_requires_grad(self, module, flag: bool):
-        """Recursively set requires_grad."""
         if isinstance(module, torch.Tensor):
             module.requires_grad = flag
         elif hasattr(module, 'parameters'):
@@ -1059,7 +1034,6 @@ class Atomiser(pl.LightningModule):
     def freeze_encoder(self):
         self._set_requires_grad(self.encoder_layers, False)
         self.latents.requires_grad = False
-        self._set_requires_grad(self.position_updater, False)
         self._set_requires_grad(self.input_processor, False)
         if self.hybrid_self_attns is not None:
             self._set_requires_grad(self.hybrid_self_attns, False)
@@ -1067,7 +1041,6 @@ class Atomiser(pl.LightningModule):
     def unfreeze_encoder(self):
         self._set_requires_grad(self.encoder_layers, True)
         self.latents.requires_grad = True
-        self._set_requires_grad(self.position_updater, True)
         self._set_requires_grad(self.input_processor, True)
         if self.hybrid_self_attns is not None:
             self._set_requires_grad(self.hybrid_self_attns, True)
@@ -1086,12 +1059,47 @@ class Atomiser(pl.LightningModule):
     def unfreeze_classifier(self):
         self._set_requires_grad(self.to_logits, True)
     
-    def freeze_position_updater(self):
-        self._set_requires_grad(self.position_updater, False)
+    def freeze_displacement(self):
+        """Freeze only the displacement predictors (keep attention trainable)."""
+        if self.hybrid_self_attns is not None:
+            for hybrid in self.hybrid_self_attns:
+                for block in hybrid.blocks:
+                    if block.displacement_predictor is not None:
+                        self._set_requires_grad(block.displacement_predictor, False)
     
-    def unfreeze_position_updater(self):
-        self._set_requires_grad(self.position_updater, True)
+    def unfreeze_displacement(self):
+        """Unfreeze displacement predictors."""
+        if self.hybrid_self_attns is not None:
+            for hybrid in self.hybrid_self_attns:
+                for block in hybrid.blocks:
+                    if block.displacement_predictor is not None:
+                        self._set_requires_grad(block.displacement_predictor, True)
+
+    # =========================================================================
+    # Trajectory Analysis
+    # =========================================================================
     
-    def get_displacement_stats(self, trajectory: List[torch.Tensor]) -> Dict[str, Any]:
+    def compute_trajectory_stats(self, trajectory: List[torch.Tensor]) -> Dict[str, Any]:
         """Compute statistics about latent movement from trajectory."""
-        return compute_displacement_stats(trajectory)
+        if trajectory is None or len(trajectory) < 2:
+            return {}
+        
+        stats = {
+            'num_steps': len(trajectory) - 1,
+            'per_step_displacement': [],
+            'cumulative_displacement': [],
+        }
+        
+        initial_coords = trajectory[0]
+        
+        for i in range(1, len(trajectory)):
+            step_disp = (trajectory[i] - trajectory[i-1]).norm(dim=-1).mean().item()
+            cumul_disp = (trajectory[i] - initial_coords).norm(dim=-1).mean().item()
+            
+            stats['per_step_displacement'].append(step_disp)
+            stats['cumulative_displacement'].append(cumul_disp)
+        
+        stats['total_displacement'] = stats['cumulative_displacement'][-1] if stats['cumulative_displacement'] else 0
+        stats['mean_step_displacement'] = sum(stats['per_step_displacement']) / len(stats['per_step_displacement']) if stats['per_step_displacement'] else 0
+        
+        return stats
