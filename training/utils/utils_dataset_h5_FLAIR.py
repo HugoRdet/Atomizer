@@ -879,7 +879,7 @@ class FLAIR_MAE(Dataset):
 
     def __init__(self, file_path, 
                  transform,
-                 transform_tokens=None,
+
                  model="None",
                  mode="train",
                  modality_mode=None,
@@ -896,7 +896,6 @@ class FLAIR_MAE(Dataset):
         self._initialize_file()
         self.transform = transform
         self.model = model
-        self.transform_tokens = transform_tokens
         self.original_mode = mode
         self.fixed_size = fixed_size
         self.fixed_resolution = fixed_resolution
@@ -1235,7 +1234,6 @@ class FLAIR_MAE(Dataset):
 class FLAIR_SEG(Dataset):
     def __init__(self, file_path, 
                  transform,
-                 transform_tokens=None,
                  model="None",
                  mode="train",
                  modality_mode=None,
@@ -1252,7 +1250,6 @@ class FLAIR_SEG(Dataset):
         self._initialize_file()
         self.transform = transform
         self.model = model
-        self.transform_tokens = transform_tokens
         self.original_mode = mode
         self.fixed_size = fixed_size
         self.fixed_resolution = fixed_resolution

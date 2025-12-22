@@ -43,7 +43,7 @@ def print_memory(label=""):
 warnings.filterwarnings("ignore", message="No positive samples found in target, recall is undefined. Setting recall to one for all thresholds.")
 
 class Model_MAE(pl.LightningModule):
-    def __init__(self, config, wand, name,transform):
+    def __init__(self, config, wand, name,transform,lookup_table):
         super().__init__()
         self.strict_loading = False
         self.config = config
@@ -59,6 +59,7 @@ class Model_MAE(pl.LightningModule):
         self.name = name
         self.table=False
         self.comment_log=""
+        self.lookup_table=lookup_table
         
     
         
@@ -72,7 +73,7 @@ class Model_MAE(pl.LightningModule):
         self.tmp_val_ap = 0
         
         if config["encoder"] == "Atomiser":
-            self.encoder = Atomiser(config=self.config,transform=self.transform)
+            self.encoder = Atomiser(config=self.config,lookup_table=self.lookup_table)
 
         self.loss = nn.MSELoss(reduction='mean')  
         self.lr = float(config["trainer"]["lr"])
@@ -213,5 +214,3 @@ class Model_MAE(pl.LightningModule):
         
         
                 
-        
-        

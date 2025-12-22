@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+data/MNIST/
 wandb/*
 data/Tiny_BigEarthNet/transformations/*
 *.mdb

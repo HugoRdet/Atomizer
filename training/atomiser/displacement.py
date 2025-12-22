@@ -72,7 +72,7 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
     Architecture:
         latents [B, L, D] -> MLP -> raw [B, L, 2] -> tanh -> bounded displacement
     
-    Initialized to output near-zero displacements so training starts from grid.
+    Initialized to output small random displacements to encourage exploration.
     """
     
     def __init__(
@@ -80,7 +80,7 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
         latent_dim: int,
         num_layers: int,
         hidden_dim: int = None,
-        max_displacement: float = 0.1,
+        max_displacement: float = 50.0,  # Max pixels per layer
         share_weights: bool = True
     ):
         """
@@ -88,11 +88,11 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
             latent_dim: Dimension of latent embeddings
             num_layers: Number of encoder layers
             hidden_dim: Hidden dimension (default: latent_dim // 2)
-            max_displacement: Maximum displacement magnitude per layer
+            max_displacement: Maximum displacement magnitude per layer (in pixels)
             share_weights: If True, share MLP weights across layers (except first)
         """
         super().__init__()
-        self.max_displacement = max_displacement
+        self.max_displacement = 10#max_displacement
         self.share_weights = share_weights
         self.num_encoder_layers = num_layers
         
@@ -100,27 +100,27 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
         
         def make_predictor():
             return nn.Sequential(
-                nn.Linear(latent_dim, 2),
-                #nn.LayerNorm(hidden_dim),
-                #nn.GELU(),
-                #nn.Linear(hidden_dim, 2)  # Output (Δx, Δy)
+                nn.Linear(latent_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2)  # Output (Δx, Δy)
             )
         
         if share_weights:
-            # Layer 0 gets its own predictor, rest share
             self.predictors = nn.ModuleList([make_predictor(), make_predictor()])
         else:
-            # Each layer gets its own predictor
             self.predictors = nn.ModuleList([make_predictor() for _ in range(num_layers)])
         
-        # Initialize to near-zero output
-        self._init_zero_displacement()
+        # Initialize with small random values (not zeros!)
+        self._init_small_displacement()
     
-    def _init_zero_displacement(self):
-        """Initialize final layer to output near-zero values."""
+    def _init_small_displacement(self):
+        """Initialize final layer to output small but non-zero values."""
         for pred in self.predictors:
-            nn.init.zeros_(pred[-1].weight)
-            nn.init.zeros_(pred[-1].bias)
+            # Small random weights so network starts with some movement
+            nn.init.normal_(pred[-1].weight, mean=0.0, std=0.03)
+            # Small random bias to break symmetry
+            nn.init.normal_(pred[-1].bias, mean=0.0, std=0.03)
     
     def forward(self, latents, current_coords, layer_idx) -> Tuple[torch.Tensor, torch.Tensor]:
         # Select predictor
@@ -132,15 +132,117 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
         # Predict raw displacement
         raw_displacement = self.predictors[pred_idx](latents)
         
-        # Bound with tanh
-        displacement = raw_displacement * 10#torch.tanh() * self.max_displacement
+        # Bound with tanh to [-max_displacement, +max_displacement]
+        displacement = torch.tanh(raw_displacement) * self.max_displacement
         
-        # Apply displacement
         new_coords = current_coords + displacement
-        
+
+    
         return new_coords, displacement
 
 
+class ConvexDisplacementUpdate(PositionUpdateStrategy):
+    """
+    Convex combination using Q·K attention for stable position updates.
+    
+    M = α * W + (1 - α) * I
+    new_pos = M @ current_pos
+    
+    where W = softmax(Q @ K^T / √d) with natural self-attention bias.
+    """
+    
+    def __init__(
+        self,
+        latent_dim: int,
+        num_layers: int,
+        num_latents: int = None,  # Not needed for Q·K
+        init_alpha: float = -2.0,
+        share_weights: bool = True,
+        **kwargs
+    ):
+        super().__init__()
+        self.share_weights = share_weights
+        self.num_encoder_layers = num_layers
+        self.scale = latent_dim ** -0.5
+        
+        n_predictors = 2 if share_weights else num_layers
+        
+        # Q and K projections
+        self.to_q = nn.ModuleList([
+            nn.Linear(latent_dim, latent_dim, bias=False)
+            for _ in range(n_predictors)
+        ])
+        self.to_k = nn.ModuleList([
+            nn.Linear(latent_dim, latent_dim, bias=False)
+            for _ in range(n_predictors)
+        ])
+        
+        # Learnable mixing coefficient α
+        self.alphas = nn.ParameterList([
+            nn.Parameter(torch.tensor(init_alpha))
+            for _ in range(n_predictors)
+        ])
+    
+    def forward(self, latents, current_coords, layer_idx) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, D = latents.shape
+        
+
+        
+    
+        # Debug: Check inputs
+        if torch.isnan(latents).any():
+            print(f"NaN in latents at layer {layer_idx}")
+        if torch.isnan(current_coords).any():
+            print(f"NaN in current_coords at layer {layer_idx}")
+        
+        pred_idx = 0 if (self.share_weights and layer_idx == 0) else 1
+        
+        q = self.to_q[pred_idx](latents)
+        k = self.to_k[pred_idx](latents)
+
+        print(f"to_q weight: min={self.to_q[pred_idx].weight.min():.4f}, max={self.to_q[pred_idx].weight.max():.4f}")
+        print(f"to_k weight: min={self.to_k[pred_idx].weight.min():.4f}, max={self.to_k[pred_idx].weight.max():.4f}")
+        print(f"alpha: {self.alphas[pred_idx].item():.4f}")
+        
+        # Debug: Check Q, K
+        if torch.isnan(q).any():
+            print(f"NaN in Q at layer {layer_idx}")
+        if torch.isnan(k).any():
+            print(f"NaN in K at layer {layer_idx}")
+        
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        
+        scores = torch.matmul(q, k.transpose(-1, -2)) / 0.1
+        
+        # Debug: Check scores
+        print(f"Layer {layer_idx}: scores min={scores.min():.2f}, max={scores.max():.2f}")
+        if torch.isnan(scores).any():
+            print(f"NaN in scores at layer {layer_idx}")
+        
+        scores = scores.clamp(-50, 50)
+        W = F.softmax(scores, dim=-1)
+        
+        # Debug: Check W
+        if torch.isnan(W).any():
+            print(f"NaN in W at layer {layer_idx}")
+        
+        alpha = torch.sigmoid(self.alphas[pred_idx])
+        print(f"Layer {layer_idx}: alpha={alpha.item():.4f}")
+        
+        identity = torch.eye(L, device=latents.device, dtype=latents.dtype)
+        M = alpha * W + (1.0 - alpha) * identity
+        
+        new_coords = torch.matmul(M, current_coords)
+        
+        # Debug: Check output
+        print(f"Layer {layer_idx}: new_coords min={new_coords.min():.2f}, max={new_coords.max():.2f}")
+        if torch.isnan(new_coords).any():
+            print(f"NaN in new_coords at layer {layer_idx}")
+        
+        displacement = new_coords - current_coords
+        
+        return new_coords, displacement
 # =============================================================================
 # Strategy: Deformable Offset (Multiple Sampling Points)
 # =============================================================================
@@ -264,6 +366,7 @@ class DeformableOffsetUpdate(PositionUpdateStrategy):
 # Factory Function
 # =============================================================================
 
+
 def create_position_updater(config: Dict[str, Any]) -> PositionUpdateStrategy:
     """
     Create position update strategy from config dictionary.
@@ -271,14 +374,24 @@ def create_position_updater(config: Dict[str, Any]) -> PositionUpdateStrategy:
     Args:
         config: Dictionary containing:
             - use_displacement: bool
-            - position_strategy: str ("none", "mlp", "deformable")
+            - position_strategy: str ("none", "mlp", "convex", "deformable")
             - latent_dim: int
             - depth: int (number of encoder layers)
-            - max_displacement: float
-            - displacement_hidden_dim: int or None
             - share_displacement_weights: bool
-            - deformable_heads: int (for deformable)
-            - deformable_points: int (for deformable)
+            
+            For "mlp":
+                - max_displacement: float (default: 15.0 meters)
+                - displacement_temperature: float (default: 3.0)
+            
+            For "convex":
+                - num_spatial_latents: int (required)
+                - convex_hidden_dim: int (default: latent_dim // 2)
+                - convex_init_alpha: float (default: 0.0 → sigmoid = 0.5)
+            
+            For "deformable":
+                - max_displacement: float (default: 15.0 meters)
+                - deformable_heads: int (default: 4)
+                - deformable_points: int (default: 4)
     
     Returns:
         PositionUpdateStrategy instance
@@ -295,8 +408,20 @@ def create_position_updater(config: Dict[str, Any]) -> PositionUpdateStrategy:
         return MLPDisplacementUpdate(
             latent_dim=config["latent_dim"],
             num_layers=config["depth"],
-            hidden_dim=config.get("displacement_hidden_dim"),
-            max_displacement=config.get("max_displacement", 0.1),
+            max_displacement=config.get("max_displacement", 15.0),
+            share_weights=config.get("share_displacement_weights", True)
+        )
+    
+   
+    
+    elif strategy == "convex":
+
+        return ConvexDisplacementUpdate(
+            latent_dim=config["latent_dim"],
+            num_layers=config["depth"],
+            num_latents=8,
+            hidden_dim=config.get("convex_hidden_dim"),
+            init_alpha=config.get("convex_init_alpha", 0.5),
             share_weights=config.get("share_displacement_weights", True)
         )
     
@@ -306,12 +431,16 @@ def create_position_updater(config: Dict[str, Any]) -> PositionUpdateStrategy:
             num_layers=config["depth"],
             num_heads=config.get("deformable_heads", 4),
             num_points=config.get("deformable_points", 4),
-            max_offset=config.get("max_displacement", 0.2),
+            max_offset=config.get("max_displacement", 15.0),
             share_weights=config.get("share_displacement_weights", True)
         )
     
     else:
-        raise ValueError(f"Unknown position strategy: {strategy}")
+        raise ValueError(f"Unknown position strategy: {strategy}. "
+                        f"Valid options: 'none', 'mlp', 'convex', 'deformable'")
+
+
+
 
 
 # =============================================================================
@@ -352,4 +481,3 @@ def compute_displacement_stats(trajectory: list) -> Dict[str, Any]:
         }
     
     return stats
-
