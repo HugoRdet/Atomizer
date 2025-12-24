@@ -137,6 +137,7 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train],
     default_root_dir="./checkpoints/",
+    
 )
 
 # Fit the model

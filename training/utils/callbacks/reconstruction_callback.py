@@ -9,278 +9,61 @@ import seaborn as sns
 from typing import Optional, Union, List
 from training.utils.image_utils import *
 
-class CustomMAEReconstructionCallback(pl.Callback):
+"""
+MAE Visualization Callback with Displacement + Explicit Signals Visualization
 
-    def __init__(
-        self,
-        config,
-    ):
-        """
-        Args:
-            config: Configuration dict containing visualization parameters
-        """
-        super().__init__()
-        self.config=config
-        
-        
-        self.log_every_n_epochs = config["debug"]["viz_every_n_epochs"]
-        self.sample_indices = config["debug"]["idxs_to_viz"]
-        self.num_samples = len(self.sample_indices)
-        
-        # Sentinel-2 band definitions (12 bands)
-        self.sentinel2_bands = {
-            'B01': 0,   # Coastal aerosol (443 nm)
-            'B02': 1,   # Blue (490 nm)
-            'B03': 2,   # Green (560 nm)
-            'B04': 3,   # Red (665 nm)
-            'B05': 4,   # Vegetation Red Edge (705 nm)
-            'B06': 5,   # Vegetation Red Edge (740 nm)
-            'B07': 6,   # Vegetation Red Edge (783 nm)
-            'B08': 7,   # NIR (842 nm)
-            'B8A': 8,   # Vegetation Red Edge (865 nm)
-            'B09': 9,   # Water vapour (945 nm)
-            'B11': 10,  # SWIR (1610 nm)
-            'B12': 11,  # SWIR (2190 nm)
-        }
-        
-        # Band combinations for visualization
-        self.rgb_bands = [self.sentinel2_bands['B04'], self.sentinel2_bands['B03'], self.sentinel2_bands['B02']]  # Red, Green, Blue
-        self.infrared_bands = [self.sentinel2_bands['B08'], self.sentinel2_bands['B11'], self.sentinel2_bands['B12']]  # NIR, SWIR1, SWIR2
-        
-    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        """Perform reconstruction visualization at the end of validation epoch."""
-        
-        # Only log every N epochs and skip first few epochs
-        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0 or trainer.current_epoch < 2:
-            return
-        
-        # **CRITICAL: Ensure we only run on GPU 0 (rank 0) to avoid multiple executions**
-        if trainer.is_global_zero == False:
-            return
-            
-        # Alternative way to check for single GPU execution
-        if hasattr(trainer, 'global_rank') and trainer.global_rank != 0:
-            return
-        
-        pl_module.eval()
-        
-        try:
-            # Only execute on rank 0
-            if wandb.run is not None:
-                self._perform_custom_reconstruction(trainer, pl_module)
-            else:
-                print("Warning: wandb not active, skipping reconstruction logging")
-        except Exception as e:
-            print(f"Error in custom reconstruction callback: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        pl_module.train()
-    
-    def _perform_custom_reconstruction(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        """Perform reconstruction using your custom data loading."""
-        
-        # Get the dataset from the trainer
-        dataset = trainer.datamodule.val_dataset
-        
-        for i, sample_idx in enumerate(self.sample_indices):
-            self._process_single_sample(sample_idx, i, dataset, pl_module, trainer.current_epoch)
-            
-    def _process_single_sample(self, dataset_idx: int, viz_idx: int, dataset, pl_module, epoch: int):
-        """Process a single sample using your get_samples_to_viz function."""
-        
-        # Get data from your custom method
-        image_tokens, attention_mask, mae_tokens, mask_MAE_res, latents_pos = dataset.get_samples_to_viz(dataset_idx)
-        #image_to_return, image, attention_mask, queries, queries_mask, label, latent_pos
-        print(latents_pos.shape)
-        # Move to device
-        mae_tokens_mask = torch.ones(mae_tokens.shape[0])
-        device = pl_module.device
-        image_tokens = image_tokens.to(device)
-        attention_mask = attention_mask.to(device) if attention_mask is not None else None
-        mae_tokens = mae_tokens.to(device)
-        mask_MAE_res = mask_MAE_res.to(device)
-        
-        with torch.no_grad():
-            try:
-                # Expand dimensions to match batch format
-                image_tokens_batch = image_tokens.unsqueeze(0) #image, , , ,
-                image_tokens_mask = attention_mask.unsqueeze(0) #attention_mask
-                mae_tokens_batch = mae_tokens.clone().unsqueeze(0) #mae_tokens
-                mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0) #mae_tokens_mask
-                #latents_pos
-                # Perform reconstruction
-                y_hat, y_mask = pl_module.forward(
-                    image_tokens_batch,
-                    image_tokens_mask,
-                    mae_tokens_batch,
-                    mae_tokens_mask_batch,
-                    latents_pos.unsqueeze(0).to(device),
-                    training=False,
-                    task="visualization"
-                )
-                
-                # Remove batch dimension for visualization
-                y_hat = y_hat.squeeze(0)
-                
-                # Reshape to spatial format
-                ground_truth = mae_tokens[:,0]
-                ground_truth = rearrange(ground_truth, "(b h w) -> b h w", b=12, h=120, w=120)
-                
-                y_hat = rearrange(y_hat, "(b h w) c -> b h w c", b=12, h=120, w=120, c=1).squeeze(-1)
-                
-                print(f"✓ Successfully reconstructed sample {dataset_idx}")
-                
-            except Exception as e:
-                print(f"Error in model forward pass for sample {dataset_idx}: {e}")
-                import traceback
-                traceback.print_exc()
-                return
-        
-        # Create and upload visualization
-        try:
-            self._create_and_upload_spatial_visualization(
-                sample_idx=dataset_idx,
-                viz_idx=viz_idx,
-                ground_truth=ground_truth,      # [12, 120, 120]
-                prediction=y_hat,               # [12, 120, 120]
-                spatial_mask=mask_MAE_res,      # [120, 120]
-                epoch=epoch
-            )
-        except Exception as e:
-            print(f"Error creating spatial visualization for sample {dataset_idx}: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def _create_and_upload_spatial_visualization(self, sample_idx, viz_idx, ground_truth, prediction, spatial_mask, epoch):
-        """Create and upload spatial reconstruction visualization to wandb."""
-        
-        # Convert to numpy for visualization
-        gt_np = ground_truth.cpu().numpy()          # [12, 120, 120]
-        pred_np = prediction.cpu().numpy()          # [12, 120, 120]
-        mask_np = spatial_mask.cpu().numpy()        # [120, 120]
-        
-        # Calculate basic metrics for logging
-        mse = np.mean((gt_np - pred_np) ** 2)
-        mae = np.mean(np.abs(gt_np - pred_np))
-        correlation = np.corrcoef(gt_np.flatten(), pred_np.flatten())[0, 1]
-        
-        # Create the main spatial visualization
-        spatial_fig = self._create_spatial_reconstruction_figure(
-            gt_np, pred_np, mask_np, sample_idx, epoch, mse, mae, correlation
-        )
-        
-        # Prepare wandb data
-        wandb_data = {
-            # Main spatial visualization
-            f"spatial_reconstruction/epoch_{epoch}_sample_{sample_idx}": wandb.Image(
-                spatial_fig, 
-                caption=f"Spatial MAE Reconstruction - Epoch {epoch}, Sample {sample_idx}, MSE: {mse:.6f}"
-            ),
-            
-            # Basic metrics
-            f"reconstruction_metrics/epoch": epoch,
-            f"reconstruction_metrics/sample_{viz_idx}_mse": mse,
-            f"reconstruction_metrics/sample_{viz_idx}_mae": mae,
-            f"reconstruction_metrics/sample_{viz_idx}_correlation": correlation,
-        }
-        
-        # Upload to wandb
-        try:
-            wandb.log(wandb_data)
-            print(f"✓ Successfully uploaded spatial reconstruction for sample {sample_idx} at epoch {epoch}")
-        except Exception as e:
-            print(f"✗ Failed to upload to wandb: {e}")
-        
-        plt.close(spatial_fig)
-    
-    def _create_spatial_reconstruction_figure(self, ground_truth, prediction, spatial_mask, 
-                                            sample_idx, epoch, mse, mae, correlation):
-        """Create clean spatial reconstruction visualization with RGB and Infrared bands."""
-        
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle(f'MAE Reconstruction - Sample {sample_idx}, Epoch {epoch}\n'
-                    f'MSE: {mse:.6f}, MAE: {mae:.6f}, Correlation: {correlation:.4f}', 
-                    fontsize=16, fontweight='bold')
-        
-        # Row 1: RGB bands (Red, Green, Blue)
-        rgb_gt = self._create_rgb_composite(ground_truth, self.rgb_bands)
-        rgb_pred = self._create_rgb_composite(prediction, self.rgb_bands)
-        
-        # Ground Truth RGB
-        axes[0, 0].imshow(rgb_gt)
-        axes[0, 0].set_title('Ground Truth\n(RGB: B04-B03-B02)', fontsize=14, fontweight='bold')
-        axes[0, 0].axis('off')
-        
-        # Prediction RGB
-        axes[0, 1].imshow(rgb_pred)
-        axes[0, 1].set_title('Prediction\n(RGB: B04-B03-B02)', fontsize=14, fontweight='bold')
-        axes[0, 1].axis('off')
-        
-        # Spatial Mask
-        axes[0, 2].imshow(spatial_mask, cmap='RdYlBu_r', alpha=0.9)
-        axes[0, 2].set_title(f'Spatial Mask\n(Masked: {np.mean(spatial_mask):.1%})', fontsize=14, fontweight='bold')
-        axes[0, 2].axis('off')
-        
-        # Row 2: Infrared bands (NIR, SWIR1, SWIR2)
-        infrared_gt = self._create_rgb_composite(ground_truth, self.infrared_bands)
-        infrared_pred = self._create_rgb_composite(prediction, self.infrared_bands)
-        
-        # Ground Truth Infrared
-        axes[1, 0].imshow(infrared_gt)
-        axes[1, 0].set_title('Ground Truth\n(False Color: B08-B11-B12)', fontsize=14, fontweight='bold')
-        axes[1, 0].axis('off')
-        
-        # Prediction Infrared
-        axes[1, 1].imshow(infrared_pred)
-        axes[1, 1].set_title('Prediction\n(False Color: B08-B11-B12)', fontsize=14, fontweight='bold')
-        axes[1, 1].axis('off')
-        
-        # Error Map (using RGB bands)
-        rgb_error = np.abs(rgb_gt.astype(float) - rgb_pred.astype(float))
-        rgb_error = rgb_error / rgb_error.max() if rgb_error.max() > 0 else rgb_error
-        axes[1, 2].imshow(rgb_error)
-        axes[1, 2].set_title('RGB Error Map\n(Absolute Difference)', fontsize=14, fontweight='bold')
-        axes[1, 2].axis('off')
-        
-        plt.tight_layout()
-        return fig
-    
-    def _create_rgb_composite(self, data, band_indices):
-        """Create RGB composite from selected bands."""
-        # data: [12, 120, 120], band_indices: [R_idx, G_idx, B_idx]
-        composite = np.stack([
-            data[band_indices[0]],  # Red channel
-            data[band_indices[1]],  # Green channel  
-            data[band_indices[2]]   # Blue channel
-        ], axis=-1)  # [120, 120, 3]
-        
-        # Normalize using the provided function
-        composite_tensor = torch.from_numpy(composite).permute(2, 0, 1)  # [3, 120, 120]
-        normalized = normalize(composite_tensor)  # [3, 120, 120]
-        
-        return normalized.permute(1, 2, 0).numpy()  # [120, 120, 3]
-    
-import torch
+Includes:
+- MAE reconstruction visualization (RGB, NIR, Elevation)
+- Latent trajectory visualization (layer by layer)
+- Displacement forces visualization (attraction, repulsion, MLP)
+- Explicit signals heatmaps (similarity, complexity, uniqueness, importance)
+- Displacement statistics logging
+"""
+
+"""
+MAE Visualization Callback for Atomizer
+
+Visualizes:
+1. MAE Reconstruction: RGB, NIR, Elevation channels with error maps
+2. Latent Trajectories: How latents move through layers (purple gradient)
+
+Uses purple gradient for trajectory colors (dark = early layer, light = late layer).
+"""
+
 import numpy as np
-import matplotlib.pyplot as plt
+import torch
 import pytorch_lightning as pl
-from einops import rearrange
+import matplotlib.pyplot as plt
 import wandb
+from einops import rearrange
+from typing import Optional, List
 
 
-def normalize(img, min_val=0, max_val=1):
-    """Normalize image to [0, 1] range."""
-    img_min = img.min()
-    img_max = img.max()
-    if img_max - img_min > 1e-6:
-        return (img - img_min) / (img_max - img_min) * (max_val - min_val) + min_val
-    return img
-
-
+def normalize(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize tensor to [0, 1] range."""
+    min_val = tensor.min()
+    max_val = tensor.max()
+    if max_val - min_val > 1e-8:
+        return (tensor - min_val) / (max_val - min_val)
+    return tensor - min_val
 
 
 class MAE_CustomVisualizationCallback(pl.Callback):
+    """
+    Callback for visualizing MAE reconstruction and latent trajectories.
+    """
+    
+    # Purple gradient: dark (early layer) → light (late layer)
+    TRAJECTORY_COLORS = [
+        '#10002b',  # Layer 0 (initial) - darkest
+        '#240046',  # Layer 1
+        '#3c096c',  # Layer 2
+        '#5a189a',  # Layer 3
+        '#7b2cbf',  # Layer 4
+        '#9d4edd',  # Layer 5
+        '#c77dff',  # Layer 6
+        '#e0aaff',  # Layer 7 - lightest
+    ]
 
     def __init__(self, config):
         """
@@ -294,21 +77,6 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         self.sample_indices = config["debug"]["idxs_to_viz"]
         self.num_samples = len(self.sample_indices)
         
-        # Band definitions for RGB visualization
-        self.rgb_bands = [2, 1, 0]  # Red, Green, Blue indices (assuming BGR order)
-        
-        # Colors for trajectory visualization (layer by layer)
-        self.trajectory_colors = [
-            "#000000",  # Layer 0 (initial) - black
-            "#3a86ff",  # Layer 1 - blue
-            "#8338ec",  # Layer 2 - purple
-            "#ff006e",  # Layer 3 - pink
-            "#fb5607",  # Layer 4 - orange
-            "#ffbe0b",  # Layer 5 - yellow (extra)
-            "#06d6a0",  # Layer 6 - teal (extra)
-            "#118ab2",  # Layer 7 - dark blue (extra)
-        ]
-        
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Perform MAE reconstruction visualization at the end of validation epoch."""
         
@@ -316,18 +84,15 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0 or trainer.current_epoch < 2:
             return
         
-        # **CRITICAL: Ensure we only run on GPU 0 (rank 0) to avoid multiple executions**
-        if trainer.is_global_zero == False:
+        # Only run on rank 0
+        if not trainer.is_global_zero:
             return
-            
-        # Alternative way to check for single GPU execution
         if hasattr(trainer, 'global_rank') and trainer.global_rank != 0:
             return
         
         pl_module.eval()
         
         try:
-            # Only execute on rank 0
             if wandb.run is not None:
                 self._perform_custom_reconstruction(trainer, pl_module)
             else:
@@ -342,25 +107,24 @@ class MAE_CustomVisualizationCallback(pl.Callback):
     def _perform_custom_reconstruction(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         """Perform MAE reconstruction visualization using custom data loading."""
         
-        # Get the dataset from the trainer
+        # Validation set
         dataset_val = trainer.datamodule.val_dataset
-        
         for i, sample_idx in enumerate(self.sample_indices):
             self._process_single_sample(
                 sample_idx, i, dataset_val, pl_module, 
-                trainer.current_epoch, id="validation"
+                trainer.current_epoch, split="validation"
             )
             
+        # Training set
         dataset_train = trainer.datamodule.train_dataset
-        
         for i, sample_idx in enumerate(self.sample_indices):
             self._process_single_sample(
                 sample_idx, i, dataset_train, pl_module, 
-                trainer.current_epoch, id="train"
+                trainer.current_epoch, split="train"
             )
     
     def _process_single_sample(self, dataset_idx: int, viz_idx: int, dataset, 
-                               pl_module, epoch: int, id="val"):
+                               pl_module, epoch: int, split: str = "val"):
         """Process a single sample for MAE reconstruction visualization."""
         
         # Get data from your custom method
@@ -383,7 +147,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
                 mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0)
                 latent_pos_batch = latent_pos.unsqueeze(0)
                 
-                # Forward pass with trajectory (single call)
+                # Forward pass with trajectory
                 result = pl_module.forward(
                     image_tokens_batch,
                     image_tokens_mask,
@@ -395,28 +159,35 @@ class MAE_CustomVisualizationCallback(pl.Callback):
                 )
                 
                 # Unpack result
-                if isinstance(result, tuple):
-                    y_hat, trajectory = result
+                if isinstance(result, dict):
+                    y_hat = result.get('predictions', result.get('y_hat'))
+                    trajectory = result.get('trajectory', None)
+                elif isinstance(result, tuple):
+                    y_hat = result[0]
+                    trajectory = result[1] if len(result) > 1 else None
                 else:
                     y_hat = result
                     trajectory = None
                 
-                # Remove batch dimension for visualization
-                y_hat = y_hat.squeeze(0)  # [num_tokens, num_channels]
+                # Validate trajectory
+                if not isinstance(trajectory, (list, tuple)) or len(trajectory) == 0:
+                    trajectory = None
                 
-                # Get original values (target)
-                target = mae_tokens[:, 0]  # [num_tokens] - reflectance values
+                # Remove batch dimension
+                y_hat = y_hat.squeeze(0)
                 
-                # Get reconstruction
-                reconstruction = y_hat.squeeze(-1) if y_hat.dim() > 1 else y_hat  # [num_tokens]
+                # Get target and reconstruction
+                target = mae_tokens[:, 0]
+                reconstruction = y_hat.squeeze(-1) if y_hat.dim() > 1 else y_hat
                 
-                print(f"✓ Successfully reconstructed sample {dataset_idx}")
-                print(f"  Target shape: {target.shape}, Reconstruction shape: {reconstruction.shape}")
+                print(f"✓ Reconstructed sample {dataset_idx} ({split})")
                 if trajectory is not None:
-                    print(f"  Trajectory: {len(trajectory)} layers, shape {trajectory[0].shape}")
+                    print(f"  Trajectory: {len(trajectory)} layers")
+                else:
+                    print(f"  Trajectory: None (displacement disabled)")
                 
             except Exception as e:
-                print(f"Error in model forward pass for sample {dataset_idx}: {e}")
+                print(f"Error in forward pass for sample {dataset_idx}: {e}")
                 import traceback
                 traceback.print_exc()
                 return
@@ -429,18 +200,26 @@ class MAE_CustomVisualizationCallback(pl.Callback):
                 original_image=image,
                 target=target,
                 reconstruction=reconstruction,
-                mask=mask_MAE_res,
                 trajectory=trajectory,
                 epoch=epoch,
-                id=id
+                split=split
             )
         except Exception as e:
             print(f"Error creating MAE visualization for sample {dataset_idx}: {e}")
             import traceback
             traceback.print_exc()
     
-    def _create_and_upload_mae_visualization(self, sample_idx, viz_idx, original_image,
-                                            target, reconstruction, mask, trajectory, epoch, id):
+    def _create_and_upload_mae_visualization(
+        self,
+        sample_idx: int,
+        viz_idx: int,
+        original_image,
+        target: torch.Tensor,
+        reconstruction: torch.Tensor,
+        trajectory: Optional[List[torch.Tensor]],
+        epoch: int,
+        split: str
+    ):
         """Create and upload MAE reconstruction visualization to wandb."""
         
         # Calculate reconstruction metrics
@@ -451,44 +230,39 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         
         # Create the main MAE visualization
         mae_fig = self._create_mae_figure(
-            original_image, target, reconstruction, mask,
+            original_image, target, reconstruction,
             sample_idx, epoch, mse, mae
         )
         
         # Prepare wandb data
         wandb_data = {
-            # Main MAE visualization
-            f"mae_reconstruction/sample_{sample_idx}_{id}": wandb.Image(
+            f"mae_reconstruction/sample_{sample_idx}_{split}": wandb.Image(
                 mae_fig, 
                 caption=f"MAE Reconstruction - Epoch {epoch}, Sample {sample_idx}, MSE: {mse:.6f}, MAE: {mae:.6f}"
             ),
-            
-            # Reconstruction metrics
-            f"mae_metrics/epoch": epoch,
-            f"mae_metrics/sample_{viz_idx}_mse_{id}": mse,
-            f"mae_metrics/sample_{viz_idx}_mae_{id}": mae,
+            f"mae_metrics/sample_{viz_idx}_mse_{split}": mse,
+            f"mae_metrics/sample_{viz_idx}_mae_{split}": mae,
         }
+        
+        plt.close(mae_fig)
         
         # Create trajectory visualization if available
         if trajectory is not None and len(trajectory) > 1:
             try:
-                trajectory_fig = self._create_latent_trajectory_figure(
-                    trajectory, sample_idx, epoch, original_image=original_image
+                traj_fig = self._create_trajectory_figure(
+                    trajectory=trajectory,
+                    original_image=original_image,
+                    sample_idx=sample_idx,
+                    epoch=epoch
                 )
-                wandb_data[f"latent_trajectory/sample_{sample_idx}_{id}"] = wandb.Image(
-                    trajectory_fig,
+                
+                wandb_data[f"latent_trajectory/sample_{sample_idx}_{split}"] = wandb.Image(
+                    traj_fig,
                     caption=f"Latent Trajectories - Epoch {epoch}, Sample {sample_idx}"
                 )
-
-               
-                traj_stats = self._compute_trajectory_stats(trajectory)
-                wandb_data[f"trajectory_stats/sample_{viz_idx}_mean_displacement_{id}"] = traj_stats['mean_total']
-                wandb_data[f"trajectory_stats/sample_{viz_idx}_max_displacement_{id}"] = traj_stats['max_total']
                 
-
+                plt.close(traj_fig)
                 
-               
-                plt.close(trajectory_fig)
             except Exception as e:
                 print(f"Error creating trajectory visualization: {e}")
                 import traceback
@@ -497,133 +271,108 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         # Upload to wandb
         try:
             wandb.log(wandb_data)
-            print(f"✓ Successfully uploaded MAE reconstruction for sample {sample_idx} at epoch {epoch}")
+            print(f"✓ Uploaded visualization for sample {sample_idx} at epoch {epoch}")
         except Exception as e:
             print(f"✗ Failed to upload to wandb: {e}")
-        
-        plt.close(mae_fig)
     
-    def _create_latent_trajectory_figure(
-        self, 
-        trajectory: list, 
-        sample_idx: int, 
+    def _create_trajectory_figure(
+        self,
+        trajectory: List[torch.Tensor],
+        original_image: np.ndarray,
+        sample_idx: int,
         epoch: int,
-        original_image: np.ndarray = None,
-        num_latents: int = None,
         figsize: tuple = (12, 12)
     ) -> plt.Figure:
         """
-        Create visualization of latent position trajectories.
+        Create visualization of latent position trajectories through layers.
         
-        Each layer gets a different color:
-        - Layer 0 (initial): black dots
-        - Layer 1: blue (#3a86ff)
-        - Layer 2: purple (#8338ec)
-        - Layer 3: pink (#ff006e)
-        - Layer 4: orange (#fb5607)
-        
-        Args:
-            trajectory: List of [B, L, 2] tensors (one per layer)
-            sample_idx: Sample index for title
-            epoch: Current epoch for title
-            original_image: Optional RGB image to show as background [H, W, C]
-            num_latents: Number of latents to plot (None = all)
-            figsize: Figure size
-            
-        Returns:
-            matplotlib Figure
+        Uses purple gradient: dark (#10002b) = early layer → light (#e0aaff) = late layer
         """
         # Extract positions for batch 0
         traj_np = [t[0].detach().cpu().numpy() for t in trajectory]
         num_layers = len(traj_np)
-        L = traj_np[0].shape[0]
+        num_latents = traj_np[0].shape[0]
         
-        # Select subset of latents if needed
-        if num_latents is not None and num_latents < L:
-            indices = np.linspace(0, L - 1, num_latents, dtype=int)
+        # Get colors - interpolate if more layers than colors
+        if num_layers <= len(self.TRAJECTORY_COLORS):
+            colors = self.TRAJECTORY_COLORS[:num_layers]
         else:
-            indices = np.arange(L)
-            num_latents = L
+            indices = np.linspace(0, len(self.TRAJECTORY_COLORS) - 1, num_layers).astype(int)
+            colors = [self.TRAJECTORY_COLORS[i] for i in indices]
         
         fig, ax = plt.subplots(figsize=figsize)
         
-        # Get coordinate bounds from trajectory
-        all_coords = np.concatenate(traj_np, axis=0)
-        x_min, x_max = all_coords[:, 0].min(), all_coords[:, 0].max()
-        y_min, y_max = all_coords[:, 1].min(), all_coords[:, 1].max()
-        
-        # Add margin
-        margin = max(x_max - x_min, y_max - y_min) * 0.05
-        extent = [x_min - margin, x_max + margin, y_min - margin, y_max + margin]
-        
-        # Show RGB background if provided
-        if original_image is not None:
-            try:
-                rgb_background = self._create_rgb_from_image(original_image)
-                # Display image with extent matching latent coordinate system
-                ax.imshow(
-                    rgb_background, 
-                    extent=extent,
-                    aspect='auto',
-                    alpha=0.5,
-                    origin='lower',
-                    zorder=1
-                )
-            except Exception as e:
-                print(f"Warning: Could not display RGB background: {e}")
+        # Get RGB background
+        try:
+            rgb_background = self._create_rgb_from_image(original_image)
+            
+            # Get coordinate bounds from trajectory
+            all_coords = np.concatenate(traj_np, axis=0)
+            x_min, x_max = all_coords[:, 0].min(), all_coords[:, 0].max()
+            y_min, y_max = all_coords[:, 1].min(), all_coords[:, 1].max()
+            margin = max(x_max - x_min, y_max - y_min) * 0.05
+            extent = [x_min - margin, x_max + margin, y_min - margin, y_max + margin]
+            
+            ax.imshow(rgb_background, extent=extent, aspect='auto', alpha=0.4, origin='lower')
+        except Exception as e:
+            print(f"Warning: Could not display RGB background: {e}")
+            extent = None
         
         # Plot each latent's trajectory
-        for lat_idx in indices:
-            # Get path for this latent
+        for lat_idx in range(num_latents):
             path = np.array([traj_np[layer][lat_idx] for layer in range(num_layers)])
             
-            # Plot initial position (black dot)
-            ax.scatter(
-                path[0, 0], path[0, 1],
-                c=self.trajectory_colors[0],
-                s=15,
-                zorder=10,
-                alpha=0.8
-            )
-            
-            # Plot each subsequent layer
-            for layer in range(1, num_layers):
-                color = self.trajectory_colors[min(layer, len(self.trajectory_colors) - 1)]
-                
-                # Draw line from previous position to current
+            # Draw trajectory lines between consecutive layers
+            for layer in range(num_layers - 1):
                 ax.plot(
-                    [path[layer - 1, 0], path[layer, 0]],
-                    [path[layer - 1, 1], path[layer, 1]],
-                    color=color,
-                    linewidth=1.0,
+                    [path[layer, 0], path[layer + 1, 0]],
+                    [path[layer, 1], path[layer + 1, 1]],
+                    color=colors[layer + 1],
+                    linewidth=1.5,
                     alpha=0.7,
                     zorder=5
                 )
+            
+            # Draw points at each layer position
+            for layer in range(num_layers):
+                if layer == 0:
+                    marker_size = 40
+                    edge_color = 'white'
+                    edge_width = 1.5
+                elif layer == num_layers - 1:
+                    marker_size = 80
+                    edge_color = 'white'
+                    edge_width = 2
+                else:
+                    marker_size = 25
+                    edge_color = 'none'
+                    edge_width = 0
                 
-                # Draw dot at current position
                 ax.scatter(
                     path[layer, 0], path[layer, 1],
-                    c=color,
-                    s=12,
+                    c=colors[layer],
+                    s=marker_size,
+                    marker='o',
+                    edgecolors=edge_color,
+                    linewidths=edge_width,
                     zorder=10,
                     alpha=0.9
                 )
         
         # Create legend
         legend_elements = []
-        layer_names = ['Initial (L0)', 'Layer 1', 'Layer 2', 'Layer 3', 'Layer 4', 
-                       'Layer 5', 'Layer 6', 'Layer 7']
-        for layer in range(min(num_layers, len(self.trajectory_colors))):
-            color = self.trajectory_colors[layer]
-            name = layer_names[layer] if layer < len(layer_names) else f'Layer {layer}'
+        for layer in range(num_layers):
+            label = f'Layer {layer}' if layer > 0 else 'Initial'
             legend_elements.append(
-                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color,
-                          markersize=8, label=name)
+                plt.Line2D([0], [0], marker='o', color='w',
+                          markerfacecolor=colors[layer],
+                          markersize=8 if layer in [0, num_layers-1] else 6,
+                          label=label)
             )
         
-        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=9, framealpha=0.9)
         
-        # Compute stats for title
+        # Compute displacement stats for title
         total_disp = traj_np[-1] - traj_np[0]
         mean_disp = np.mean(np.linalg.norm(total_disp, axis=-1))
         max_disp = np.max(np.linalg.norm(total_disp, axis=-1))
@@ -633,7 +382,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         ax.set_title(
             f'Latent Trajectories - Sample {sample_idx}, Epoch {epoch}\n'
             f'{num_latents} latents, {num_layers} layers | '
-            f'Mean Δ: {mean_disp:.3f}m, Max Δ: {max_disp:.3f}m',
+            f'Mean Δ: {mean_disp:.2f}m, Max Δ: {max_disp:.2f}m',
             fontsize=14,
             fontweight='bold'
         )
@@ -643,41 +392,25 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         plt.tight_layout()
         return fig
     
-    def _compute_trajectory_stats(self, trajectory: list) -> dict:
-        """Compute statistics about latent trajectories."""
-        traj = [t[0].detach().cpu() for t in trajectory]
-        
-        # Total displacement
-        total_delta = traj[-1] - traj[0]
-        total_magnitude = torch.norm(total_delta, dim=-1)
-        
-        stats = {
-            'mean_total': total_magnitude.mean().item(),
-            'max_total': total_magnitude.max().item(),
-            'min_total': total_magnitude.min().item(),
-            'std_total': total_magnitude.std().item(),
-        }
-        
-        # Per-layer stats
-        for layer in range(1, len(traj)):
-            delta = traj[layer] - traj[layer - 1]
-            magnitude = torch.norm(delta, dim=-1)
-            stats[f'mean_layer_{layer}'] = magnitude.mean().item()
-        
-        return stats
-    
-    def _create_mae_figure(self, original_image, target, reconstruction, mask,
-                          sample_idx, epoch, mse, mae):
+    def _create_mae_figure(
+        self,
+        original_image,
+        target: torch.Tensor,
+        reconstruction: torch.Tensor,
+        sample_idx: int,
+        epoch: int,
+        mse: float,
+        mae: float
+    ) -> plt.Figure:
         """Create MAE reconstruction visualization figure with RGB, NIR, and Elevation."""
         
         # Spatial dimensions
         h, w, c = 512, 512, 5
         
-        # Reshape target and reconstruction using einops rearrange
+        # Reshape target and reconstruction
         try:
             target_spatial = rearrange(target, "(c h w) -> c h w", h=h, w=w, c=c)
             reconstruction_spatial = rearrange(reconstruction, "(c h w) -> c h w", h=h, w=w, c=c)
-            
         except Exception as e:
             print(f"Warning: Could not reshape target/reconstruction: {e}")
             print(f"Target shape: {target.shape}, Reconstruction shape: {reconstruction.shape}")
@@ -754,7 +487,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         plt.tight_layout()
         return fig
     
-    def _create_rgb_from_image(self, image):
+    def _create_rgb_from_image(self, image) -> np.ndarray:
         """Create RGB composite from image array."""
         if len(image.shape) == 3 and image.shape[2] >= 3:
             rgb_composite = np.stack([
@@ -772,7 +505,7 @@ class MAE_CustomVisualizationCallback(pl.Callback):
         
         return normalized.permute(1, 2, 0).numpy()
     
-    def _create_rgb_from_reconstruction(self, reconstruction_spatial):
+    def _create_rgb_from_reconstruction(self, reconstruction_spatial: torch.Tensor) -> np.ndarray:
         """Create RGB composite from reconstructed channels."""
         rgb_composite = torch.stack([
             reconstruction_spatial[2],  # Red

@@ -1,27 +1,28 @@
 """
-Hybrid Self-Attention with Attention-Guided Displacement
+Hybrid Self-Attention with Explicit Displacement + Learned Weights
 
-Key insight: Use attention patterns to guide latent displacement.
-- Attention provides NON-ZERO base signal (softmax guarantee)
-- MLP learns corrections/refinements
-- Even if MLP collapses to zero, attention still provides reasonable displacement
+Key Design Principles:
+1. EXPLICIT SIGNALS provide DIRECTIONS (similarity-based repulsion, attention-based attraction)
+2. MLP learns per-latent WEIGHTS for those directions (not directions themselves!)
+3. Fully interpretable: each component has clear semantic meaning
+4. Easy to ablate: can disable MLP modulation to test explicit-only
 
-Architecture matches SelfAttentionWithGaussianBias + learnable position updates.
+Why MLP outputs weights, not directions:
+- MLP only sees latent features, NOT neighbor positions/features
+- Therefore MLP CANNOT compute meaningful directions
+- But MLP CAN learn "given my content, how much should I trust attraction vs repulsion?"
 
 Usage:
     hybrid = HybridSelfAttentionWithDisplacement(
         dim=512,
-        pos_encoder=token_processor.pos_encoder,
+        pos_encoder=pos_encoder,
         k=64,
         enable_displacement=True,
-        max_displacement=5.0,
-        ...
+        use_mlp_weights=True,  # Set False for explicit-only (ablation)
     )
     
     cache = hybrid.compute_cache(spatial_coords)
-    latents, new_positions, disp_stats = hybrid(
-        latents, cache, num_spatial, current_positions
-    )
+    latents, displacement, stats = hybrid(latents, cache, num_spatial, positions)
 """
 
 import torch
@@ -31,25 +32,77 @@ import math
 from typing import Optional, Tuple, Dict, Any, List
 from einops import rearrange
 
-from .nn_comp import FeedForward, CrossAttention
+from .nn_comp import FeedForward
 
 
 # =============================================================================
-# ATTENTION-GUIDED DISPLACEMENT MODULE
+# EXPLICIT SIGNAL COMPUTATION
 # =============================================================================
 
-class AttentionGuidedDisplacement(nn.Module):
+def compute_explicit_signals(
+    latents: torch.Tensor,            # [B, L_s, D]
+    neighbor_features: torch.Tensor,  # [B, L_s, k, D]
+    neighbor_positions: torch.Tensor, # [B, L_s, k, 2]
+    current_positions: torch.Tensor,  # [B, L_s, 2]
+) -> Dict[str, torch.Tensor]:
     """
-    Predicts displacement from attention patterns + MLP correction.
+    Compute explicit (non-learned) signals from features and positions.
     
-    Key properties:
-    - Attention provides base signal that NEVER collapses to zero
-    - MLP is initialized to zero, learns corrections over time
-    - Learnable weights control attention vs MLP contribution
+    These are EXPERT PRIORS - meaningful from epoch 1, no training required!
     
-    Training dynamics:
-    - Early: MLP ≈ 0, displacement ≈ attention-weighted center of mass
-    - Late: MLP learns refinements, weights shift as needed
+    Returns:
+        similarity: [B, L_s, k] - cosine similarity with each neighbor
+        complexity: [B, L_s] - feature complexity (normalized std)
+        uniqueness: [B, L_s] - how different from neighbors (1 - mean similarity)
+        distances: [B, L_s, k] - distance to each neighbor
+        delta: [B, L_s, k, 2] - vector to each neighbor
+    """
+    B, L_s, D = latents.shape
+    k = neighbor_features.shape[2]
+    
+    # === 1. Similarity with neighbors ===
+    latents_exp = latents.unsqueeze(2)  # [B, L_s, 1, D]
+    similarity = F.cosine_similarity(latents_exp, neighbor_features, dim=-1)  # [B, L_s, k]
+    
+    # === 2. Feature complexity (high std = rich content) ===
+    feature_std = latents.std(dim=-1)  # [B, L_s]
+    std_min = feature_std.min(dim=-1, keepdim=True)[0]
+    std_max = feature_std.max(dim=-1, keepdim=True)[0]
+    complexity = (feature_std - std_min) / (std_max - std_min + 1e-8)
+    
+    # === 3. Uniqueness (high = different from neighbors) ===
+    uniqueness = 1 - similarity.mean(dim=-1)  # [B, L_s]
+    
+    # === 4. Distances and directions ===
+    delta = neighbor_positions - current_positions.unsqueeze(2)  # [B, L_s, k, 2]
+    distances = delta.norm(dim=-1)  # [B, L_s, k]
+    
+    return {
+        'similarity': similarity,
+        'complexity': complexity,
+        'uniqueness': uniqueness,
+        'distances': distances,
+        'delta': delta,
+    }
+
+
+# =============================================================================
+# EXPLICIT DISPLACEMENT WITH LEARNED WEIGHTS
+# =============================================================================
+
+class ExplicitDisplacementWithLearnedWeights(nn.Module):
+    """
+    Displacement predictor where:
+    - DIRECTIONS come from explicit signals (attraction, repulsion)
+    - WEIGHTS come from MLP (content-dependent modulation)
+    
+    This is more principled than MLP outputting directions because:
+    - MLP can't see neighbors, so it CAN'T compute directions
+    - But MLP CAN learn when to trust each direction based on content
+    
+    Ablation modes:
+    - use_mlp_weights=True: Full model with learned weight modulation
+    - use_mlp_weights=False: Explicit signals only with global weights
     """
     
     def __init__(
@@ -57,132 +110,199 @@ class AttentionGuidedDisplacement(nn.Module):
         dim: int,
         num_heads: int,
         max_displacement: float = 5.0,
-        mlp_hidden_ratio: float = 0.25,
-        init_attn_weight: float = 1.0,
-        init_mlp_weight: float = -2.0,
+        use_mlp_weights: bool = True,
+        importance_weight: float = 0.8,
     ):
-        """
-        Args:
-            dim: Latent dimension
-            num_heads: Number of attention heads
-            max_displacement: Maximum displacement in meters
-            mlp_hidden_ratio: Hidden dim = dim * ratio
-            init_attn_weight: Initial log-weight for attention (exp(1) ≈ 2.7)
-            init_mlp_weight: Initial log-weight for MLP (exp(-2) ≈ 0.1)
-        """
         super().__init__()
         
         self.num_heads = num_heads
         self.max_displacement = max_displacement
+        self.use_mlp_weights = use_mlp_weights
         
-        # === Head importance weights ===
-        # Learn which heads contain positional vs semantic information
+        # === Attention head importance (which heads for attraction) ===
         self.head_weights = nn.Parameter(torch.zeros(num_heads))
         
-        # === MLP correction network ===
-        hidden_dim = int(dim * mlp_hidden_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 2),
-        )
-        # Initialize MLP to output near-zero
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        # === Repulsion temperature (sharpness) ===
+        self.repulsion_temperature = nn.Parameter(torch.tensor(1.0))
         
-        # === Learnable balance between attention and MLP ===
-        # Using log-space for numerical stability
-        self.log_attn_weight = nn.Parameter(torch.tensor(init_attn_weight))
-        self.log_mlp_weight = nn.Parameter(torch.tensor(init_mlp_weight))
+        # === Global base weights ===
+        self.log_base_attn = nn.Parameter(torch.tensor(1.0))      # exp(1) ≈ 2.7
+        self.log_base_repulsion = nn.Parameter(torch.tensor(0.0)) # exp(0) = 1.0
+        
+        # === Importance strength (how much complexity+uniqueness reduces movement) ===
+        self.importance_strength = nn.Parameter(torch.tensor(importance_weight))
+        
+        # === MLP for per-latent weight modulation ===
+        if use_mlp_weights:
+            self.weight_mlp = nn.Sequential(
+                nn.Linear(dim, dim // 4),
+                nn.GELU(),
+                nn.LayerNorm(dim // 4),
+                nn.Linear(dim // 4, 3),  # [w_attn_mod, w_repulsion_mod, scale_mod]
+            )
+            # Initialize to output ~0 → sigmoid(0)=0.5 → modulation ≈ 1.0
+            nn.init.zeros_(self.weight_mlp[-1].weight)
+            nn.init.zeros_(self.weight_mlp[-1].bias)
+        else:
+            self.weight_mlp = None
     
     def forward(
         self,
-        latents: torch.Tensor,           # [B, L_s, D]
-        attn_weights: torch.Tensor,      # [B, H, L_s, 1+k+G]
+        latents: torch.Tensor,            # [B, L_s, D]
+        attn_weights: torch.Tensor,       # [B, H, L_s, 1+k+G]
+        neighbor_features: torch.Tensor,  # [B, L_s, k, D]
         neighbor_positions: torch.Tensor, # [B, L_s, k, 2]
         current_positions: torch.Tensor,  # [B, L_s, 2]
         k: int,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        Compute displacement for each spatial latent.
+        Compute displacement using explicit directions + learned weights.
         
-        Args:
-            latents: Spatial latent features
-            attn_weights: Attention weights from spatial local attention
-            neighbor_positions: Positions of k-NN neighbors
-            current_positions: Current latent positions
-            k: Number of neighbors
-            
         Returns:
-            displacement: [B, L_s, 2] displacement in meters
-            stats: Dictionary with diagnostic information
+            displacement: [B, L_s, 2]
+            stats: dict with interpretable diagnostics
         """
         B, L_s, D = latents.shape
-        device = latents.device
         
         # =====================================================================
-        # 1. Attention-based displacement (NEVER zero due to softmax)
+        # 1. EXPLICIT SIGNALS (no learning, meaningful from epoch 1)
         # =====================================================================
+        signals = compute_explicit_signals(
+            latents, neighbor_features, neighbor_positions, current_positions
+        )
         
-        # Extract attention to spatial neighbors only (skip self at 0, skip global at end)
+        # =====================================================================
+        # 2. ATTRACTION DIRECTION (from attention patterns)
+        # =====================================================================
         neighbor_attn = attn_weights[:, :, :, 1:1+k]  # [B, H, L_s, k]
         
-        # Compute head importance (softmax ensures all heads contribute)
+        # Weight attention heads by learned importance
         head_importance = F.softmax(self.head_weights, dim=0)  # [H]
-        
-        # Weighted average across heads
-        # [H] x [B, H, L_s, k] -> [B, L_s, k]
         weighted_attn = torch.einsum('h, b h l k -> b l k', head_importance, neighbor_attn)
-        
-        # Normalize to sum to 1 (proper probability distribution over neighbors)
         weighted_attn = weighted_attn / (weighted_attn.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Compute weighted center of mass
-        # [B, L_s, k] x [B, L_s, k, 2] -> [B, L_s, 2]
+        # Compute weighted center of attended neighbors
         weighted_center = torch.einsum('b l k, b l k d -> b l d', weighted_attn, neighbor_positions)
-        
-        # Attention-based displacement: move towards weighted center
-        attn_displacement = weighted_center - current_positions  # [B, L_s, 2]
+        attraction = weighted_center - current_positions  # [B, L_s, 2]
         
         # =====================================================================
-        # 2. MLP correction (can be zero, that's OK)
+        # 3. REPULSION DIRECTION (from similarity - explicit!)
         # =====================================================================
+        # Direction away from each neighbor (unit vectors)
+        direction_away = -signals['delta'] / (signals['distances'].unsqueeze(-1) + 1e-8)
         
-        mlp_displacement = self.mlp(latents)  # [B, L_s, 2]
+        # Repulsion strength: high similarity + close = strong repulsion
+        temp = self.repulsion_temperature.abs() + 1e-8
+        similarity_factor = torch.exp(signals['similarity'] / temp)
+        distance_factor = 1.0 / (signals['distances'] + 0.1)
+        
+        repulsion_strength = similarity_factor * distance_factor
+        repulsion_strength = repulsion_strength / (repulsion_strength.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # Weighted sum of repulsion directions
+        repulsion = torch.einsum('b l k, b l k d -> b l d', repulsion_strength, direction_away)
         
         # =====================================================================
-        # 3. Combine with learnable weights
+        # 4. IMPORTANCE (explicit: complexity + uniqueness)
         # =====================================================================
-        
-        w_attn = self.log_attn_weight.exp()
-        w_mlp = self.log_mlp_weight.exp()
-        
-        # Weighted combination (normalized)
-        total_weight = w_attn + w_mlp + 1e-8
-        combined = (w_attn * attn_displacement + w_mlp * mlp_displacement) / total_weight
+        importance = 0.5 * signals['complexity'] + 0.5 * signals['uniqueness']
+        imp_strength = torch.sigmoid(self.importance_strength)
+        explicit_scale = 1.0 - imp_strength * importance  # [B, L_s]
         
         # =====================================================================
-        # 4. Constrain magnitude
+        # 5. WEIGHT MODULATION (learned, content-dependent)
         # =====================================================================
+        base_attn = self.log_base_attn.exp()
+        base_repulsion = self.log_base_repulsion.exp()
         
-        # Soft constraint using tanh
+        if self.use_mlp_weights and self.weight_mlp is not None:
+            # MLP predicts per-latent weight modulation
+            weight_mods = self.weight_mlp(latents)  # [B, L_s, 3]
+            
+            # Modulation factors: sigmoid → [0, 1], then scale to [0, 2]
+            # This allows both suppressing (×0.5) and amplifying (×1.5) base weights
+            w_attn_mod = 2 * torch.sigmoid(weight_mods[..., 0])      # [B, L_s]
+            w_repulsion_mod = 2 * torch.sigmoid(weight_mods[..., 1]) # [B, L_s]
+            scale_mod = torch.sigmoid(weight_mods[..., 2])           # [B, L_s]
+            
+            # Per-latent weights = base × modulation
+            w_attn = base_attn * w_attn_mod
+            w_repulsion = base_repulsion * w_repulsion_mod
+            final_scale = explicit_scale * scale_mod
+        else:
+            # Ablation: no MLP, just global weights
+            w_attn = base_attn * torch.ones(B, L_s, device=latents.device)
+            w_repulsion = base_repulsion * torch.ones(B, L_s, device=latents.device)
+            w_attn_mod = torch.ones(B, L_s, device=latents.device)
+            w_repulsion_mod = torch.ones(B, L_s, device=latents.device)
+            scale_mod = torch.ones(B, L_s, device=latents.device)
+            final_scale = explicit_scale
+        
+        # =====================================================================
+        # 6. COMBINE DIRECTIONS WITH WEIGHTS
+        # =====================================================================
+        total_w = w_attn + w_repulsion + 1e-8
+        
+        combined = (
+            w_attn.unsqueeze(-1) * attraction +
+            w_repulsion.unsqueeze(-1) * repulsion
+        ) / total_w.unsqueeze(-1)
+        
+        # Apply importance scaling (explicit) × learned scale
+        combined = combined * final_scale.unsqueeze(-1)
+        
+        # =====================================================================
+        # 7. CONSTRAIN MAGNITUDE
+        # =====================================================================
         displacement = torch.tanh(combined / self.max_displacement) * self.max_displacement
         
         # =====================================================================
-        # 5. Compute diagnostics
+        # 8. DIAGNOSTICS (all interpretable!)
         # =====================================================================
-        
         with torch.no_grad():
             stats = {
-                'attn_disp_magnitude': attn_displacement.norm(dim=-1).mean().item(),
-                'mlp_disp_magnitude': mlp_displacement.norm(dim=-1).mean().item(),
-                'final_disp_magnitude': displacement.norm(dim=-1).mean().item(),
-                'w_attn': w_attn.item(),
-                'w_mlp': w_mlp.item(),
-                'w_attn_fraction': (w_attn / total_weight).item(),
+                # Directions (explicit)
+                'attraction_magnitude': attraction.norm(dim=-1).mean().item(),
+                'repulsion_magnitude': repulsion.norm(dim=-1).mean().item(),
+                'final_displacement_magnitude': displacement.norm(dim=-1).mean().item(),
+                
+                # Global weights
+                'base_w_attn': base_attn.item(),
+                'base_w_repulsion': base_repulsion.item(),
+                
+                # Per-latent weight modulation (if MLP enabled)
+                'w_attn_mod_mean': w_attn_mod.mean().item(),
+                'w_repulsion_mod_mean': w_repulsion_mod.mean().item(),
+                'w_attn_mod_std': w_attn_mod.std().item(),
+                'w_repulsion_mod_std': w_repulsion_mod.std().item(),
+                'scale_mod_mean': scale_mod.mean().item(),
+                
+                # Effective per-latent weights
+                'w_attn_effective_mean': w_attn.mean().item(),
+                'w_repulsion_effective_mean': w_repulsion.mean().item(),
+                'w_attn_fraction': (w_attn / total_w).mean().item(),
+                
+                # Explicit signals
+                'similarity_mean': signals['similarity'].mean().item(),
+                'complexity_mean': signals['complexity'].mean().item(),
+                'uniqueness_mean': signals['uniqueness'].mean().item(),
+                'importance_mean': importance.mean().item(),
+                
+                # Scaling
+                'explicit_scale_mean': explicit_scale.mean().item(),
+                'final_scale_mean': final_scale.mean().item(),
+                
+                # Parameters
+                'repulsion_temperature': temp.item(),
+                'importance_strength': imp_strength.item(),
                 'head_importance': head_importance.tolist(),
-                'max_displacement_used': displacement.norm(dim=-1).max().item(),
+                
+                # For visualization (per-latent tensors)
+                'similarity_per_latent': signals['similarity'].mean(dim=-1),  # [B, L_s]
+                'complexity_per_latent': signals['complexity'],                # [B, L_s]
+                'uniqueness_per_latent': signals['uniqueness'],                # [B, L_s]
+                'importance_per_latent': importance,                           # [B, L_s]
+                'movement_scale_per_latent': final_scale,                      # [B, L_s]
             }
         
         return displacement, stats
@@ -194,8 +314,7 @@ class AttentionGuidedDisplacement(nn.Module):
 
 class LocalAttentionCache(nn.Module):
     """
-    Computes k-NN, distances, and RPE for local self-attention.
-    Also stores neighbor positions for displacement computation.
+    Computes k-NN, distances, RPE, and neighbor positions for local attention.
     """
     
     def __init__(
@@ -216,13 +335,6 @@ class LocalAttentionCache(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Compute k-nearest neighbors, RPE, distances, and neighbor positions.
-        
-        Returns cache dict with:
-            - topk_indices: [B, L, k]
-            - rpe: [B, L, k, pe_dim]
-            - self_rpe: [B, L, 1, pe_dim]
-            - distances: [B, L, k]
-            - neighbor_positions: [B, L, k, 2]  <- NEW for displacement
         """
         B, L, _ = positions.shape
         device = positions.device
@@ -246,34 +358,33 @@ class LocalAttentionCache(nn.Module):
         # Gather neighbor positions
         idx_exp = topk_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
         positions_exp = positions.unsqueeze(1).expand(-1, L, -1, -1)
-        neighbor_positions = torch.gather(positions_exp, dim=2, index=idx_exp)  # [B, L, k, 2]
+        neighbor_positions = torch.gather(positions_exp, dim=2, index=idx_exp)
         
         # Compute delta for RPE
         delta = neighbor_positions - positions.unsqueeze(2)
         delta_x = delta[..., 0]
         delta_y = delta[..., 1]
         
-        # Distances for Gaussian bias
+        # Distances
         distances = torch.sqrt(delta_x**2 + delta_y**2 + 1e-8)
         
-        # RPE for neighbors: [B, L, k, pe_dim]
+        # RPE for neighbors
         rpe = self.pos_encoder(delta_x, delta_y, physical_scale, gsd=None)
         
-        # Self-RPE: should be [B, L, 1, pe_dim]
+        # Self-RPE
         self_delta_x = torch.zeros(B, L, 1, device=device, dtype=dtype)
         self_delta_y = torch.zeros(B, L, 1, device=device, dtype=dtype)
         self_rpe = self.pos_encoder(self_delta_x, self_delta_y, physical_scale, gsd=None)
         
-        # Ensure 4D shape (pos_encoder might squeeze singleton dim)
         if self_rpe.dim() == 3:
-            self_rpe = self_rpe.unsqueeze(2)  # [B, L, pe_dim] -> [B, L, 1, pe_dim]
+            self_rpe = self_rpe.unsqueeze(2)
         
         return {
             'topk_indices': topk_indices,
             'rpe': rpe,
             'self_rpe': self_rpe,
             'distances': distances,
-            'neighbor_positions': neighbor_positions,  # NEW
+            'neighbor_positions': neighbor_positions,
         }
     
     def get_output_dim(self) -> int:
@@ -281,20 +392,13 @@ class LocalAttentionCache(nn.Module):
 
 
 # =============================================================================
-# SPATIAL LOCAL ATTENTION (returns attention weights for displacement)
+# SPATIAL LOCAL ATTENTION
 # =============================================================================
 
 class SpatialLocalAttention(nn.Module):
     """
     Local self-attention for spatial latents.
-    Returns attention weights for use in displacement computation.
-    
-    With RPE enabled (default), attention is direction-aware:
-    - Gaussian bias encodes distance (scalar)
-    - RPE encodes distance + direction (r, θ)
-    
-    This directional information helps displacement prediction
-    by allowing heads to specialize in different directions.
+    Returns attention weights + neighbor features for displacement computation.
     """
     
     def __init__(
@@ -304,7 +408,7 @@ class SpatialLocalAttention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
-        use_rpe: bool = True,  # Default True for directional awareness
+        use_rpe: bool = True,
         use_gaussian_bias: bool = True,
         sigma_init: float = 3.0,
         learnable_sigma: bool = True,
@@ -355,20 +459,10 @@ class SpatialLocalAttention(nn.Module):
         distances: torch.Tensor,
         global_latents: Optional[torch.Tensor] = None,
         return_attn: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return_neighbor_features: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Args:
-            spatial: [B, L_s, D]
-            topk_indices: [B, L_s, k]
-            rpe: [B, L_s, k, pe_dim] or None
-            self_rpe: [B, L_s, 1, pe_dim] or None
-            distances: [B, L_s, k]
-            global_latents: [B, G, D] or None
-            return_attn: If True, return attention weights
-            
-        Returns:
-            output: [B, L_s, D]
-            attn_weights: [B, H, L_s, 1+k+G] if return_attn else None
+        Forward pass with optional attention weights and neighbor features.
         """
         B, L_s, D = spatial.shape
         k = topk_indices.shape[-1]
@@ -378,18 +472,17 @@ class SpatialLocalAttention(nn.Module):
         
         G = global_latents.shape[1] if global_latents is not None else 0
         
-        # === Build context: [self, k neighbors, global] ===
-        
         # Gather k-NN neighbors
         idx_exp = topk_indices.unsqueeze(-1).expand(-1, -1, -1, D)
         spatial_exp = spatial.unsqueeze(1).expand(-1, L_s, -1, -1)
         neighbors = torch.gather(spatial_exp, dim=2, index=idx_exp)
         
-        # Add self
-        self_feat = spatial.unsqueeze(2)
-        context = torch.cat([self_feat, neighbors], dim=2)  # [B, L_s, 1+k, D]
+        neighbor_features_out = neighbors.clone() if return_neighbor_features else None
         
-        # Add global
+        # Build context: [self, k neighbors, global]
+        self_feat = spatial.unsqueeze(2)
+        context = torch.cat([self_feat, neighbors], dim=2)
+        
         if G > 0:
             global_exp = global_latents.unsqueeze(1).expand(-1, L_s, -1, -1)
             context = torch.cat([context, global_exp], dim=2)
@@ -409,9 +502,7 @@ class SpatialLocalAttention(nn.Module):
                 rpe_cat = torch.cat([rpe_cat, global_rpe], dim=2)
             context = torch.cat([context, rpe_cat], dim=-1)
         
-        # === Attention ===
-        ctx_size = 1 + k + G
-        
+        # Attention
         Q = self.to_q(spatial)
         K = self.to_k(context)
         V = self.to_v(context)
@@ -434,15 +525,15 @@ class SpatialLocalAttention(nn.Module):
             if G > 0 and self.global_bias is not None:
                 attn[:, :, :, 1+k:] = attn[:, :, :, 1+k:] + self.global_bias
         
-        attn_weights = F.softmax(attn, dim=-1)  # [B, H, L_s, 1+k+G]
+        attn_weights = F.softmax(attn, dim=-1)
         out = torch.einsum('b h l c, b h l c d -> b h l d', attn_weights, V)
         
         out = rearrange(out, 'b h l d -> b l (h d)')
         out = self.to_out(out)
         
-        if return_attn:
-            return out, attn_weights
-        return out, None
+        attn_out = attn_weights if return_attn else None
+        
+        return out, attn_out, neighbor_features_out
 
 
 # =============================================================================
@@ -490,7 +581,6 @@ class GlobalFullAttention(nn.Module):
         spatial_latents: torch.Tensor,
     ) -> torch.Tensor:
         B, G, D = global_latents.shape
-        L_s = spatial_latents.shape[1]
         H = self.heads
         
         context = torch.cat([spatial_latents, global_latents], dim=1)
@@ -521,16 +611,13 @@ class GlobalFullAttention(nn.Module):
 
 class HybridSelfAttentionBlockWithDisplacement(nn.Module):
     """
-    Self-attention block with integrated displacement prediction.
+    Self-attention block with integrated displacement.
     
     Architecture:
-    1. Spatial local attention (with global in context), return attn weights
-    2. Predict displacement from attention weights + MLP
+    1. Spatial local attention → attn_weights + neighbor_features
+    2. Displacement from explicit signals + learned weights
     3. Global full attention
-    4. FeedForward for both
-    
-    With RPE enabled (default), attention patterns are direction-aware,
-    which helps displacement prediction understand "move LEFT" vs "move RIGHT".
+    4. FeedForward
     """
     
     def __init__(
@@ -541,19 +628,20 @@ class HybridSelfAttentionBlockWithDisplacement(nn.Module):
         dim_head: int = 64,
         ff_mult: int = 4,
         dropout: float = 0.0,
-        use_rpe: bool = True,  # Default True for directional awareness
+        use_rpe: bool = True,
         use_gaussian_bias: bool = True,
         sigma_init: float = 3.0,
         learnable_sigma: bool = True,
         has_global: bool = True,
         enable_displacement: bool = True,
         max_displacement: float = 5.0,
+        use_mlp_weights: bool = True,
     ):
         super().__init__()
         self.has_global = has_global
         self.enable_displacement = enable_displacement
         
-        # 1. Spatial local attention
+        # Spatial local attention
         self.spatial_norm = nn.LayerNorm(dim)
         self.spatial_attn = SpatialLocalAttention(
             dim=dim,
@@ -569,17 +657,18 @@ class HybridSelfAttentionBlockWithDisplacement(nn.Module):
         self.spatial_ff_norm = nn.LayerNorm(dim)
         self.spatial_ff = FeedForward(dim, mult=ff_mult, dropout=dropout)
         
-        # 2. Displacement predictor (optional)
+        # Displacement predictor
         if enable_displacement:
-            self.displacement_predictor = AttentionGuidedDisplacement(
+            self.displacement_predictor = ExplicitDisplacementWithLearnedWeights(
                 dim=dim,
                 num_heads=heads,
                 max_displacement=max_displacement,
+                use_mlp_weights=use_mlp_weights,
             )
         else:
             self.displacement_predictor = None
         
-        # 3. Global attention
+        # Global attention
         if has_global:
             self.global_norm = nn.LayerNorm(dim)
             self.global_attn = GlobalFullAttention(
@@ -598,18 +687,9 @@ class HybridSelfAttentionBlockWithDisplacement(nn.Module):
         cache: Dict[str, torch.Tensor],
         num_spatial: int,
         current_positions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         """
-        Args:
-            latents: [B, L_total, D]
-            cache: dict with topk_indices, rpe, self_rpe, distances, neighbor_positions
-            num_spatial: L_s
-            current_positions: [B, L_s, 2]
-            
-        Returns:
-            latents: [B, L_total, D]
-            displacement: [B, L_s, 2] or None
-            disp_stats: dict
+        Forward pass.
         """
         L_s = num_spatial
         k = cache['topk_indices'].shape[-1]
@@ -617,34 +697,38 @@ class HybridSelfAttentionBlockWithDisplacement(nn.Module):
         spatial = latents[:, :L_s]
         global_ = latents[:, L_s:] if latents.shape[1] > L_s else None
         
-        # 1. Spatial attention (return attention weights)
-        spatial_out, attn_weights = self.spatial_attn(
+        # Spatial attention
+        need_disp_info = self.enable_displacement and self.displacement_predictor is not None
+        
+        spatial_out, attn_weights, neighbor_features = self.spatial_attn(
             self.spatial_norm(spatial),
             cache['topk_indices'],
             cache.get('rpe'),
             cache.get('self_rpe'),
             cache['distances'],
             global_latents=global_,
-            return_attn=True,
+            return_attn=need_disp_info,
+            return_neighbor_features=need_disp_info,
         )
         spatial = spatial + spatial_out
         
-        # 2. Predict displacement (if enabled)
+        # Displacement
         displacement = None
         disp_stats = {}
-        if self.enable_displacement and self.displacement_predictor is not None:
+        if need_disp_info:
             displacement, disp_stats = self.displacement_predictor(
-                spatial,  # Use updated spatial features
+                spatial,
                 attn_weights,
+                neighbor_features,
                 cache['neighbor_positions'],
                 current_positions,
                 k,
             )
         
-        # 3. FeedForward for spatial
+        # FeedForward for spatial
         spatial = spatial + self.spatial_ff(self.spatial_ff_norm(spatial))
         
-        # 4. Global attention
+        # Global attention
         if self.has_global and global_ is not None and global_.shape[1] > 0:
             global_ = global_ + self.global_attn(
                 self.global_norm(global_),
@@ -667,21 +751,15 @@ class HybridSelfAttentionBlockWithDisplacement(nn.Module):
 
 class HybridSelfAttentionWithDisplacement(nn.Module):
     """
-    Hybrid self-attention with attention-guided displacement.
+    Hybrid self-attention with explicit displacement + learned weights.
     
-    Key features:
-    - Spatial: Q=spatial, K/V=[self, k-NN, global] - local attention
-    - Global: Q=global, K/V=[ALL spatial, global] - full attention
-    - Displacement: Attention patterns + MLP correction
-    - RPE: Direction-aware attention (enabled by default)
+    Key Design:
+    - DIRECTIONS from explicit signals (attention-based attraction, similarity-based repulsion)
+    - WEIGHTS from MLP (content-dependent modulation of directions)
     
-    With RPE enabled, attention heads can specialize:
-    - Some heads focus on semantic similarity
-    - Some heads focus on specific directions (LEFT, RIGHT, etc.)
-    
-    This directional awareness significantly helps displacement prediction.
-    
-    Memory: O(L_s × (k+1+G) + G × (L_s+G))
+    Ablation-friendly:
+    - use_mlp_weights=False → test explicit-only baseline
+    - enable_displacement=False → test no-displacement baseline
     """
     
     def __init__(
@@ -694,7 +772,7 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
         dim_head: int = 64,
         ff_mult: int = 4,
         dropout: float = 0.0,
-        use_rpe: bool = True,  # Default True for directional awareness
+        use_rpe: bool = True,
         use_gaussian_bias: bool = True,
         sigma_init: float = 3.0,
         learnable_sigma: bool = True,
@@ -703,7 +781,8 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
         share_weights: bool = False,
         enable_displacement: bool = True,
         max_displacement: float = 5.0,
-        displacement_mode: str = 'per_block',  # 'per_block', 'last_only', 'accumulate'
+        displacement_mode: str = 'last_only',
+        use_mlp_weights: bool = True,
     ):
         super().__init__()
         
@@ -713,6 +792,7 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
         self.num_blocks = num_blocks
         self.enable_displacement = enable_displacement
         self.displacement_mode = displacement_mode
+        self.use_mlp_weights = use_mlp_weights
         
         # Cache computation
         self.local_cache = LocalAttentionCache(
@@ -721,11 +801,11 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
         )
         self.pe_dim = self.local_cache.get_output_dim()
         
+        # Determine which blocks have displacement
+        block_has_displacement = self._get_block_displacement_flags(num_blocks)
+        
         # Attention blocks
         if share_weights:
-            # Determine which blocks have displacement
-            block_has_displacement = self._get_block_displacement_flags(num_blocks)
-            
             block = HybridSelfAttentionBlockWithDisplacement(
                 dim=dim,
                 pe_dim=self.pe_dim,
@@ -740,11 +820,10 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
                 has_global=has_global,
                 enable_displacement=enable_displacement,
                 max_displacement=max_displacement,
+                use_mlp_weights=use_mlp_weights,
             )
             self.blocks = nn.ModuleList([block] * num_blocks)
         else:
-            block_has_displacement = self._get_block_displacement_flags(num_blocks)
-            
             self.blocks = nn.ModuleList([
                 HybridSelfAttentionBlockWithDisplacement(
                     dim=dim,
@@ -760,6 +839,7 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
                     has_global=has_global,
                     enable_displacement=block_has_displacement[i],
                     max_displacement=max_displacement,
+                    use_mlp_weights=use_mlp_weights,
                 )
                 for i in range(num_blocks)
             ])
@@ -773,7 +853,7 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
             flags = [False] * num_blocks
             flags[-1] = True
             return flags
-        else:  # 'per_block' or 'accumulate'
+        else:
             return [True] * num_blocks
     
     def compute_cache(
@@ -796,22 +876,15 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
         """
         Forward pass.
         
-        Args:
-            latents: [B, L_total, D]
-            cache: dict from compute_cache
-            num_spatial: L_s
-            current_positions: [B, L_s, 2]
-            
         Returns:
             latents: [B, L_total, D]
-            total_displacement: [B, L_s, 2] or None
-            stats: dict with diagnostics
+            displacement: [B, L_s, 2] or None
+            stats: dict with interpretable diagnostics
         """
         all_stats = {
             'per_block': [],
         }
         
-        # Track displacement based on mode
         if self.displacement_mode == 'accumulate':
             total_displacement = torch.zeros_like(current_positions)
         else:
@@ -825,23 +898,23 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
             block_stats['block_idx'] = i
             all_stats['per_block'].append(block_stats)
             
-            # Handle displacement based on mode
             if block_displacement is not None:
                 if self.displacement_mode == 'accumulate':
                     total_displacement = total_displacement + block_displacement
-                elif self.displacement_mode == 'per_block':
-                    # Return last block's displacement
-                    total_displacement = block_displacement
-                elif self.displacement_mode == 'last_only':
+                else:
                     total_displacement = block_displacement
         
-        # Compute aggregate stats
+        # Aggregate stats
         if self.enable_displacement and len(all_stats['per_block']) > 0:
-            valid_stats = [s for s in all_stats['per_block'] if 'attn_disp_magnitude' in s]
+            valid_stats = [s for s in all_stats['per_block'] if 'attraction_magnitude' in s]
             if valid_stats:
-                all_stats['mean_attn_disp'] = sum(s['attn_disp_magnitude'] for s in valid_stats) / len(valid_stats)
-                all_stats['mean_mlp_disp'] = sum(s['mlp_disp_magnitude'] for s in valid_stats) / len(valid_stats)
-                all_stats['mean_w_attn_fraction'] = sum(s['w_attn_fraction'] for s in valid_stats) / len(valid_stats)
+                all_stats['mean_attraction'] = sum(s['attraction_magnitude'] for s in valid_stats) / len(valid_stats)
+                all_stats['mean_repulsion'] = sum(s['repulsion_magnitude'] for s in valid_stats) / len(valid_stats)
+                all_stats['mean_similarity'] = sum(s['similarity_mean'] for s in valid_stats) / len(valid_stats)
+                all_stats['mean_complexity'] = sum(s['complexity_mean'] for s in valid_stats) / len(valid_stats)
+                all_stats['mean_uniqueness'] = sum(s['uniqueness_mean'] for s in valid_stats) / len(valid_stats)
+                all_stats['mean_w_attn_mod'] = sum(s['w_attn_mod_mean'] for s in valid_stats) / len(valid_stats)
+                all_stats['mean_w_repulsion_mod'] = sum(s['w_repulsion_mod_mean'] for s in valid_stats) / len(valid_stats)
         
         if total_displacement is not None:
             all_stats['total_displacement_magnitude'] = total_displacement.norm(dim=-1).mean().item()
@@ -872,16 +945,19 @@ class HybridSelfAttentionWithDisplacement(nn.Module):
         }
     
     def get_displacement_stats(self) -> Dict[str, Any]:
-        """Get displacement predictor statistics."""
+        """Get displacement predictor parameter statistics."""
         stats = {}
         
         for i, block in enumerate(self.blocks):
             if block.displacement_predictor is not None:
                 pred = block.displacement_predictor
                 stats[f'block_{i}'] = {
-                    'w_attn': pred.log_attn_weight.exp().item(),
-                    'w_mlp': pred.log_mlp_weight.exp().item(),
+                    'base_w_attn': pred.log_base_attn.exp().item(),
+                    'base_w_repulsion': pred.log_base_repulsion.exp().item(),
+                    'repulsion_temperature': pred.repulsion_temperature.abs().item(),
+                    'importance_strength': torch.sigmoid(pred.importance_strength).item(),
                     'head_importance': F.softmax(pred.head_weights, dim=0).tolist(),
+                    'use_mlp_weights': pred.use_mlp_weights,
                 }
         
         return stats
@@ -895,7 +971,7 @@ def create_hybrid_self_attention_with_displacement(
     config: dict,
     pos_encoder: nn.Module,
 ) -> HybridSelfAttentionWithDisplacement:
-    """Factory function."""
+    """Factory function for creating from config."""
     cfg = config.get("Atomiser", config)
     
     return HybridSelfAttentionWithDisplacement(
@@ -907,7 +983,7 @@ def create_hybrid_self_attention_with_displacement(
         dim_head=cfg.get("latent_dim_head", 64),
         ff_mult=cfg.get("ff_mult", 4),
         dropout=cfg.get("attn_dropout", 0.0),
-        use_rpe=cfg.get("use_rpe", True),  # Default True
+        use_rpe=cfg.get("use_rpe", True),
         use_gaussian_bias=cfg.get("use_gaussian_bias", True),
         sigma_init=cfg.get("sigma_init", 3.0),
         learnable_sigma=cfg.get("learnable_sigma", True),
@@ -916,5 +992,6 @@ def create_hybrid_self_attention_with_displacement(
         share_weights=cfg.get("weight_tie_layers", False),
         enable_displacement=cfg.get("enable_displacement", True),
         max_displacement=cfg.get("max_displacement", 5.0),
-        displacement_mode=cfg.get("displacement_mode", "per_block"),
+        displacement_mode=cfg.get("displacement_mode", "last_only"),
+        use_mlp_weights=cfg.get("use_mlp_weights", True),
     )
