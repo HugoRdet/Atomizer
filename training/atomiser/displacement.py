@@ -118,9 +118,9 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
         """Initialize final layer to output small but non-zero values."""
         for pred in self.predictors:
             # Small random weights so network starts with some movement
-            nn.init.normal_(pred[-1].weight, mean=0.0, std=0.03)
+            nn.init.normal_(pred[-1].weight, mean=0.0, std=0.00)
             # Small random bias to break symmetry
-            nn.init.normal_(pred[-1].bias, mean=0.0, std=0.03)
+            nn.init.normal_(pred[-1].bias, mean=0.0, std=0.00)
     
     def forward(self, latents, current_coords, layer_idx) -> Tuple[torch.Tensor, torch.Tensor]:
         # Select predictor
@@ -133,7 +133,7 @@ class MLPDisplacementUpdate(PositionUpdateStrategy):
         raw_displacement = self.predictors[pred_idx](latents)
         
         # Bound with tanh to [-max_displacement, +max_displacement]
-        displacement = torch.tanh(raw_displacement) * self.max_displacement
+        displacement = torch.tanh(raw_displacement) * 10#self.max_displacement
         
         new_coords = current_coords + displacement
 

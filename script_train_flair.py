@@ -91,6 +91,19 @@ model = Model_MAE(
     lookup_table=lookup_table
 )
 
+checkpoint_path = "./checkpoints/Atomiserxp_20251218_173057_5vi9-val_loss-epoch=31-val_loss=0.0290.ckpt"
+
+# Option 1: Load checkpoint with strict=False (recommended)
+#model = Model_MAE.load_from_checkpoint(
+#    checkpoint_path,
+#    strict=False,  # Allow missing keys (displacement MLP is new)
+#    config=config_model,
+#    wand=True,
+#    name=xp_name,
+#    transform=input_processor,
+#    lookup_table=lookup_table
+#)
+
 
 
 data_module = UnifiedDataModule(
@@ -125,6 +138,7 @@ checkpoint_val_mod_train = ModelCheckpoint(
 )
 
 accumulator = GradientAccumulationScheduler(scheduling={0:1})
+gradient_warmup = DisplacementGradientWarmupCallback(start_epoch=10, warmup_epochs=10)
 
 # Trainer
 trainer = Trainer(
@@ -135,7 +149,7 @@ trainer = Trainer(
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train],
+    callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train,gradient_warmup],
     default_root_dir="./checkpoints/",
     
 )
