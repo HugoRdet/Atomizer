@@ -7,7 +7,7 @@ import numpy as np
 from einops import rearrange
 import seaborn as sns
 from typing import Optional, Union, List
-from training.utils.image_utils import *
+from training.utils.datasets.image_utils import *
 
 """
 MAE Visualization Callback with Displacement + Explicit Signals Visualization
@@ -632,7 +632,7 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         """Process a single sample using your get_samples_to_viz function."""
         
         # Get data from your custom method
-        image,image_tokens, attention_mask, mae_tokens, mask_MAE_res,label_res = dataset.get_samples_to_viz(dataset_idx)
+        image,image_tokens, attention_mask, mae_tokens, mask_MAE_res,label_res,latent_pos = dataset.get_samples_to_viz(dataset_idx)
         
         # Move to device
         mae_tokens_mask = torch.ones(mae_tokens.shape[0])
@@ -641,6 +641,7 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         attention_mask = attention_mask.to(device) if attention_mask is not None else None
         mae_tokens = mae_tokens.to(device)
         mask_MAE_res = mask_MAE_res.to(device)
+        latent_pos = latent_pos.to(device)
         
         with torch.no_grad():
             try:
@@ -649,15 +650,19 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
                 image_tokens_mask = attention_mask.unsqueeze(0)
                 mae_tokens_batch = mae_tokens.clone().unsqueeze(0)
                 mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0)
+                latent_pos_batch=latent_pos.unsqueeze(0)
                 
-                y_hat, (bias_matrix,attention_matrix) = pl_module.forward(
+                result = pl_module.forward(
                     image_tokens_batch,
                     image_tokens_mask,
                     mae_tokens_batch,
                     mae_tokens_mask_batch,
+                    latent_pos_batch,
                     training=False,
-                    task="vizualisation"
+                    task="visualization",
                 )
+                
+                y_hat=result['predictions']
 
 
                 
@@ -694,27 +699,9 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         
         # Create and upload visualization
         try:
-            self._create_and_upload_bias_matrix_slices(
-                bias_matrix,
-                slices=[0,110,378],
-                sample_idx=dataset_idx,
-                viz_idx=viz_idx,
-                epoch=epoch,
-                id=id,
-                title_prefix = "Bias Matrix Slices",
-                title="Bias"
-            )
+           
 
-            self._create_and_upload_bias_matrix_slices(
-                attention_matrix,
-                slices=[0,110,378],
-                sample_idx=dataset_idx,
-                viz_idx=viz_idx,
-                epoch=epoch,
-                id=id,
-                title_prefix = "Attention Matrix Slices",
-                title="Attention"
-            )
+          
                 
             self._create_and_upload_segmentation_visualization(
                 sample_idx=dataset_idx,

@@ -124,6 +124,7 @@ class TokenProcessor(nn.Module):
             latent_coords = grid.view(1, L, 1, 2).expand(B, -1, m, -1)
             
         # C. Relative Displacement: [B, L, m]
+        
         delta_x = token_coords[..., 0] - latent_coords[..., 0]
         delta_y = token_coords[..., 1] - latent_coords[..., 1]
 

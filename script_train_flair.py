@@ -2,6 +2,7 @@ from training.perceiver import *
 from training.utils import *
 from training.losses import *
 from training.utils.callbacks import *
+from training.utils.datasets import*
 from training.VIT import *
 from training.ResNet import *
 from collections import defaultdict
@@ -83,7 +84,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # We pass the input_processor where 'transform' used to go
 # Ensure your Model_MAE/__init__ assigns self.input_processor = input_processor
 # AND that Atomiser inside Model_MAE uses it.
-model = Model_MAE(
+model = Model_FLAIR(
     config_model,
     wand=True,
     name=xp_name,
@@ -91,7 +92,7 @@ model = Model_MAE(
     lookup_table=lookup_table
 )
 
-checkpoint_path = "./checkpoints/Atomiserxp_20251218_173057_5vi9-val_loss-epoch=31-val_loss=0.0290.ckpt"
+checkpoint_path = "./checkpoints/Atos_tofine.ckpt"
 
 # Option 1: Load checkpoint with strict=False (recommended)
 #model = Model_MAE.load_from_checkpoint(
@@ -119,7 +120,7 @@ data_module = UnifiedDataModule(
     dataset_class=FLAIR_MAE
 )
 
-reconstruction_callback = MAE_CustomVisualizationCallback(
+reconstruction_callback = FLAIR_CustomSegmentationCallback( #MAE_CustomVisualizationCallback
     config=config_model
 )
 
@@ -138,7 +139,7 @@ checkpoint_val_mod_train = ModelCheckpoint(
 )
 
 accumulator = GradientAccumulationScheduler(scheduling={0:1})
-gradient_warmup = DisplacementGradientWarmupCallback(start_epoch=10, warmup_epochs=10)
+#gradient_warmup = DisplacementGradientWarmupCallback(start_epoch=10, warmup_epochs=10)
 
 # Trainer
 trainer = Trainer(
@@ -149,9 +150,8 @@ trainer = Trainer(
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train,gradient_warmup],
+    callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train],
     default_root_dir="./checkpoints/",
-    
 )
 
 # Fit the model

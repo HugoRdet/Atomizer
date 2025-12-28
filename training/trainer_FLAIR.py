@@ -31,12 +31,14 @@ import seaborn as sns
 from pytorch_optimizer import Lamb
 
 import torch_optimizer as optim
+
+
 class Model_FLAIR(pl.LightningModule):
-    def __init__(self, config, wand, name, transform):
+    def __init__(self, config, wand, name,transform,lookup_table):
         super().__init__()
         self.strict_loading = False
         self.config = config
-        self.transform = transform
+        self.transform=transform
         self.wand = wand
         self.num_classes = config["trainer"]["num_classes"]
         self.logging_step = config["trainer"]["logging_step"]
@@ -46,8 +48,9 @@ class Model_FLAIR(pl.LightningModule):
         self.mode = "training"
         self.multi_modal = config["trainer"]["multi_modal"]
         self.name = name
-        self.table = False
-        self.comment_log = ""
+        self.table=False
+        self.comment_log=""
+        self.lookup_table=lookup_table
         
         # Metrics
         self.metric_IoU_train = torchmetrics.JaccardIndex(task="multiclass", num_classes=self.num_classes, average="macro")
@@ -56,7 +59,7 @@ class Model_FLAIR(pl.LightningModule):
         
         # Model
         if config["encoder"] == "Atomiser":
-            self.encoder = Atomiser(config=self.config, transform=self.transform)
+            self.encoder = Atomiser(config=self.config,lookup_table=self.lookup_table)
         else:
             self.encoder =PerceiverIO(
             depth=8,
@@ -72,18 +75,21 @@ class Model_FLAIR(pl.LightningModule):
             weight_tie_layers = False,
             decoder_ff = False,
             seq_dropout_prob = 0.)
+
+        self.tmp_val_loss = 0
+        self.tmp_val_ap = 0
     
 
         self.loss = nn.CrossEntropyLoss()
         self.lr = float(config["trainer"]["lr"])
         
-    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask, training=False, task="reconstruction"):
-        return self.encoder(image, attention_mask, mae_tokens, mae_tokens_mask, training=training, task=task)
+    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=False, task="reconstruction"):
+        return self.encoder(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=training, task=task)
 
     def training_step(self, batch, batch_idx):
-        image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
+        image, attention_mask, mae_tokens, mae_tokens_mask, _ , latents_pos = batch
 
-        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=True)
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=True)
         #labels = mae_tokens[:,::5,4]
         labels = mae_tokens[:,:,4]
 
@@ -130,9 +136,9 @@ class Model_FLAIR(pl.LightningModule):
         
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         
-        image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
-        
-        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
+        image, attention_mask, mae_tokens, mae_tokens_mask, _ , latents_pos = batch
+
+        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=False)
         
         #labels = mae_tokens[:,::5,4]
         labels = mae_tokens[:,:,4]
@@ -145,8 +151,10 @@ class Model_FLAIR(pl.LightningModule):
         
         
         loss = self.loss(y_hat_loss, labels_loss.long())
-        
+       
         preds = torch.argmax(y_hat.clone(), dim=-1)
+
+        
         self.metric_IoU_val.update(preds, labels)
         
         # Log the loss directly here instead of manually tracking

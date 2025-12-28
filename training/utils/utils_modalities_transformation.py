@@ -1,7 +1,7 @@
 import torch
-from .utils_dataset import read_yaml,save_yaml
-from .image_utils import *
-from .files_utils import*
+from training.utils.datasets.utils_dataset import read_yaml,save_yaml
+from training.utils.datasets.image_utils import *
+from training.utils.datasets.files_utils import*
 from math import pi
 import einops 
 import numpy as np
