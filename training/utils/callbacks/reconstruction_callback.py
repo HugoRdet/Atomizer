@@ -955,3 +955,600 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
             rgb_image[mask] = color
         
         return rgb_image
+    
+
+
+
+import numpy as np
+import torch
+import pytorch_lightning as pl
+import matplotlib.pyplot as plt
+import wandb
+from einops import rearrange
+from typing import Optional, List, Dict, Any
+
+
+def normalize(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize tensor to [0, 1] range."""
+    min_val = tensor.min()
+    max_val = tensor.max()
+    if max_val - min_val > 1e-8:
+        return (tensor - min_val) / (max_val - min_val)
+    return tensor - min_val
+
+
+class MAE_err_CustomVisualizationCallback(pl.Callback):
+    """
+    Callback for visualizing MAE reconstruction and latent trajectories.
+    Updated to support error-guided displacement visualization.
+    """
+    
+    # Purple gradient: dark (early layer) → light (late layer)
+    TRAJECTORY_COLORS = [
+        '#10002b',  # Layer 0 (initial) - darkest
+        '#240046',  # Layer 1
+        '#3c096c',  # Layer 2
+        '#5a189a',  # Layer 3
+        '#7b2cbf',  # Layer 4
+        '#9d4edd',  # Layer 5
+        '#c77dff',  # Layer 6
+        '#e0aaff',  # Layer 7 - lightest
+    ]
+
+    def __init__(self, config):
+        """
+        Args:
+            config: Configuration dict containing visualization parameters
+        """
+        super().__init__()
+        self.config = config
+        
+        self.log_every_n_epochs = config["debug"]["viz_every_n_epochs"]
+        self.sample_indices = config["debug"]["idxs_to_viz"]
+        self.num_samples = len(self.sample_indices)
+        
+        # Image parameters for correct scaling
+        self.image_size = config.get("image_size", 512)
+        self.gsd = config.get("gsd", 0.2)
+        
+        # Compute actual physical extent
+        self.image_extent_meters = self.image_size * self.gsd  # 512 * 0.2 = 102.4m
+        
+        # Check for mismatch with latent_surface
+        # Note: Both systems are centered at (0,0)
+        # Latent grid: -latent_surface/2 to +latent_surface/2
+        # Image: -image_extent/2 to +image_extent/2
+        latent_surface = config.get("Atomiser", {}).get("latent_surface", 103.0)
+        if abs(latent_surface - self.image_extent_meters) > 1.0:
+            print(f"[VizCallback] Note: latent_surface ({latent_surface}m) != "
+                  f"image_extent ({self.image_extent_meters}m)")
+            print(f"[VizCallback]   Latent grid: ±{latent_surface/2:.1f}m")
+            print(f"[VizCallback]   Image extent: ±{self.image_extent_meters/2:.1f}m")
+        
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Perform MAE reconstruction visualization at the end of validation epoch."""
+        
+        # Only log every N epochs and skip first few epochs
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0 or trainer.current_epoch < 2:
+            return
+        
+        # Only run on rank 0
+        if not trainer.is_global_zero:
+            return
+        if hasattr(trainer, 'global_rank') and trainer.global_rank != 0:
+            return
+        
+        pl_module.eval()
+        
+        try:
+            if wandb.run is not None:
+                self._perform_custom_reconstruction(trainer, pl_module)
+            else:
+                print("Warning: wandb not active, skipping MAE reconstruction logging")
+        except Exception as e:
+            print(f"Error in MAE visualization callback: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        pl_module.train()
+    
+    def _perform_custom_reconstruction(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """Perform MAE reconstruction visualization using custom data loading."""
+        
+        # Validation set
+        dataset_val = trainer.datamodule.val_dataset
+        for i, sample_idx in enumerate(self.sample_indices):
+            self._process_single_sample(
+                sample_idx, i, dataset_val, pl_module, 
+                trainer.current_epoch, split="validation"
+            )
+            
+        # Training set
+        dataset_train = trainer.datamodule.train_dataset
+        for i, sample_idx in enumerate(self.sample_indices):
+            self._process_single_sample(
+                sample_idx, i, dataset_train, pl_module, 
+                trainer.current_epoch, split="train"
+            )
+    
+    def _process_single_sample(self, dataset_idx: int, viz_idx: int, dataset, 
+                               pl_module, epoch: int, split: str = "val"):
+        """Process a single sample for MAE reconstruction visualization."""
+        
+        # Get data from your custom method
+        image, image_tokens, attention_mask, mae_tokens, mask_MAE_res, _, latent_pos, _ = dataset.get_samples_to_viz(dataset_idx)
+        
+        # Move to device
+        device = pl_module.device
+        image_tokens = image_tokens.to(device)
+        attention_mask = attention_mask.to(device) if attention_mask is not None else None
+        mae_tokens = mae_tokens.to(device)
+        mae_tokens_mask = torch.ones(mae_tokens.shape[0]).to(device)
+        latent_pos = latent_pos.to(device)
+        
+        with torch.no_grad():
+            try:
+                # Expand dimensions to match batch format
+                image_tokens_batch = image_tokens.unsqueeze(0) 
+                image_tokens_mask = attention_mask.unsqueeze(0)
+                mae_tokens_batch = mae_tokens.clone().unsqueeze(0)
+                mae_tokens_mask_batch = mae_tokens_mask.unsqueeze(0)
+                latent_pos_batch = latent_pos.unsqueeze(0)
+                
+                # Forward pass with trajectory and predicted errors
+                result = pl_module.forward(
+                    image_tokens_batch,
+                    image_tokens_mask,
+                    mae_tokens_batch,
+                    mae_tokens_mask_batch,
+                    latent_pos_batch,
+                    training=False,
+                    task="visualization",
+                )
+                
+                # Unpack result
+                if isinstance(result, dict):
+                    y_hat = result.get('predictions', result.get('y_hat'))
+                    trajectory = result.get('trajectory', None)
+                    predicted_errors = result.get('predicted_errors', None)
+                    displacement_stats = result.get('displacement_stats', None)
+                    final_coords = result.get('final_coords', None)
+                    latents = result.get('latents', None)
+                elif isinstance(result, tuple):
+                    y_hat = result[0]
+                    trajectory = result[1] if len(result) > 1 else None
+                    predicted_errors = None
+                    displacement_stats = None
+                    final_coords = None
+                    latents = None
+                else:
+                    y_hat = result
+                    trajectory = None
+                    predicted_errors = None
+                    displacement_stats = None
+                    final_coords = None
+                    latents = None
+                
+                # Validate trajectory
+                if not isinstance(trajectory, (list, tuple)) or len(trajectory) == 0:
+                    trajectory = None
+                
+                # Remove batch dimension
+                y_hat = y_hat.squeeze(0)
+                
+                # Get target and reconstruction
+                target = mae_tokens[:, 0]
+                reconstruction = y_hat.squeeze(-1) if y_hat.dim() > 1 else y_hat
+                
+                print(f"✓ Reconstructed sample {dataset_idx} ({split})")
+                if trajectory is not None:
+                    print(f"  Trajectory: {len(trajectory)} layers")
+                else:
+                    print(f"  Trajectory: None (displacement disabled)")
+                
+                if predicted_errors is not None:
+                    print(f"  Predicted errors: {len(predicted_errors)} layers")
+                
+            except Exception as e:
+                print(f"Error in forward pass for sample {dataset_idx}: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+        
+        # Create and upload visualization
+        try:
+            self._create_and_upload_mae_visualization(
+                sample_idx=dataset_idx,
+                viz_idx=viz_idx,
+                original_image=image,
+                target=target,
+                reconstruction=reconstruction,
+                trajectory=trajectory,
+                predicted_errors=predicted_errors,
+                displacement_stats=displacement_stats,
+                epoch=epoch,
+                split=split,
+                pl_module=pl_module,
+            )
+        except Exception as e:
+            print(f"Error creating MAE visualization for sample {dataset_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _create_and_upload_mae_visualization(
+        self,
+        sample_idx: int,
+        viz_idx: int,
+        original_image,
+        target: torch.Tensor,
+        reconstruction: torch.Tensor,
+        trajectory: Optional[List[torch.Tensor]],
+        predicted_errors: Optional[List[torch.Tensor]],
+        displacement_stats: Optional[Dict[str, Any]],
+        epoch: int,
+        split: str,
+        pl_module: pl.LightningModule,
+    ):
+        """Create and upload MAE reconstruction visualization to wandb."""
+        
+        # Calculate reconstruction metrics
+        target_np = target.cpu().numpy()
+        reconstruction_np = reconstruction.cpu().numpy()
+        mse = np.mean((target_np - reconstruction_np) ** 2)
+        mae = np.mean(np.abs(target_np - reconstruction_np))
+        
+        # Create the main MAE visualization
+        mae_fig = self._create_mae_figure(
+            original_image, target, reconstruction,
+            sample_idx, epoch, mse, mae
+        )
+        
+        # Prepare wandb data
+        wandb_data = {
+            f"mae_reconstruction/sample_{sample_idx}_{split}": wandb.Image(
+                mae_fig, 
+                caption=f"MAE Reconstruction - Epoch {epoch}, Sample {sample_idx}, MSE: {mse:.6f}, MAE: {mae:.6f}"
+            ),
+            f"mae_metrics/sample_{viz_idx}_mse_{split}": mse,
+            f"mae_metrics/sample_{viz_idx}_mae_{split}": mae,
+        }
+        
+        plt.close(mae_fig)
+        
+        # Create trajectory visualization if available
+        if trajectory is not None and len(trajectory) > 1:
+            try:
+                traj_fig = self._create_trajectory_figure(
+                    trajectory=trajectory,
+                    predicted_errors=predicted_errors,
+                    original_image=original_image,
+                    sample_idx=sample_idx,
+                    epoch=epoch,
+                    image_size=self.image_size,
+                    gsd=self.gsd,
+                )
+                
+                wandb_data[f"latent_trajectory/sample_{sample_idx}_{split}"] = wandb.Image(
+                    traj_fig,
+                    caption=f"Latent Trajectories - Epoch {epoch}, Sample {sample_idx}"
+                )
+                
+                plt.close(traj_fig)
+                
+            except Exception as e:
+                print(f"Error creating trajectory visualization: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Log error-guided displacement metrics if available
+        if predicted_errors is not None:
+            try:
+                for layer_idx, pred_err in enumerate(predicted_errors):
+                    pred_err_np = pred_err.squeeze(0).cpu().numpy()  # Remove batch dim
+                    wandb_data[f"error_predictor/sample_{viz_idx}_layer_{layer_idx}_mean_{split}"] = pred_err_np.mean()
+                    wandb_data[f"error_predictor/sample_{viz_idx}_layer_{layer_idx}_std_{split}"] = pred_err_np.std()
+            except Exception as e:
+                print(f"Error logging predicted errors: {e}")
+        
+        # Log displacement scale if available (learnable parameter)
+        if hasattr(pl_module, 'encoder') and hasattr(pl_module.encoder, 'error_displacement'):
+            error_disp = pl_module.encoder.error_displacement
+            if error_disp is not None and hasattr(error_disp, 'displacement_scale'):
+                wandb_data[f"error_guided/displacement_scale"] = error_disp.displacement_scale.item()
+        
+        # Log gravity displacement info if available
+        if hasattr(pl_module, 'encoder') and hasattr(pl_module.encoder, 'gravity_displacement'):
+            gravity_disp = pl_module.encoder.gravity_displacement
+            if gravity_disp is not None:
+                wandb_data[f"gravity/repulsion_strength"] = gravity_disp.repulsion_strength
+                wandb_data[f"gravity/gravity_power"] = gravity_disp.gravity_power
+                wandb_data[f"gravity/error_offset"] = gravity_disp.error_offset
+        
+        # Upload to wandb
+        try:
+            wandb.log(wandb_data)
+            print(f"✓ Uploaded visualization for sample {sample_idx} at epoch {epoch}")
+        except Exception as e:
+            print(f"✗ Failed to upload to wandb: {e}")
+    
+    def _create_trajectory_figure(
+        self,
+        trajectory: List[torch.Tensor],
+        predicted_errors: Optional[List[torch.Tensor]],
+        original_image: np.ndarray,
+        sample_idx: int,
+        epoch: int,
+        figsize: tuple = (12, 12),
+        image_size: int = 512,
+        gsd: float = 0.2,
+    ) -> plt.Figure:
+        """
+        Create visualization of latent position trajectories through layers.
+        
+        Uses purple gradient: dark (#10002b) = early layer → light (#e0aaff) = late layer
+        
+        Args:
+            trajectory: List of [B, L, 2] tensors for each layer
+            predicted_errors: Optional list of [B, L] tensors
+            original_image: RGB image array
+            sample_idx: Sample index for title
+            epoch: Epoch number for title
+            figsize: Figure size
+            image_size: Image size in pixels (default 512)
+            gsd: Ground sampling distance in meters/pixel (default 0.2)
+        """
+        # Extract positions for batch 0
+        traj_np = [t[0].detach().cpu().numpy() for t in trajectory]
+        num_layers = len(traj_np)
+        num_latents = traj_np[0].shape[0]
+        
+        # Extract predicted errors if available
+        pred_errors_np = None
+        if predicted_errors is not None and len(predicted_errors) > 0:
+            try:
+                pred_errors_np = [e[0].detach().cpu().numpy() for e in predicted_errors]
+            except Exception as e:
+                print(f"Warning: Could not extract predicted errors: {e}")
+        
+        # Get colors - interpolate if more layers than colors
+        if num_layers <= len(self.TRAJECTORY_COLORS):
+            colors = self.TRAJECTORY_COLORS[:num_layers]
+        else:
+            indices = np.linspace(0, len(self.TRAJECTORY_COLORS) - 1, num_layers).astype(int)
+            colors = [self.TRAJECTORY_COLORS[i] for i in indices]
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Compute FIXED image extent from physical dimensions
+        # IMPORTANT: Coordinate system is CENTERED at (0, 0)
+        # Image extent: 512 * 0.2 = 102.4m total, so from -51.2 to +51.2
+        half_extent = (image_size * gsd) / 2.0  # 51.2 for 512px at 0.2 GSD
+        
+        # Image extent: [x_min, x_max, y_min, y_max] - CENTERED
+        image_extent = [-half_extent, half_extent, -half_extent, half_extent]
+        
+        # Get RGB background
+        try:
+            rgb_background = self._create_rgb_from_image(original_image)
+            
+            # Display with FIXED extent based on physical dimensions (CENTERED)
+            ax.imshow(
+                rgb_background, 
+                extent=image_extent, 
+                aspect='equal',  # Keep aspect ratio correct
+                alpha=0.5, 
+                origin='lower'
+            )
+        except Exception as e:
+            print(f"Warning: Could not display RGB background: {e}")
+        
+        # Set axis limits to match image extent (with small margin for trajectory visibility)
+        margin = half_extent * 0.04
+        ax.set_xlim(-half_extent - margin, half_extent + margin)
+        ax.set_ylim(-half_extent - margin, half_extent + margin)
+        
+        # Plot each latent's trajectory
+        for lat_idx in range(num_latents):
+            path = np.array([traj_np[layer][lat_idx] for layer in range(num_layers)])
+            
+            # Draw trajectory lines between consecutive layers
+            for layer in range(num_layers - 1):
+                ax.plot(
+                    [path[layer, 0], path[layer + 1, 0]],
+                    [path[layer, 1], path[layer + 1, 1]],
+                    color=colors[layer + 1],
+                    linewidth=1.5,
+                    alpha=0.7,
+                    zorder=5
+                )
+            
+            # Draw points at each layer position
+            for layer in range(num_layers):
+                if layer == 0:
+                    marker_size = 40
+                    edge_color = 'white'
+                    edge_width = 1.5
+                elif layer == num_layers - 1:
+                    marker_size = 80
+                    edge_color = 'white'
+                    edge_width = 2
+                else:
+                    marker_size = 25
+                    edge_color = 'none'
+                    edge_width = 0
+                
+                ax.scatter(
+                    path[layer, 0], path[layer, 1],
+                    c=colors[layer],
+                    s=marker_size,
+                    marker='o',
+                    edgecolors=edge_color,
+                    linewidths=edge_width,
+                    zorder=10,
+                    alpha=0.9
+                )
+        
+        # Create legend
+        legend_elements = []
+        for layer in range(num_layers):
+            label = f'Layer {layer}' if layer > 0 else 'Initial'
+            legend_elements.append(
+                plt.Line2D([0], [0], marker='o', color='w',
+                          markerfacecolor=colors[layer],
+                          markersize=8 if layer in [0, num_layers-1] else 6,
+                          label=label)
+            )
+        
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=9, framealpha=0.9)
+        
+        # Compute displacement stats for title
+        total_disp = traj_np[-1] - traj_np[0]
+        mean_disp = np.mean(np.linalg.norm(total_disp, axis=-1))
+        max_disp = np.max(np.linalg.norm(total_disp, axis=-1))
+        
+        # Build title with error info if available
+        image_extent_meters = image_size * gsd
+        title_lines = [
+            f'Latent Trajectories - Sample {sample_idx}, Epoch {epoch}',
+            f'{num_latents} latents, {num_layers} layers | Mean Δ: {mean_disp:.2f}m, Max Δ: {max_disp:.2f}m',
+            f'Image: {image_size}×{image_size}px @ {gsd}m/px | Extent: ±{half_extent:.1f}m (centered)'
+        ]
+        
+        if pred_errors_np is not None:
+            # Show mean predicted error per layer
+            error_str = "Pred Error: " + ", ".join([f"L{i}:{e.mean():.4f}" for i, e in enumerate(pred_errors_np)])
+            title_lines.append(error_str)
+        
+        ax.set_xlabel('X (meters)', fontsize=12)
+        ax.set_ylabel('Y (meters)', fontsize=12)
+        ax.set_title('\n'.join(title_lines), fontsize=12, fontweight='bold')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return fig
+    
+    def _create_mae_figure(
+        self,
+        original_image,
+        target: torch.Tensor,
+        reconstruction: torch.Tensor,
+        sample_idx: int,
+        epoch: int,
+        mse: float,
+        mae: float
+    ) -> plt.Figure:
+        """Create MAE reconstruction visualization figure with RGB, NIR, and Elevation."""
+        
+        # Spatial dimensions
+        h, w, c = 512, 512, 5
+        
+        # Reshape target and reconstruction
+        try:
+            target_spatial = rearrange(target, "(c h w) -> c h w", h=h, w=w, c=c)
+            reconstruction_spatial = rearrange(reconstruction, "(c h w) -> c h w", h=h, w=w, c=c)
+        except Exception as e:
+            print(f"Warning: Could not reshape target/reconstruction: {e}")
+            print(f"Target shape: {target.shape}, Reconstruction shape: {reconstruction.shape}")
+            device = target.device if hasattr(target, 'device') else 'cpu'
+            target_spatial = torch.zeros((c, h, w), device=device)
+            reconstruction_spatial = torch.zeros((c, h, w), device=device)
+        
+        # Create figure with 8 subplots (2 rows x 4 columns)
+        fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+        fig.suptitle(
+            f'MAE Reconstruction - Sample {sample_idx}, Epoch {epoch}\n'
+            f'MSE: {mse:.6f}, MAE: {mae:.6f}', 
+            fontsize=16, fontweight='bold'
+        )
+        
+        # 1. Original RGB composite
+        rgb_composite = self._create_rgb_from_image(original_image)
+        axes[0, 0].imshow(rgb_composite)
+        axes[0, 0].set_title('Original RGB Image', fontsize=14, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        # 2. NIR channel (index 3) - Original
+        nir_original = original_image[:, :, 3]
+        nir_vmin, nir_vmax = nir_original.min(), nir_original.max()
+        im1 = axes[0, 1].imshow(nir_original, cmap='RdYlGn', vmin=nir_vmin, vmax=nir_vmax)
+        axes[0, 1].set_title('Original NIR Channel', fontsize=14, fontweight='bold')
+        axes[0, 1].axis('off')
+        plt.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+        
+        # 3. Elevation channel (index 4) - Original
+        elevation_original = original_image[:, :, 4]
+        elevation_vmin, elevation_vmax = elevation_original.min(), elevation_original.max()
+        im2 = axes[0, 2].imshow(elevation_original, cmap='gray', vmin=elevation_vmin, vmax=elevation_vmax)
+        axes[0, 2].set_title('Original Elevation', fontsize=14, fontweight='bold')
+        axes[0, 2].axis('off')
+        plt.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
+        
+        # 4. Combined Error
+        error_all = torch.abs(target_spatial - reconstruction_spatial)
+        error_mean = torch.mean(error_all, dim=0)
+        im3 = axes[0, 3].imshow(error_mean.cpu().numpy(), cmap='hot')
+        axes[0, 3].set_title('Mean Absolute Error (All Channels)', fontsize=14, fontweight='bold')
+        axes[0, 3].axis('off')
+        plt.colorbar(im3, ax=axes[0, 3], fraction=0.046, pad=0.04)
+        
+        # 5. Reconstructed RGB composite
+        reconstructed_rgb = self._create_rgb_from_reconstruction(reconstruction_spatial)
+        axes[1, 0].imshow(reconstructed_rgb)
+        axes[1, 0].set_title('Reconstructed RGB Image', fontsize=14, fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        # 6. NIR channel - Reconstruction
+        nir_reconstruction = reconstruction_spatial[3]
+        im4 = axes[1, 1].imshow(nir_reconstruction.cpu().numpy(), cmap='RdYlGn', vmin=nir_vmin, vmax=nir_vmax)
+        axes[1, 1].set_title('Reconstructed NIR Channel', fontsize=14, fontweight='bold')
+        axes[1, 1].axis('off')
+        plt.colorbar(im4, ax=axes[1, 1], fraction=0.046, pad=0.04)
+        
+        # 7. Elevation channel - Reconstruction
+        elevation_reconstruction = reconstruction_spatial[4]
+        im5 = axes[1, 2].imshow(elevation_reconstruction.cpu().numpy(), cmap='gray', vmin=elevation_vmin, vmax=elevation_vmax)
+        axes[1, 2].set_title('Reconstructed Elevation', fontsize=14, fontweight='bold')
+        axes[1, 2].axis('off')
+        plt.colorbar(im5, ax=axes[1, 2], fraction=0.046, pad=0.04)
+        
+        # 8. RGB Error
+        rgb_error = np.abs(rgb_composite - reconstructed_rgb)
+        rgb_error_magnitude = np.mean(rgb_error, axis=-1)
+        im6 = axes[1, 3].imshow(rgb_error_magnitude, cmap='hot')
+        axes[1, 3].set_title('RGB Reconstruction Error', fontsize=14, fontweight='bold')
+        axes[1, 3].axis('off')
+        plt.colorbar(im6, ax=axes[1, 3], fraction=0.046, pad=0.04)
+        
+        plt.tight_layout()
+        return fig
+    
+    def _create_rgb_from_image(self, image) -> np.ndarray:
+        """Create RGB composite from image array."""
+        if len(image.shape) == 3 and image.shape[2] >= 3:
+            rgb_composite = np.stack([
+                image[:, :, 2],  # Red channel
+                image[:, :, 1],  # Green channel  
+                image[:, :, 0]   # Blue channel
+            ], axis=-1)
+        else:
+            print(f"Warning: Cannot create RGB from image shape {image.shape}")
+            single_channel = image[:, :, 0] if len(image.shape) == 3 else image
+            rgb_composite = np.stack([single_channel] * 3, axis=-1)
+        
+        composite_tensor = torch.from_numpy(rgb_composite).permute(2, 0, 1)
+        normalized = normalize(composite_tensor)
+        
+        return normalized.permute(1, 2, 0).numpy()
+    
+    def _create_rgb_from_reconstruction(self, reconstruction_spatial: torch.Tensor) -> np.ndarray:
+        """Create RGB composite from reconstructed channels."""
+        rgb_composite = torch.stack([
+            reconstruction_spatial[2],  # Red
+            reconstruction_spatial[1],  # Green
+            reconstruction_spatial[0]   # Blue
+        ], dim=0)
+        
+        normalized = normalize(rgb_composite)
+        
+        return normalized.permute(1, 2, 0).cpu().numpy()

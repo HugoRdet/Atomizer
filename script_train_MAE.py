@@ -1,6 +1,8 @@
 from training.perceiver import *
 from training.utils import *
 from training.losses import *
+from training.utils.callbacks import *
+from training.utils.datasets import*
 from training.VIT import *
 from training.ResNet import *
 from collections import defaultdict
@@ -17,15 +19,14 @@ import torch.nn.functional as F
 import einops as einops
 from einops import rearrange, repeat
 from einops.layers.torch import Reduce
-
-# ← new imports for the PyTorch profiler
+from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.profilers import PyTorchProfiler
 from torch.profiler import ProfilerActivity
-
+from pytorch_lightning.callbacks import LearningRateFinder
 import matplotlib.pyplot as plt
 
 from configilm import util
-util.MESSAGE_LEVEL = util.MessageLevel.INFO  # use INFO to see all messages
+util.MESSAGE_LEVEL = util.MessageLevel.INFO
 
 seed_everything(42, workers=True)
 from configilm.extra.DataSets import BENv2_DataSet
@@ -33,15 +34,9 @@ from configilm.extra.DataModules import BENv2_DataModule
 import random
 import argparse
 
-# instantiate the PyTorchProfiler
-#profiler = PyTorchProfiler(
-#    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-#    record_shapes=True,
-#    profile_memory=True,
-#    export_to_chrome=True,       # dumps a trace.json for Chrome/TensorBoard
-#    dirpath="profiling",         # where to write trace.json
-#    filename="trace"             # will produce "profiling/trace.json"
-#)
+# --- NEW IMPORTS ---
+# Import the new TokenProcessor from your refactored module
+from training.utils.token_building.processor import TokenProcessor
 
 # Create the parser
 parser = argparse.ArgumentParser(description="Training script")
@@ -54,35 +49,66 @@ xp_name = args.xp_name
 config_model = read_yaml("./training/configs/" + args.config_model)
 configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
 bands_yaml       = "./data/bands_info/bands.yaml"
-lookup_table=Lookup_encoding(read_yaml(configs_dataset),read_yaml(bands_yaml))
-modalities_trans = modalities_transformations_config(configs_dataset,model=config_model["encoder"], name_config=args.dataset_name)
-test_conf=None
-if config_model["encoder"] == "Atomiser_tradi":
-    test_conf        = transformations_config_tradi(bands_yaml, config_model,lookup_table=lookup_table)
-else:
-    test_conf        = transformations_config(bands_yaml, config_model,lookup_table=lookup_table)
+
+# 1. Initialize Lookup Table (Kept as is, assuming it handles modality indices)
+lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
+
+# 2. Modalities Transformations (Data Augmentation stuff)
+modalities_trans = modalities_transformations_config(
+    configs_dataset, 
+    model=config_model["encoder"], 
+    name_config=args.dataset_name
+)
+
+# 3. Initialize the New Processor (Replaces transformations_config)
+# The TokenProcessor handles all encoding logic (Physics + Math)
+# It takes the full config and the lookup table.
+input_processor = TokenProcessor(config_model, lookup_table)
+
 
 wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
     wandb.init(
         name=config_model["encoder"],
-        project="MAE_debug",
+        project="FLAIR_seg_overfitting",
         config=config_model
     )
-    wandb_logger = WandbLogger(project="MAE_debug")
+    wandb_logger = WandbLogger(project="FLAIR_seg_overfitting")
+
+    wandb.define_metric("train_loss", step_metric="trainer/global_step")
+    wandb.define_metric("val_loss", step_metric="trainer/global_step")
     
 
-model = Model_MAE( #Model_FLAIR
+# 4. Instantiate Model
+# We pass the input_processor where 'transform' used to go
+# Ensure your Model_MAE/__init__ assigns self.input_processor = input_processor
+# AND that Atomiser inside Model_MAE uses it.
+model = Model_FLAIR(
     config_model,
     wand=True,
     name=xp_name,
-    transform=test_conf
+    transform=input_processor, # Pass the new processor here,
+    lookup_table=lookup_table
 )
 
-data_module = Tiny_BigEarthNetDataModule(
-    f"./data/Tiny_BigEarthNet/{args.dataset_name}",
-    #f"./data/custom_flair/{args.dataset_name}",
+checkpoint_path = "./checkpoints/Atos_tofine.ckpt"
+
+# Option 1: Load checkpoint with strict=False (recommended)
+#model = Model_MAE.load_from_checkpoint(
+#    checkpoint_path,
+#    strict=False,  # Allow missing keys (displacement MLP is new)
+#    config=config_model,
+#    wand=True,
+#    name=xp_name,
+#    transform=input_processor,
+#    lookup_table=lookup_table
+#)
+
+
+
+data_module = UnifiedDataModule(
+    f"./data/custom_flair/{args.dataset_name}",
     batch_size=config_model["dataset"]["batchsize"],
     num_workers=4,
     trans_modalities=modalities_trans,
@@ -91,56 +117,49 @@ data_module = Tiny_BigEarthNetDataModule(
     dataset_config=read_yaml(bands_yaml),
     config_model=config_model,
     look_up=lookup_table,
-    dataset_class=Tiny_BigEarthNet_MAE#FLAIR_MAE###R##
+    dataset_class=FLAIR_MAE,
+    limit_train_batches=10,
+    limit_val_batches=5,
 )
 
-reconstruction_callback = CustomMAEReconstructionCallback(
+reconstruction_callback = FLAIR_CustomSegmentationCallback( #MAE_CustomVisualizationCallback
     config=config_model
-    )
+)
 
-#reconstruction_callback = FLAIR_CustomSegmentationCallback(
-#    config=config_model
-#    )
+LR_finder=LearningRateFinder(min_lr=1e-05, max_lr=1, num_training_steps=450, mode='exponential', early_stop_threshold=4.0, update_attr=True, attr_name='')
 
 
-
-
-#knn_callback_multiclass=KNNEvaluationCallback(
-#    config=config_model,
-#    knn_datamodule=data_module
-#)
-
-
+lr_monitor = LearningRateMonitor(logging_interval="step")
 
 checkpoint_val_mod_train = ModelCheckpoint(
     dirpath="./checkpoints/",
-    filename=f"{config_model['encoder']}{xp_name}-val_reconstruction_loss-{{epoch:02d}}-{{val_reconstruction_loss:.4f}}",
-    monitor="val_reconstruction_loss",
+    filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_loss:.4f}}",
+    monitor="val_loss",
     mode="min",
     save_top_k=1,
     verbose=True,
 )
+
 accumulator = GradientAccumulationScheduler(scheduling={0:1})
-#reconstruction_callback,knn_callback_multiclass
+#gradient_warmup = DisplacementGradientWarmupCallback(start_epoch=10, warmup_epochs=10)
+
 # Trainer
 trainer = Trainer(
-    strategy="ddp_find_unused_parameters_true",#,
-    devices=[-1],
+    strategy="ddp_find_unused_parameters_true",
+    devices=-1,
     max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu",
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[ accumulator,reconstruction_callback], #checkpoint_val_mod_train,
+    callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train],
     default_root_dir="./checkpoints/",
-    #profiler=profiler,           # ← attach the PyTorchProfiler here
-    overfit_batches=1
 )
 
 # Fit the model
 trainer.fit(model, datamodule=data_module)
 
-# Save wandb run ID if needed
+# Save wandb run ID
 if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
     run_id = wandb.run.id
     print("WANDB_RUN_ID:", run_id)

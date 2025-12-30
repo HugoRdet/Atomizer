@@ -251,3 +251,212 @@ class SensorGeometry(nn.Module):
             latent_bias = self.latent_grid.unsqueeze(0).expand(B, -1, -1)
         
         return token_bias, latent_bias
+
+    # =========================================================================
+    # COORDINATE CONVERSION (for error-guided displacement)
+    # =========================================================================
+
+    def meters_to_pixels(
+        self,
+        coords_meters: torch.Tensor,
+        image_size: int = 512,
+        gsd: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        Convert coordinates from meters to pixel indices.
+        
+        Assumes image is centered at origin, spanning [-extent/2, extent/2] meters
+        where extent = image_size * gsd.
+        
+        Args:
+            coords_meters: [..., 2] coordinates in meters (x, y)
+                Can be any shape as long as last dimension is 2.
+                Examples: [B, L, 2], [B, depth, L, 2], [B, depth, L, num_samples, 2]
+            image_size: image dimension in pixels (default 512)
+            gsd: ground sample distance in meters/pixel (default: self.default_gsd)
+        
+        Returns:
+            coords_pixels: [..., 2] coordinates in pixels (long integers)
+                Same shape as input, clamped to [0, image_size-1]
+        
+        Example:
+            >>> geometry = SensorGeometry(config, lookup_table)
+            >>> # Latent at origin (0, 0) meters → center of image (256, 256) pixels
+            >>> coords_m = torch.tensor([[[0.0, 0.0]]])  # [1, 1, 2]
+            >>> coords_px = geometry.meters_to_pixels(coords_m)
+            >>> # coords_px ≈ [[[256, 256]]]
+            
+            >>> # Latent at (-51.2, -51.2) meters → corner (0, 0) pixels
+            >>> coords_m = torch.tensor([[[-51.2, -51.2]]])
+            >>> coords_px = geometry.meters_to_pixels(coords_m)
+            >>> # coords_px = [[[0, 0]]]
+        """
+        if gsd is None:
+            gsd = self.default_gsd
+        
+        # Physical extent of the image
+        extent = image_size * gsd  # 512 * 0.2 = 102.4 meters
+        half_extent = extent / 2.0  # 51.2 meters
+        
+        # Convert: meters → pixels
+        # Origin (0,0) in meters → center of image (image_size/2) in pixels
+        # -half_extent in meters → 0 in pixels
+        # +half_extent in meters → image_size in pixels
+        coords_pixels = (coords_meters + half_extent) / gsd
+        
+        # Round to integers and clamp to valid range
+        coords_pixels = coords_pixels.round().long()
+        coords_pixels = coords_pixels.clamp(0, image_size - 1)
+        
+        return coords_pixels
+
+    def pixels_to_meters(
+        self,
+        coords_pixels: torch.Tensor,
+        image_size: int = 512,
+        gsd: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        Convert coordinates from pixel indices to meters.
+        
+        Inverse of meters_to_pixels().
+        
+        Args:
+            coords_pixels: [..., 2] coordinates in pixels (x, y)
+            image_size: image dimension in pixels (default 512)
+            gsd: ground sample distance in meters/pixel (default: self.default_gsd)
+        
+        Returns:
+            coords_meters: [..., 2] coordinates in meters
+        """
+        if gsd is None:
+            gsd = self.default_gsd
+        
+        extent = image_size * gsd
+        half_extent = extent / 2.0
+        
+        # Convert: pixels → meters
+        coords_meters = coords_pixels.float() * gsd - half_extent
+        
+        return coords_meters
+
+    def sample_grid_around_positions(
+        self,
+        coords_pixels: torch.Tensor,
+        grid_size: int = 3,
+        spacing: int = 2,
+        image_size: int = 512,
+    ) -> torch.Tensor:
+        """
+        Sample a grid of points around each position.
+        
+        Creates a grid_size × grid_size grid of sample points centered 
+        at each input position.
+        
+        Args:
+            coords_pixels: [..., 2] center coordinates in pixels
+                Examples: [B, L, 2], [B, depth, L, 2]
+            grid_size: number of points per dimension (e.g., 3 → 3×3 = 9 points)
+            spacing: distance between grid points in pixels
+            image_size: image dimension for clamping (default 512)
+        
+        Returns:
+            sample_coords: [..., grid_size², 2] sample coordinates in pixels
+                Example: [B, L, 2] → [B, L, 9, 2] for grid_size=3
+        
+        Example:
+            >>> coords = torch.tensor([[[256, 256]]])  # [1, 1, 2]
+            >>> samples = geometry.sample_grid_around_positions(coords, grid_size=3, spacing=2)
+            >>> # samples[0, 0] contains 9 points:
+            >>> # (254,254), (254,256), (254,258),
+            >>> # (256,254), (256,256), (256,258),
+            >>> # (258,254), (258,256), (258,258)
+        """
+        device = coords_pixels.device
+        original_shape = coords_pixels.shape[:-1]  # [...] without the 2
+        
+        # Create grid offsets: [-spacing, 0, spacing] for grid_size=3
+        half_grid = (grid_size - 1) // 2
+        offsets_1d = torch.arange(-half_grid, half_grid + 1, device=device) * spacing
+        
+        # Create 2D grid of offsets: [grid_size², 2]
+        grid_y, grid_x = torch.meshgrid(offsets_1d, offsets_1d, indexing='ij')
+        offsets = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)  # [grid_size², 2]
+        num_samples = offsets.shape[0]
+        
+        # Expand coords to [..., 1, 2] and offsets to [1, ..., grid_size², 2]
+        coords_expanded = coords_pixels.unsqueeze(-2)  # [..., 1, 2]
+        
+        # Broadcast addition: [..., 1, 2] + [grid_size², 2] → [..., grid_size², 2]
+        sample_coords = coords_expanded + offsets
+        
+        # Clamp to valid image range
+        sample_coords = sample_coords.clamp(0, image_size - 1)
+        
+        return sample_coords
+
+    def extract_query_tokens_from_image(
+        self,
+        image_err: torch.Tensor,
+        sample_coords: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract query tokens from image at given pixel positions.
+        
+        For each position, extracts tokens for ALL channels (bands).
+        
+        Args:
+            image_err: [B, C, H, W, 6] full image with metadata
+            sample_coords: [B, ..., 2] pixel coordinates (x, y)
+                Can be any shape, e.g., [B, L, 2] or [B, depth, L, num_samples, 2]
+        
+        Returns:
+            query_tokens: [B, num_queries, 6] where num_queries = prod(sample_shape) * C
+            ground_truth: [B, num_queries] reflectance values at those positions
+            original_shape: tuple of the shape between B and 2 in sample_coords
+                (useful for reshaping error back to per-latent format)
+        
+        Example:
+            >>> sample_coords = torch.tensor([[[256, 256], [100, 100]]])  # [1, 2, 2]
+            >>> tokens, gt, shape = geometry.extract_query_tokens_from_image(image_err, sample_coords)
+            >>> # tokens.shape = [1, 2*5, 6] = [1, 10, 6] (2 positions × 5 channels)
+            >>> # shape = (2,)
+        """
+        B, C, H, W, metadata_dim = image_err.shape
+        device = image_err.device
+        
+        # Flatten sample coordinates: [B, ..., 2] → [B, N, 2]
+        original_shape = sample_coords.shape[1:-1]  # everything between B and 2
+        N = sample_coords[..., 0].numel() // B  # number of positions per batch
+        sample_coords_flat = sample_coords.view(B, N, 2)
+        
+        # Get pixel indices
+        px_x = sample_coords_flat[..., 0].long()  # [B, N]
+        px_y = sample_coords_flat[..., 1].long()  # [B, N]
+        
+        # Clamp to valid range
+        px_x = px_x.clamp(0, W - 1)
+        px_y = px_y.clamp(0, H - 1)
+        
+        # Extract tokens for all channels at each position
+        # We need: image_err[b, c, y, x, :] for all b, all c, all (x,y) pairs
+        
+        # Expand indices for all channels: [B, N] → [B, N, C]
+        px_x_exp = px_x.unsqueeze(-1).expand(-1, -1, C)  # [B, N, C]
+        px_y_exp = px_y.unsqueeze(-1).expand(-1, -1, C)  # [B, N, C]
+        
+        # Create batch and channel indices
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, C)
+        channel_idx = torch.arange(C, device=device).view(1, 1, C).expand(B, N, -1)
+        
+        # Index into image_err: [B, C, H, W, 6]
+        # Result: [B, N, C, 6]
+        tokens = image_err[batch_idx, channel_idx, px_y_exp, px_x_exp, :]
+        
+        # Reshape to [B, N*C, 6]
+        query_tokens = tokens.view(B, N * C, metadata_dim)
+        
+        # Ground truth is the reflectance (index 0)
+        ground_truth = query_tokens[..., 0]  # [B, N*C]
+        
+        return query_tokens, ground_truth, original_shape

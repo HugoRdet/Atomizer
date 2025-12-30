@@ -348,6 +348,7 @@ class FLAIR_MAE_err(Dataset):
         ], dim=-1)
         
         queries = image.clone()
+        image_err=image.clone()
         
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
@@ -361,7 +362,7 @@ class FLAIR_MAE_err(Dataset):
         queries = queries[:nb_queries]
         queries_mask = torch.zeros(queries.shape[0])
 
-        return image, attention_mask, queries, queries_mask, label, latent_pos
+        return image, attention_mask, queries, queries_mask, label, latent_pos, image_err
  
     def get_samples_to_viz(self, idx):
         label = None
@@ -401,6 +402,7 @@ class FLAIR_MAE_err(Dataset):
         ], dim=-1)
         
         queries = image.clone()
+        image_err=image.clone()
 
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
@@ -411,5 +413,5 @@ class FLAIR_MAE_err(Dataset):
 
         queries_mask = torch.zeros(queries.shape[0])
 
-        return image_to_return, image, attention_mask, queries, queries_mask, label, latent_pos
+        return image_to_return, image, attention_mask, queries, queries_mask, label, latent_pos,image_err
 

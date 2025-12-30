@@ -84,7 +84,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # We pass the input_processor where 'transform' used to go
 # Ensure your Model_MAE/__init__ assigns self.input_processor = input_processor
 # AND that Atomiser inside Model_MAE uses it.
-model = Model_FLAIR(
+model = Model_MAE_err(
     config_model,
     wand=True,
     name=xp_name,
@@ -117,10 +117,10 @@ data_module = UnifiedDataModule(
     dataset_config=read_yaml(bands_yaml),
     config_model=config_model,
     look_up=lookup_table,
-    dataset_class=FLAIR_MAE
+    dataset_class=FLAIR_MAE_err
 )
 
-reconstruction_callback = FLAIR_CustomSegmentationCallback( #MAE_CustomVisualizationCallback
+reconstruction_callback = MAE_err_CustomVisualizationCallback( #FLAIR_CustomSegmentationCallback
     config=config_model
 )
 
@@ -152,6 +152,8 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train],
     default_root_dir="./checkpoints/",
+    #limit_train_batches=5,
+    #limit_val_batches=5,
 )
 
 # Fit the model

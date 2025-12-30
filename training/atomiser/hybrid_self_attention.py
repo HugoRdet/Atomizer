@@ -707,11 +707,16 @@ def create_hybrid_self_attention(
     """Factory function to create HybridSelfAttention from config."""
     cfg = config.get("Atomiser", config)
     
+    # Compute latent_spacing from latent_surface and spatial_latents
+    latent_surface = cfg.get("latent_surface", 102.4)
+    spatial_latents_per_row = cfg.get("spatial_latents", 25)
+    latent_spacing = latent_surface / (spatial_latents_per_row - 1)
+    
     return HybridSelfAttention(
         dim=cfg.get("latent_dim", 512),
         pos_encoder=pos_encoder,
         k=cfg.get("self_attn_k", 64),
-        latent_spacing=cfg.get("latent_spacing", 3.0),
+        latent_spacing=latent_spacing,
         heads=cfg.get("latent_heads", 8),
         dim_head=cfg.get("latent_dim_head", 64),
         ff_mult=cfg.get("ff_mult", 4),
