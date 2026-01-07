@@ -176,6 +176,10 @@ class LocalCrossAttention(nn.Module):
         
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
+
+        attn_weights = F.softmax(attn, dim=-1)  # [B, H, N, k]
+
+
         
         out = torch.einsum('b n h k, b n k h d -> b n h d', attn, V)
         

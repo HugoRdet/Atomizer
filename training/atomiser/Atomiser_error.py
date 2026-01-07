@@ -1,31 +1,39 @@
 """
-Atomiser Model with Standalone MLP-based Latent Displacement
+Atomiser Model with Two-Phase Dynamics for Latent Displacement
 
 REFACTORED VERSION: Geographic pruning logic moved to geographic_attention.py
 
 Key design:
 - Self-attention handles feature mixing (2 modes: gaussian_bias, standard)
-- Displacement handles position updates (4 strategies: none, mlp, convex, deformable)
+- Displacement handles position updates (multiple strategies including gravity-based)
 - Geographic pruning handles spatial token selection (separate module)
 - These are INDEPENDENT - any combination can be used
 
-This serves as a baseline before implementing error-guided displacement.
+Two-Phase Dynamics (RECOMMENDED):
+    Phase 1: Attraction - latents move toward high-error regions via gravity model
+    Phase 2: Spreading - error-aware density spreading prevents piling
 
 Config options:
-    use_displacement: bool - Enable/disable displacement
-    position_strategy: str - "none", "mlp", "convex", "deformable"
-    max_displacement: float - Max displacement per layer (in meters/pixels)
-    share_displacement_weights: bool - Share MLP weights across layers
-    stable_depth: int - Number of final layers with NO displacement (default: 0)
+    use_gravity_displacement: bool - Enable two-phase dynamics (recommended)
+    max_displacement: float - Max displacement per layer (default: 3.0m)
+    min_displacement: float - Min displacement per layer (default: 0.5m)
+    repulsion_strength: float - Phase 1 repulsion strength (default: 0.5)
+    danger_zone_divisor: float - Repulsion activation zone (default: 2.0)
+    use_density_spreading: bool - Enable Phase 2 (default: True)
+    density_iters: int - Spreading iterations (default: 3)
+    stable_depth: int - Final layers with NO displacement (default: 0)
 
 Usage:
     config = {
         "Atomiser": {
-            "use_displacement": True,
-            "position_strategy": "mlp",
-            "max_displacement": 10.0,
-            "share_displacement_weights": True,
-            "stable_depth": 2,  # No displacement in last 2 layers
+            "use_gravity_displacement": True,
+            "max_displacement": 3.0,
+            "min_displacement": 0.5,
+            "repulsion_strength": 0.5,
+            "danger_zone_divisor": 2.0,
+            "use_density_spreading": True,
+            "density_iters": 3,
+            "stable_depth": 1,  # No displacement in last layer
             # ... other config
         }
     }
@@ -231,8 +239,8 @@ class Atomiser_error(pl.LightningModule):
         # =====================================================================
         self.use_displacement = config["Atomiser"].get("use_displacement", False)
         self.position_strategy = config["Atomiser"].get("position_strategy", "mlp")
-        self.max_displacement = config["Atomiser"].get("max_displacement", 10.0)
-        self.min_displacement = config["Atomiser"].get("min_displacement", 0.0)
+        self.max_displacement = config["Atomiser"].get("max_displacement", 3.0)   # Reduced from 10.0
+        self.min_displacement = config["Atomiser"].get("min_displacement", 0.5)   # Increased from 0.0
         self.share_displacement_weights = config["Atomiser"].get("share_displacement_weights", True)
         
         # STABLE DEPTH: Number of final layers with NO displacement
@@ -247,10 +255,17 @@ class Atomiser_error(pl.LightningModule):
         
         # Gravity-based displacement (NEW - recommended)
         self.use_gravity_displacement = config["Atomiser"].get("use_gravity_displacement", False)
-        self.repulsion_strength = config["Atomiser"].get("repulsion_strength", 0.3)
+        self.repulsion_strength = config["Atomiser"].get("repulsion_strength", 0.5)      # Increased
         self.gravity_power = config["Atomiser"].get("gravity_power", 2.0)
         self.error_offset = config["Atomiser"].get("error_offset", 0.1)
-        self.danger_zone_divisor = config["Atomiser"].get("danger_zone_divisor", 4.0)
+        self.danger_zone_divisor = config["Atomiser"].get("danger_zone_divisor", 2.0)    # Reduced
+        
+        # Density spreading (Phase 2 of two-phase dynamics)
+        self.use_density_spreading = config["Atomiser"].get("use_density_spreading", True)
+        self.density_iters = config["Atomiser"].get("density_iters", 3)
+        self.density_sigma_mult = config["Atomiser"].get("density_sigma_mult", 0.5)
+        self.density_step_mult = config["Atomiser"].get("density_step_mult", 0.1)
+        self.max_density_step_mult = config["Atomiser"].get("max_density_step_mult", 0.25)
         
         # =====================================================================
         # 7. INITIALIZE COMPONENTS
@@ -291,15 +306,23 @@ class Atomiser_error(pl.LightningModule):
         
         # Displacement strategy
         if self.use_gravity_displacement:
-            print(f"[Atomiser] Displacement: GRAVITY-BASED (scale-invariant)")
+            print(f"[Atomiser] Displacement: TWO-PHASE DYNAMICS")
+            print(f"[Atomiser]   --- Phase 1: Attraction ---")
             print(f"[Atomiser]   max_displacement={self.max_displacement}m")
             print(f"[Atomiser]   min_displacement={self.min_displacement}m")
             print(f"[Atomiser]   repulsion_strength={self.repulsion_strength}")
             print(f"[Atomiser]   danger_zone_divisor={self.danger_zone_divisor}")
             print(f"[Atomiser]   gravity_power={self.gravity_power}")
             print(f"[Atomiser]   error_offset={self.error_offset}")
+            print(f"[Atomiser]   --- Phase 2: Density Spreading ---")
+            print(f"[Atomiser]   use_density_spreading={self.use_density_spreading}")
+            print(f"[Atomiser]   density_iters={self.density_iters}")
+            print(f"[Atomiser]   density_sigma_mult={self.density_sigma_mult}")
+            print(f"[Atomiser]   density_step_mult={self.density_step_mult}")
+            print(f"[Atomiser]   max_density_step_mult={self.max_density_step_mult}")
+            print(f"[Atomiser]   --- General ---")
             print(f"[Atomiser]   share_error_predictor_weights={self.share_error_predictor_weights}")
-            print(f"[Atomiser]   stable_depth={self.stable_depth} (no displacement in last {self.stable_depth} layers)")
+            print(f"[Atomiser]   stable_depth={self.stable_depth}")
         elif self.use_error_guided_displacement:
             print(f"[Atomiser] Displacement: ERROR-GUIDED (gradient-based)")
             print(f"[Atomiser]   max_displacement={self.max_displacement}m")
@@ -341,7 +364,7 @@ class Atomiser_error(pl.LightningModule):
         self.position_updater = None
         
         if self.use_gravity_displacement:
-            # Gravity-based displacement (NEW - recommended)
+            # Gravity-based displacement with two-phase dynamics
             self.gravity_displacement = GravityDisplacement(
                 latent_dim=self.latent_dim,
                 num_latents_per_row=self.spatial_latents_per_row,
@@ -354,8 +377,14 @@ class Atomiser_error(pl.LightningModule):
                 latent_surface=self.latent_surface,
                 error_offset=self.error_offset,
                 danger_zone_divisor=self.danger_zone_divisor,
+                # Phase 2: Density spreading
+                use_density_spreading=self.use_density_spreading,
+                density_iters=self.density_iters,
+                density_sigma_mult=self.density_sigma_mult,
+                density_step_mult=self.density_step_mult,
+                max_density_step_mult=self.max_density_step_mult,
             )
-            print(f"[Atomiser] Position updater: GravityDisplacement")
+            print(f"[Atomiser] Position updater: GravityDisplacement (Two-Phase)")
         
         elif self.use_error_guided_displacement:
             # Error-guided displacement (gradient-based)
@@ -421,9 +450,7 @@ class Atomiser_error(pl.LightningModule):
             # It handles all self-attention blocks internally per layer
             self.hybrid_self_attn = HybridSelfAttention(
                 dim=self.latent_dim,
-                pos_encoder=self.input_processor.pos_encoder,
                 k=self.self_attn_k,
-                latent_spacing=self.latent_spacing,
                 heads=self.latent_heads,
                 dim_head=self.latent_dim_head,
                 ff_mult=4,
@@ -435,6 +462,10 @@ class Atomiser_error(pl.LightningModule):
                 num_blocks=self.self_per_cross_attn,
                 has_global=self.num_global_latents > 0,
                 share_weights=self.weight_tie_layers,
+                # New log-distance RPE parameters (optional, these are defaults)
+                rpe_num_bands=32,
+                rpe_max_freq=32,
+                rpe_log_scale=1.0,
             )
             get_latent_attn = None  # Not used in hybrid mode
             get_latent_ff = None    # Included in HybridSelfAttention
@@ -594,12 +625,14 @@ class Atomiser_error(pl.LightningModule):
         device = tokens.device
         
         # Initialize latents
-        latents = repeat(self.latents, 'n d -> b n d', b=B)
+        latents = repeat(self.latents.clone(), 'n d -> b n d', b=B)
+        initial_spatial_latents = latents[:, :L_spatial, :].clone()  # Only save spatial for reset
+
 
         # Initialize coordinates (always start from grid for now)
         del latents_coords
-        current_coords = self._get_default_latent_coords(B, device)
-        
+        current_coords = self._get_default_latent_coords(B, device) #latents_coords#
+     
         # Tracking
         trajectory = [current_coords.clone()] if return_trajectory else None
         all_displacements = [] if return_displacement_stats else None
@@ -726,7 +759,15 @@ class Atomiser_error(pl.LightningModule):
                 
                 # Don't append to predicted_errors_list for stable layers
                 # The error loss will only be computed for layers with actual predictions
-            
+
+
+            if displacement_enabled and layer_idx < ((self.depth - self.stable_depth)-1):
+                latents = torch.cat([
+                    initial_spatial_latents.clone(),
+                    latents[:, L_spatial:, :]  # Keep global latents unchanged
+                ], dim=1)
+
+                
             # Apply displacement
             current_coords = new_coords
             

@@ -79,12 +79,8 @@ class Model_MAE_err(pl.LightningModule):
         # =====================================================================
         # DISPLACEMENT WITH ERROR SUPERVISION SETUP
         # =====================================================================
-        self.use_error_guided_displacement = config["Atomiser"].get(
-            "use_error_guided_displacement", False
-        )
-        self.use_gravity_displacement = config["Atomiser"].get(
-            "use_gravity_displacement", False
-        )
+        self.use_error_guided_displacement = config["Atomiser"].get( "use_error_guided_displacement" , False )
+        self.use_gravity_displacement = config["Atomiser"].get( "use_gravity_displacement" , False )
         
         # Either error-guided or gravity displacement uses error supervision
         self.use_error_supervision = (
@@ -244,6 +240,84 @@ class Model_MAE_err(pl.LightningModule):
             self._log_displacement_stats(trajectory, prefix='train')
         
         return total_loss
+    
+
+    def on_after_backward(self):
+        """Called after loss.backward() - perfect place to check gradients."""
+ 
+        return
+        # Only check periodically to avoid spam
+        if self.global_step % 100 != 0:
+            return
+        
+        print(f"\n[Gradient Check] Step {self.global_step}")
+        
+        # 1. Check RPE encoder gradients (if using hybrid self-attention)
+        if hasattr(self.encoder, 'hybrid_self_attn') and self.encoder.hybrid_self_attn is not None:
+            self._check_module_gradients(
+                self.encoder.hybrid_self_attn.local_cache.rpe_encoder,
+                "HybridSelfAttn.RPE"
+            )
+        
+        # 2. Check decoder position encoder gradients
+        if hasattr(self.encoder, 'input_processor'):
+            self._check_module_gradients(
+                self.encoder.input_processor.pos_encoder,
+                "Decoder.PosEncoder"
+            )
+        
+        # 3. Check self-attention gradients (for Gaussian bias)
+        if hasattr(self.encoder, 'encoder_layers'):
+            for layer_idx, layer in enumerate(self.encoder.encoder_layers):
+                if layer[2] is not None:  # self_attns
+                    for sa_idx, (self_attn, self_ff) in enumerate(layer[2]):
+                        if hasattr(self_attn.fn, 'log_sigma'):
+                            sigma = self_attn.fn.log_sigma
+                            if sigma.grad is not None:
+                                print(f"  Layer {layer_idx} SA {sa_idx} log_sigma grad: {sigma.grad.norm():.6f}")
+                        break  # Only check first layer
+                break
+        
+        # 4. Check for any NaN or Inf gradients in entire model
+        nan_count = 0
+        inf_count = 0
+        zero_count = 0
+        total_params = 0
+        
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                total_params += 1
+                if param.grad.isnan().any():
+                    nan_count += 1
+                    print(f"  ⚠️ NaN gradient in {name}")
+                if param.grad.isinf().any():
+                    inf_count += 1
+                    print(f"  ⚠️ Inf gradient in {name}")
+                if param.grad.abs().max() < 1e-10:
+                    zero_count += 1
+                    # Only print if it's a position-related parameter
+                    if 'pos' in name.lower() or 'rpe' in name.lower():
+                        print(f"  ⚠️ Near-zero gradient in {name}")
+        
+        print(f"  Summary: {nan_count} NaN, {inf_count} Inf, {zero_count} near-zero out of {total_params} params")
+    
+    def _check_module_gradients(self, module, name):
+        """Check gradients for a specific module."""
+        if module is None:
+            return
+        
+        for param_name, param in module.named_parameters():
+            if param.grad is None:
+                print(f"  {name}.{param_name}: NO GRADIENT")
+            else:
+                grad_norm = param.grad.norm().item()
+                grad_max = param.grad.abs().max().item()
+                grad_has_nan = param.grad.isnan().any().item()
+                grad_has_inf = param.grad.isinf().any().item()
+                
+                status = "✓" if not (grad_has_nan or grad_has_inf) else "⚠️"
+                print(f"  {status} {name}.{param_name}: norm={grad_norm:.6f}, max={grad_max:.6f}, nan={grad_has_nan}, inf={grad_has_inf}")
+    
     
     def _log_displacement_stats(self, trajectory, prefix='train'):
         """Log displacement statistics from trajectory."""

@@ -124,7 +124,7 @@ class FLAIR_MAE_err(Dataset):
             self.num_samples = len(f.keys()) // 8  # Number of samples
 
     def _precompute_oracle_positions(self):
-        return
+     
         """Precompute oracle latent positions for all images, or load from cache."""
         import os
         
@@ -323,7 +323,7 @@ class FLAIR_MAE_err(Dataset):
         im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
         
         # Get precomputed oracle positions (fast lookup!)
-        latent_pos =torch.ones(1)#self.oracle_positions[idx].clone()  # [L, 2]
+        latent_pos =self.oracle_positions[idx].clone()  # [L, 2]
 
         label = torch.tensor(f[f'mask_{idx}'][:], dtype=torch.float32)  # [512,512]
         label = self.process_mask(label)
@@ -362,6 +362,10 @@ class FLAIR_MAE_err(Dataset):
         queries = queries[:nb_queries]
         queries_mask = torch.zeros(queries.shape[0])
 
+        latent_pos=self.shuffle_arrays([latent_pos])[0]
+        latent_pos=latent_pos[:625]
+
+
         return image, attention_mask, queries, queries_mask, label, latent_pos, image_err
  
     def get_samples_to_viz(self, idx):
@@ -374,7 +378,7 @@ class FLAIR_MAE_err(Dataset):
         im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
 
         # Get precomputed oracle positions (fast lookup!)
-        latent_pos = torch.ones(1)#self.oracle_positions[idx].clone()  # [L, 2]
+        latent_pos = self.oracle_positions[idx].clone()  # [L, 2]
 
         image_to_return = im_aerial.clone()
         image_to_return = einops.rearrange(image_to_return, "c h w -> h w c")
@@ -412,6 +416,9 @@ class FLAIR_MAE_err(Dataset):
         image = image[attention_mask == 0.0]
 
         queries_mask = torch.zeros(queries.shape[0])
+
+        #latent_pos=self.shuffle_arrays([latent_pos])[0]
+        latent_pos=latent_pos[:625]
 
         return image_to_return, image, attention_mask, queries, queries_mask, label, latent_pos,image_err
 
