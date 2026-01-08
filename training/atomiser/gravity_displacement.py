@@ -33,58 +33,24 @@ from typing import Tuple, Optional
 
 
 class ErrorPredictor(nn.Module):
-    """
-    Predicts reconstruction error from (latent_features, position).
+    """Predicts reconstruction error from latent features ONLY."""
     
-    Positions are normalized to [-1, 1] internally for stable training.
-    Simple MLP architecture for fast inference.
-    """
-    
-    def __init__(
-        self,
-        latent_dim: int,
-        pos_hidden_dim: int = 64,
-        error_hidden_dim: int = 256,
-        spatial_extent: float = 51.5,  # Half of latent_surface (for centered coords)
-    ):
+    def __init__(self, latent_dim: int, hidden_dim: int = 256):
         super().__init__()
         
-        self.spatial_extent = spatial_extent
-        
-        # Position encoder: normalized (x, y) → features
-        self.position_encoder = nn.Sequential(
-            nn.Linear(2, pos_hidden_dim),
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(pos_hidden_dim, pos_hidden_dim),
-        )
-        
-        # Error predictor: concat(latent, pos_features) → scalar error
-        self.error_mlp = nn.Sequential(
-            nn.Linear(latent_dim + pos_hidden_dim, error_hidden_dim),
-            nn.LayerNorm(error_hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(error_hidden_dim, error_hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(error_hidden_dim // 2, 1),
-            nn.Softplus(),  # Error is non-negative
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus(),
         )
     
-    def forward(self, latents: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            latents: [B, L, D] latent features
-            positions: [B, L, 2] latent positions (x, y) in meters
-        
-        Returns:
-            errors: [B, L] predicted reconstruction error per latent
-        """
-        # Normalize positions to [-1, 1] for symmetric, stable encoding
-        positions_norm = positions / self.spatial_extent
-        
-        pos_features = self.position_encoder(positions_norm)  # [B, L, pos_hidden]
-        combined = torch.cat([latents, pos_features], dim=-1)  # [B, L, D + pos_hidden]
-        errors = self.error_mlp(combined).squeeze(-1)  # [B, L]
-        return errors
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        # [B, L, D] → [B, L]
+        return self.mlp(latents).squeeze(-1)
 
 
 class GravityDisplacement(nn.Module):
@@ -201,17 +167,13 @@ class GravityDisplacement(nn.Module):
         if share_weights:
             self.error_predictor = ErrorPredictor(
                 latent_dim=latent_dim,
-                pos_hidden_dim=pos_hidden_dim,
-                error_hidden_dim=error_hidden_dim,
-                spatial_extent=spatial_extent,
+                hidden_dim=error_hidden_dim,
             )
         else:
             self.error_predictors = nn.ModuleList([
                 ErrorPredictor(
                     latent_dim=latent_dim,
-                    pos_hidden_dim=pos_hidden_dim,
-                    error_hidden_dim=error_hidden_dim,
-                    spatial_extent=spatial_extent,
+                    hidden_dim=error_hidden_dim,
                 )
                 for _ in range(depth)
             ])
@@ -580,7 +542,7 @@ class GravityDisplacement(nn.Module):
         # =====================================================================
         
         # Predict error at all latent positions (detached to prevent cheating)
-        predicted_errors = error_predictor(latents.detach(), positions.detach())  # [B, L]
+        predicted_errors = error_predictor(latents.detach())  # [B, L]
         
         # Normalize errors for gravity (with offset)
         errors_norm = self.normalize_errors(predicted_errors)  # [B, L]
