@@ -22,6 +22,7 @@ Config options:
     use_density_spreading: bool - Enable Phase 2 (default: True)
     density_iters: int - Spreading iterations (default: 3)
     stable_depth: int - Final layers with NO displacement (default: 0)
+    predictor_only: bool - Freeze everything except error predictor (default: False)
 
 Usage:
     config = {
@@ -34,6 +35,7 @@ Usage:
             "use_density_spreading": True,
             "density_iters": 3,
             "stable_depth": 1,  # No displacement in last layer
+            "predictor_only": False,  # Set True to only train error predictor
             # ... other config
         }
     }
@@ -163,6 +165,9 @@ class Atomiser_error(pl.LightningModule):
     
     Stable depth: Number of final layers where displacement is disabled,
     allowing the model to stabilize representations after movement.
+    
+    Predictor-only mode: When predictor_only=True, freezes all model components
+    except the error predictor, allowing isolated training of the error prediction.
     """
     
     def __init__(self, *, config, lookup_table):
@@ -268,7 +273,12 @@ class Atomiser_error(pl.LightningModule):
         self.max_density_step_mult = config["Atomiser"].get("max_density_step_mult", 0.25)
         
         # =====================================================================
-        # 7. INITIALIZE COMPONENTS
+        # 7. PREDICTOR-ONLY MODE
+        # =====================================================================
+        self.predictor_only = config["Atomiser"].get("predictor_only", False)
+        
+        # =====================================================================
+        # 8. INITIALIZE COMPONENTS
         # =====================================================================
         self._init_latents()
         self._init_geographic_pruning()
@@ -279,6 +289,12 @@ class Atomiser_error(pl.LightningModule):
         
         # Log configuration
         self._log_config()
+        
+        # =====================================================================
+        # 9. APPLY PREDICTOR-ONLY MODE (freeze everything except error predictor)
+        # =====================================================================
+        if self.predictor_only:
+            self._apply_predictor_only_mode()
 
     def _log_config(self):
         """Log important configuration settings."""
@@ -339,6 +355,10 @@ class Atomiser_error(pl.LightningModule):
             print(f"[Atomiser]   stable_depth={self.stable_depth} (no displacement in last {self.stable_depth} layers)")
         else:
             print(f"[Atomiser] Displacement: DISABLED (fixed positions)")
+        
+        # Predictor-only mode
+        if self.predictor_only:
+            print(f"[Atomiser] *** PREDICTOR-ONLY MODE: Only error predictor is trainable ***")
 
     def _init_latents(self):
         """Initialize learnable latent vectors."""
@@ -570,6 +590,114 @@ class Atomiser_error(pl.LightningModule):
             )
         else:
             self.to_logits = nn.Identity()
+
+    # =========================================================================
+    # Predictor-Only Mode
+    # =========================================================================
+    
+    def _apply_predictor_only_mode(self):
+        """
+        Freeze all model components EXCEPT the error predictor.
+        
+        This mode is useful for:
+        1. Pre-training the error predictor with a frozen encoder
+        2. Fine-tuning only the error prediction without affecting reconstruction
+        3. Debugging/analyzing error predictor behavior in isolation
+        
+        Components frozen:
+        - Latent embeddings
+        - Input processor
+        - Encoder layers (cross-attention, self-attention, FFN)
+        - Hybrid self-attention (if used)
+        - Decoder (cross-attention, output head)
+        - Classifier
+        - Geographic pruning (if it has learnable params)
+        
+        Components kept trainable:
+        - Error predictor (inside gravity_displacement or error_displacement)
+        """
+        print(f"[Atomiser] Applying predictor-only mode...")
+        
+        # Check that we have an error predictor to train
+        has_error_predictor = (
+            self.gravity_displacement is not None or 
+            self.error_displacement is not None
+        )
+        
+        if not has_error_predictor:
+            raise ValueError(
+                "predictor_only=True requires use_gravity_displacement=True or "
+                "use_error_guided_displacement=True to have an error predictor to train!"
+            )
+        
+        # Count params before freezing
+        total_params_before = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        # Freeze everything first
+        self.freeze_all()
+        
+        # Unfreeze ONLY the error predictor
+        self._unfreeze_error_predictor_only()
+        
+        # Count params after freezing
+        total_params_after = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        print(f"[Atomiser] Predictor-only mode applied:")
+        print(f"[Atomiser]   Trainable params before: {total_params_before:,}")
+        print(f"[Atomiser]   Trainable params after:  {total_params_after:,}")
+        print(f"[Atomiser]   Frozen params: {total_params_before - total_params_after:,}")
+    
+    def freeze_all(self):
+        """Freeze all model parameters."""
+        for param in self.parameters():
+            param.requires_grad = False
+    
+    def unfreeze_all(self):
+        """Unfreeze all model parameters."""
+        for param in self.parameters():
+            param.requires_grad = True
+    
+    def _unfreeze_error_predictor_only(self):
+        """Unfreeze only the error predictor parameters."""
+        if self.gravity_displacement is not None:
+            # Gravity displacement has error_predictor or error_predictors
+            if self.gravity_displacement.share_weights:
+                for param in self.gravity_displacement.error_predictor.parameters():
+                    param.requires_grad = True
+            else:
+                for predictor in self.gravity_displacement.error_predictors:
+                    for param in predictor.parameters():
+                        param.requires_grad = True
+        
+        if self.error_displacement is not None:
+            # Error-guided displacement has error_predictor or error_predictors
+            if self.error_displacement.share_weights:
+                for param in self.error_displacement.error_predictor.parameters():
+                    param.requires_grad = True
+            else:
+                for predictor in self.error_displacement.error_predictors:
+                    for param in predictor.parameters():
+                        param.requires_grad = True
+    
+    def get_error_predictor_parameters(self):
+        """Return iterator over error predictor parameters (for optimizer)."""
+        params = []
+        
+        if self.gravity_displacement is not None:
+            if self.gravity_displacement.share_weights:
+                params.extend(self.gravity_displacement.error_predictor.parameters())
+            else:
+                for predictor in self.gravity_displacement.error_predictors:
+                    params.extend(predictor.parameters())
+        
+        if self.error_displacement is not None:
+            if self.error_displacement.share_weights:
+                params.extend(self.error_displacement.error_predictor.parameters())
+            else:
+                for predictor in self.error_displacement.error_predictors:
+                    params.extend(predictor.parameters())
+        
+        return iter(params)
 
     # =========================================================================
     # Coordinate Utilities
@@ -1057,6 +1185,11 @@ class Atomiser_error(pl.LightningModule):
                 self._set_requires_grad(self.error_displacement.error_predictor, False)
             else:
                 self._set_requires_grad(self.error_displacement.error_predictors, False)
+        if self.gravity_displacement is not None:
+            if self.gravity_displacement.share_weights:
+                self._set_requires_grad(self.gravity_displacement.error_predictor, False)
+            else:
+                self._set_requires_grad(self.gravity_displacement.error_predictors, False)
     
     def unfreeze_error_predictor(self):
         """Unfreeze the error predictor."""
@@ -1065,6 +1198,11 @@ class Atomiser_error(pl.LightningModule):
                 self._set_requires_grad(self.error_displacement.error_predictor, True)
             else:
                 self._set_requires_grad(self.error_displacement.error_predictors, True)
+        if self.gravity_displacement is not None:
+            if self.gravity_displacement.share_weights:
+                self._set_requires_grad(self.gravity_displacement.error_predictor, True)
+            else:
+                self._set_requires_grad(self.gravity_displacement.error_predictors, True)
 
     # =========================================================================
     # Trajectory Analysis

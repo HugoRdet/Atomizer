@@ -29,6 +29,15 @@ class ErrorPredictor(nn.Module):
 class GravityDisplacement(nn.Module):
     """
     Two-phase gravity-based displacement with Log-Robust Quantile Normalization.
+    
+    Key feature: Uses ERROR ANOMALY (error - mean_error) as gravitational mass.
+    This removes the geometric center bias where boundary latents are pulled
+    inward simply because there's more "space" in the interior.
+    
+    With anomaly mass:
+    - Uniform error → zero net force (no geometric bias)
+    - Above-average error → positive mass (attracts)
+    - Below-average error → negative mass (repels)
     """
     
     def __init__(
@@ -54,6 +63,7 @@ class GravityDisplacement(nn.Module):
         max_density_step_mult: float = 0.25,
         max_total_spread_mult: float = 0.5,
         freeze_boundary: bool = False,
+        use_error_anomaly: bool = True,  # NEW: toggle anomaly-based mass
     ):
         super().__init__()
         
@@ -70,6 +80,7 @@ class GravityDisplacement(nn.Module):
         self.error_offset = error_offset
         self.danger_zone_divisor = danger_zone_divisor
         self.freeze_boundary = freeze_boundary
+        self.use_error_anomaly = use_error_anomaly  # NEW
         
         # Spatial bounds
         if centered:
@@ -106,6 +117,7 @@ class GravityDisplacement(nn.Module):
         
         # Log
         print(f"[GravityDisplacement] Initialized with LOG-ROBUST QUANTILE normalization (20-80%)")
+        print(f"[GravityDisplacement] use_error_anomaly={use_error_anomaly} (removes geometric center bias)")
 
     def _create_boundary_mask(self) -> torch.Tensor:
         n = self.num_latents_per_row
@@ -128,53 +140,37 @@ class GravityDisplacement(nn.Module):
         return new_pos, disp
 
     # =========================================================================
-    # LOG-ROBUST NORMALIZATION (Updated)
+    # LOG-ROBUST NORMALIZATION
     # =========================================================================
 
     def _robust_normalize(self, errors: torch.Tensor) -> torch.Tensor:
         """
         Normalize errors using Log-Compression followed by Robust Quantile Scaling.
-        
-        Step 1: Compress dynamic range using log(1 + error).
-                This prevents massive outliers (e.g., error=100.0) from acting
-                as "black holes" that suck in all latents.
-                
-        Step 2: Scale based on 20th and 80th percentiles of the LOG values.
-                values < p20 -> 0.0 (background noise)
-                values > p80 -> 1.0 (high priority)
         """
         # 1. Log Compression
-        # log1p is numerically stable for small x
         errors_log = torch.log1p(errors)
         
-        # 2. Robust Quantile Scaling (on log values)
-        # q: [B, 1]
-        #q_low = torch.quantile(errors_log, 0.2, dim=-1, keepdim=True)
-        #q_high = torch.quantile(errors_log, 0.8, dim=-1, keepdim=True)
-        
-        # Range
-        #denom = q_high - q_low
-        
+        # 2. Min-Max scaling on log values
         val_min = errors_log.min(dim=-1, keepdim=True).values
         val_max = errors_log.max(dim=-1, keepdim=True).values
         
-        # Range
         denom = val_max - val_min
-        
-        # Safety: avoid division by zero if error distribution is flat
         denom = torch.maximum(denom, torch.tensor(1e-6, device=errors.device))
         
-        # Scale to [0, 1]
         errors_norm = (errors_log - val_min) / denom
         
         return errors_norm
     
     def normalize_errors(self, errors: torch.Tensor) -> torch.Tensor:
-        """Normalize for Gravity (Phase 1). Includes offset."""
-        # Log-Robust scaling [0, 1]
+        """Normalize for Gravity (Phase 1). Includes offset if not using anomaly."""
         norm = self._robust_normalize(errors)
-        # Add offset so 0.0 still exerts some weak pull (connectivity)
-        return norm + self.error_offset
+        
+        if self.use_error_anomaly:
+            # With anomaly mass, offset is not needed (and would re-introduce bias)
+            return norm
+        else:
+            # Legacy: add offset so 0.0 still exerts some weak pull
+            return norm + self.error_offset
     
     def normalize_errors_zero_one(self, errors: torch.Tensor) -> torch.Tensor:
         """Normalize for Spreading (Phase 2). Strict [0, 1]."""
@@ -185,21 +181,55 @@ class GravityDisplacement(nn.Module):
     # =========================================================================
     
     def compute_gravity_forces(self, positions, errors_norm):
+        """
+        Compute gravitational forces between latents.
+        
+        If use_error_anomaly=True:
+            mass = error - mean_error
+            This removes geometric bias: uniform error → zero net force
+            Above-average error attracts, below-average repels
+        
+        If use_error_anomaly=False:
+            mass = error (original behavior with center bias)
+        """
         B, L, _ = positions.shape
-        pos_i = positions.unsqueeze(2)
-        pos_j = positions.unsqueeze(1)
-        delta = pos_j - pos_i
-        dist = delta.norm(dim=-1).clamp(min=1e-6)
-        direction = delta / dist.unsqueeze(-1)
+        pos_i = positions.unsqueeze(2)  # [B, L, 1, 2]
+        pos_j = positions.unsqueeze(1)  # [B, 1, L, 2]
+        delta = pos_j - pos_i  # [B, L, L, 2]
+        dist = delta.norm(dim=-1).clamp(min=1e-6)  # [B, L, L]
+        direction = delta / dist.unsqueeze(-1)  # [B, L, L, 2]
         
-        # Gravity: error_j / dist^2
-        error_j = errors_norm.unsqueeze(1)
-        gravity_mag = error_j / (dist ** self.gravity_power)
+        # =====================================================================
+        # KEY CHANGE: Use error ANOMALY as mass
+        # =====================================================================
+        if self.use_error_anomaly:
+            # Compute mean error across all latents per batch
+            mean_error = errors_norm.mean(dim=-1, keepdim=True)  # [B, 1]
+            
+            # Anomaly: how much above/below average each latent's error is
+            # Positive = above average (attracts)
+            # Negative = below average (repels)
+            error_anomaly = errors_norm - mean_error  # [B, L]
+            
+            # Use anomaly as mass
+            mass_j = error_anomaly.unsqueeze(1)  # [B, 1, L]
+        else:
+            # Original behavior: use raw normalized error as mass
+            mass_j = errors_norm.unsqueeze(1)  # [B, 1, L]
         
+        # Gravity magnitude: mass / dist^power
+        # Note: mass can be negative with anomaly, which creates repulsion
+        gravity_mag = mass_j / (dist ** self.gravity_power)  # [B, L, L]
+        
+        # Mask out self-interactions
         mask = ~torch.eye(L, dtype=torch.bool, device=positions.device)
         gravity_mag = gravity_mag * mask.unsqueeze(0)
         
-        return (direction * gravity_mag.unsqueeze(-1)).sum(dim=2)
+        # Sum forces from all other latents
+        # direction * magnitude → force vector
+        forces = (direction * gravity_mag.unsqueeze(-1)).sum(dim=2)  # [B, L, 2]
+        
+        return forces
     
     def compute_repulsion_forces(self, positions):
         B, L, _ = positions.shape
@@ -290,7 +320,7 @@ class GravityDisplacement(nn.Module):
         errors_norm = self.normalize_errors(raw_errors)
         errors_norm_01 = self.normalize_errors_zero_one(raw_errors)
         
-        # 2. Attraction
+        # 2. Attraction (now with anomaly-based mass if enabled)
         g_force = self.compute_gravity_forces(positions, errors_norm)
         r_force = self.compute_repulsion_forces(positions) if self.repulsion_strength > 0 else 0
         
@@ -307,6 +337,7 @@ class GravityDisplacement(nn.Module):
         new_pos, total_disp = self.apply_boundary_freeze(new_pos, initial_pos, total_disp)
         
         return new_pos, total_disp, raw_errors
+
 
 # Factory
 def create_gravity_displacement(config):
@@ -331,4 +362,5 @@ def create_gravity_displacement(config):
         max_density_step_mult=c.get("max_density_step_mult", 0.25),
         max_total_spread_mult=c.get("max_total_spread_mult", 0.5),
         freeze_boundary=c.get("freeze_boundary", False),
+        use_error_anomaly=c.get("use_error_anomaly", True),  # NEW: default True
     )
