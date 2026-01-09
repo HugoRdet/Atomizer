@@ -383,6 +383,7 @@ class Atomiser_error(pl.LightningModule):
                 density_sigma_mult=self.density_sigma_mult,
                 density_step_mult=self.density_step_mult,
                 max_density_step_mult=self.max_density_step_mult,
+                freeze_boundary=self.config["Atomiser"].get("freeze_boundary", False)
             )
             print(f"[Atomiser] Position updater: GravityDisplacement (Two-Phase)")
         
@@ -955,7 +956,7 @@ class Atomiser_error(pl.LightningModule):
             return result
         
         if task == "reconstruction" or task == "visualization":
-            chunk_size = 100000
+            chunk_size = 10000
             N = mae_tokens.shape[1]
             
             if N > chunk_size:

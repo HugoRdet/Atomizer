@@ -94,7 +94,7 @@ class Model_MAE_err(pl.LightningModule):
             # Error supervision module for computing actual errors
             self.error_supervision = ErrorSupervisionModule(
                 geometry=self.encoder.input_processor.geometry,
-                grid_size=config["Atomiser"].get("error_grid_size", 3),
+                grid_size=config["Atomiser"].get("error_grid_size", 5),
                 spacing=config["Atomiser"].get("error_grid_spacing", 2),
                 image_size=512,
                 gsd=0.2,

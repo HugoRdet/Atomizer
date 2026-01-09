@@ -51,7 +51,7 @@ configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.
 bands_yaml       = "./data/bands_info/bands.yaml"
 
 # Hardcoded checkpoint path
-checkpoint_path = "./checkpoints/Atomiserxp_20260106_175918_zyo5-val_loss-epoch=27-val_loss=0.1260.ckpt"
+checkpoint_path = "./checkpoints/Atomiserxp_20260108_094816_o2w4-val_loss-epoch=06-val_loss=0.2000.ckpt"
 
 
 # 1. Initialize Lookup Table (Kept as is, assuming it handles modality indices)
