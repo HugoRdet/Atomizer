@@ -632,7 +632,11 @@ class FLAIR_CustomSegmentationCallback(pl.Callback):
         """Process a single sample using your get_samples_to_viz function."""
         
         # Get data from your custom method
-        image,image_tokens, attention_mask, mae_tokens, mask_MAE_res,label_res,latent_pos = dataset.get_samples_to_viz(dataset_idx)
+        image,image_tokens, attention_mask, mae_tokens, mask_MAE_res,label_res,latent_pos,_ = dataset.get_samples_to_viz(dataset_idx)
+
+   
+        
+        device = pl_module.device
         
         # Move to device
         mae_tokens_mask = torch.ones(mae_tokens.shape[0])

@@ -106,6 +106,7 @@ class CartesianRelativeEncoder(nn.Module):
     """
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
+       
         
         self.num_bands = config["Atomiser"].get("cartesian_num_bands", 32)
         self.max_freq = config["Atomiser"].get("cartesian_max_freq", 32)
@@ -136,17 +137,28 @@ class CartesianRelativeEncoder(nn.Module):
         # B. Signed Compression: (-inf, inf) -> (-1, 1)
         dx_comp = dx / (1.0 + torch.abs(dx))
         dy_comp = dy / (1.0 + torch.abs(dy))
-        
+ 
         # C. Fourier Encoding
         x_enc = fourier_encode(dx_comp, max_freq=self.max_freq, num_bands=self.num_bands)
         y_enc = fourier_encode(dy_comp, max_freq=self.max_freq, num_bands=self.num_bands)
         
         # D. Optional GSD Encoding
         if gsd is not None:
+            # Convert gsd to tensor if it's a scalar
+            if not isinstance(gsd, torch.Tensor):
+                gsd = torch.full_like(delta_x, gsd)  # Broadcast to match delta_x shape
+            
+            # Ensure gsd has same shape as delta_x
+            if gsd.shape != delta_x.shape:
+                try:
+                    gsd = gsd.expand_as(delta_x)
+                except RuntimeError:
+                    gsd = torch.full_like(delta_x, gsd.mean().item())
+            
             log_gsd = torch.log((gsd / self.G_ref) + 1e-8)
             gsd_enc = fourier_encode(log_gsd, max_freq=self.max_freq, num_bands=self.num_bands)
             return torch.cat([x_enc, y_enc, gsd_enc], dim=-1)
-        
+     
         return torch.cat([x_enc, y_enc], dim=-1)
 
     def get_output_dim(self, include_gsd: bool = True) -> int:

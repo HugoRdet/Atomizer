@@ -1,20 +1,11 @@
 """
-Hybrid Self-Attention Module with k-NN + Global Context + Log-Distance RPE
+Hybrid Self-Attention Module with k-NN + Global Context + Cartesian RPE
 
-FIXES from previous version:
-1. Bug fix: Check both self_rpe and rpe for None before concatenating
-2. New RPE: Log-distance encoding that handles all scales without aliasing
-3. Self-attention: Learnable embedding instead of degenerate (0,0) encoding
-
-Architecture:
-- Spatial attention: Q=spatial, K/V=[self, k-NN spatial, ALL global]
-- Global attention: Q=global, K/V=[ALL spatial, ALL global]
-- Both use SINGLE softmax for proper competition
-
-Log-Distance RPE:
-- distance: log(d_ij + eps) → spreads all scales evenly
-- direction: atan2(dy, dx) / pi → [-1, 1]
-- No aliasing at small distances, no saturation at large distances
+UPDATED: Switched from LogDistanceRPE to CartesianRPE
+- No polar singularity at (0, 0)
+- Smooth signed compression everywhere
+- No special self-token embedding needed
+- rpe_normalize_scale in meters for proper scaling
 """
 
 import torch
@@ -28,7 +19,7 @@ from .nn_comp import FeedForward
 
 
 # =============================================================================
-# LOG-DISTANCE POSITION ENCODER
+# FOURIER ENCODING
 # =============================================================================
 
 def fourier_encode(x: torch.Tensor, max_freq: int, num_bands: int) -> torch.Tensor:
@@ -36,7 +27,7 @@ def fourier_encode(x: torch.Tensor, max_freq: int, num_bands: int) -> torch.Tens
     Fourier feature encoding.
     
     Args:
-        x: [...] input values (should be roughly in [-1, 1] or [0, 1] for best results)
+        x: [...] input values (should be roughly in [-1, 1] for best results)
         max_freq: maximum frequency
         num_bands: number of frequency bands
         
@@ -56,43 +47,52 @@ def fourier_encode(x: torch.Tensor, max_freq: int, num_bands: int) -> torch.Tens
     return encoded
 
 
-class LogDistanceRPE(nn.Module):
+# =============================================================================
+# CARTESIAN RPE
+# =============================================================================
+
+class CartesianRPE(nn.Module):
     """
-    Log-Distance Relative Position Encoding.
+    Cartesian Relative Position Encoding for self-attention.
     
     Encodes pairwise relationships as:
-    - log_distance: log(d_ij + eps) normalized to reasonable range
-    - direction: atan2(dy, dx) / pi in [-1, 1]
+    - dx_compressed: (dx / scale) / (1 + |dx / scale|) in [-1, 1]
+    - dy_compressed: (dy / scale) / (1 + |dy / scale|) in [-1, 1]
     
-    Advantages over linear-scale RPE:
-    - No aliasing at small distances (0.1m and 0.2m are distinguishable)
-    - No saturation at large distances (4m and 8m are distinguishable)
-    - Log-space naturally spreads all scales evenly
+    Advantages over polar/log-distance RPE:
+    - No atan2 singularity at (0, 0)
+    - Signed compression is smooth everywhere, including at origin
+    - No special handling needed for self-attention (i=j)
+    - Naturally handles the self-loop case: (0, 0) -> (0, 0) -> valid encoding
     
-    For self-attention (i=j), uses a learnable embedding instead of
-    degenerate (0, 0) which would give log(0) = -inf.
+    The compression x / (1 + |x|) maps:
+    - 0 -> 0 (smooth, no singularity)
+    - ±1 -> ±0.5
+    - ±∞ -> ±1
+    
+    Args:
+        num_bands: Number of Fourier frequency bands
+        max_freq: Maximum frequency for Fourier encoding
+        normalize_scale: Scale factor in METERS. Typical values:
+            - latent_spacing (e.g., 6.87m): adjacent latents have dx ≈ 1 before compression
+            - Smaller values → more sensitivity to small displacements
+            - Larger values → more sensitivity to large displacements
     """
     
     def __init__(
         self,
         num_bands: int = 32,
         max_freq: int = 32,
-        log_scale: float = 1.0,  # Normalization: log(d) / log_scale
-        min_dist: float = 0.01,  # Floor to avoid log(0)
+        normalize_scale: float = 1.0,  # In meters!
     ):
         super().__init__()
         self.num_bands = num_bands
         self.max_freq = max_freq
-        self.log_scale = log_scale
-        self.min_dist = min_dist
+        self.normalize_scale = normalize_scale
         
-        # Output dim: (log_dist + direction) each with (1 + 2*num_bands)
+        # Output dim: X and Y each with (1 + 2*num_bands)
         self.per_component_dim = num_bands * 2 + 1
         self.out_dim = self.per_component_dim * 2
-        
-        # Learnable embedding for self-attention (i=j)
-        # This replaces the degenerate (0, 0) case
-        self.self_token_embedding = nn.Parameter(torch.randn(self.out_dim) * 0.02)
     
     def forward(
         self,
@@ -103,69 +103,58 @@ class LogDistanceRPE(nn.Module):
         Encode relative positions.
         
         Args:
-            delta_x: [...] x component of (pos_j - pos_i)
-            delta_y: [...] y component of (pos_j - pos_i)
+            delta_x: [...] x component of (pos_j - pos_i) in meters
+            delta_y: [...] y component of (pos_j - pos_i) in meters
             
         Returns:
             encoding: [..., out_dim]
         """
-        # Distance (with floor to handle d=0)
-        dist = torch.sqrt(delta_x**2 + delta_y**2 + 1e-8)
-        dist_floored = torch.clamp(dist, min=self.min_dist)
+        # A. Normalize by scale (in meters)
+        # After this, adjacent latents (at latent_spacing) have dx ≈ 1
+        dx = delta_x / self.normalize_scale
+        dy = delta_y / self.normalize_scale
         
-        # Log-distance, normalized
-        log_dist = torch.log(dist_floored) / self.log_scale  # Roughly in [-5, 5] for typical ranges
-        log_dist_normalized = log_dist / 5.0  # Roughly in [-1, 1]
+        # B. Signed compression: (-inf, inf) -> (-1, 1)
+        # This is smooth everywhere including at (0, 0)
+        # At dx=0: output is 0
+        # At dx=scale: output is 0.5
+        # At dx=2*scale: output is 0.67
+        # At dx=inf: output approaches 1
+        dx_comp = dx / (1.0 + torch.abs(dx))
+        dy_comp = dy / (1.0 + torch.abs(dy))
         
-        # Direction
-        theta = torch.atan2(delta_y, delta_x)  # [-pi, pi]
-        theta_normalized = theta / math.pi  # [-1, 1]
+        # C. Fourier encode both
+        x_enc = fourier_encode(dx_comp, self.max_freq, self.num_bands)
+        y_enc = fourier_encode(dy_comp, self.max_freq, self.num_bands)
         
-        # Fourier encode both
-        dist_enc = fourier_encode(log_dist_normalized, self.max_freq, self.num_bands)
-        theta_enc = fourier_encode(theta_normalized, self.max_freq, self.num_bands)
-        
-        return torch.cat([dist_enc, theta_enc], dim=-1)
-    
-    def get_self_embedding(self, batch_shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-        """
-        Get self-attention embedding expanded to batch shape.
-        
-        Args:
-            batch_shape: (B, L) or similar
-            device: target device
-            
-        Returns:
-            self_emb: [*batch_shape, 1, out_dim]
-        """
-        return self.self_token_embedding.view(1, 1, 1, -1).expand(*batch_shape, 1, -1).to(device)
+        return torch.cat([x_enc, y_enc], dim=-1)
     
     def get_output_dim(self) -> int:
         return self.out_dim
 
 
 # =============================================================================
-# LOCAL ATTENTION CACHE (UPDATED)
+# LOCAL ATTENTION CACHE
 # =============================================================================
 
 class LocalAttentionCache(nn.Module):
     """
     Computes k-NN, distances, and RPE for local self-attention.
     
-    UPDATED: Uses LogDistanceRPE for better multi-scale handling.
+    Uses CartesianRPE - no special self-token needed.
     """
     
     def __init__(
         self,
         num_bands: int = 32,
         max_freq: int = 32,
-        log_scale: float = 1.0,
+        normalize_scale: float = 1.0,  # In meters!
     ):
         super().__init__()
-        self.rpe_encoder = LogDistanceRPE(
+        self.rpe_encoder = CartesianRPE(
             num_bands=num_bands,
             max_freq=max_freq,
-            log_scale=log_scale,
+            normalize_scale=normalize_scale,
         )
         self.pe_dim = self.rpe_encoder.get_output_dim()
     
@@ -186,6 +175,7 @@ class LocalAttentionCache(nn.Module):
         """
         B, L, _ = positions.shape
         device = positions.device
+        dtype = positions.dtype
         
         k = min(k, L - 1)
         
@@ -208,14 +198,17 @@ class LocalAttentionCache(nn.Module):
         delta_x = delta[..., 0]  # [B, L, k]
         delta_y = delta[..., 1]  # [B, L, k]
         
-        # Distances for Gaussian bias
+        # Distances for Gaussian bias (in meters)
         distances = torch.sqrt(delta_x**2 + delta_y**2 + 1e-8)  # [B, L, k]
         
-        # RPE for neighbors using log-distance encoding
+        # RPE for neighbors using Cartesian encoding
         rpe = self.rpe_encoder(delta_x, delta_y)  # [B, L, k, pe_dim]
         
-        # Self-RPE: learnable embedding (not computed from (0, 0))
-        self_rpe = self.rpe_encoder.get_self_embedding((B, L), device)  # [B, L, 1, pe_dim]
+        # Self-RPE: just encode (0, 0) - Cartesian handles this naturally!
+        # No learnable embedding needed, no discontinuity
+        self_delta_x = torch.zeros(B, L, 1, device=device, dtype=dtype)
+        self_delta_y = torch.zeros(B, L, 1, device=device, dtype=dtype)
+        self_rpe = self.rpe_encoder(self_delta_x, self_delta_y)  # [B, L, 1, pe_dim]
         
         return {
             'topk_indices': topk_indices,
@@ -229,7 +222,7 @@ class LocalAttentionCache(nn.Module):
 
 
 # =============================================================================
-# SPATIAL LOCAL SELF-ATTENTION (FIXED)
+# SPATIAL LOCAL SELF-ATTENTION
 # =============================================================================
 
 class SpatialLocalAttention(nn.Module):
@@ -237,8 +230,6 @@ class SpatialLocalAttention(nn.Module):
     Local self-attention for spatial latents.
     
     Context: [self, k-NN spatial neighbors, ALL global latents]
-    
-    FIXED: Proper None checks for RPE tensors.
     """
     
     def __init__(
@@ -309,7 +300,7 @@ class SpatialLocalAttention(nn.Module):
             topk_indices: [B, L_s, k]
             rpe: [B, L_s, k, pe_dim] or None
             self_rpe: [B, L_s, 1, pe_dim] or None
-            distances: [B, L_s, k]
+            distances: [B, L_s, k] in meters
             global_latents: [B, G, D] or None
         """
         B, L_s, D = spatial.shape
@@ -348,10 +339,9 @@ class SpatialLocalAttention(nn.Module):
             dist_cat = torch.cat([dist_cat, global_dist], dim=2)  # [B, L_s, 1+k+G]
         
         # =====================================================================
-        # Add RPE to context (FIXED: proper None checks)
+        # Add RPE to context
         # =====================================================================
         if self.use_rpe:
-            # Check that we have both RPE tensors
             if rpe is not None and self_rpe is not None:
                 rpe_cat = torch.cat([self_rpe, rpe], dim=2)  # [B, L_s, 1+k, pe_dim]
                 
@@ -363,7 +353,6 @@ class SpatialLocalAttention(nn.Module):
                 context = torch.cat([context, rpe_cat], dim=-1)  # [B, L_s, 1+k+G, D+pe_dim]
             else:
                 # RPE requested but not provided - pad with zeros
-                # This shouldn't happen in normal operation but prevents crashes
                 total_ctx = 1 + k + G
                 zero_rpe = torch.zeros(B, L_s, total_ctx, self.pe_dim, device=device, dtype=dtype)
                 context = torch.cat([context, zero_rpe], dim=-1)
@@ -383,10 +372,10 @@ class SpatialLocalAttention(nn.Module):
         attn = torch.einsum('b h l d, b h l c d -> b h l c', Q, K) * self.scale
         
         # =====================================================================
-        # Gaussian bias
+        # Gaussian bias (distances in meters)
         # =====================================================================
         if self.use_gaussian_bias and self.sigma is not None:
-            sigma_sq = (self.sigma ** 2).view(1, H, 1, 1)
+            sigma_sq = (self.sigma ** 2).view(1, H, 1, 1)  # sigma in meters
             
             # Spatial part (self + k neighbors)
             spatial_dist = dist_cat[:, :, :1+k]  # [B, L_s, 1+k]
@@ -578,12 +567,13 @@ class HybridSelfAttentionBlock(nn.Module):
 
 class HybridSelfAttention(nn.Module):
     """
-    Hybrid self-attention with log-distance RPE.
+    Hybrid self-attention with Cartesian RPE.
     
     Key features:
-    1. Log-distance RPE: handles all scales without aliasing
-    2. Learnable self-embedding: replaces degenerate (0,0) case
+    1. Cartesian RPE: smooth everywhere, no polar singularity
+    2. No special self-embedding needed: (0,0) encodes naturally
     3. k-NN spatial attention + full global attention
+    4. rpe_normalize_scale in METERS for proper scaling
     
     Memory: O(L_s × (k + 1 + G) + G × (L_s + G)) instead of O((L_s + G)²)
     """
@@ -603,10 +593,10 @@ class HybridSelfAttention(nn.Module):
         num_blocks: int = 4,
         has_global: bool = True,
         share_weights: bool = False,
-        # Log-distance RPE parameters
+        # Cartesian RPE parameters
         rpe_num_bands: int = 32,
         rpe_max_freq: int = 32,
-        rpe_log_scale: float = 1.0,
+        rpe_normalize_scale: float = 6.87,  # In METERS (e.g., latent_spacing)
     ):
         super().__init__()
         
@@ -615,15 +605,16 @@ class HybridSelfAttention(nn.Module):
         self.use_gaussian_bias = use_gaussian_bias
         self.num_blocks = num_blocks
         
-        # Cache module with log-distance RPE
+        # Cache module with Cartesian RPE
         self.local_cache = LocalAttentionCache(
             num_bands=rpe_num_bands,
             max_freq=rpe_max_freq,
-            log_scale=rpe_log_scale,
+            normalize_scale=rpe_normalize_scale,
         )
         self.pe_dim = self.local_cache.get_output_dim()
         
-        print(f"[HybridSelfAttention] Log-distance RPE dim: {self.pe_dim}")
+        print(f"[HybridSelfAttention] Cartesian RPE dim: {self.pe_dim}")
+        print(f"[HybridSelfAttention] rpe_normalize_scale={rpe_normalize_scale}m")
         print(f"[HybridSelfAttention] use_rpe={use_rpe}, use_gaussian_bias={use_gaussian_bias}")
         
         # Attention blocks
@@ -665,7 +656,7 @@ class HybridSelfAttention(nn.Module):
         positions: torch.Tensor,
         k: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute k-NN cache with log-distance RPE."""
+        """Compute k-NN cache with Cartesian RPE."""
         k = k or self.k
         return self.local_cache(positions, k)
     
@@ -717,6 +708,11 @@ def create_hybrid_self_attention(config: dict) -> HybridSelfAttention:
     """Factory function to create HybridSelfAttention from config."""
     cfg = config.get("Atomiser", config)
     
+    # Compute default latent_spacing for RPE normalization
+    latent_surface = cfg.get("latent_surface", 103.0)
+    spatial_latents = cfg.get("spatial_latents", 16)
+    default_latent_spacing = latent_surface / (spatial_latents - 1)
+    
     return HybridSelfAttention(
         dim=cfg.get("latent_dim", 512),
         k=cfg.get("self_attn_k", 64),
@@ -726,12 +722,13 @@ def create_hybrid_self_attention(config: dict) -> HybridSelfAttention:
         dropout=cfg.get("attn_dropout", 0.0),
         use_rpe=cfg.get("use_rpe", True),
         use_gaussian_bias=cfg.get("use_gaussian_bias", True),
-        sigma_init=cfg.get("sigma_init", 3.0),
+        sigma_init=cfg.get("gaussian_sigma", 3.0),
         learnable_sigma=cfg.get("learnable_sigma", True),
         num_blocks=cfg.get("self_per_cross_attn", 4),
         has_global=cfg.get("global_latents", 0) > 0,
         share_weights=cfg.get("weight_tie_layers", False),
         rpe_num_bands=cfg.get("rpe_num_bands", 32),
         rpe_max_freq=cfg.get("rpe_max_freq", 32),
-        rpe_log_scale=cfg.get("rpe_log_scale", 1.0),
+        # Use config value if provided, otherwise compute from latent geometry
+        rpe_normalize_scale=cfg.get("rpe_normalize_scale", 3),
     )

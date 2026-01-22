@@ -3,7 +3,6 @@ from training.atomiser import *
 from training.utils import *
 from training.losses import *
 from training.VIT import *
-from training.perceiverIO import *
 from training.ScaleMae import*
 from training.ResNet import *
 from collections import defaultdict
@@ -30,233 +29,151 @@ from transformers import get_cosine_schedule_with_warmup
 import seaborn as sns
 from pytorch_optimizer import Lamb
 
-import torch_optimizer as optim
+# Error supervision imports - UPDATED to v3
+from training.atomiser.error_supervision import (
+    compute_error_supervision,
+)
 
 
 class Model_FLAIR(pl.LightningModule):
-    def __init__(self, config, wand, name,transform,lookup_table):
+    def __init__(self, config, wand, name, transform, lookup_table):
         super().__init__()
         self.strict_loading = False
         self.config = config
-        self.transform=transform
+        self.transform = transform
         self.wand = wand
         self.num_classes = config["trainer"]["num_classes"]
-        self.logging_step = config["trainer"]["logging_step"]
-        self.actual_epoch = 0
-        self.labels_idx = load_json_to_dict("./data/Encoded-BigEarthNet/labels.json")
-        self.weight_decay = float(config["trainer"]["weight_decay"])
-        self.mode = "training"
-        self.multi_modal = config["trainer"]["multi_modal"]
         self.name = name
-        self.table=False
-        self.comment_log=""
-        self.lookup_table=lookup_table
+        self.lookup_table = lookup_table
         
-        # Metrics
+        # Classification Metrics
         self.metric_IoU_train = torchmetrics.JaccardIndex(task="multiclass", num_classes=self.num_classes, average="macro")
         self.metric_IoU_val = torchmetrics.classification.MulticlassJaccardIndex(self.num_classes, average="macro")
         self.metric_IoU_test = torchmetrics.classification.MulticlassJaccardIndex(self.num_classes, average=None)
-        
-        # Model
-        if config["encoder"] == "Atomiser":
-            self.encoder = Atomiser(config=self.config,lookup_table=self.lookup_table)
-        else:
-            self.encoder =PerceiverIO(
-            depth=8,
-            dim=5,
-            queries_dim=256,
-            logits_dim = None,
-            num_latents = 512,
-            latent_dim = 512,
-            cross_heads = 1,
-            latent_heads = 8,
-            cross_dim_head = 64,
-            latent_dim_head = 64,
-            weight_tie_layers = False,
-            decoder_ff = False,
-            seq_dropout_prob = 0.)
 
-        self.tmp_val_loss = 0
-        self.tmp_val_ap = 0
-    
+        # Core Architecture
+        # Using Atomiser_error to support the return of trajectories and predicted errors
+        self.encoder = Atomiser_error(config=self.config, lookup_table=self.lookup_table)
 
         self.loss = nn.CrossEntropyLoss()
         self.lr = float(config["trainer"]["lr"])
+        self.weight_decay = float(config["trainer"]["weight_decay"])
+
+        # Error Supervision Setup (v3)
+        self.use_error_guided_displacement = config["Atomiser"].get("use_error_guided_displacement", False)
+        self.use_gravity_displacement = config["Atomiser"].get("use_gravity_displacement", False)
+        self.use_error_supervision = (self.use_error_guided_displacement or self.use_gravity_displacement)
         
-    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=False, task="reconstruction"):
-        return self.encoder(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=training, task=task)
+        if self.use_error_supervision:
+            self.lambda_error = config["Atomiser"].get("lambda_error", 0.1)
+            self.error_grid_size = config["Atomiser"].get("error_grid_size", 7)
+            self.error_grid_spacing = config["Atomiser"].get("error_grid_spacing", 2)
+            self.error_channels_to_sample = config["Atomiser"].get("error_channels_to_sample", 1)
+            self.error_loss_type = config["Atomiser"].get("error_loss_type", "mse")
+            self.error_normalize = config["Atomiser"].get("error_normalize", True)
+            self.error_warmup = config["Atomiser"].get("error_supervision_warmup_epochs", 0)
+            self.stable_depth = config["Atomiser"].get("stable_depth", 0)
+
+    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos, 
+                training=False, task="reconstruction", return_trajectory=False, 
+                return_predicted_errors=False):
+        return self.encoder(
+            image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos, 
+            training=training, task=task,
+            return_trajectory=return_trajectory,
+            return_predicted_errors=return_predicted_errors,
+        )
+
+    def _should_supervise_error(self):
+        return self.use_error_supervision and self.current_epoch >= self.error_warmup
 
     def training_step(self, batch, batch_idx):
-        image, attention_mask, mae_tokens, mae_tokens_mask, _ , latents_pos = batch
+        image, attention_mask, mae_tokens, mae_tokens_mask, _, latents_pos, image_err = batch
+        supervise_error = self._should_supervise_error()
 
-        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=True)
-        #labels = mae_tokens[:,::5,4]
-        labels = mae_tokens[:,:,4]
+        # Forward with potential trajectory/error prediction
+        result = self.forward(
+            image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos,
+            training=True,
+            task="reconstruction",
+            return_trajectory=supervise_error,
+            return_predicted_errors=supervise_error,
+        )
 
+
+        y_hat = result
+        labels = mae_tokens[:, :, 4].long() # Class labels
+
+        # Classification Loss
+        y_hat_loss = rearrange(y_hat, "b t c -> (b t) c")
+        labels_loss = rearrange(labels, "b p -> (b p)")
+        class_loss = self.loss(y_hat_loss, labels_loss)
+
+        # Error Supervision Loss
+        total_loss = class_loss
+        if supervise_error and result.get('predicted_errors') is not None:
+            error_loss, error_stats = compute_error_supervision(
+                model=self.encoder,
+                trajectory=result['trajectory'],
+                predicted_errors=result['predicted_errors'],
+                latents=result['latents'],
+                final_coords=result['final_coords'],
+                image_err=image_err,
+                geometry=self.encoder.input_processor.geometry,
+                grid_size=self.error_grid_size,
+                spacing=self.error_grid_spacing,
+                num_channels_to_sample=self.error_channels_to_sample,
+                loss_type=self.error_loss_type,
+                normalize=self.error_normalize,
+            )
+            total_loss = class_loss + (self.lambda_error * error_loss)
+            self.log('train_error_loss', error_loss, on_epoch=True)
+
+        self.metric_IoU_train.update(torch.argmax(y_hat, dim=-1), labels)
+        self.log('train_loss', total_loss, on_epoch=True, prog_bar=True)
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        image, attention_mask, mae_tokens, mae_tokens_mask, _, latents_pos, image_err = batch
         
+        # Validation always monitors full output
+        result = self.forward(
+            image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos,
+            training=False, task="reconstruction",
+            return_trajectory=True, return_predicted_errors=True
+        )
         
-        labels_loss=rearrange(labels,"b p -> (b p)")
-        y_hat_loss =rearrange(y_hat.clone() ,"b t c -> (b t) c")
+        y_hat = result['predictions']
         
+        labels = mae_tokens[:, :, 4].long()
         
-        
-        loss = self.loss(y_hat_loss, labels_loss.long())
-        
-        preds = torch.argmax(y_hat.clone(), dim=-1)
-        self.metric_IoU_train.update(preds, labels)
-        
-        # Log the loss directly here instead of manually tracking
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-        
-        return loss
-    
-    def on_fit_start(self):
-        # Model setup
-        return
-        self.encoder.unfreeze_encoder()
-        self.encoder.unfreeze_decoder()
-        self.encoder.freeze_classifier()
-    
-    def on_train_epoch_start(self):
-        return
-        self.encoder.unfreeze_encoder()    
-        self.encoder.unfreeze_decoder()
-        self.encoder.freeze_classifier()
-        
+        class_loss = self.loss(rearrange(y_hat, "b t c -> (b t) c"), labels.flatten())
+        self.metric_IoU_val.update(torch.argmax(y_hat, dim=-1), labels)
+        self.log('val_loss', class_loss, on_epoch=True, prog_bar=True)
+        return class_loss
+
     def on_train_epoch_end(self):
-        # Compute and log IoU
-        train_iou = self.metric_IoU_train.compute()
-        self.log("train_IoU", train_iou, on_epoch=True, logger=True, sync_dist=True)
-        
-        # Reset metrics
+        self.log("train_IoU", self.metric_IoU_train.compute(), on_epoch=True)
         self.metric_IoU_train.reset()
-    
-    def on_validation_epoch_start(self):
-        self.trainer.datamodule.val_dataset.set_modality_mode("validation")
-        
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        
-        image, attention_mask, mae_tokens, mae_tokens_mask, _ , latents_pos = batch
-
-        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask,latents_pos, training=False)
-        
-        #labels = mae_tokens[:,::5,4]
-        labels = mae_tokens[:,:,4]
-        
-        
-        
-        labels_loss=rearrange(labels,"b p -> (b p)")
-        y_hat_loss =rearrange(y_hat.clone() ,"b t c -> (b t) c")
-        
-        
-        
-        loss = self.loss(y_hat_loss, labels_loss.long())
-       
-        preds = torch.argmax(y_hat.clone(), dim=-1)
-
-        
-        self.metric_IoU_val.update(preds, labels)
-        
-        # Log the loss directly here instead of manually tracking
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-        
-        return loss
 
     def on_validation_epoch_end(self):
-      
-        # Compute and log IoU
-        val_iou = self.metric_IoU_val.compute()
-        self.log("val_IoU", val_iou, on_epoch=True, logger=True, sync_dist=True)
-        
-        # Reset metrics
+        self.log("val_IoU", self.metric_IoU_val.compute(), on_epoch=True)
         self.metric_IoU_val.reset()
-        
-        # Reset dataset mode
-        self.trainer.datamodule.val_dataset.set_modality_mode("validation")
 
-    def test_step(self, batch, batch_idx):
-        image, attention_mask, mae_tokens, mae_tokens_mask, _ = batch
-
-        # Forward pass
-        y_hat = self.forward(image, attention_mask, mae_tokens, mae_tokens_mask, training=False)
-        
-        # Get labels and predictions - keep original format
-        labels = mae_tokens[:, 4]
-        preds = torch.argmax(y_hat.clone(), dim=-1)
-        y_hat = y_hat.squeeze(-1)
-        
-        # CRITICAL: Clamp labels to valid range [0, num_classes-1]
-        labels = torch.clamp(labels, 0, self.num_classes - 1).long()
-        
-        # Calculate loss
-        loss = self.loss(y_hat, labels)
-        
-        # Update metrics
-        self.metric_IoU_test.update(preds, labels)
-        
-        # Log loss
-        self.log('test_loss', loss, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        
-        return loss
-    
-    def on_test_epoch_end(self):
-        # Compute per-class IoU
-        test_iou_per_class = self.metric_IoU_test.compute()
-        
-        # Log mean IoU
-        mean_iou = test_iou_per_class.mean()
-        self.log("test_IoU_mean", mean_iou, on_epoch=True, logger=True, sync_dist=True)
-        
-        # Log per-class IoU if needed
-        for i, iou in enumerate(test_iou_per_class):
-            self.log(f"test_IoU_class_{i}", iou, on_epoch=True, logger=True, sync_dist=True)
-        
-        # Reset metrics
-        self.metric_IoU_test.reset()
-        
+    # --- Persistence Methods ---
     def save_model(self, name=None):
-        if name is not None:
-            file_path = f"./pth_files/{self.config['encoder']}_{self.name}_{name}.pth"
-        else:
-            file_path = f"./pth_files/{self.config['encoder']}_{self.name}.pth"
+        suffix = f"_{name}" if name else ""
+        file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
         torch.save(self.encoder.state_dict(), file_path)
         
     def load_model(self, name=None):
-        if name is not None:
-            file_path = f"./pth_files/{self.config['encoder']}_{self.name}_{name}.pth"
-        else:
-            file_path = f"./pth_files/{self.config['encoder']}_{self.name}.pth"
+        suffix = f"_{name}" if name else ""
+        file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
         self.encoder.load_state_dict(torch.load(file_path, weights_only=True))
 
-
     def configure_optimizers(self):
-        base_lr = self.lr
-        wd = self.weight_decay
-
-        if self.config["optimizer"]["name"] == "ADAM":
-            optimizer = torch.optim.Adam(self.parameters(), lr=base_lr, weight_decay=wd)
-        else:
-            import torch_optimizer as optim
-            optimizer = optim.Lamb(self.parameters(), lr=base_lr, weight_decay=wd,
-                                betas=(0.9, 0.999), eps=1e-6)
-
-        # total optimizer steps for the entire fit (already accounts for grad accumulation & epochs)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         total_steps = int(self.trainer.estimated_stepping_batches)
-        
-        # pick a % warmup or your fixed value, but keep it <= total_steps
-        warmup_steps = min(self.config["optimizer"]["warmup_steps"], max(1, int(0.05 * total_steps)))
-
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",   # per-step schedule
-                # no 'monitor' here
-            },
-        }
+        warmup_steps = min(1000, max(1, int(0.05 * total_steps)))
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}

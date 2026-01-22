@@ -84,18 +84,17 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # We pass the input_processor where 'transform' used to go
 # Ensure your Model_MAE/__init__ assigns self.input_processor = input_processor
 # AND that Atomiser inside Model_MAE uses it.
-model = Model_MAE_err(
+model = Model_MAE_err( #Model_FLAIR
     config_model,
     wand=True,
     name=xp_name,
     transform=input_processor, # Pass the new processor here,
-    lookup_table=lookup_table
+    lookup_table=lookup_table,
 )
 
-checkpoint_path = "./checkpoints/Atos_tofine.ckpt"
-
+#checkpoint_path = "./checkpoints/Atomiserxp_20260109_013902_e3yh-val_loss-epoch=37-val_loss=0.0583.ckpt"
 # Option 1: Load checkpoint with strict=False (recommended)
-#model = Model_MAE.load_from_checkpoint(
+#model = Model_MAE_err.load_from_checkpoint(
 #    checkpoint_path,
 #    strict=False,  # Allow missing keys (displacement MLP is new)
 #    config=config_model,
@@ -124,6 +123,8 @@ reconstruction_callback = MAE_err_CustomVisualizationCallback( #FLAIR_CustomSegm
     config=config_model
 )
 
+gravity_callback=ErrorLandscapeVisualizationCallback(config=config_model)
+
 LR_finder=LearningRateFinder(min_lr=1e-05, max_lr=1, num_training_steps=450, mode='exponential', early_stop_threshold=4.0, update_attr=True, attr_name='')
 
 
@@ -150,10 +151,10 @@ trainer = Trainer(
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train],
+    callbacks=[accumulator, reconstruction_callback,gravity_callback, checkpoint_val_mod_train],
     default_root_dir="./checkpoints/",
-    #limit_train_batches=5,
-    #limit_val_batches=5,
+    #limit_train_batches=1,
+    #limit_val_batches=1,
 )
 
 # Fit the model

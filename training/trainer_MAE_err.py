@@ -29,10 +29,9 @@ from transformers import get_cosine_schedule_with_warmup
 import seaborn as sns
 from pytorch_optimizer import Lamb
 
-# Error supervision imports
+# Error supervision imports - UPDATED to v3
 from training.atomiser.error_supervision import (
-    ErrorSupervisionModule,
-    compute_error_predictor_loss,
+    compute_error_supervision,
 )
 
 
@@ -77,10 +76,20 @@ class Model_MAE_err(pl.LightningModule):
         self.lr = float(config["trainer"]["lr"])
         
         # =====================================================================
+        # PREDICTOR-ONLY MODE
+        # =====================================================================
+        self.predictor_only = config["Atomiser"].get("predictor_only", False)
+        
+        if self.predictor_only:
+            print(f"[Trainer] *** PREDICTOR-ONLY MODE ***")
+            print(f"[Trainer]   Training: Only error predictor loss (no reconstruction)")
+            print(f"[Trainer]   Validation: Full reconstruction for monitoring")
+        
+        # =====================================================================
         # DISPLACEMENT WITH ERROR SUPERVISION SETUP
         # =====================================================================
-        self.use_error_guided_displacement = config["Atomiser"].get( "use_error_guided_displacement" , False )
-        self.use_gravity_displacement = config["Atomiser"].get( "use_gravity_displacement" , False )
+        self.use_error_guided_displacement = config["Atomiser"].get("use_error_guided_displacement", False)
+        self.use_gravity_displacement = config["Atomiser"].get("use_gravity_displacement", False)
         
         # Either error-guided or gravity displacement uses error supervision
         self.use_error_supervision = (
@@ -90,19 +99,17 @@ class Model_MAE_err(pl.LightningModule):
         # Get stable_depth from config (for logging purposes)
         self.stable_depth = config["Atomiser"].get("stable_depth", 0)
         
+        # Error supervision parameters (v3 uses convenience function)
         if self.use_error_supervision:
-            # Error supervision module for computing actual errors
-            self.error_supervision = ErrorSupervisionModule(
-                geometry=self.encoder.input_processor.geometry,
-                grid_size=config["Atomiser"].get("error_grid_size", 5),
-                spacing=config["Atomiser"].get("error_grid_spacing", 2),
-                image_size=512,
-                gsd=0.2,
-                num_channels=5,  # B, G, R, NIR, Elevation
-            )
-            
             # Weight for error predictor loss
             self.lambda_error = config["Atomiser"].get("lambda_error", 0.1)
+            
+            # Grid parameters for error sampling
+            self.error_grid_size = config["Atomiser"].get("error_grid_size", 7)
+            self.error_grid_spacing = config["Atomiser"].get("error_grid_spacing", 2)
+            self.error_channels_to_sample = config["Atomiser"].get("error_channels_to_sample", 1)
+            self.error_loss_type = config["Atomiser"].get("error_loss_type", "mse")
+            self.error_normalize = config["Atomiser"].get("error_normalize", True)
             
             # Optional: warmup epochs before enabling error supervision
             self.error_supervision_warmup_epochs = config["Atomiser"].get(
@@ -112,10 +119,13 @@ class Model_MAE_err(pl.LightningModule):
             displacement_type = "GRAVITY" if self.use_gravity_displacement else "ERROR-GUIDED"
             print(f"[Trainer] {displacement_type} displacement ENABLED")
             print(f"[Trainer]   lambda_error={self.lambda_error}")
+            print(f"[Trainer]   error_grid_size={self.error_grid_size}")
+            print(f"[Trainer]   error_channels_to_sample={self.error_channels_to_sample}")
+            print(f"[Trainer]   error_loss_type={self.error_loss_type}")
             print(f"[Trainer]   warmup_epochs={self.error_supervision_warmup_epochs}")
-            print(f"[Trainer]   stable_depth={self.stable_depth} (no displacement in last {self.stable_depth} layers)")
+            print(f"[Trainer]   stable_depth={self.stable_depth}")
+            print(f"[Trainer]   === v3: Using INITIAL positions + FINAL latents ===")
         else:
-            self.error_supervision = None
             self.lambda_error = 0.0
             print(f"[Trainer] Error supervision DISABLED (no error-based displacement)")
         
@@ -147,6 +157,18 @@ class Model_MAE_err(pl.LightningModule):
         # Check if we should use error supervision
         supervise_error = self._should_supervise_error()
         
+        # =====================================================================
+        # PREDICTOR-ONLY MODE: Skip reconstruction, only train error predictor
+        # =====================================================================
+        if self.predictor_only:
+            return self._training_step_predictor_only(
+                image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos, image_err,
+                batch_idx, profiler
+            )
+        
+        # =====================================================================
+        # STANDARD MODE: Full training with reconstruction + error supervision
+        # =====================================================================
         if supervise_error:
             # Forward with trajectory and predicted errors
             result = self.forward(
@@ -188,19 +210,24 @@ class Model_MAE_err(pl.LightningModule):
         
         # Compute error supervision loss if enabled
         if supervise_error and predicted_errors is not None and len(predicted_errors) > 0:
-            # Compute actual errors at trajectory positions
-            # Pass stable_depth to only compute errors for displacement layers
-            actual_errors = self.error_supervision.compute_actual_error(
+            # ================================================================
+            # v3: Use compute_error_supervision convenience function
+            # This uses INITIAL positions (trajectory[0]) + FINAL latents
+            # ================================================================
+            error_loss, error_stats = compute_error_supervision(
+                model=self.encoder,
                 trajectory=trajectory,
+                predicted_errors=predicted_errors,
                 latents=latents,
                 final_coords=final_coords,
                 image_err=image_err,
-                model=self.encoder,
-                stable_depth=self.encoder.stable_depth,  # Only compute for displacement layers
-            )  # [B, num_displacement_layers, L]
-            
-            # Compute error predictor supervision loss
-            error_loss = compute_error_predictor_loss(predicted_errors, actual_errors)
+                geometry=self.encoder.input_processor.geometry,
+                grid_size=self.error_grid_size,
+                spacing=self.error_grid_spacing,
+                num_channels_to_sample=self.error_channels_to_sample,
+                loss_type=self.error_loss_type,
+                normalize=self.error_normalize,
+            )
             
             # Total loss
             total_loss = recon_loss + self.lambda_error * error_loss
@@ -208,20 +235,21 @@ class Model_MAE_err(pl.LightningModule):
             # Log error-related metrics
             self.log('train_error_loss', error_loss, on_step=False, on_epoch=True, 
                      prog_bar=False, logger=True, sync_dist=False)
-            self.log('train_actual_error_mean', actual_errors.mean(), on_step=False, 
-                     on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            self.log('train_actual_error_mean', error_stats['actual_error_mean'], 
+                     on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
             
-            # Log per-layer correlation between predicted and actual errors
-            if batch_idx % 100 == 0:  # Log less frequently to reduce overhead
-                for layer_idx, pred_err in enumerate(predicted_errors):
-                    actual_err = actual_errors[:, layer_idx, :]
-                    if pred_err.numel() > 1:
-                        corr = torch.corrcoef(
-                            torch.stack([pred_err.flatten(), actual_err.flatten()])
-                        )[0, 1]
-                        if not torch.isnan(corr):
-                            self.log(f'train_error_corr_layer_{layer_idx}', corr,
-                                     on_step=False, on_epoch=True, logger=True)
+            # Log correlation (from error_stats)
+            if 'correlation' in error_stats:
+                self.log('train_error_corr', error_stats['correlation'],
+                         on_step=False, on_epoch=True, logger=True)
+            if 'rank_correlation' in error_stats:
+                self.log('train_error_rank_corr', error_stats['rank_correlation'],
+                         on_step=False, on_epoch=True, logger=True)
+            
+            # Log movement-error correlation (should be positive!)
+            if 'movement_error_correlation' in error_stats and batch_idx % 100 == 0:
+                self.log('train_movement_error_corr', error_stats['movement_error_correlation'],
+                         on_step=False, on_epoch=True, logger=True)
             
             if profiler and batch_idx == 0:
                 print_memory("D. After error supervision")
@@ -240,6 +268,93 @@ class Model_MAE_err(pl.LightningModule):
             self._log_displacement_stats(trajectory, prefix='train')
         
         return total_loss
+    
+    def _training_step_predictor_only(
+        self, image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos, image_err,
+        batch_idx, profiler=False
+    ):
+        """
+        Training step for predictor-only mode.
+        
+        Only runs the encoder (no reconstruction) and computes error predictor loss.
+        This is much faster since we skip:
+        1. The decoder forward pass
+        2. The reconstruction loss computation
+        """
+        if profiler and batch_idx == 0:
+            print_memory("A. Predictor-only: Start")
+        
+        # Forward through encoder only (task="encoder" skips reconstruction)
+        result = self.forward(
+            image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos,
+            training=True,
+            task="encoder",  # This skips reconstruction!
+            return_trajectory=True,
+            return_predicted_errors=True,
+        )
+        
+        # Unpack result
+        trajectory = result['trajectory']
+        predicted_errors = result['predicted_errors']
+        latents = result['latents']
+        final_coords = result['final_coords']
+        
+        if profiler and batch_idx == 0:
+            print_memory("B. Predictor-only: After encoder")
+        
+        # ====================================================================
+        # v3: Use compute_error_supervision convenience function
+        # ====================================================================
+        error_loss, error_stats = compute_error_supervision(
+            model=self.encoder,
+            trajectory=trajectory,
+            predicted_errors=predicted_errors,
+            latents=latents,
+            final_coords=final_coords,
+            image_err=image_err,
+            geometry=self.encoder.input_processor.geometry,
+            grid_size=self.error_grid_size,
+            spacing=self.error_grid_spacing,
+            num_channels_to_sample=self.error_channels_to_sample,
+            loss_type=self.error_loss_type,
+            normalize=self.error_normalize,
+        )
+        
+        if profiler and batch_idx == 0:
+            print_memory("C. Predictor-only: After error supervision")
+        
+        # Log metrics
+        self.log('train_loss', error_loss, on_step=False, on_epoch=True, 
+                 prog_bar=True, logger=True, sync_dist=False)
+        self.log('train_error_loss', error_loss, on_step=False, on_epoch=True, 
+                 prog_bar=False, logger=True, sync_dist=False)
+        self.log('train_actual_error_mean', error_stats['actual_error_mean'], 
+                 on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+        
+        # Log correlations
+        if 'correlation' in error_stats:
+            self.log('train_error_corr', error_stats['correlation'],
+                     on_step=False, on_epoch=True, logger=True)
+        if 'rank_correlation' in error_stats:
+            self.log('train_error_rank_corr', error_stats['rank_correlation'],
+                     on_step=False, on_epoch=True, logger=True)
+        
+        # Log movement stats
+        if 'movement_mean' in error_stats:
+            self.log('train_movement_mean', error_stats['movement_mean'],
+                     on_step=False, on_epoch=True, logger=True)
+        if 'movement_error_correlation' in error_stats:
+            self.log('train_movement_error_corr', error_stats['movement_error_correlation'],
+                     on_step=False, on_epoch=True, logger=True)
+        
+        # Log displacement stats
+        if trajectory is not None and batch_idx % 100 == 0:
+            self._log_displacement_stats(trajectory, prefix='train')
+        
+        if profiler and batch_idx == 0:
+            print_memory("D. Predictor-only: End")
+        
+        return error_loss
     
 
     def on_after_backward(self):
@@ -365,12 +480,19 @@ class Model_MAE_err(pl.LightningModule):
         pass
         
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        """
+        Validation step - ALWAYS performs full reconstruction for monitoring.
+        
+        Even in predictor_only mode, we compute reconstruction loss to track
+        whether the frozen encoder is still performing well.
+        """
         # Unpack batch - now includes image_err
         image, attention_mask, mae_tokens, mae_tokens_mask, _, latents_pos, image_err = batch
         
         # Check if we should use error supervision
         supervise_error = self._should_supervise_error()
         
+        # Always do full reconstruction in validation (even in predictor_only mode)
         if supervise_error:
             # Forward with trajectory and predicted errors
             result = self.forward(
@@ -403,31 +525,59 @@ class Model_MAE_err(pl.LightningModule):
         
         # Compute error supervision loss if enabled
         if supervise_error and predicted_errors is not None and len(predicted_errors) > 0:
-            # Pass stable_depth to only compute errors for displacement layers
-            actual_errors = self.error_supervision.compute_actual_error(
+            # ================================================================
+            # v3: Use compute_error_supervision convenience function
+            # ================================================================
+            error_loss, error_stats = compute_error_supervision(
+                model=self.encoder,
                 trajectory=trajectory,
+                predicted_errors=predicted_errors,
                 latents=latents,
                 final_coords=final_coords,
                 image_err=image_err,
-                model=self.encoder,
-                stable_depth=self.encoder.stable_depth,  # Only compute for displacement layers
+                geometry=self.encoder.input_processor.geometry,
+                grid_size=self.error_grid_size,
+                spacing=self.error_grid_spacing,
+                num_channels_to_sample=self.error_channels_to_sample,
+                loss_type=self.error_loss_type,
+                normalize=self.error_normalize,
             )
             
-            error_loss = compute_error_predictor_loss(predicted_errors, actual_errors)
-            total_loss = recon_loss + self.lambda_error * error_loss
+            # In predictor_only mode, total_loss is just error_loss for consistency
+            # But we still log recon_loss separately for monitoring
+            if self.predictor_only:
+                total_loss = error_loss
+            else:
+                total_loss = recon_loss + self.lambda_error * error_loss
             
             self.log('val_error_loss', error_loss, on_step=False, on_epoch=True, 
                      prog_bar=False, logger=True, sync_dist=False)
-            self.log('val_actual_error_mean', actual_errors.mean(), on_step=False, 
-                     on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            self.log('val_actual_error_mean', error_stats['actual_error_mean'], 
+                     on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            
+            # Log correlations
+            if 'correlation' in error_stats:
+                self.log('val_error_corr', error_stats['correlation'],
+                         on_step=False, on_epoch=True, logger=True)
+            if 'rank_correlation' in error_stats:
+                self.log('val_error_rank_corr', error_stats['rank_correlation'],
+                         on_step=False, on_epoch=True, logger=True)
+            
+            # Log movement stats
+            if 'movement_mean' in error_stats:
+                self.log('val_movement_mean', error_stats['movement_mean'],
+                         on_step=False, on_epoch=True, logger=True)
+            if 'movement_error_correlation' in error_stats:
+                self.log('val_movement_error_corr', error_stats['movement_error_correlation'],
+                         on_step=False, on_epoch=True, logger=True)
         else:
             total_loss = recon_loss
         
-        # Log losses
+        # Log losses - always log recon_loss for monitoring
         self.log('val_loss', total_loss, on_step=False, on_epoch=True, 
                  prog_bar=True, logger=True, sync_dist=False)
         self.log('val_recon_loss', recon_loss, on_step=False, on_epoch=True, 
-                 prog_bar=False, logger=True, sync_dist=False)
+                 prog_bar=True if self.predictor_only else False, logger=True, sync_dist=False)
         
         # Log displacement stats on first batch
         if supervise_error and trajectory is not None and batch_idx == 0:
@@ -460,11 +610,22 @@ class Model_MAE_err(pl.LightningModule):
         base_lr = self.lr
         wd = self.weight_decay
 
+        # In predictor_only mode, we can optionally use only error predictor params
+        # But using self.parameters() still works since only error predictor has requires_grad=True
+        if self.predictor_only:
+            # Option 1: Use all parameters (frozen ones won't update anyway)
+            params = self.parameters()
+            # Option 2: Use only error predictor parameters (slightly more efficient)
+            # params = self.encoder.get_error_predictor_parameters()
+            print(f"[Trainer] Optimizer: Using all parameters (frozen ones have requires_grad=False)")
+        else:
+            params = self.parameters()
+
         if self.config["optimizer"] == "ADAM":
-            optimizer = torch.optim.Adam(self.parameters(), lr=base_lr, weight_decay=wd)
+            optimizer = torch.optim.Adam(params, lr=base_lr, weight_decay=wd)
         else:
             import torch_optimizer as optim
-            optimizer = optim.Lamb(self.parameters(), lr=base_lr, weight_decay=wd,
+            optimizer = optim.Lamb(params, lr=base_lr, weight_decay=wd,
                                 betas=(0.9, 0.999), eps=1e-6)
 
         # total optimizer steps for the entire fit (already accounts for grad accumulation & epochs)

@@ -349,9 +349,12 @@ class FLAIR_MAE_err(Dataset):
         
         queries = image.clone()
         image_err=image.clone()
+
+        attention_mask[:,224:288,224:288]=1.0
         
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
+        
         queries = einops.rearrange(queries, "b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
         image = image[attention_mask == 0.0]
@@ -408,10 +411,14 @@ class FLAIR_MAE_err(Dataset):
         queries = image.clone()
         image_err=image.clone()
 
+        attention_mask[:,224:288,224:288]=1.0
+
         # Reshape and sample tokens
         image = einops.rearrange(image, "b h w c -> (b h w) c")
         queries = einops.rearrange(queries, "b h w c -> (b h w) c")
         attention_mask = einops.rearrange(attention_mask, "c h w -> (c h w)")
+
+        
 
         image = image[attention_mask == 0.0]
 

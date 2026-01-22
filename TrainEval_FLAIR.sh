@@ -11,7 +11,7 @@ CONFIG_MODEL="$2"
 CONFIG_DATASET="$3"
 
 #echo "Starting training..."
-python -u script_train_flair.py --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET"
+python -u script_train_mnist.py --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET"
 
 # Read the WandB run ID from the wandb_runs directory using the xp_name variable for the filename
 RUN_FILE="training/wandb_runs/${XP_NAME}.txt"

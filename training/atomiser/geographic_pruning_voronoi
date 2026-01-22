@@ -87,7 +87,6 @@ class GeographicPruning(nn.Module):
         tokens_per_latent = self._gather_tokens(tokens, selected_indices)
         masks_per_latent = self._gather_masks(mask, selected_indices)
 
-      
         return tokens_per_latent, masks_per_latent, selected_bias.to(tokens.dtype)
 
     def _gather_tokens(self, tokens: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:

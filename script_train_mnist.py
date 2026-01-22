@@ -32,8 +32,7 @@ import matplotlib.pyplot as plt
 import argparse
 
 # Import MNIST-specific components
-from training.utils.utils_dataset_MNIST import MNISTSparseCanvas
-from training.utils.dataloaders import UnifiedDataModule
+from training.utils.datasets import MNISTSparseCanvas,EMNISTSparseCanvas, UnifiedDataModule
 from training.utils.callbacks import *
 
 seed_everything(42, workers=True)
@@ -48,10 +47,8 @@ xp_name = "mnist_latent_movement"
 config_model = read_yaml("./training/configs/config_test-Atomiser_Atos_One.yaml")
 
 # Override config for MNIST experiment
-config_model["dataset"]["batchsize"] = 8  # Smaller batch due to large token count
 config_model["trainer"]["max_tokens"] = 262144  # 512*512
 config_model["trainer"]["max_tokens_reconstruction"] = 65536  # 256*256 queries
-config_model["Atomiser"]["spatial_latents"] = 4  # 4x4 = 16 latents
 
 # Debug/visualization config
 config_model["debug"] = {
@@ -114,6 +111,9 @@ model = Model_MNIST(
     lookup_table=lookup_table
 )
 
+
+#model= Diagnostic_MLP(config=config_model)
+
 # =============================================================================
 # Data Module
 # =============================================================================
@@ -127,12 +127,13 @@ data_module = UnifiedDataModule(
     # MNIST-specific params
 )
 
+
+
 # =============================================================================
 # Callbacks
 # =============================================================================
 
 # MNIST visualization callback (reconstruction + trajectory)
-visualization_callback = MNISTVisualizationCallback(config=config_model)
 
 # Learning rate monitor
 lr_monitor = LearningRateMonitor(logging_interval="step")
@@ -150,6 +151,7 @@ checkpoint_callback = ModelCheckpoint(
 # Gradient accumulation (optional)
 accumulator = GradientAccumulationScheduler(scheduling={0: 1})
 
+token_sel=TokenAssignmentVisualizationCallbackMNIST(config=config_model)
 # =============================================================================
 # Trainer
 # =============================================================================
@@ -158,10 +160,9 @@ trainer = Trainer(
     accelerator="gpu" if torch.cuda.is_available() else "cpu",
     devices=-1,
     precision="16-mixed" if torch.cuda.is_available() else "32-true",
-    max_epochs=10,
     logger=wandb_logger,
     callbacks=[
-        visualization_callback,
+        token_sel,
         lr_monitor,
         checkpoint_callback,
         accumulator,
@@ -172,8 +173,8 @@ trainer = Trainer(
     val_check_interval=1.0,  # Validate every epoch
     # Debugging options (uncomment for quick testing)
     # fast_dev_run=True,
-    #limit_train_batches=10,
-    #limit_val_batches=5,
+    #limit_train_batches=1,
+    #limit_val_batches=1,
 )
 
 # =============================================================================

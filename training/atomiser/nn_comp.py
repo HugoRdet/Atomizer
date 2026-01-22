@@ -8,6 +8,7 @@ from training.utils.token_building.fourier_features import fourier_encode
 # ---------------------------------
 # Utilities
 # ---------------------------------
+from typing import Dict, Optional, Tuple, Any
 
 def exists(val):
     return val is not None
@@ -129,17 +130,231 @@ import torch.nn.functional as F
 from einops import rearrange
 
 
-class LocalCrossAttention(nn.Module):
+from torch.utils.checkpoint import checkpoint
+
+
+# =============================================================================
+# LOCAL ROPE 2D MODULE
+# =============================================================================
+
+class LocalRoPE2D(nn.Module):
     """
-    Cross-attention where each query has its own local context.
-    Works for both encoder (latent→token) and decoder (token→latent).
+    Local Rotary Position Encoding for 2D.
+    
+    Two modes:
+    1. Cross-attention: Q at origin (no rotation), K rotated by delta
+    2. Self-attention: Both Q and K rotated by their positions
     """
     
-    def __init__(self, dim_query, dim_context, dim_out, heads=8, dim_head=64, dropout=0.0):
+    def __init__(
+        self,
+        dim_head: int,
+        base: float = 10.0,
+        reference_gsd: float = 0.2,
+        learnable_scale: bool = True,
+        per_head_scale: bool = False,
+        num_heads: int = 8,
+    ):
         super().__init__()
+        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
+        
+        self.dim_head = dim_head
+        self.reference_gsd = reference_gsd
+        
+        quarter_dim = dim_head // 4
+        
+        # Base frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim).float() / quarter_dim))
+        self.register_buffer('inv_freq', inv_freq)
+        
+        # Log reference for resolution scaling
+        self.register_buffer('log_ref', torch.tensor(math.log(1.0 + reference_gsd)))
+        
+        # Learnable frequency scales
+        if learnable_scale:
+            if per_head_scale:
+                self.scale_x = nn.Parameter(torch.ones(num_heads, quarter_dim))
+                self.scale_y = nn.Parameter(torch.ones(num_heads, quarter_dim))
+            else:
+                self.scale_x = nn.Parameter(torch.ones(quarter_dim))
+                self.scale_y = nn.Parameter(torch.ones(quarter_dim))
+            nn.init.normal_(self.scale_x, mean=1.0, std=0.1)
+            nn.init.normal_(self.scale_y, mean=1.0, std=0.1)
+        else:
+            self.scale_x = None
+            self.scale_y = None
+        
+        # Resolution sensitivity
+        self.res_sensitivity = nn.Parameter(torch.tensor(0.5))
+    
+    def forward_cross(
+        self,
+        q: torch.Tensor,        # [B, N, H, d] latent queries
+        k: torch.Tensor,        # [B, N, k, H, d] token keys
+        delta_x: torch.Tensor,  # [B, N, k] relative X (token - latent)
+        delta_y: torch.Tensor,  # [B, N, k] relative Y (token - latent)
+        gsd: Optional[torch.Tensor] = None,  # [B, N, k] token GSD
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Cross-attention: Q unchanged (at origin), K rotated by delta."""
+        res_scale = self._compute_resolution_scale(gsd)
+        k_rotated = self._rotate_2d_cross(k, delta_x, delta_y, res_scale)
+        return q, k_rotated
+    
+    def forward_self(
+        self,
+        q: torch.Tensor,        # [B, N, H, d]
+        k: torch.Tensor,        # [B, N, H, d]
+        pos_x: torch.Tensor,    # [B, N] absolute X positions
+        pos_y: torch.Tensor,    # [B, N] absolute Y positions
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Self-attention: Both Q and K rotated by their positions."""
+        q_rotated = self._rotate_2d_self(q, pos_x, pos_y)
+        k_rotated = self._rotate_2d_self(k, pos_x, pos_y)
+        return q_rotated, k_rotated
+    
+    def _compute_resolution_scale(
+        self,
+        gsd: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Log-scale resolution factor."""
+        if gsd is None:
+            return None
+        
+        log_gsd = torch.log(1.0 + gsd)
+        log_ratio = self.log_ref - log_gsd
+        res_scale = torch.exp(log_ratio * self.res_sensitivity)
+        return res_scale.clamp(min=0.1, max=10.0)
+    
+    def _rotate_2d_cross(
+        self,
+        x: torch.Tensor,        # [B, N, k, H, d]
+        delta_x: torch.Tensor,  # [B, N, k]
+        delta_y: torch.Tensor,  # [B, N, k]
+        res_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Rotate for cross-attention (5D input)."""
+        half_d = self.dim_head // 2
+        
+        x_part = x[..., :half_d]
+        y_part = x[..., half_d:]
+        
+        x_rotated = self._apply_rotary_cross(x_part, delta_x, self.scale_x, res_scale)
+        y_rotated = self._apply_rotary_cross(y_part, delta_y, self.scale_y, res_scale)
+        
+        return torch.cat([x_rotated, y_rotated], dim=-1)
+    
+    def _rotate_2d_self(
+        self,
+        x: torch.Tensor,        # [B, N, H, d]
+        pos_x: torch.Tensor,    # [B, N]
+        pos_y: torch.Tensor,    # [B, N]
+    ) -> torch.Tensor:
+        """Rotate for self-attention (4D input)."""
+        half_d = self.dim_head // 2
+        
+        x_part = x[..., :half_d]
+        y_part = x[..., half_d:]
+        
+        x_rotated = self._apply_rotary_self(x_part, pos_x, self.scale_x)
+        y_rotated = self._apply_rotary_self(y_part, pos_y, self.scale_y)
+        
+        return torch.cat([x_rotated, y_rotated], dim=-1)
+    
+    def _apply_rotary_cross(
+        self,
+        x: torch.Tensor,        # [B, N, k, H, half_d]
+        delta: torch.Tensor,    # [B, N, k]
+        freq_scale: Optional[torch.Tensor] = None,
+        res_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Rotary for cross-attention."""
+        B, N, k, H, half_d = x.shape
+        
+        effective_delta = delta
+        if res_scale is not None:
+            effective_delta = delta * res_scale
+        
+        freq = self.inv_freq
+        if freq_scale is not None and freq_scale.dim() == 1:
+            freq = freq * freq_scale
+        
+        angles = effective_delta.unsqueeze(-1) * freq  # [B, N, k, quarter_dim]
+        angles = angles.unsqueeze(3)  # [B, N, k, 1, quarter_dim]
+        
+        cos = angles.cos()
+        sin = angles.sin()
+        
+        def rotate_half(t):
+            t1, t2 = t.chunk(2, dim=-1)
+            return torch.cat((-t2, t1), dim=-1)
+        
+        cos = torch.cat([cos, cos], dim=-1)
+        sin = torch.cat([sin, sin], dim=-1)
+        
+        return x * cos + rotate_half(x) * sin
+    
+    def _apply_rotary_self(
+        self,
+        x: torch.Tensor,        # [B, N, H, half_d]
+        pos: torch.Tensor,      # [B, N]
+        freq_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Rotary for self-attention."""
+        B, N, H, half_d = x.shape
+        
+        freq = self.inv_freq
+        if freq_scale is not None and freq_scale.dim() == 1:
+            freq = freq * freq_scale
+        
+        angles = pos.unsqueeze(-1) * freq  # [B, N, quarter_dim]
+        angles = angles.unsqueeze(2)  # [B, N, 1, quarter_dim]
+        
+        cos = angles.cos()
+        sin = angles.sin()
+        
+        def rotate_half(t):
+            t1, t2 = t.chunk(2, dim=-1)
+            return torch.cat((-t2, t1), dim=-1)
+        
+        cos = torch.cat([cos, cos], dim=-1)
+        sin = torch.cat([sin, sin], dim=-1)
+        
+        return x * cos + rotate_half(x) * sin
+
+
+# =============================================================================
+# CROSS-ATTENTION WITH LOCAL ROPE
+# =============================================================================
+
+class LocalCrossAttentionRoPE(nn.Module):
+    """
+    Cross-attention with Resolution-Aware Local RoPE.
+    
+    Q (latents) at origin, K (tokens) rotated by relative position.
+    """
+    
+    def __init__(
+        self,
+        dim_query: int,
+        dim_context: int,
+        dim_out: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        # RoPE params
+        use_rope: bool = True,
+        rope_base: float = 10.0,
+        rope_reference_gsd: float = 0.2,
+        rope_learnable_scale: bool = True,
+    ):
+        super().__init__()
+        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
+        
         self.heads = heads
         self.dim_head = dim_head
         self.scale = dim_head ** -0.5
+        self.use_rope = use_rope
+        
         inner_dim = heads * dim_head
         
         self.to_q = nn.Linear(dim_query, inner_dim, bias=False)
@@ -147,17 +362,27 @@ class LocalCrossAttention(nn.Module):
         self.to_v = nn.Linear(dim_context, inner_dim, bias=False)
         self.to_out = nn.Linear(inner_dim, dim_out)
         self.dropout = nn.Dropout(dropout)
+        
+        if use_rope:
+            self.rope = LocalRoPE2D(
+                dim_head=dim_head,
+                base=rope_base,
+                reference_gsd=rope_reference_gsd,
+                learnable_scale=rope_learnable_scale,
+                num_heads=heads,
+            )
+        else:
+            self.rope = None
     
-    def forward(self, x, context, mask=None, bias=None):
-        """
-        Args:
-            x: [B, N, dim_query] - queries
-            context: [B, N, k, dim_context] - local context per query
-            mask: [B, N, k] optional
-            bias: [B, N, k] optional
-        Returns:
-            [B, N, dim_out]
-        """
+    def forward(
+        self,
+        x: torch.Tensor,        # [B, N, dim_query]
+        context: torch.Tensor,  # [B, N, k, dim_context]
+        mask: Optional[torch.Tensor] = None,
+        delta_x: Optional[torch.Tensor] = None,
+        delta_y: Optional[torch.Tensor] = None,
+        gsd: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, N, _ = x.shape
         k = context.shape[2]
         H, d = self.heads, self.dim_head
@@ -166,25 +391,470 @@ class LocalCrossAttention(nn.Module):
         K = self.to_k(context).view(B, N, k, H, d)
         V = self.to_v(context).view(B, N, k, H, d)
         
-        scores = torch.einsum('b n h d, b n k h d -> b n h k', q, K) * self.scale
+        # Apply RoPE
+        if self.use_rope and self.rope is not None and delta_x is not None:
+            q, K = self.rope.forward_cross(q, K, delta_x, delta_y, gsd=gsd)
         
-        if bias is not None:
-            scores = scores + bias.unsqueeze(2)
+        scores = torch.einsum('b n h d, b n k h d -> b n h k', q, K) * self.scale
         
         if mask is not None:
             scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
         
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
-
-        attn_weights = F.softmax(attn, dim=-1)  # [B, H, N, k]
-
-
         
+        out = torch.einsum('b n h k, b n k h d -> b n h d', attn, V)
+        return self.to_out(out.reshape(B, N, H * d))
+
+
+# =============================================================================
+# SELF-ATTENTION WITH LOCAL ROPE
+# =============================================================================
+
+class SelfAttentionRoPE(nn.Module):
+    """
+    Self-attention with 2D RoPE for spatial latents.
+    
+    Both Q and K get rotated by their positions.
+    Relative position is automatically encoded in dot product.
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        # RoPE params
+        use_rope: bool = True,
+        rope_base: float = 10.0,
+        rope_learnable_scale: bool = True,
+    ):
+        super().__init__()
+        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
+        
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.use_rope = use_rope
+        
+        inner_dim = heads * dim_head
+        
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        if use_rope:
+            self.rope = LocalRoPE2D(
+                dim_head=dim_head,
+                base=rope_base,
+                reference_gsd=0.2,  # Not used for self-attention
+                learnable_scale=rope_learnable_scale,
+                num_heads=heads,
+            )
+        else:
+            self.rope = None
+    
+    def forward(
+        self,
+        x: torch.Tensor,        # [B, N, dim]
+        pos_x: Optional[torch.Tensor] = None,  # [B, N] latent X positions
+        pos_y: Optional[torch.Tensor] = None,  # [B, N] latent Y positions
+        num_spatial: Optional[int] = None,     # Number of spatial latents (rest are global)
+    ) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, d = self.heads, self.dim_head
+        
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = [t.view(B, N, H, d) for t in qkv]
+        
+        # Apply RoPE only to spatial latents
+        if self.use_rope and self.rope is not None and pos_x is not None:
+            if num_spatial is not None and num_spatial < N:
+                # Split spatial and global
+                q_spatial, q_global = q[:, :num_spatial], q[:, num_spatial:]
+                k_spatial, k_global = k[:, :num_spatial], k[:, num_spatial:]
+                
+                # Rotate only spatial
+                q_spatial, k_spatial = self.rope.forward_self(
+                    q_spatial, k_spatial, pos_x, pos_y
+                )
+                
+                # Recombine
+                q = torch.cat([q_spatial, q_global], dim=1)
+                k = torch.cat([k_spatial, k_global], dim=1)
+            else:
+                # All spatial
+                q, k = self.rope.forward_self(q, k, pos_x, pos_y)
+        
+        # Standard attention
+        scores = torch.einsum('b i h d, b j h d -> b h i j', q, k) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        out = torch.einsum('b h i j, b j h d -> b i h d', attn, v)
+        return self.to_out(out.reshape(B, N, H * d))
+
+
+# =============================================================================
+# PRENORM WRAPPER FOR ROPE SELF-ATTENTION
+# =============================================================================
+
+class PreNormRoPE(nn.Module):
+    """PreNorm that passes positions to the inner RoPE attention."""
+    
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    
+    def forward(self, x, pos_x=None, pos_y=None, num_spatial=None, **kwargs):
+        x = self.norm(x)
+        return self.fn(x, pos_x=pos_x, pos_y=pos_y, num_spatial=num_spatial, **kwargs)
+
+
+class LocalCrossAttention(nn.Module):
+    """
+    Cross-attention where each query has its own local context.
+    Optionally supports Local RoPE for resolution-aware position encoding.
+    """
+    
+    def __init__(
+        self,
+        dim_query: int,
+        dim_context: int,
+        dim_out: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        # RoPE options
+        use_rope: bool = False,
+        rope_base: float = 10.0,
+        rope_reference_gsd: float = 0.2,
+        rope_learnable_scale: bool = True,
+    ):
+        super().__init__()
+        assert not use_rope or dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
+        
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.use_rope = use_rope
+        
+        inner_dim = heads * dim_head
+        
+        self.to_q = nn.Linear(dim_query, inner_dim, bias=False)
+        self.to_k = nn.Linear(dim_context, inner_dim, bias=False)
+        self.to_v = nn.Linear(dim_context, inner_dim, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim_out)
+        self.dropout = nn.Dropout(dropout)
+        
+        # RoPE for position encoding
+        if use_rope:
+            self.rope = LocalRoPE2D(
+                dim_head=dim_head,
+                base=rope_base,
+                reference_gsd=rope_reference_gsd,
+                learnable_scale=rope_learnable_scale,
+                num_heads=heads,
+            )
+        else:
+            self.rope = None
+    
+    def forward(
+        self,
+        x: torch.Tensor,        # [B, N, dim_query]
+        context: torch.Tensor,  # [B, N, k, dim_context]
+        mask: Optional[torch.Tensor] = None,   # [B, N, k]
+        bias: Optional[torch.Tensor] = None,   # [B, N, k]
+        delta_x: Optional[torch.Tensor] = None,  # [B, N, k] for RoPE
+        delta_y: Optional[torch.Tensor] = None,  # [B, N, k] for RoPE
+        gsd: Optional[torch.Tensor] = None,      # [B, N, k] for RoPE
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: queries [B, N, dim_query]
+            context: local context per query [B, N, k, dim_context]
+            mask: attention mask [B, N, k]
+            bias: attention bias [B, N, k]
+            delta_x/delta_y: relative positions for RoPE [B, N, k]
+            gsd: ground sample distance for resolution-aware RoPE [B, N, k]
+        
+        Returns:
+            [B, N, dim_out]
+        """
+        B, N, _ = x.shape
+        k = context.shape[2]
+        H, d = self.heads, self.dim_head
+        
+        # Project to Q, K, V
+        q = self.to_q(x).view(B, N, H, d)
+        K = self.to_k(context).view(B, N, k, H, d)
+        V = self.to_v(context).view(B, N, k, H, d)
+        
+        # Apply RoPE if enabled
+        if self.use_rope and self.rope is not None and delta_x is not None:
+            q, K = self.rope.forward_cross(q, K, delta_x, delta_y, gsd=gsd)
+        
+        # Compute attention scores
+        scores = torch.einsum('b n h d, b n k h d -> b n h k', q, K) * self.scale
+        
+        # Apply bias if provided
+        if bias is not None:
+            scores = scores + bias.unsqueeze(2)
+        
+        # Apply mask if provided
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
+        
+        # Softmax + dropout
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Weighted sum
         out = torch.einsum('b n h k, b n k h d -> b n h d', attn, V)
         
         return self.to_out(out.reshape(B, N, H * d))
+
+class CompressedFourierRPE(nn.Module):
+    """
+    Fourier RPE with compression MLP.
     
+    Can be used standalone (slow) or with precomputed cache (fast).
+    """
+    
+    def __init__(
+        self,
+        num_bands: int = 16,
+        compress_dim: int = 16,
+        normalize_scale: float = 3.0,
+    ):
+        super().__init__()
+        self.num_bands = num_bands
+        self.normalize_scale = normalize_scale
+        self.compress_dim = compress_dim
+        
+        freqs = torch.linspace(1.0, float(num_bands), num_bands)
+        self.register_buffer('freqs', freqs)
+        
+        fourier_dim = (2 * num_bands + 1) * 2
+        
+        self.compress = nn.Sequential(
+            nn.Linear(fourier_dim, compress_dim * 2),
+            nn.GELU(),
+            nn.Linear(compress_dim * 2, compress_dim),
+        )
+    
+    def forward(self, delta_x: torch.Tensor, delta_y: torch.Tensor) -> torch.Tensor:
+        """Standard forward (slower, for fallback use)."""
+        dx = delta_x / self.normalize_scale
+        dy = delta_y / self.normalize_scale
+        dx = dx / (1.0 + torch.abs(dx))
+        dy = dy / (1.0 + torch.abs(dy))
+        
+        x_enc = self._fourier(dx)
+        y_enc = self._fourier(dy)
+        return self.compress(torch.cat([x_enc, y_enc], dim=-1))
+    
+    def _fourier(self, x: torch.Tensor) -> torch.Tensor:
+        angles = x.unsqueeze(-1) * self.freqs * math.pi
+        return torch.cat([x.unsqueeze(-1), torch.sin(angles), torch.cos(angles)], dim=-1)
+
+
+class PrecomputedFourierRPE(nn.Module):
+    """
+    RPE with precomputed token Fourier features.
+    
+    Uses product formula to avoid recomputing token Fourier every layer.
+    Only latent Fourier (L elements) needs recomputation, not token Fourier (L×k elements).
+    """
+    
+    def __init__(
+        self,
+        num_bands: int = 16,
+        compress_dim: int = 16,
+        normalize_scale: float = 3.0,
+    ):
+        super().__init__()
+        self.num_bands = num_bands
+        self.normalize_scale = normalize_scale
+        self.compress_dim = compress_dim
+        
+        # Frequencies
+        freqs = torch.linspace(1.0, float(num_bands), num_bands)
+        self.register_buffer('freqs', freqs)
+        
+        # Output dim: 2 * (2 * num_bands + 1) for (x, y)
+        # After product formula: same structure as before
+        fourier_dim = (2 * num_bands + 1) * 2
+        
+        self.compress = nn.Sequential(
+            nn.Linear(fourier_dim, compress_dim * 2),
+            nn.GELU(),
+            nn.Linear(compress_dim * 2, compress_dim),
+        )
+    
+    def precompute_token_fourier(
+        self, 
+        token_positions: torch.Tensor,  # [B, L, k, 2]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Precompute Fourier features for tokens. Call ONCE per forward pass.
+        
+        Returns:
+            Dict with sin/cos components for x and y
+        """
+        # Normalize and compress
+        tx = token_positions[..., 0] / self.normalize_scale
+        ty = token_positions[..., 1] / self.normalize_scale
+        tx = tx / (1.0 + torch.abs(tx))  # [B, L, k]
+        ty = ty / (1.0 + torch.abs(ty))  # [B, L, k]
+        
+        # Compute sin/cos for all frequencies
+        # [B, L, k, num_bands]
+        angles_x = tx.unsqueeze(-1) * self.freqs * math.pi
+        angles_y = ty.unsqueeze(-1) * self.freqs * math.pi
+        
+        return {
+            'tx': tx,  # [B, L, k] - normalized x
+            'ty': ty,  # [B, L, k] - normalized y
+            'sin_x': torch.sin(angles_x),  # [B, L, k, num_bands]
+            'cos_x': torch.cos(angles_x),
+            'sin_y': torch.sin(angles_y),
+            'cos_y': torch.cos(angles_y),
+        }
+    
+    def forward_with_cache(
+        self,
+        latent_positions: torch.Tensor,  # [B, L, 2]
+        token_cache: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute RPE using precomputed token cache.
+        
+        Only computes Fourier for L latents, not L×k tokens.
+        """
+        B, L, _ = latent_positions.shape
+        k = token_cache['tx'].shape[2]
+        
+        # Normalize latent positions
+        lx = latent_positions[..., 0] / self.normalize_scale
+        ly = latent_positions[..., 1] / self.normalize_scale
+        lx = lx / (1.0 + torch.abs(lx))  # [B, L]
+        ly = ly / (1.0 + torch.abs(ly))  # [B, L]
+        
+        # Compute latent sin/cos - SMALL! Only [B, L, num_bands]
+        angles_lx = lx.unsqueeze(-1) * self.freqs * math.pi  # [B, L, num_bands]
+        angles_ly = ly.unsqueeze(-1) * self.freqs * math.pi
+        
+        sin_lx = torch.sin(angles_lx)  # [B, L, num_bands]
+        cos_lx = torch.cos(angles_lx)
+        sin_ly = torch.sin(angles_ly)
+        cos_ly = torch.cos(angles_ly)
+        
+        # Expand latent features for broadcasting with [B, L, k, num_bands]
+        sin_lx = sin_lx.unsqueeze(2)  # [B, L, 1, num_bands]
+        cos_lx = cos_lx.unsqueeze(2)
+        sin_ly = sin_ly.unsqueeze(2)
+        cos_ly = cos_ly.unsqueeze(2)
+        
+        # Product formula for relative Fourier features
+        # cos(a - b) = cos(a)cos(b) + sin(a)sin(b)
+        # sin(a - b) = sin(a)cos(b) - cos(a)sin(b)
+        # Here: a = token, b = latent (so delta = token - latent)
+        
+        cos_delta_x = token_cache['cos_x'] * cos_lx + token_cache['sin_x'] * sin_lx
+        sin_delta_x = token_cache['sin_x'] * cos_lx - token_cache['cos_x'] * sin_lx
+        cos_delta_y = token_cache['cos_y'] * cos_ly + token_cache['sin_y'] * sin_ly
+        sin_delta_y = token_cache['sin_y'] * cos_ly - token_cache['cos_y'] * sin_ly
+        
+        # Also need the raw delta for the linear term
+        # delta_x = token_x - latent_x
+        delta_x = token_cache['tx'] - lx.unsqueeze(2)  # [B, L, k]
+        delta_y = token_cache['ty'] - ly.unsqueeze(2)
+        
+        # Concatenate into Fourier features
+        # Same structure as original: [raw, sin, cos] for x, then for y
+        x_features = torch.cat([
+            delta_x.unsqueeze(-1),  # [B, L, k, 1]
+            sin_delta_x,            # [B, L, k, num_bands]
+            cos_delta_x,            # [B, L, k, num_bands]
+        ], dim=-1)  # [B, L, k, 2*num_bands + 1]
+        
+        y_features = torch.cat([
+            delta_y.unsqueeze(-1),
+            sin_delta_y,
+            cos_delta_y,
+        ], dim=-1)
+        
+        fourier_features = torch.cat([x_features, y_features], dim=-1)
+        # [B, L, k, 2 * (2*num_bands + 1)] = [B, L, k, 66] for num_bands=16
+        
+        return self.compress(fourier_features)
+    
+    def forward(
+        self,
+        delta_x: torch.Tensor,
+        delta_y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fallback: standard forward without cache."""
+        dx = delta_x / self.normalize_scale
+        dy = delta_y / self.normalize_scale
+        dx = dx / (1.0 + torch.abs(dx))
+        dy = dy / (1.0 + torch.abs(dy))
+        
+        x_enc = self._fourier(dx)
+        y_enc = self._fourier(dy)
+        return self.compress(torch.cat([x_enc, y_enc], dim=-1))
+    
+    def _fourier(self, x: torch.Tensor) -> torch.Tensor:
+        angles = x.unsqueeze(-1) * self.freqs * math.pi
+        return torch.cat([x.unsqueeze(-1), torch.sin(angles), torch.cos(angles)], dim=-1)
+
+class CompressedFourierRPE(nn.Module):
+    """Simplified - no internal checkpointing."""
+    
+    def __init__(
+        self,
+        num_bands: int = 16,
+        compress_dim: int = 16,
+        normalize_scale: float = 3.0,
+    ):
+        super().__init__()
+        self.num_bands = num_bands
+        self.normalize_scale = normalize_scale
+        self.compress_dim = compress_dim
+        
+        freqs = torch.linspace(1.0, float(num_bands), num_bands)
+        self.register_buffer('freqs', freqs)
+        
+        fourier_dim = (2 * num_bands + 1) * 2
+        
+        self.compress = nn.Sequential(
+            nn.Linear(fourier_dim, compress_dim * 2),
+            nn.GELU(),
+            nn.Linear(compress_dim * 2, compress_dim),
+        )
+    
+    def forward(self, delta_x: torch.Tensor, delta_y: torch.Tensor) -> torch.Tensor:
+        dx = delta_x / self.normalize_scale
+        dy = delta_y / self.normalize_scale
+        dx_comp = dx / (1.0 + torch.abs(dx))
+        dy_comp = dy / (1.0 + torch.abs(dy))
+        
+        x_enc = self._fourier(dx_comp)
+        y_enc = self._fourier(dy_comp)
+        fourier_features = torch.cat([x_enc, y_enc], dim=-1)
+        
+        return self.compress(fourier_features)
+    
+    def _fourier(self, x: torch.Tensor) -> torch.Tensor:
+        angles = x.unsqueeze(-1) * self.freqs * math.pi
+        return torch.cat([
+            x.unsqueeze(-1),
+            torch.sin(angles),
+            torch.cos(angles),
+        ], dim=-1)
 
 class CrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., use_flash=True, id=0):
@@ -1027,3 +1697,87 @@ class SelfAttentionWithGaussianBias(nn.Module):
         out = out.transpose(1, 2).reshape(B, L, -1)  # [B, L, inner_dim]
         return self.to_out(out)
 
+class PreNormWithPositions(nn.Module):
+    """PreNorm wrapper that passes positions to the inner function."""
+    
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    
+    def forward(self, x, positions=None, num_spatial=None, **kwargs):
+        x = self.norm(x)
+        if positions is not None:
+            return self.fn(x, positions=positions, num_spatial=num_spatial, **kwargs)
+        return self.fn(x, **kwargs)
+    
+
+class LatentPositionEncoder(nn.Module):
+    """
+    Encodes latent grid positions using Fourier features + linear projection.
+    Added to spatial latent content to give each latent unique identity.
+    """
+    
+    def __init__(
+        self,
+        output_dim: int,
+        num_bands: int = 8,
+        max_freq: float = 8.0,
+        normalize_scale: float = 103,
+        init_scale: float = 0.02,  # Small init so position starts subtle
+    ):
+        super().__init__()
+        
+        self.num_bands = num_bands
+        self.max_freq = max_freq
+        self.normalize_scale = normalize_scale
+        
+        # Raw Fourier dim: (num_bands * 2 + 1) per coordinate × 2 coordinates
+        self.raw_dim = (num_bands * 2 + 1) * 2
+        
+        # Simple linear projection (no MLP)
+        self.proj = nn.Linear(self.raw_dim, output_dim)
+        
+        # Initialize to small values so position encoding starts subtle
+        nn.init.normal_(self.proj.weight, std=init_scale)
+        nn.init.zeros_(self.proj.bias)
+    
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            positions: [N, 2] or [B, N, 2] grid positions in meters
+        
+        Returns:
+            [N, output_dim] or [B, N, output_dim] position encodings
+        """
+        x = positions[..., 0]
+        y = positions[..., 1]
+        
+        # Normalize by scale
+        x_norm = x / self.normalize_scale
+        y_norm = y / self.normalize_scale
+        
+        # Compress to (-1, 1)
+        x_comp = x_norm / (1.0 + torch.abs(x_norm))
+        y_comp = y_norm / (1.0 + torch.abs(y_norm))
+        
+        # Fourier encode
+        x_enc = self._fourier_encode(x_comp)
+        y_enc = self._fourier_encode(y_comp)
+        
+        # Concatenate and project
+        raw = torch.cat([x_enc, y_enc], dim=-1)
+        return self.proj(raw)
+    
+    def _fourier_encode(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        dtype = x.dtype
+        
+        freqs = torch.linspace(1.0, self.max_freq, self.num_bands, device=device, dtype=dtype)
+        angles = x.unsqueeze(-1) * freqs * math.pi
+        
+        return torch.cat([
+            x.unsqueeze(-1),
+            torch.sin(angles),
+            torch.cos(angles),
+        ], dim=-1)

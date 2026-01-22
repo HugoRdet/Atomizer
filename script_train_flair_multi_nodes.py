@@ -39,7 +39,7 @@ import argparse
 from training.utils.token_building.processor import TokenProcessor
 
 # Create the parser
-parser = argparse.ArgumentParser(description="Execute visualization callback")
+parser = argparse.ArgumentParser(description="Training script")
 parser.add_argument("--xp_name",       type=str, required=True, help="Experiment name")
 parser.add_argument("--config_model",  type=str, required=True, help="Model config yaml file")
 parser.add_argument("--dataset_name",  type=str, required=True, help="Name of the dataset used")
@@ -49,9 +49,6 @@ xp_name = args.xp_name
 config_model = read_yaml("./training/configs/" + args.config_model)
 configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
 bands_yaml       = "./data/bands_info/bands.yaml"
-
-# Hardcoded checkpoint path
-checkpoint_path = "./checkpoints/Atomiserxp_20260111_101757_qup6-val_loss-epoch=58-val_loss=0.0403.ckpt"
 
 # 1. Initialize Lookup Table (Kept as is, assuming it handles modality indices)
 lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
@@ -74,28 +71,39 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
     wandb.init(
         name=config_model["encoder"],
-        project="dynamic_sys",
+        project="FLAIR_seg_overfitting",
         config=config_model
     )
-    wandb_logger = WandbLogger(project="dynamic_sys")
+    wandb_logger = WandbLogger(project="FLAIR_seg_overfitting")
 
     wandb.define_metric("train_loss", step_metric="trainer/global_step")
     wandb.define_metric("val_loss", step_metric="trainer/global_step")
     
 
-# Load model from checkpoint
-print(f"Loading model from checkpoint: {checkpoint_path}")
-model = Model_MAE_err.load_from_checkpoint(
-    checkpoint_path,
-    strict=False,  # Allow missing keys (displacement MLP is new)
-    config=config_model,
+# 4. Instantiate Model
+# We pass the input_processor where 'transform' used to go
+# Ensure your Model_MAE/__init__ assigns self.input_processor = input_processor
+# AND that Atomiser inside Model_MAE uses it.
+model = Model_MAE_err( #Model_FLAIR
+    config_model,
     wand=True,
     name=xp_name,
-    transform=input_processor,
-    lookup_table=lookup_table
+    transform=input_processor, # Pass the new processor here,
+    lookup_table=lookup_table,
 )
-model.eval()
-print("✓ Model loaded successfully")
+
+#checkpoint_path = "./checkpoints/Atomiserxp_20260109_013902_e3yh-val_loss-epoch=37-val_loss=0.0583.ckpt"
+# Option 1: Load checkpoint with strict=False (recommended)
+#model = Model_MAE_err.load_from_checkpoint(
+#    checkpoint_path,
+#    strict=False,  # Allow missing keys (displacement MLP is new)
+#    config=config_model,
+#    wand=True,
+#    name=xp_name,
+#    transform=input_processor,
+#    lookup_table=lookup_table
+#)
+
 
 
 data_module = UnifiedDataModule(
@@ -111,50 +119,49 @@ data_module = UnifiedDataModule(
     dataset_class=FLAIR_MAE_err
 )
 
-reconstruction_callback = MAE_err_CustomVisualizationCallback(
+reconstruction_callback = MAE_err_CustomVisualizationCallback( #FLAIR_CustomSegmentationCallback
     config=config_model
 )
 
 gravity_callback=ErrorLandscapeVisualizationCallback(config=config_model)
-token_assign_callback=TokenAssignmentVisualizationCallback(config=config_model)
-# Trainer - simplified for callback execution only
+
+LR_finder=LearningRateFinder(min_lr=1e-05, max_lr=1, num_training_steps=450, mode='exponential', early_stop_threshold=4.0, update_attr=True, attr_name='')
+
+
+lr_monitor = LearningRateMonitor(logging_interval="step")
+
+checkpoint_val_mod_train = ModelCheckpoint(
+    dirpath="./checkpoints/",
+    filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_loss:.4f}}",
+    monitor="val_loss",
+    mode="min",
+    save_top_k=1,
+    verbose=True,
+)
+
+accumulator = GradientAccumulationScheduler(scheduling={0:1})
+#gradient_warmup = DisplacementGradientWarmupCallback(start_epoch=10, warmup_epochs=10)
+
+# Trainer
 trainer = Trainer(
-    devices=1,  # Use single device for visualization
+    strategy="ddp",                # 'ddp' is better for multi-node than ddp_find_unused... unless necessary
+    devices=2,                     # 2 GPUs per node
+    num_nodes=2,                   # 2 Nodes total
     accelerator="gpu",
     precision="bf16-mixed",
     logger=wandb_logger,
-    callbacks=[token_assign_callback],
-    default_root_dir="./checkpoints/",
-    limit_val_batches=1,
+    callbacks=[accumulator, reconstruction_callback, gravity_callback, checkpoint_val_mod_train],
 )
 
-# Run validation loop to initialize everything
-print("Running validation to execute callback...")
-trainer.validate(model, datamodule=data_module)
-
-# Directly call the callback's visualization method to bypass epoch checks
-# (callback normally checks epoch >= 2 and epoch % log_every_n_epochs == 0)
-print("Executing callback visualization...")
-if hasattr(trainer, 'is_global_zero') and trainer.is_global_zero:
-    try:
-        token_assign_callback._generate_visualizations(trainer, model)
-        #gravity_callback._generate_visualizations(trainer, model)
-        #reconstruction_callback._perform_custom_reconstruction(trainer, model)
-        
-        print("✓ Callback visualization completed!")
-    except Exception as e:
-        print(f"Error executing callback: {e}")
-        import traceback
-        traceback.print_exc()
-else:
-    print("⚠ Not on global rank 0, skipping visualization")
-
-print("✓ Callback execution completed!")
+# Fit the model
+trainer.fit(model, datamodule=data_module)
 
 # Save wandb run ID
-if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
+if trainer.global_rank == 0:
+
+
     run_id = wandb.run.id
     print("WANDB_RUN_ID:", run_id)
     os.makedirs("training/wandb_runs", exist_ok=True)
-    with open(f"training/wandb_runs/{xp_name}_viz.txt", "w") as f:
+    with open(f"training/wandb_runs/{xp_name}.txt", "w") as f:
         f.write(run_id)

@@ -47,6 +47,38 @@ class SensorGeometry(nn.Module):
         self._init_modality_buffers()
         self._init_latent_grid()
 
+
+    def get_query_pixel_coords(
+        self, 
+        query_tokens: torch.Tensor, 
+        image_size: int = 512
+    ) -> torch.Tensor:
+        """
+        Convert query token metadata into global pixel (x, y) coordinates.
+        
+        Args:
+            query_tokens: [B, N, 6] or [B, N, D] tokens where index 1,2 are 
+                          spatial indices mapping to meters.
+            image_size: The target image resolution (default 512).
+            
+        Returns:
+            pixel_coords: [B, N, 2] tensor of long integers (x, y) 
+                          clamped to [0, image_size-1].
+        """
+        # 1. Convert the token metadata indices into meters (x, y)
+        # Uses the pre-registered 'token_centers_lookup' buffer
+        meter_coords = self.get_token_centers(query_tokens) # [B, N, 2]
+        
+        # 2. Project meters into pixel space
+        # We reuse your existing meters_to_pixels logic
+        pixel_coords = self.meters_to_pixels(
+            meter_coords, 
+            image_size=image_size, 
+            gsd=None  # Uses self.default_gsd
+        )
+        
+        return pixel_coords
+
     def _init_token_geometry_buffers(self):
         """Create lookup tables for token index -> physical coordinates."""
         max_global_index = sum(size for _, size in self.lookup_table.table.keys())

@@ -90,7 +90,7 @@ class TokenProcessor(nn.Module):
         token_data: torch.Tensor, 
         mask: torch.Tensor,
         latent_positions: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        ) -> torch.Tensor:
         """
         Main pipeline for the Encoder.
         
@@ -137,17 +137,26 @@ class TokenProcessor(nn.Module):
         # =========================================================
         # STEP 2: ENCODINGS
         # =========================================================
+
         
         # A. Positional: [B, L, m, pos_dim]
         pos_features = self.pos_encoder(delta_x, delta_y, physical_scale, gsd)
+        if len(pos_features.shape)<4:
+            pos_features=pos_features.unsqueeze(-2)
+
         
+        
+
         # B. Spectral: [B, L, m, spec_dim]
         channel_indices = token_data[..., 3].long()
         spectral_features = self.spectral_encoder(channel_indices)
         
+        
         # C. Reflectance: [B, L, m, refl_dim]
         b_values = token_data[..., 0]
         reflectance_features = self.reflectance_encoder(b_values)
+        if len(reflectance_features.shape)<4:
+            reflectance_features=reflectance_features.unsqueeze(-2)
         
         # =========================================================
         # STEP 3: ASSEMBLY
@@ -158,6 +167,7 @@ class TokenProcessor(nn.Module):
             spectral_features, 
             reflectance_features
         ], dim=-1)
+
         
         return features
 

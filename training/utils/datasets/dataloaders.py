@@ -136,9 +136,9 @@ class UnifiedDataModule(pl.LightningDataModule):
         look_up=None,
         dataset_class=None,
         # MNISTSparseCanvas specific params
-        canvas_size=512,
-        min_digit_size=32,
-        max_digit_size=256,
+        canvas_size=64,
+        min_digit_size=59,
+        max_digit_size=59,
         num_samples_train=None,
         num_samples_val=None,
         fixed_position=False,

@@ -1,21 +1,25 @@
 """
-Error Supervision Module for Error-Guided Displacement (v2)
+Error Supervision Module for Error-Guided Displacement (v3)
 
-Changes from v1:
-- Added channel subsampling to reduce VRAM while allowing larger spatial grids
-- Fixed spatial_latents extraction from latents tensor
-- Removed position from error predictor (features-only)
+KEY CHANGE in v3:
+- Uses INITIAL POSITIONS (uniform grid) + FINAL LATENTS for supervision
+- This creates accountability: "Can you still reconstruct where you started?"
+- If a latent abandons a complex region, its final features (tuned for destination)
+  will perform poorly at reconstructing its origin → high error → penalty
+
+Why this works:
+- Final latents are most refined (best representation)
+- Initial positions are stable (no circularity from movement)
+- Creates right incentive: leaving hard regions hurts more than leaving easy ones
 
 Usage:
     error_module = ErrorSupervisionModule(geometry, config)
     actual_errors = error_module.compute_actual_error(
-        trajectory=trajectory,
-        latents=latents,
-        final_coords=final_coords,
+        initial_positions=trajectory[0],  # Uniform grid
+        final_latents=latents,             # After all processing
+        final_coords=final_coords,         # For k-NN in decoder
         image_err=image_err,
         model=model,
-        stable_depth=2,
-        num_channels_to_sample=2,  # NEW: sample 2 random channels per position
     )
 """
 
@@ -29,8 +33,11 @@ class ErrorSupervisionModule(nn.Module):
     """
     Module to compute actual reconstruction error for error predictor supervision.
     
-    Supports channel subsampling to reduce memory usage while allowing
-    larger spatial grids for better error estimation.
+    v3: Uses initial positions + final latents.
+    
+    The key insight: We ask each latent "can you reconstruct your ORIGIN region?"
+    using your FINAL features. If you abandoned a complex region, your features
+    are now tuned for somewhere else → poor reconstruction → high error.
     """
     
     def __init__(
@@ -41,7 +48,7 @@ class ErrorSupervisionModule(nn.Module):
         image_size: int = 512,
         gsd: float = 0.2,
         num_channels: int = 5,
-        num_channels_to_sample: Optional[int] = None,  # NEW
+        num_channels_to_sample: Optional[int] = None,
     ):
         """
         Args:
@@ -52,7 +59,6 @@ class ErrorSupervisionModule(nn.Module):
             gsd: Ground sample distance in meters/pixel
             num_channels: Total number of spectral channels
             num_channels_to_sample: If set, randomly sample this many channels.
-                Allows larger grid_size with same VRAM budget.
         """
         super().__init__()
         self.geometry = geometry
@@ -64,11 +70,9 @@ class ErrorSupervisionModule(nn.Module):
         self.num_channels_to_sample = num_channels_to_sample
         self.num_samples_per_position = grid_size ** 2
         
-        # Log memory savings
         if num_channels_to_sample is not None:
             ratio = num_channels_to_sample / num_channels
-            print(f"[ErrorSupervision] Channel subsampling: {num_channels_to_sample}/{num_channels} "
-                  f"({ratio:.1%} of channels, {1/ratio:.1f}x larger grid possible)")
+       
     
     def _subsample_channels(
         self,
@@ -78,44 +82,20 @@ class ErrorSupervisionModule(nn.Module):
         num_channels: int,
         num_to_sample: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Randomly subsample channels from query tokens and ground truth.
-        
-        Assumes tokens are organized as:
-            [pos0_ch0, pos0_ch1, ..., pos0_chC, pos1_ch0, pos1_ch1, ...]
-        
-        Args:
-            query_tokens: [B, num_positions * num_channels, token_dim]
-            ground_truth: [B, num_positions * num_channels]
-            num_positions: Number of spatial positions (L * num_samples)
-            num_channels: Total number of channels (C)
-            num_to_sample: Number of channels to randomly select (k)
-        
-        Returns:
-            query_tokens_sampled: [B, num_positions * num_to_sample, token_dim]
-            ground_truth_sampled: [B, num_positions * num_to_sample]
-        """
+        """Randomly subsample channels from query tokens and ground truth."""
         B = query_tokens.shape[0]
         device = query_tokens.device
         token_dim = query_tokens.shape[-1]
         
-        # Reshape to separate positions and channels
-        # [B, num_positions * C, D] → [B, num_positions, C, D]
         query_tokens = query_tokens.view(B, num_positions, num_channels, token_dim)
         ground_truth = ground_truth.view(B, num_positions, num_channels)
         
-        # Random channel indices (same for all positions in batch, different per batch item)
-        # For simplicity, use same channels across batch (can be made per-item if needed)
         channel_indices = torch.randperm(num_channels, device=device)[:num_to_sample]
-        channel_indices = channel_indices.sort().values  # Keep order for consistency
+        channel_indices = channel_indices.sort().values
         
-        # Select channels
-        # [B, num_positions, k, D]
         query_tokens_sampled = query_tokens[:, :, channel_indices, :]
         ground_truth_sampled = ground_truth[:, :, channel_indices]
         
-        # Reshape back to flat
-        # [B, num_positions * k, D]
         query_tokens_sampled = query_tokens_sampled.reshape(B, num_positions * num_to_sample, token_dim)
         ground_truth_sampled = ground_truth_sampled.reshape(B, num_positions * num_to_sample)
         
@@ -123,182 +103,82 @@ class ErrorSupervisionModule(nn.Module):
     
     def compute_actual_error(
         self,
-        trajectory: List[torch.Tensor],
-        latents: torch.Tensor,
+        initial_positions: torch.Tensor,
+        final_latents: torch.Tensor,
         final_coords: torch.Tensor,
-        image_err: torch.Tensor,
-        model,
-        layers_to_supervise: Optional[List[int]] = None,
-        stable_depth: int = 0,
-        num_channels_to_sample: Optional[int] = None,  # Can override instance default
-    ) -> torch.Tensor:
-        """
-        Compute actual reconstruction error at latent positions for each layer.
-        
-        Args:
-            trajectory: List of [B, L, 2] positions in meters, one per layer
-            latents: [B, L_total, D] final encoded latents (may include global latents)
-            final_coords: [B, L_spatial, 2] final latent positions
-            image_err: [B, C, H, W, 6] full image with metadata
-            model: Atomiser model (used for decoding)
-            layers_to_supervise: Optional list of layer indices to supervise
-            stable_depth: Number of final layers without displacement
-            num_channels_to_sample: Override instance setting for channel sampling
-        
-        Returns:
-            actual_errors: [B, num_displacement_layers, L] reconstruction error per latent per layer
-        """
-        B = latents.shape[0]
-        depth = len(trajectory) - 1
-        L = trajectory[0].shape[1]  # Number of SPATIAL latents
-        device = latents.device
-        C = self.num_channels
-        
-        # Use instance default if not overridden
-        if num_channels_to_sample is None:
-            num_channels_to_sample = self.num_channels_to_sample
-        
-        # Effective channels for reshape
-        C_effective = num_channels_to_sample if num_channels_to_sample else C
-        
-        # Extract spatial latents only (in case latents includes global latents)
-        spatial_latents = latents[:, :L, :]  # [B, L, D]
-        
-        if layers_to_supervise is None:
-            num_displacement_layers = depth - stable_depth
-            layers_to_supervise = list(range(num_displacement_layers))
-        
-        all_layer_errors = []
-        
-        for layer_idx in layers_to_supervise:
-            layer_coords = trajectory[layer_idx]  # [B, L, 2] in meters
-            
-            # Step 1: Convert meters to pixels
-            positions_pixels = self.geometry.meters_to_pixels(
-                layer_coords,
-                image_size=self.image_size,
-                gsd=self.gsd,
-            )
-            
-            # Step 2: Sample grid around each latent position
-            sample_coords = self.geometry.sample_grid_around_positions(
-                positions_pixels,
-                grid_size=self.grid_size,
-                spacing=self.spacing,
-                image_size=self.image_size,
-            )  # [B, L, num_samples, 2]
-            
-            num_samples = sample_coords.shape[-2]
-            num_positions = L * num_samples
-            
-            # Step 3: Extract query tokens from image
-            sample_coords_flat = sample_coords.view(B, -1, 2)
-            
-            query_tokens, ground_truth, _ = self.geometry.extract_query_tokens_from_image(
-                image_err,
-                sample_coords_flat,
-            )
-            # query_tokens: [B, num_positions * C, 6]
-            # ground_truth: [B, num_positions * C]
-            
-            # Step 3.5: Subsample channels if requested
-            if num_channels_to_sample is not None and num_channels_to_sample < C:
-                query_tokens, ground_truth = self._subsample_channels(
-                    query_tokens,
-                    ground_truth,
-                    num_positions=num_positions,
-                    num_channels=C,
-                    num_to_sample=num_channels_to_sample,
-                )
-                C_effective = num_channels_to_sample
-            else:
-                C_effective = C
-            
-            # Step 4: Decode
-            query_mask = torch.zeros(query_tokens.shape[:2], device=device)
-            
-            predictions = model.reconstruct(
-                spatial_latents,  # Use spatial latents only
-                layer_coords,
-                query_tokens,
-                query_mask,
-            )
-            
-            # Handle output shape
-            if predictions.dim() == 3 and predictions.shape[-1] == 1:
-                predictions = predictions.squeeze(-1)
-            elif predictions.dim() == 3:
-                predictions = predictions[..., 0]
-            
-            # Step 5: Compute MSE per query
-            errors = (predictions - ground_truth) ** 2
-            
-            # Step 6: Reshape and aggregate per latent
-            errors = errors.view(B, L, num_samples, C_effective)
-            layer_errors = errors.mean(dim=(-1, -2))  # [B, L]
-            
-            all_layer_errors.append(layer_errors)
-        
-        actual_errors = torch.stack(all_layer_errors, dim=1)
-        
-        return actual_errors
-    
-    def compute_error_at_single_layer(
-        self,
-        positions: torch.Tensor,
-        latents: torch.Tensor,
-        latent_coords: torch.Tensor,
         image_err: torch.Tensor,
         model,
         num_channels_to_sample: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Compute error at a single set of positions (for debugging/visualization).
+        Compute actual reconstruction error at INITIAL positions using FINAL latents.
+        
+        This creates accountability: each latent must still be able to reconstruct
+        the region it started at. If it moved away from a complex region, its
+        features (now tuned for the destination) will struggle → high error.
         
         Args:
-            positions: [B, L, 2] positions in meters to sample around
-            latents: [B, L, D] latents to use for decoding
-            latent_coords: [B, L, 2] latent positions for k-NN lookup
-            image_err: [B, C, H, W, 6]
-            model: Atomiser model
-            num_channels_to_sample: Override channel sampling
+            initial_positions: [B, L, 2] initial grid positions (trajectory[0])
+            final_latents: [B, L, D] final latent features after all layers
+            final_coords: [B, L, 2] final latent positions (for k-NN in decoder)
+            image_err: [B, C, H, W, 6] full image with metadata
+            model: Atomiser model (used for decoding)
+            num_channels_to_sample: Override instance setting for channel sampling
         
         Returns:
-            errors: [B, L] error per latent
+            actual_errors: [B, L] reconstruction error per latent
         """
-        B, L, _ = positions.shape
-        device = latents.device
+        B = final_latents.shape[0]
+        L = initial_positions.shape[1]
+        device = final_latents.device
         C = self.num_channels
         
         if num_channels_to_sample is None:
             num_channels_to_sample = self.num_channels_to_sample
         
-        # Convert to pixels
+        C_effective = num_channels_to_sample if num_channels_to_sample else C
+        
+        # Extract spatial latents only (in case latents includes global latents)
+        spatial_latents = final_latents[:, :L, :]
+        
+        # =================================================================
+        # STEP 1: Sample query positions around INITIAL positions
+        # =================================================================
+        
+        # Convert initial positions (meters) to pixels
         positions_pixels = self.geometry.meters_to_pixels(
-            positions, image_size=self.image_size, gsd=self.gsd
+            initial_positions,
+            image_size=self.image_size,
+            gsd=self.gsd,
         )
         
-        # Sample grid
+        # Sample grid around each initial position
         sample_coords = self.geometry.sample_grid_around_positions(
             positions_pixels,
             grid_size=self.grid_size,
             spacing=self.spacing,
             image_size=self.image_size,
-        )
+        )  # [B, L, num_samples, 2]
         
         num_samples = sample_coords.shape[-2]
         num_positions = L * num_samples
         
-        # Extract query tokens
+        # =================================================================
+        # STEP 2: Extract query tokens from image
+        # =================================================================
+        
         sample_coords_flat = sample_coords.view(B, -1, 2)
+        
         query_tokens, ground_truth, _ = self.geometry.extract_query_tokens_from_image(
-            image_err, sample_coords_flat
+            image_err,
+            sample_coords_flat,
         )
         
-        # Subsample channels
+        # Subsample channels if requested
         if num_channels_to_sample is not None and num_channels_to_sample < C:
             query_tokens, ground_truth = self._subsample_channels(
-                query_tokens, ground_truth,
+                query_tokens,
+                ground_truth,
                 num_positions=num_positions,
                 num_channels=C,
                 num_to_sample=num_channels_to_sample,
@@ -307,35 +187,79 @@ class ErrorSupervisionModule(nn.Module):
         else:
             C_effective = C
         
-        # Decode
+        # =================================================================
+        # STEP 3: Decode using FINAL latents at INITIAL positions
+        # 
+        # Key: We use initial_positions for the k-NN lookup in decoder,
+        # NOT final_coords. This asks "how well can you reconstruct HERE
+        # (your origin) with your current features?"
+        # =================================================================
+        
         query_mask = torch.zeros(query_tokens.shape[:2], device=device)
-        predictions = model.reconstruct(latents, latent_coords, query_tokens, query_mask)
         
-        if predictions.dim() == 3:
-            predictions = predictions.squeeze(-1) if predictions.shape[-1] == 1 else predictions[..., 0]
+        predictions = model.reconstruct(
+            spatial_latents,  # FINAL features
+            final_coords,     # FINAL positions (k-NN lookup)
+            query_tokens,     # queries at INITIAL positions
+            query_mask,
+        )
+                
+        # Handle output shape
+        if predictions.dim() == 3 and predictions.shape[-1] == 1:
+            predictions = predictions.squeeze(-1)
+        elif predictions.dim() == 3:
+            predictions = predictions[..., 0]
         
-        # Compute error
+        # =================================================================
+        # STEP 4: Compute MSE per latent
+        # =================================================================
+        
         errors = (predictions - ground_truth) ** 2
-        
-        # Reshape and aggregate
         errors = errors.view(B, L, num_samples, C_effective)
-        errors_per_latent = errors.mean(dim=(-1, -2))
+        errors_per_latent = errors.mean(dim=(-1, -2))  # [B, L]
         
         return errors_per_latent
+    
+    def compute_actual_error_at_current_positions(
+        self,
+        current_positions: torch.Tensor,
+        latents: torch.Tensor,
+        image_err: torch.Tensor,
+        model,
+        num_channels_to_sample: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Alternative: Compute error at CURRENT positions (for comparison/debugging).
+        
+        This measures "how well can you reconstruct WHERE YOU ARE NOW?"
+        Useful for seeing if movement actually helped reconstruction.
+        """
+        return self.compute_actual_error(
+            initial_positions=current_positions,  # Use current as "initial"
+            final_latents=latents,
+            final_coords=current_positions,
+            image_err=image_err,
+            model=model,
+            num_channels_to_sample=num_channels_to_sample,
+        )
 
 
 def compute_error_predictor_loss(
     predicted_errors: List[torch.Tensor],
     actual_errors: torch.Tensor,
     loss_type: str = 'mse',
+    normalize: bool = True,
 ) -> torch.Tensor:
     """
     Compute supervision loss for error predictor.
     
+    All layers predict the SAME target: intrinsic difficulty at initial positions.
+    
     Args:
         predicted_errors: List of [B, L] predicted errors, one per displacement layer
-        actual_errors: [B, num_displacement_layers, L] actual errors
-        loss_type: 'mse' or 'ranking' (ranking loss for relative ordering)
+        actual_errors: [B, L] actual errors (same target for all layers!)
+        loss_type: 'mse', 'ranking', or 'log_mse'
+        normalize: If True, normalize both pred and target before loss
     
     Returns:
         loss: Scalar loss for error predictor supervision
@@ -345,14 +269,33 @@ def compute_error_predictor_loss(
     
     total_loss = 0.0
     num_layers = len(predicted_errors)
+    target = actual_errors.detach()
     
-    for layer_idx, pred_error in enumerate(predicted_errors):
-        target = actual_errors[:, layer_idx, :].detach()
+    # Optionally normalize target (log-robust)
+    if normalize:
+        target_log = torch.log1p(target)
+        target_min = target_log.min(dim=-1, keepdim=True).values
+        target_max = target_log.max(dim=-1, keepdim=True).values
+        target_norm = (target_log - target_min) / (target_max - target_min + 1e-6)
+    else:
+        target_norm = target
+    
+    for pred_error in predicted_errors:
+        # Normalize predictions similarly
+        if normalize:
+            pred_log = torch.log1p(pred_error)
+            pred_min = pred_log.min(dim=-1, keepdim=True).values
+            pred_max = pred_log.max(dim=-1, keepdim=True).values
+            pred_norm = (pred_log - pred_min) / (pred_max - pred_min + 1e-6)
+        else:
+            pred_norm = pred_error
         
         if loss_type == 'mse':
-            layer_loss = F.mse_loss(pred_error, target)
+            layer_loss = F.mse_loss(pred_norm, target_norm)
+        elif loss_type == 'log_mse':
+            # MSE in log space (handles large value differences)
+            layer_loss = F.mse_loss(torch.log1p(pred_error), torch.log1p(target))
         elif loss_type == 'ranking':
-            # Ranking loss: care about relative ordering, not absolute values
             layer_loss = ranking_loss(pred_error, target)
         else:
             raise ValueError(f"Unknown loss_type: {loss_type}")
@@ -365,31 +308,15 @@ def compute_error_predictor_loss(
 def ranking_loss(pred: torch.Tensor, target: torch.Tensor, margin: float = 0.1) -> torch.Tensor:
     """
     Pairwise ranking loss: if target_i > target_j, then pred_i should be > pred_j.
-    
-    This is useful when we care about relative ordering (which latents have higher error)
-    rather than absolute error values.
-    
-    Args:
-        pred: [B, L] predicted errors
-        target: [B, L] actual errors
-    
-    Returns:
-        loss: Scalar ranking loss
     """
     B, L = pred.shape
     
-    # Pairwise differences
-    pred_diff = pred.unsqueeze(-1) - pred.unsqueeze(-2)  # [B, L, L]
-    target_diff = target.unsqueeze(-1) - target.unsqueeze(-2)  # [B, L, L]
+    pred_diff = pred.unsqueeze(-1) - pred.unsqueeze(-2)
+    target_diff = target.unsqueeze(-1) - target.unsqueeze(-2)
     
-    # Sign of target difference (which should be larger)
-    target_sign = torch.sign(target_diff)  # +1 if i > j, -1 if i < j, 0 if equal
-    
-    # Hinge loss: if target_i > target_j, then pred_i - pred_j should be > margin
-    # loss = max(0, margin - target_sign * pred_diff)
+    target_sign = torch.sign(target_diff)
     loss = F.relu(margin - target_sign * pred_diff)
     
-    # Mask diagonal (self-comparison)
     mask = ~torch.eye(L, dtype=torch.bool, device=pred.device)
     loss = loss[:, mask].mean()
     
@@ -404,28 +331,30 @@ def compute_error_supervision(
     final_coords: torch.Tensor,
     image_err: torch.Tensor,
     geometry,
-    grid_size: int = 7,  # Larger default since we subsample channels
+    grid_size: int = 7,
     spacing: int = 2,
-    stable_depth: int = 0,
-    num_channels_to_sample: int = 1,  # NEW: default to 2 channels
+    num_channels_to_sample: int = 1,
     loss_type: str = 'mse',
+    normalize: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
     Convenience function to compute error supervision loss in training step.
     
+    Uses INITIAL positions (trajectory[0]) + FINAL latents.
+    
     Args:
         model: Atomiser model
-        trajectory: List of [B, L, 2] positions
+        trajectory: List of [B, L, 2] positions (trajectory[0] = initial grid)
         predicted_errors: List of [B, L] predicted errors from error predictor
-        latents: [B, L, D] final latents
+        latents: [B, L, D] final latents (after all processing)
         final_coords: [B, L, 2] final positions
         image_err: [B, C, H, W, 6]
         geometry: SensorGeometry instance
-        grid_size: Sampling grid size (default 5 for 5×5=25 samples)
+        grid_size: Sampling grid size
         spacing: Grid spacing in pixels
-        stable_depth: Number of final layers without displacement
         num_channels_to_sample: Number of channels to randomly sample
-        loss_type: 'mse' or 'ranking'
+        loss_type: 'mse', 'ranking', or 'log_mse'
+        normalize: If True, normalize pred and target before loss
     
     Returns:
         loss: Error predictor supervision loss
@@ -438,6 +367,9 @@ def compute_error_supervision(
             'predicted_error_mean': 0.0,
         }
     
+    # Get initial positions (uniform grid, before any movement)
+    initial_positions = trajectory[0]
+    
     # Infer num_channels from image_err
     num_channels = image_err.shape[1]
     
@@ -449,39 +381,124 @@ def compute_error_supervision(
         num_channels_to_sample=num_channels_to_sample,
     )
     
+    # Compute actual error at INITIAL positions using FINAL latents
     actual_errors = error_module.compute_actual_error(
-        trajectory=trajectory,
-        latents=latents,
+        initial_positions=initial_positions,
+        final_latents=latents,
         final_coords=final_coords,
         image_err=image_err,
         model=model,
-        stable_depth=stable_depth,
+        num_channels_to_sample=num_channels_to_sample,
     )
     
-    loss = compute_error_predictor_loss(predicted_errors, actual_errors, loss_type=loss_type)
+    # Compute loss (same target for all layers)
+    loss = compute_error_predictor_loss(
+        predicted_errors, 
+        actual_errors, 
+        loss_type=loss_type,
+        normalize=normalize,
+    )
     
     # Statistics
+    pred_stack = torch.stack(predicted_errors)
+    
     stats = {
         'actual_error_mean': actual_errors.mean().item(),
         'actual_error_std': actual_errors.std().item(),
         'actual_error_max': actual_errors.max().item(),
-        'predicted_error_mean': torch.stack(predicted_errors).mean().item(),
-        'predicted_error_std': torch.stack(predicted_errors).std().item(),
+        'actual_error_min': actual_errors.min().item(),
+        'predicted_error_mean': pred_stack.mean().item(),
+        'predicted_error_std': pred_stack.std().item(),
+        'predicted_error_max': pred_stack.max().item(),
+        'predicted_error_min': pred_stack.min().item(),
         'num_displacement_layers': len(predicted_errors),
         'grid_size': grid_size,
         'num_channels_sampled': num_channels_to_sample,
+        'loss_type': loss_type,
     }
     
-    # Per-layer correlation (useful diagnostic)
-    for i, pred in enumerate(predicted_errors):
-        actual = actual_errors[:, i, :]
-        if pred.numel() > 1:
-            # Compute Spearman-like rank correlation
-            pred_flat = pred.flatten()
-            actual_flat = actual.flatten()
-            correlation = torch.corrcoef(
-                torch.stack([pred_flat, actual_flat])
-            )[0, 1].item()
-            stats[f'layer_{i}_correlation'] = correlation
+    # Correlation between predicted and actual (across all latents)
+    # Use first layer's predictions as representative
+    if predicted_errors[0].numel() > 1:
+        pred_flat = predicted_errors[0].flatten()
+        actual_flat = actual_errors.flatten()
+        
+        # Pearson correlation
+        pred_centered = pred_flat - pred_flat.mean()
+        actual_centered = actual_flat - actual_flat.mean()
+        correlation = (pred_centered * actual_centered).sum() / (
+            pred_centered.norm() * actual_centered.norm() + 1e-8
+        )
+        stats['correlation'] = correlation.item()
+        
+        # Spearman rank correlation (more robust)
+        pred_ranks = pred_flat.argsort().argsort().float()
+        actual_ranks = actual_flat.argsort().argsort().float()
+        pred_ranks_centered = pred_ranks - pred_ranks.mean()
+        actual_ranks_centered = actual_ranks - actual_ranks.mean()
+        rank_correlation = (pred_ranks_centered * actual_ranks_centered).sum() / (
+            pred_ranks_centered.norm() * actual_ranks_centered.norm() + 1e-8
+        )
+        stats['rank_correlation'] = rank_correlation.item()
+    
+    # Movement statistics (how much did latents move?)
+    if len(trajectory) > 1:
+        total_displacement = (trajectory[-1] - trajectory[0]).norm(dim=-1)
+        stats['movement_mean'] = total_displacement.mean().item()
+        stats['movement_max'] = total_displacement.max().item()
+        stats['movement_std'] = total_displacement.std().item()
+        
+        # Correlation between movement and error (should be positive!)
+        # Latents should move MORE toward high-error regions
+        if total_displacement.numel() > 1:
+            disp_flat = total_displacement.flatten()
+            disp_centered = disp_flat - disp_flat.mean()
+            movement_error_corr = (disp_centered * actual_centered).sum() / (
+                disp_centered.norm() * actual_centered.norm() + 1e-8
+            )
+            stats['movement_error_correlation'] = movement_error_corr.item()
     
     return loss, stats
+
+
+def compute_abandonment_penalty(
+    trajectory: List[torch.Tensor],
+    actual_errors: torch.Tensor,
+    penalty_weight: float = 0.1,
+) -> torch.Tensor:
+    """
+    Optional: Explicit penalty for abandoning high-error regions.
+    
+    If a latent moves away from a high-error region, add extra penalty.
+    
+    Args:
+        trajectory: List of positions
+        actual_errors: [B, L] error at initial positions
+        penalty_weight: Weight for abandonment penalty
+    
+    Returns:
+        penalty: Scalar penalty term
+    """
+    if len(trajectory) < 2:
+        return torch.tensor(0.0, device=actual_errors.device)
+    
+    # Movement magnitude
+    movement = (trajectory[-1] - trajectory[0]).norm(dim=-1)  # [B, L]
+    
+    # Normalize errors to [0, 1]
+    errors_norm = (actual_errors - actual_errors.min()) / (
+        actual_errors.max() - actual_errors.min() + 1e-6
+    )
+    
+    # Penalty: movement * error (moving away from high-error = bad)
+    # But we want to ENCOURAGE moving toward high-error...
+    # So actually we want to penalize when movement is AWAY from high-error
+    
+    # Simple heuristic: penalize movement that's not proportional to error
+    # If error is high but movement is low → penalty (should have moved there!)
+    # If error is low but movement is high → no penalty (fine to leave)
+    
+    # This is tricky to compute without knowing direction...
+    # For now, just return correlation as diagnostic
+    
+    return torch.tensor(0.0, device=actual_errors.device)
