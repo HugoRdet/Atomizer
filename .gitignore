@@ -199,3 +199,15 @@ cython_debug/
 wandb/
 ziLcChuT
 .nfs000000002388237300000378
+
+
+# Ignore raw data files
+data/EMNIST/raw/
+*.ubyte
+
+# Ignore generated figures
+figures/*.png
+
+# Ignore Python cache
+__pycache__/
+*.pyc

@@ -291,13 +291,13 @@ class Atomiser_error(pl.LightningModule):
             # NEW STYLE: Shared content + position encoding
             self.spatial_latent_content = nn.Parameter(torch.randn(self.latent_dim))
             nn.init.trunc_normal_(self.spatial_latent_content, std=0.02, a=-2., b=2.)
-            
+
             self.latent_pos_encoder = LatentPositionEncoder(
                 output_dim=self.latent_dim,
-                num_bands=self.config["Atomiser"].get("latent_pos_num_bands", 32),
-                max_freq=self.config["Atomiser"].get("latent_pos_max_freq", 32),
+                num_bands=self.config["latent_grids"].get("latent_pos_num_bands", 32),
+                max_freq=self.config["latent_grids"].get("latent_pos_max_freq", 32),
                 normalize_scale=self.latent_surface,
-                init_scale=self.config["Atomiser"].get("latent_pos_init_scale", 0.02),
+                init_scale=0.02,
             )
             print("[Atomiser] Using NEW STYLE: shared content + APE")
         
