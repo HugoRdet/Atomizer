@@ -158,14 +158,47 @@ class SensorGeometry(nn.Module):
         )
 
     def _init_latent_grid(self):
-        """Pre-compute the default latent grid (PERFORMANCE - done once)."""
-        half_extent = self.latent_surface / 2.0
-        coords = torch.linspace(-half_extent, half_extent, self.spatial_latents_per_row)
-        grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
-        grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
-        
-        # Register as buffer - will auto-move to GPU with model
-        self.register_buffer("latent_grid", grid)
+        configs = self.config["latent_grids"]
+
+        for key, tmp_config in configs.items():
+            # 1. Physical Parameters
+            total_span = tmp_config["span"]
+            num_latents = tmp_config["latents"]
+            
+            # Determine N per side (handling total count vs side count)
+            if num_latents > 100:
+                n = int(math.sqrt(num_latents))
+            else:
+                n = int(num_latents)
+
+            # 2. CALCULATE STEP AND OFFSET
+            # Each latent covers exactly this much distance:
+            step = total_span / n 
+            
+            # To center the latents within their partitions:
+            # The first point is at (-total_span/2 + step/2)
+            # The last point is at (total_span/2 - step/2)
+            start_pos = -total_span / 2.0 + step / 2.0
+            end_pos = total_span / 2.0 - step / 2.0
+            
+            # 3. Generate Coordinates
+            # This ensures exactly 'n' points spaced by 'step'
+            coords = torch.linspace(start_pos, end_pos, n)
+            
+            # 4. Create Meshgrid & Flatten
+            grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
+            
+            # Stack as [L, 2] -> [x, y]
+            grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
+            
+            # 5. Dynamic Buffer Naming
+            res_key = int(round(tmp_config["resolution"] * 1000))
+            size_key = int(tmp_config["pixel_size"])
+            buffer_name = f"latent_grid_{res_key}_{size_key}"
+            
+            self.register_buffer(buffer_name, grid)
+            
+         
 
     # =========================================================================
     # PUBLIC API (Optimized)
@@ -187,14 +220,23 @@ class SensorGeometry(nn.Module):
         x_idx = token_data[..., 1].long()
         return self.token_gsd_lookup[x_idx]
 
-    def get_default_latent_grid(self, device=None) -> torch.Tensor:
+    def get_default_latent_grid(self, config) -> torch.Tensor:
         """
-        Get the pre-computed latent grid.
+        Get the pre-computed latent grid based on resolution.
+        """
+        # Use single quotes inside the bracket to avoid breaking the f-string
+        res_key = int(round(config["resolution"] * 1000))
+        size_key= int(config["pixel_size"])
+        buffer_name = f"latent_grid_{res_key}_{size_key}"
+
+
         
-        PERFORMANCE: Grid is pre-computed in __init__, just return it.
-        Device parameter ignored - buffer auto-moves with model.
-        """
-        return self.latent_grid
+        
+        if hasattr(self, buffer_name):
+            return getattr(self, buffer_name)
+        else:
+            raise AttributeError(f"Latent grid for resolution {res_key}mm not found. "
+                                f"Was it initialized in _init_latent_grid?")
 
     def get_physical_scale(self, token_data: torch.Tensor) -> torch.Tensor:
         """Get normalization scale for input batch."""

@@ -36,7 +36,9 @@ from .RPE import (
     LocalCrossAttentionRoPE,
     PreNormRPEConcat,
     SelfAttentionRPEConcat,
-    LocalCrossAttentionRoPE
+    LocalCrossAttentionRoPE,
+    SelfAttentionRoPE,
+    PreNormRoPE
 )
 
 from .displacement import (
@@ -129,6 +131,7 @@ class Atomiser_error(pl.LightningModule):
         # 1. INPUT PROCESSOR
         # =====================================================================
         self.input_processor = TokenProcessor(config, lookup_table)
+        self.geo_pruning=dict()
         
         # =====================================================================
         # 2. LATENT CONFIGURATION
@@ -165,7 +168,7 @@ class Atomiser_error(pl.LightningModule):
         self.geo_k = config["Atomiser"].get("geo_k", 1500)
         self.geo_m_train = config["Atomiser"].get("geo_m_train", 500)
         self.geo_m_val = config["Atomiser"].get("geo_m_val", 500)
-        self.geo_sigma = config["Atomiser"].get("geo_sigma", 0.5)
+        
         
         # Decoder parameters
         self.decoder_k_spatial = config["Atomiser"].get("decoder_k_spatial", 4)
@@ -178,9 +181,9 @@ class Atomiser_error(pl.LightningModule):
         # =====================================================================
         # 6. ROPE CONFIGURATION
         # =====================================================================
-        self.encoder_use_rpe = config["Atomiser"].get("encoder_use_rpe", False)
-        self.decoder_use_rpe = config["Atomiser"].get("decoder_use_rpe", False)
-        self.use_rpe = config["Atomiser"].get("use_rpe", False)  # For self-attention
+        self.encoder_use_rpe = config["Atomiser"]["RPE"].get("encoder_use_rpe", False)
+        self.decoder_use_rpe = config["Atomiser"]["RPE"].get("decoder_use_rpe", False)
+        self.use_rpe = config["Atomiser"]["RPE"].get("selfattn_use_rpe", False)  # For self-attention
         self.rope_base = config["Atomiser"].get("rope_base", 10.0)
         self.rope_reference_gsd = config["Atomiser"].get("rope_reference_gsd", 0.2)
         self.rope_learnable_scale = config["Atomiser"].get("rope_learnable_scale", True)
@@ -235,73 +238,19 @@ class Atomiser_error(pl.LightningModule):
         self._init_decoder()
         self._init_classifier()
         
-        self._log_config()
         
         if self.predictor_only:
             self._apply_predictor_only_mode()
 
-    def _log_config(self):
-        """Log important configuration settings."""
-        print(f"[Atomiser] Input dim: {self.input_dim}, Latent dim: {self.latent_dim}")
-        print(f"[Atomiser] Spatial latents: {self.num_spatial_latents}, Global: {self.num_global_latents}")
-        print(f"[Atomiser] Depth: {self.depth}, self_per_cross_attn: {self.self_per_cross_attn}")
-        
-        print(f"[Atomiser] RoPE Configuration:")
-        print(f"[Atomiser]   encoder_use_rpe={self.encoder_use_rpe}")
-        print(f"[Atomiser]   decoder_use_rpe={self.decoder_use_rpe}")
-        print(f"[Atomiser]   self_attn_use_rpe={self.use_rpe}")
-        if self.encoder_use_rpe or self.decoder_use_rpe or self.use_rpe:
-            print(f"[Atomiser]   rope_base={self.rope_base}")
-            print(f"[Atomiser]   rope_reference_gsd={self.rope_reference_gsd}")
-        
-        print(f"[Atomiser] Geographic: k={self.geo_k}, σ={self.geo_sigma}")
-        
-        if self.use_hybrid_self_attention:
-            print(f"[Atomiser] Self-Attention: HYBRID")
-        elif self.use_rpe:
-            print(f"[Atomiser] Self-Attention: RoPE")
-        elif self.use_gaussian_bias:
-            print(f"[Atomiser] Self-Attention: Gaussian bias")
-        else:
-            print(f"[Atomiser] Self-Attention: Standard")
-        
-        if self.use_gravity_displacement:
-            print(f"[Atomiser] Displacement: TWO-PHASE DYNAMICS")
-        elif self.use_error_guided_displacement:
-            print(f"[Atomiser] Displacement: ERROR-GUIDED")
-        elif self.use_displacement:
-            print(f"[Atomiser] Displacement: MLP-BASED")
-        else:
-            print(f"[Atomiser] Displacement: DISABLED")
+
 
     
 
     def _init_latents(self):
-        """Initialize learnable latent vectors."""
+        """Initialize learnable latent vectors."""        
+        self.spatial_latent_content = nn.Parameter(torch.randn(self.latent_dim))
+        nn.init.trunc_normal_(self.spatial_latent_content, std=0.02, a=-2., b=2.)
 
-        self.use_learned_latents = self.config["latent_grids"].get("use_learned_latents", False)
-        
-        if self.use_learned_latents:
-            # OLD STYLE: Each spatial latent has its own learned embedding
-            self.spatial_latents = nn.Parameter(torch.randn(self.num_spatial_latents, self.latent_dim))
-            nn.init.trunc_normal_(self.spatial_latents, std=0.02, a=-2., b=2.)
-            self.latent_pos_encoder = None
-            
-        else:
-            # NEW STYLE: Shared content + position encoding
-            self.spatial_latent_content = nn.Parameter(torch.randn(self.latent_dim))
-            nn.init.trunc_normal_(self.spatial_latent_content, std=0.02, a=-2., b=2.)
-
-            self.latent_pos_encoder = LatentPositionEncoder(
-                output_dim=self.latent_dim,
-                num_bands=self.config["latent_grids"].get("latent_pos_num_bands", 32),
-                max_freq=self.config["latent_grids"].get("latent_pos_max_freq", 32),
-                normalize_scale=self.latent_surface,
-                init_scale=0.02,
-            )
-            print("[Atomiser] Using NEW STYLE: shared content + APE")
-        
-        # Global latents (same for both)
         self.global_latents = nn.Parameter(torch.randn(self.num_global_latents, self.latent_dim))
         nn.init.trunc_normal_(self.global_latents, std=0.02, a=-2., b=2.)
 
@@ -309,35 +258,36 @@ class Atomiser_error(pl.LightningModule):
     
     def _init_geographic_pruning(self):
         """Initialize geographic pruning module."""
-        self.geo_pruning = GeographicPruning(
-            geometry=self.input_processor.geometry,
-            num_spatial_latents=self.num_spatial_latents,
-            geo_k=self.geo_k,
-            default_sigma=self.geo_sigma,
-        )
+        for grid_name in self.config["latent_grids"]:
+            #We define a grid per resolution, in the config file a
+            #list of grids configs is defined here: "latent_grids"
+            grid_options=self.config["latent_grids"][grid_name]
+
+            self.geo_pruning[grid_name] = GeographicPruning(
+                geometry=self.input_processor.geometry,
+                num_spatial_latents=grid_options["latents"]**2,
+                geo_k=grid_options["geo_k"],
+                default_sigma=grid_options["geo_sigma"],
+            )
 
 
-    def _init_latents_with_positions(
+    def get_spatial_latents(
             self, 
             batch_size: int, 
-            coords: torch.Tensor,
-            device: torch.device
+            grid_options: dict
         ) -> torch.Tensor:
-        """Initialize latents based on mode."""
+        """Initialize spatial latents. 
+        The grid options are defined in the config file under latent_grids part."""
         
-        if self.use_learned_latents:
-            # OLD STYLE
-            spa_latents = repeat(self.spatial_latents, 'n d -> b n d', b=batch_size)
-        else:
-            
-            # NEW STYLE
-            L_spatial = self.num_spatial_latents
-            spa_content = repeat(self.spatial_latent_content, 'd -> b n d', b=batch_size, n=L_spatial)
-            pos_encoding = self.latent_pos_encoder(coords)
-            spa_latents = spa_content + pos_encoding*0
+        return repeat(self.spatial_latent_content, 'd -> b n d', b=batch_size, n=grid_options["latents"]**2)
+    
+    def get_global_latents(
+            self, 
+            batch_size: int, 
+        ) -> torch.Tensor:
+        """Initialize global latents."""
         
-        glob_latents = repeat(self.global_latents, 'n d -> b n d', b=batch_size)
-        return torch.cat([spa_latents, glob_latents], dim=1)
+        return repeat(self.global_latents, 'n d -> b n d', b=batch_size)
     
     def _init_displacement_updater(self):
         """Initialize the position update strategy from config."""
@@ -439,18 +389,19 @@ class Atomiser_error(pl.LightningModule):
 
         elif self.use_rpe:
             self.hybrid_self_attn = None
-            get_latent_attn = cache_fn(lambda: PreNormRPEConcat(
+            get_latent_attn = cache_fn(lambda: PreNormRoPE(
                 self.latent_dim,
-                SelfAttentionRPEConcat(
+                SelfAttentionRoPE(
                     dim=self.latent_dim,
                     heads=self.latent_heads,
                     dim_head=self.latent_dim_head,
                     dropout=self.attn_dropout,
-                    rpe_num_bands=self.config["Atomiser"].get("rpe_num_bands", 32),
-                    rpe_max_freq=self.config["Atomiser"].get("rpe_max_freq", 32.0),
-                    rpe_normalize_scale=self.latent_spacing,
+                    use_rope=True,  # This activates the RoPE logic
+                    rope_base=self.rope_base,
+                    rope_learnable_scale=self.rope_learnable_scale
                 )
             ))
+            
             get_latent_ff = cache_fn(lambda: PreNorm(
                 self.latent_dim,
                 FeedForward(self.latent_dim, dropout=self.ff_dropout)
@@ -613,8 +564,9 @@ class Atomiser_error(pl.LightningModule):
     # Coordinate Utilities
     # =========================================================================
 
-    def _get_default_latent_coords(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        grid = self.input_processor.geometry.get_default_latent_grid(device)
+    def _get_default_latent_coords(self, batch_size: int, device: torch.device,config: dict) -> torch.Tensor:
+        grid = self.input_processor.geometry.get_default_latent_grid(config)
+        
         return grid.unsqueeze(0).expand(batch_size, -1, -1).clone()
 
     # =========================================================================
@@ -706,12 +658,15 @@ class Atomiser_error(pl.LightningModule):
             hybrid_cache = self.hybrid_self_attn.compute_cache(current_coords)
             latents = self.hybrid_self_attn(latents, hybrid_cache, num_spatial=L_spatial)
         elif self.use_rpe:
+            px = current_coords[..., 0] # [B, L_spatial]
+            py = current_coords[..., 1] # [B, L_spatial]
+
             for self_attn, self_ff in self_attns:
                 latents = self_attn(
                     latents,
-                    positions=current_coords,  # [B, L_spatial, 2]
-                    num_spatial=L_spatial,
-                    gsd=None,
+                    pos_x=px,
+                    pos_y=py,
+                    num_spatial=L_spatial
                 ) + latents
                 latents = self_ff(latents) + latents
         elif self.use_gaussian_bias:
@@ -773,23 +728,30 @@ class Atomiser_error(pl.LightningModule):
         return_predicted_errors: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]], Optional[Dict[str, Any]], Optional[List[torch.Tensor]]]:
         """Encode with Local RoPE."""
+        
         B = tokens.shape[0]
         L_spatial = self.num_spatial_latents
         device = tokens.device
+
         
         # =========================================================================
         # INITIALIZE COORDINATES
         # =========================================================================
         
-        current_coords = self._get_default_latent_coords(B, device)
-      
+        current_coords = self._get_default_latent_coords(B, device,self.config["latent_grids"]["FLAIR"])
+        
+        
         # =========================================================================
         # INITIALIZE LATENTS WITH POSITION ENCODING
         # =========================================================================
-        latents = self._init_latents_with_positions(B, current_coords, device)
+        spatial_latents = self.get_spatial_latents(B, self.config["latent_grids"]["FLAIR"])
+        global_latents  = self.get_global_latents(B) 
+
+        latents=torch.cat([spatial_latents,global_latents],dim=1)
 
        
         num_spatial = latents.shape[1] - self.num_global_latents
+
         spatial_idx = torch.randperm(num_spatial, device=latents.device)
 
         # 2. Create the index for the global latents (keeping them at the end)
@@ -804,6 +766,7 @@ class Atomiser_error(pl.LightningModule):
         # Coordinates only exist for spatial latents, so we use the spatial_idx specifically
         current_coords = current_coords[:, spatial_idx, :]
 
+
         
 
        
@@ -813,9 +776,11 @@ class Atomiser_error(pl.LightningModule):
         trajectory = [current_coords.clone()] if return_trajectory else None
         all_displacements = [] if return_displacement_stats else None
         predicted_errors_list = [] if return_predicted_errors else None
+
+
         
         # Initial geographic pruning
-        geo_tokens, geo_masks, _ = self.geo_pruning(tokens, mask, current_coords)
+        geo_tokens, geo_masks, _ = self.geo_pruning["FLAIR"](tokens, mask, current_coords)
         k = geo_tokens.shape[2]
 
   
@@ -905,7 +870,7 @@ class Atomiser_error(pl.LightningModule):
             
             # Re-compute geographic pruning
             if layer_idx < num_layers - 1:
-                geo_tokens, geo_masks, _ = self.geo_pruning(tokens, mask, current_coords)
+                geo_tokens, geo_masks, _ = self.geo_pruning["FLAIR"](tokens, mask, current_coords)
                 k = geo_tokens.shape[2]
                 
                 m = self.geo_m_train if training else self.geo_m_val
@@ -1014,7 +979,7 @@ class Atomiser_error(pl.LightningModule):
             context,
             delta_x=delta_x,
             delta_y=delta_y,
-            gsd=None,  # Decoder doesn't need GSD modulation
+            gsd=0.2,  # Decoder doesn't need GSD modulation
         )
         
         output_with_query = torch.cat([output, query_features], dim=-1)

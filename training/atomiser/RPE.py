@@ -49,7 +49,7 @@ class PairwiseRPEEncoder(nn.Module):
         # key_pos:   [B, 1, N_k, 2]
         # delta:     [B, N_q, N_k, 2]
         delta = key_pos.unsqueeze(1) - query_pos.unsqueeze(2)
-        
+      
         delta_x = delta[..., 0]  # [B, N_q, N_k]
         delta_y = delta[..., 1]  # [B, N_q, N_k]
         
@@ -95,7 +95,7 @@ class SelfAttentionRPEConcat(nn.Module):
         # RPE parameters
         rpe_num_bands: int = 32,
         rpe_max_freq: float = 32.0,
-        rpe_normalize_scale: float = 51.0,
+        rpe_normalize_scale: float = 7.8,
     ):
         super().__init__()
         
@@ -105,7 +105,7 @@ class SelfAttentionRPEConcat(nn.Module):
         self.scale = dim_head ** -0.5
         
         inner_dim = heads * dim_head
-        rpe_normalize_scale=51.0
+        rpe_normalize_scale=7.8
         rpe_num_bands= 16
         rpe_max_freq= 16
         
@@ -1122,11 +1122,17 @@ class LocalRoPE2D(nn.Module):
 # CROSS-ATTENTION WITH LOCAL ROPE
 # =============================================================================
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+
 class LocalCrossAttentionRoPE(nn.Module):
     """
-    Cross-attention with Resolution-Aware Local RoPE.
+    Cross-attention with Resolution-Aware Axial RoPE.
     
-    Q (latents) at origin, K (tokens) rotated by relative position.
+    Q (latents) are treated as the center (relative 0,0).
+    K (tokens) are rotated by their displacement (delta_x, delta_y).
     """
     
     def __init__(
@@ -1138,12 +1144,13 @@ class LocalCrossAttentionRoPE(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         use_rope: bool = True,
-        rope_base: float = 10.0,
+        rope_base: float = 1000.0,        # Updated to 1000 for MNIST/Spatial stability
         rope_reference_gsd: float = 0.2,
         rope_learnable_scale: bool = True,
     ):
         super().__init__()
-        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
+        # 2D RoPE needs dim_head to be divisible by 4 (2 per axis, sin/cos for each)
+        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for Axial 2D RoPE"
         
         self.heads = heads
         self.dim_head = dim_head
@@ -1159,6 +1166,8 @@ class LocalCrossAttentionRoPE(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         if use_rope:
+            # IMPORTANT: Ensure your LocalRoPE2D implementation 
+            # handles Axial (independent X/Y) rotations.
             self.rope = LocalRoPE2D(
                 dim_head=dim_head,
                 base=rope_base,
@@ -1171,46 +1180,61 @@ class LocalCrossAttentionRoPE(nn.Module):
     
     def forward(
         self,
-        x: torch.Tensor,        # [B, N, dim_query]
-        context: torch.Tensor,  # [B, N, k, dim_context]
+        x: torch.Tensor,        # [B, L, dim_query] (Latents)
+        context: torch.Tensor,  # [B, L, k, dim_context] (Sampleled Tokens)
         mask: Optional[torch.Tensor] = None,
-        delta_x: Optional[torch.Tensor] = None,
-        delta_y: Optional[torch.Tensor] = None,
+        delta_x: Optional[torch.Tensor] = None, # [B, L, k]
+        delta_y: Optional[torch.Tensor] = None, # [B, L, k]
         gsd: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        B, N, _ = x.shape
-        k = context.shape[2]
+        B, L, _ = x.shape
+        k_samples = context.shape[2]
         H, d = self.heads, self.dim_head
         
-        q = self.to_q(x).view(B, N, H, d)
-        K = self.to_k(context).view(B, N, k, H, d)
-        V = self.to_v(context).view(B, N, k, H, d)
+        # 1. Project to Q, K, V
+        q = self.to_q(x).view(B, L, H, d)
+        K = self.to_k(context).view(B, L, k_samples, H, d)
+        V = self.to_v(context).view(B, L, k_samples, H, d)
         
-        # Apply RoPE
+        # 2. Apply Axial RoPE
+        # We rotate K by (delta_x, delta_y). Q stays at (0,0) rotationally.
         if self.use_rope and self.rope is not None and delta_x is not None:
+            # forward_cross should apply independent X-rotation to first d/2 
+            # and Y-rotation to second d/2 of the dim_head.
             q, K = self.rope.forward_cross(q, K, delta_x, delta_y, gsd=gsd)
         
-        scores = torch.einsum('b n h d, b n k h d -> b n h k', q, K) * self.scale
+        # 3. Attention calculation
+        # [B, L, H, d] @ [B, L, k, H, d] -> [B, L, H, k]
+        scores = torch.einsum('b l h d, b l k h d -> b l h k', q, K) * self.scale
         
         if mask is not None:
+            # mask shape is [B, L, k]
             scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
         
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
         
-        out = torch.einsum('b n h k, b n k h d -> b n h d', attn, V)
-        return self.to_out(out.reshape(B, N, H * d))
+        # 4. Weighted sum of values
+        # [B, L, H, k] @ [B, L, k, H, d] -> [B, L, H, d]
+        out = torch.einsum('b l h k, b l k h d -> b l h d', attn, V)
+        
+        # 5. Final projection
+        return self.to_out(out.reshape(B, L, H * d))
 
 
 # =============================================================================
 # SELF-ATTENTION WITH LOCAL ROPE
 # =============================================================================
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+
 class SelfAttentionRoPE(nn.Module):
     """
-    Self-attention with 2D RoPE for spatial latents.
-    
-    Both Q and K get rotated by their positions.
+    Optimized Self-attention with 2D RoPE for spatial latents.
+    Uses Flash Attention (scaled_dot_product_attention) for performance.
     """
     
     def __init__(
@@ -1220,22 +1244,21 @@ class SelfAttentionRoPE(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         use_rope: bool = True,
-        rope_base: float = 10.0,
+        rope_base: float = 1000.0, # Increased for smoother spatial gradients
         rope_learnable_scale: bool = True,
     ):
         super().__init__()
         assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
-        
+        rope_base=1000.0
         self.heads = heads
         self.dim_head = dim_head
-        self.scale = dim_head ** -0.5
         self.use_rope = use_rope
+        self.dropout_p = dropout
         
         inner_dim = heads * dim_head
         
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = nn.Linear(inner_dim, dim)
-        self.dropout = nn.Dropout(dropout)
         
         if use_rope:
             self.rope = LocalRoPE2D(
@@ -1258,15 +1281,18 @@ class SelfAttentionRoPE(nn.Module):
         B, N, _ = x.shape
         H, d = self.heads, self.dim_head
         
+        # 1. Generate Q, K, V
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = [t.view(B, N, H, d) for t in qkv]
         
-        # Apply RoPE only to spatial latents
+        # 2. Apply RoPE (Rotary Positional Embeddings)
         if self.use_rope and self.rope is not None and pos_x is not None:
+            # Handle hybrid latents (Spatial + Global)
             if num_spatial is not None and num_spatial < N:
                 q_spatial, q_global = q[:, :num_spatial], q[:, num_spatial:]
                 k_spatial, k_global = k[:, :num_spatial], k[:, num_spatial:]
                 
+                # Only spatial latents get geometric rotation
                 q_spatial, k_spatial = self.rope.forward_self(
                     q_spatial, k_spatial, pos_x, pos_y
                 )
@@ -1276,12 +1302,25 @@ class SelfAttentionRoPE(nn.Module):
             else:
                 q, k = self.rope.forward_self(q, k, pos_x, pos_y)
         
-        scores = torch.einsum('b i h d, b j h d -> b h i j', q, k) * self.scale
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
+        # 3. Flash Attention / Scaled Dot Product Attention
+        # Standard input for SDPA: [B, H, N, d]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         
-        out = torch.einsum('b h i j, b j h d -> b i h d', attn, v)
-        return self.to_out(out.reshape(B, N, H * d))
+        # SDPA is equivalent to: (Q @ K.T) / sqrt(d) -> Softmax -> Dropout -> V
+        # It is much faster and more memory efficient for N=784
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False
+        )
+        
+        # 4. Final Projection
+        # [B, H, N, d] -> [B, N, H*d]
+        out = out.transpose(1, 2).reshape(B, N, H * d)
+        return self.to_out(out)
 
 
 # =============================================================================

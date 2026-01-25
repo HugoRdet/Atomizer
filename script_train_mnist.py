@@ -161,6 +161,8 @@ trainer = Trainer(
     devices=-1,
     precision="16-mixed" if torch.cuda.is_available() else "32-true",
     logger=wandb_logger,
+    strategy="ddp_find_unused_parameters_true",
+    max_epochs=config_model["trainer"]["epochs"],
     callbacks=[
         token_sel,
         lr_monitor,

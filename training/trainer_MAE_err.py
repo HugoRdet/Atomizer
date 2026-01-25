@@ -358,64 +358,27 @@ class Model_MAE_err(pl.LightningModule):
     
 
     def on_after_backward(self):
-        """Called after loss.backward() - perfect place to check gradients."""
- 
+        # On ne vérifie que pour le premier step pour ne pas polluer les logs
         return
-        # Only check periodically to avoid spam
-        if self.global_step % 100 != 0:
-            return
-        
-        print(f"\n[Gradient Check] Step {self.global_step}")
-        
-        # 1. Check RPE encoder gradients (if using hybrid self-attention)
-        if hasattr(self.encoder, 'hybrid_self_attn') and self.encoder.hybrid_self_attn is not None:
-            self._check_module_gradients(
-                self.encoder.hybrid_self_attn.local_cache.rpe_encoder,
-                "HybridSelfAttn.RPE"
-            )
-        
-        # 2. Check decoder position encoder gradients
-        if hasattr(self.encoder, 'input_processor'):
-            self._check_module_gradients(
-                self.encoder.input_processor.pos_encoder,
-                "Decoder.PosEncoder"
-            )
-        
-        # 3. Check self-attention gradients (for Gaussian bias)
-        if hasattr(self.encoder, 'encoder_layers'):
-            for layer_idx, layer in enumerate(self.encoder.encoder_layers):
-                if layer[2] is not None:  # self_attns
-                    for sa_idx, (self_attn, self_ff) in enumerate(layer[2]):
-                        if hasattr(self_attn.fn, 'log_sigma'):
-                            sigma = self_attn.fn.log_sigma
-                            if sigma.grad is not None:
-                                print(f"  Layer {layer_idx} SA {sa_idx} log_sigma grad: {sigma.grad.norm():.6f}")
-                        break  # Only check first layer
-                break
-        
-        # 4. Check for any NaN or Inf gradients in entire model
-        nan_count = 0
-        inf_count = 0
-        zero_count = 0
-        total_params = 0
-        
+
+        print("\n--- Vérification des paramètres inutilisés (No Gradient) ---")
+        unused_params = []
         for name, param in self.named_parameters():
-            if param.grad is not None:
-                total_params += 1
-                if param.grad.isnan().any():
-                    nan_count += 1
-                    print(f"  ⚠️ NaN gradient in {name}")
-                if param.grad.isinf().any():
-                    inf_count += 1
-                    print(f"  ⚠️ Inf gradient in {name}")
-                if param.grad.abs().max() < 1e-10:
-                    zero_count += 1
-                    # Only print if it's a position-related parameter
-                    if 'pos' in name.lower() or 'rpe' in name.lower():
-                        print(f"  ⚠️ Near-zero gradient in {name}")
+            if param.requires_grad and (param.grad is None or param.grad.abs().sum() == 0):
+                unused_params.append(name)
         
-        print(f"  Summary: {nan_count} NaN, {inf_count} Inf, {zero_count} near-zero out of {total_params} params")
+        if unused_params:
+            print(f"⚠️ {len(unused_params)} paramètres ne participent pas à la loss :")
+            for name in unused_params[:10]: # On affiche les 10 premiers
+                print(f"  - {name}")
+            if len(unused_params) > 10:
+                print(f"  - ... et {len(unused_params)-10} autres.")
+        else:
+            print("✅ Tous les paramètres actifs ont reçu un gradient.")
+        print("----------------------------------------------------------\n")
     
+
+
     def _check_module_gradients(self, module, name):
         """Check gradients for a specific module."""
         if module is None:

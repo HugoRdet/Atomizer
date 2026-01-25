@@ -153,6 +153,7 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=[accumulator, reconstruction_callback,gravity_callback, checkpoint_val_mod_train],
     default_root_dir="./checkpoints/",
+    #overfit_batches=1
     #limit_train_batches=1,
     #limit_val_batches=1,
 )
