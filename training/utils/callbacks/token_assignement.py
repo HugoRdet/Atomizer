@@ -184,7 +184,7 @@ class TokenAssignmentVisualizationCallback(pl.Callback):
             # Get token assignments for final positions (static visualization)
             # =================================================================
             final_coords = trajectory[-1]
-            geo_tokens, geo_masks, _ = encoder.geo_pruning(tokens, mask, final_coords)
+            geo_tokens, geo_masks, _ = encoder.geo_pruning["FLAIR"](tokens, mask, final_coords)
             
             # Extract token centers using geometry
             token_centers_np, geo_masks_np = self._extract_token_centers(
@@ -467,7 +467,7 @@ class TokenAssignmentVisualizationCallback(pl.Callback):
                 coords = trajectory[traj_idx]
                 
                 # Run geographic pruning with these coordinates
-                geo_tokens, geo_masks, _ = encoder.geo_pruning(tokens, mask, coords)
+                geo_tokens, geo_masks, _ = encoder.geo_pruning["FLAIR"](tokens, mask, coords)
                 
                 # Extract token centers
                 token_centers_np, geo_masks_np = self._extract_token_centers(

@@ -82,18 +82,25 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     wandb.define_metric("train_loss", step_metric="trainer/global_step")
     wandb.define_metric("val_loss", step_metric="trainer/global_step")
     
-
-# Load model from checkpoint
-print(f"Loading model from checkpoint: {checkpoint_path}")
-model = Model_MAE_err.load_from_checkpoint(
-    checkpoint_path,
-    strict=False,  # Allow missing keys (displacement MLP is new)
-    config=config_model,
+model = Model_MAE_err( #Model_FLAIR
+    config_model,
     wand=True,
     name=xp_name,
-    transform=input_processor,
-    lookup_table=lookup_table
+    transform=input_processor, # Pass the new processor here,
+    lookup_table=lookup_table,
 )
+
+# Load model from checkpoint
+#print(f"Loading model from checkpoint: {checkpoint_path}")
+#model = Model_MAE_err.load_from_checkpoint(
+#    checkpoint_path,
+#    strict=False,  # Allow missing keys (displacement MLP is new)
+#    config=config_model,
+#    wand=True,
+#    name=xp_name,
+#    transform=input_processor,
+#    lookup_table=lookup_table
+#)
 model.eval()
 print("✓ Model loaded successfully")
 

@@ -60,6 +60,22 @@ modalities_trans = modalities_transformations_config(
     name_config=args.dataset_name
 )
 
+
+def print_memory(label: str):
+    """Print current GPU memory usage."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"[{label}] Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB | Max: {max_allocated:.2f} GB")
+
+def reset_memory_stats():
+    """Reset peak memory tracking."""
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+        
 # 3. Initialize the New Processor (Replaces transformations_config)
 # The TokenProcessor handles all encoding logic (Physics + Math)
 # It takes the full config and the lookup table.
@@ -92,7 +108,28 @@ model = Model_MAE_err( #Model_FLAIR
     lookup_table=lookup_table,
 )
 
-#checkpoint_path = "./checkpoints/Atomiserxp_20260109_013902_e3yh-val_loss-epoch=37-val_loss=0.0583.ckpt"
+#checkpoint = torch.load("./checkpoints/Atos_tofine.ckpt", map_location="cpu")
+#state_dict = checkpoint["state_dict"]
+
+#mismatched_keys = [
+#    "transform.geometry.token_centers_lookup",
+#    "transform.geometry.token_gsd_lookup",
+#    "encoder.input_processor.geometry.token_centers_lookup",
+#    "encoder.input_processor.geometry.token_gsd_lookup"
+#]
+
+# 3. Remove them from the state_dict
+#for key in mismatched_keys:
+#    if key in state_dict:
+#        print(f"Removing {key} from checkpoint due to size mismatch.")
+#        del state_dict[key]
+
+# 4. Save the modified checkpoint to a temporary file or load directly if the method allows
+# Most Lightning-based models prefer a path, so we save it back:
+#temp_path = "./checkpoints/modified_checkpoint.ckpt"
+#torch.save(checkpoint, temp_path)
+
+checkpoint_path = "./checkpoints/Atomiserxp_20260129_161407_2fj2-val_loss-epoch=52-val_loss=0.0422.ckpt"
 # Option 1: Load checkpoint with strict=False (recommended)
 #model = Model_MAE_err.load_from_checkpoint(
 #    checkpoint_path,
@@ -104,7 +141,33 @@ model = Model_MAE_err( #Model_FLAIR
 #    lookup_table=lookup_table
 #)
 
+def load_checkpoint_with_rope_reset(model, checkpoint_path):
+    """Load checkpoint but reinitialize RoPE parameters."""
+    
+    checkpoint = torch.load(checkpoint_path)
+    state_dict = checkpoint['state_dict']
+    
+    # Find and remove RoPE-related keys
+    rope_keys = [k for k in state_dict.keys() if any(x in k for x in [
+        'rope.inv_freq',
+        'rope.scale_x', 
+        'rope.scale_y',
+        'rope.log_ref_scale',
+        'log_sigma',  # Also reset Gaussian sigma if using combined
+    ])]
+    
+    print(f"Resetting RoPE parameters: {rope_keys}")
+    for k in rope_keys:
+        del state_dict[k]
+    
+    # Load remaining weights (strict=False allows missing keys)
+    model.load_state_dict(state_dict, strict=False)
+    
+    # RoPE parameters are now freshly initialized from model.__init__
+    return model
 
+
+#load_checkpoint_with_rope_reset(model, checkpoint_path)
 
 data_module = UnifiedDataModule(
     f"./data/custom_flair/{args.dataset_name}",
@@ -122,6 +185,8 @@ data_module = UnifiedDataModule(
 reconstruction_callback = MAE_err_CustomVisualizationCallback( #FLAIR_CustomSegmentationCallback
     config=config_model
 )
+
+
 
 gravity_callback=ErrorLandscapeVisualizationCallback(config=config_model)
 
@@ -142,6 +207,12 @@ checkpoint_val_mod_train = ModelCheckpoint(
 accumulator = GradientAccumulationScheduler(scheduling={0:1})
 #gradient_warmup = DisplacementGradientWarmupCallback(start_epoch=10, warmup_epochs=10)
 
+profiler = PyTorchProfiler(
+    dirpath="./profiling/", 
+    filename="perf_logs", 
+    export_to_chrome=True  # This ensures the .json is created
+)
+
 # Trainer
 trainer = Trainer(
     strategy="ddp_find_unused_parameters_true",
@@ -153,6 +224,7 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=[accumulator, reconstruction_callback,gravity_callback, checkpoint_val_mod_train],
     default_root_dir="./checkpoints/",
+    #profiler=profiler
     #overfit_batches=1
     #limit_train_batches=1,
     #limit_val_batches=1,

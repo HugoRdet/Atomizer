@@ -127,10 +127,11 @@ class TokenProcessor(nn.Module):
         delta_x = token_coords[..., 0] - latent_coords[..., 0]
         delta_y = token_coords[..., 1] - latent_coords[..., 1]
 
-      
        
         # D. Normalization Scale: [B, 1, 1] (broadcasts)
-        physical_scale = self.geometry.get_physical_scale(token_data)
+        physical_scale = self.geometry.get_physical_scale(token_data)/2.0
+
+
         
         # E. GSD: scalar (cached) or [B, L, m] tensor
         gsd = self._constant_gsd if self.use_constant_gsd else self.geometry.get_token_gsd(token_data)
@@ -141,7 +142,7 @@ class TokenProcessor(nn.Module):
 
         
         # A. Positional: [B, L, m, pos_dim]
-        pos_features = self.pos_encoder(delta_x, delta_y, physical_scale, gsd)
+        pos_features = self.pos_encoder(delta_x, delta_y)
         if len(pos_features.shape)<4:
             pos_features=pos_features.unsqueeze(-2)
 
@@ -169,6 +170,7 @@ class TokenProcessor(nn.Module):
             reflectance_features
         ], dim=-1)
 
+        
         
         return features
 

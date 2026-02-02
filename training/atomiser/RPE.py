@@ -945,23 +945,27 @@ def create_self_attention_with_rpe(
 # =============================================================================
 # LOCAL ROPE 2D
 # =============================================================================
-
 class LocalRoPE2D(nn.Module):
     """
-    Local Rotary Position Encoding for 2D.
+    2D RoPE with physical distance encoding using compression.
     
-    Two modes:
-    1. Cross-attention: Q at origin (no rotation), K rotated by delta
-    2. Self-attention: Both Q and K rotated by their positions
+    Key insight: Use PHYSICAL distance (meters) with compression.
+    Adjacent FLAIR latents (4m) should encode differently than
+    adjacent Sentinel-2 latents (42m) because they represent
+    different physical scales.
     
-    Resolution-aware via log-scale GSD modulation.
+    Compression function: pos / (scale + |pos|)
+    - Bounded to (-1, 1)
+    - Linear near origin (good resolution for small distances)
+    - Saturates at large distances (numerical stability)
+    - Same physical distance → same encoding regardless of image span
     """
     
     def __init__(
         self,
         dim_head: int,
-        base: float = 10.0,
-        reference_gsd: float = 0.2,
+        base: float = 10000.0,
+        compression_scale: float = 50.0,  # Physical scale in meters
         learnable_scale: bool = True,
         num_heads: int = 8,
     ):
@@ -969,272 +973,186 @@ class LocalRoPE2D(nn.Module):
         assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
         
         self.dim_head = dim_head
-        self.reference_gsd = reference_gsd
+        self.num_heads = num_heads
         
         quarter_dim = dim_head // 4
         
-        # Base frequencies
+        # Standard RoPE frequencies
         inv_freq = 1.0 / (base ** (torch.arange(0, quarter_dim).float() / quarter_dim))
         self.register_buffer('inv_freq', inv_freq)
         
-        # Log reference for resolution scaling
-        self.register_buffer('log_ref', torch.tensor(math.log(1.0 + reference_gsd)))
-        
-        # Learnable frequency scales
+        # Learnable compression scale and per-frequency scales
         if learnable_scale:
+            self.log_scale = nn.Parameter(torch.tensor(math.log(compression_scale)))
             self.scale_x = nn.Parameter(torch.ones(quarter_dim))
             self.scale_y = nn.Parameter(torch.ones(quarter_dim))
-            nn.init.normal_(self.scale_x, mean=1.0, std=0.1)
-            nn.init.normal_(self.scale_y, mean=1.0, std=0.1)
         else:
+            self.register_buffer('log_scale', torch.tensor(math.log(compression_scale)))
             self.register_buffer('scale_x', torch.ones(quarter_dim))
             self.register_buffer('scale_y', torch.ones(quarter_dim))
+    
+    @property
+    def compression_scale(self) -> torch.Tensor:
+        """Learnable compression scale (in meters)."""
+        return self.log_scale.exp()
+    
+    def _compress(self, pos: torch.Tensor) -> torch.Tensor:
+        """
+        Compress physical position (meters) to bounded range (-1, 1).
         
-        # Resolution sensitivity
-        self.res_sensitivity = nn.Parameter(torch.tensor(0.5))
+        Properties:
+        - Same physical distance → same encoding
+        - Bounded to (-1, 1) for numerical stability
+        - Linear near origin: compress(x) ≈ x/scale for small x
+        - Saturates at large distances: compress(x) → ±1 for large |x|
+        """
+        return pos / (self.compression_scale + torch.abs(pos))
     
     def forward_cross(
         self,
-        q: torch.Tensor,        # [B, N, H, d]
-        k: torch.Tensor,        # [B, N, k, H, d]
-        delta_x: torch.Tensor,  # [B, N, k]
-        delta_y: torch.Tensor,  # [B, N, k]
-        gsd: Optional[torch.Tensor] = None,  # [B, N, k]
+        q: torch.Tensor,        # [B, L, H, d]
+        k: torch.Tensor,        # [B, L, k, H, d]
+        delta_x: torch.Tensor,  # [B, L, k] in meters (relative position)
+        delta_y: torch.Tensor,  # [B, L, k] in meters (relative position)
+        gsd: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Cross-attention: Q unchanged (at origin), K rotated by delta."""
-        res_scale = self._compute_resolution_scale(gsd)
-        k_rotated = self._rotate_2d_cross(k, delta_x, delta_y, res_scale)
+        """
+        Cross-attention: Q unchanged, K rotated by relative position.
+        
+        For cross-attention, we use RELATIVE positions (delta_x, delta_y)
+        which represent the displacement from latent to token.
+        """
+        k_rotated = self._rotate_2d_cross(k, delta_x, delta_y)
         return q, k_rotated
     
     def forward_self(
         self,
         q: torch.Tensor,        # [B, N, H, d]
         k: torch.Tensor,        # [B, N, H, d]
-        pos_x: torch.Tensor,    # [B, N]
-        pos_y: torch.Tensor,    # [B, N]
+        pos_x: torch.Tensor,    # [B, N] in METERS (absolute position)
+        pos_y: torch.Tensor,    # [B, N] in METERS (absolute position)
+        gsd: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Self-attention: Both Q and K rotated by their positions."""
-        q_rotated = self._rotate_2d_self(q, pos_x, pos_y)
-        k_rotated = self._rotate_2d_self(k, pos_x, pos_y)
-        return q_rotated, k_rotated
-    
-    def _compute_resolution_scale(
-        self,
-        gsd: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """Log-scale resolution factor."""
-        if gsd is None:
-            return None
+        """
+        Self-attention: Both Q and K rotated by absolute position.
         
-        log_gsd = torch.log(1.0 + gsd)
-        log_ratio = self.log_ref - log_gsd
-        res_scale = torch.exp(log_ratio * self.res_sensitivity)
-        return res_scale.clamp(min=0.1, max=10.0)
+        For self-attention, we use ABSOLUTE positions.
+        RoPE property: q_i^T k_j depends on (pos_i - pos_j), so
+        relative position emerges naturally from the dot product.
+        """
+        # Compress physical positions to bounded range
+        px_compressed = self._compress(pos_x)
+        py_compressed = self._compress(pos_y)
+        
+        q_rotated = self._rotate_2d_self(q, px_compressed, py_compressed)
+        k_rotated = self._rotate_2d_self(k, px_compressed, py_compressed)
+        
+        return q_rotated, k_rotated
     
     def _rotate_2d_cross(
         self,
-        x: torch.Tensor,        # [B, N, k, H, d]
-        delta_x: torch.Tensor,  # [B, N, k]
-        delta_y: torch.Tensor,  # [B, N, k]
-        res_scale: Optional[torch.Tensor] = None,
+        x: torch.Tensor,        # [B, L, k, H, d]
+        delta_x: torch.Tensor,  # [B, L, k] in meters
+        delta_y: torch.Tensor,  # [B, L, k] in meters
     ) -> torch.Tensor:
-        """Rotate for cross-attention (5D input)."""
+        """Rotate keys for cross-attention using relative positions."""
         half_d = self.dim_head // 2
         
-        x_part = x[..., :half_d]
-        y_part = x[..., half_d:]
+        x_part = x[..., :half_d]   # X-axis rotation
+        y_part = x[..., half_d:]   # Y-axis rotation
         
-        x_rotated = self._apply_rotary_cross(x_part, delta_x, self.scale_x, res_scale)
-        y_rotated = self._apply_rotary_cross(y_part, delta_y, self.scale_y, res_scale)
+        # Compress relative positions
+        dx_compressed = self._compress(delta_x)
+        dy_compressed = self._compress(delta_y)
+        
+        x_rotated = self._apply_rotary_cross(x_part, dx_compressed, self.scale_x)
+        y_rotated = self._apply_rotary_cross(y_part, dy_compressed, self.scale_y)
         
         return torch.cat([x_rotated, y_rotated], dim=-1)
     
     def _rotate_2d_self(
         self,
         x: torch.Tensor,        # [B, N, H, d]
-        pos_x: torch.Tensor,    # [B, N]
-        pos_y: torch.Tensor,    # [B, N]
+        px: torch.Tensor,       # [B, N] compressed positions
+        py: torch.Tensor,       # [B, N] compressed positions
     ) -> torch.Tensor:
-        """Rotate for self-attention (4D input)."""
+        """Rotate for self-attention using compressed absolute positions."""
         half_d = self.dim_head // 2
         
-        x_part = x[..., :half_d]
-        y_part = x[..., half_d:]
+        x_part = x[..., :half_d]   # X-axis rotation
+        y_part = x[..., half_d:]   # Y-axis rotation
         
-        x_rotated = self._apply_rotary_self(x_part, pos_x, self.scale_x)
-        y_rotated = self._apply_rotary_self(y_part, pos_y, self.scale_y)
+        x_rotated = self._apply_rotary_self(x_part, px, self.scale_x)
+        y_rotated = self._apply_rotary_self(y_part, py, self.scale_y)
         
         return torch.cat([x_rotated, y_rotated], dim=-1)
     
     def _apply_rotary_cross(
         self,
-        x: torch.Tensor,        # [B, N, k, H, half_d]
-        delta: torch.Tensor,    # [B, N, k]
-        freq_scale: torch.Tensor,
-        res_scale: Optional[torch.Tensor] = None,
+        x: torch.Tensor,            # [B, L, k, H, half_d]
+        pos_compressed: torch.Tensor,  # [B, L, k] in (-1, 1)
+        freq_scale: torch.Tensor,   # [quarter_dim]
     ) -> torch.Tensor:
-        """Rotary for cross-attention."""
-        effective_delta = delta
-        if res_scale is not None:
-            effective_delta = delta * res_scale
+        """Apply rotary embedding for cross-attention (5D tensor)."""
+        freq = self.inv_freq * freq_scale  # [quarter_dim]
         
-        freq = self.inv_freq * freq_scale
-        angles = effective_delta.unsqueeze(-1) * freq  # [B, N, k, quarter_dim]
-        angles = angles.unsqueeze(3)  # [B, N, k, 1, quarter_dim]
+        # pos_compressed: [B, L, k] -> [B, L, k, quarter_dim]
+        angles = pos_compressed.unsqueeze(-1) * freq
+        # -> [B, L, k, 1, quarter_dim] for broadcasting with [B, L, k, H, half_d]
+        angles = angles.unsqueeze(3)
         
         cos = angles.cos()
         sin = angles.sin()
         
-        def rotate_half(t):
-            t1, t2 = t.chunk(2, dim=-1)
-            return torch.cat((-t2, t1), dim=-1)
-        
-        cos = torch.cat([cos, cos], dim=-1)
+        # Duplicate for the pair structure
+        cos = torch.cat([cos, cos], dim=-1)  # [B, L, k, 1, half_d]
         sin = torch.cat([sin, sin], dim=-1)
         
-        return x * cos + rotate_half(x) * sin
+        # Rotate pairs: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
+        x1, x2 = x.chunk(2, dim=-1)
+        x_rotated = torch.cat([
+            x1 * cos[..., :x1.shape[-1]] - x2 * sin[..., :x1.shape[-1]],
+            x2 * cos[..., :x2.shape[-1]] + x1 * sin[..., :x2.shape[-1]],
+        ], dim=-1)
+        
+        return x_rotated
     
     def _apply_rotary_self(
         self,
-        x: torch.Tensor,        # [B, N, H, half_d]
-        pos: torch.Tensor,      # [B, N]
-        freq_scale: torch.Tensor,
+        x: torch.Tensor,            # [B, N, H, half_d]
+        pos_compressed: torch.Tensor,  # [B, N] in (-1, 1)
+        freq_scale: torch.Tensor,   # [quarter_dim]
     ) -> torch.Tensor:
-        """Rotary for self-attention."""
-        freq = self.inv_freq * freq_scale
-        angles = pos.unsqueeze(-1) * freq  # [B, N, quarter_dim]
-        angles = angles.unsqueeze(2)  # [B, N, 1, quarter_dim]
+        """Apply rotary embedding for self-attention (4D tensor)."""
+        freq = self.inv_freq * freq_scale  # [quarter_dim]
+        
+        # pos_compressed: [B, N] -> [B, N, quarter_dim]
+        angles = pos_compressed.unsqueeze(-1) * freq
+        # -> [B, N, 1, quarter_dim] for broadcasting with [B, N, H, half_d]
+        angles = angles.unsqueeze(2)
         
         cos = angles.cos()
         sin = angles.sin()
         
-        def rotate_half(t):
-            t1, t2 = t.chunk(2, dim=-1)
-            return torch.cat((-t2, t1), dim=-1)
-        
-        cos = torch.cat([cos, cos], dim=-1)
+        # Duplicate for the pair structure
+        cos = torch.cat([cos, cos], dim=-1)  # [B, N, 1, half_d]
         sin = torch.cat([sin, sin], dim=-1)
         
-        return x * cos + rotate_half(x) * sin
-
+        # Rotate pairs: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
+        x1, x2 = x.chunk(2, dim=-1)
+        x_rotated = torch.cat([
+            x1 * cos[..., :x1.shape[-1]] - x2 * sin[..., :x1.shape[-1]],
+            x2 * cos[..., :x2.shape[-1]] + x1 * sin[..., :x2.shape[-1]],
+        ], dim=-1)
+        
+        return x_rotated
 
 # =============================================================================
 # CROSS-ATTENTION WITH LOCAL ROPE
 # =============================================================================
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
-
-class LocalCrossAttentionRoPE(nn.Module):
-    """
-    Cross-attention with Resolution-Aware Axial RoPE.
-    
-    Q (latents) are treated as the center (relative 0,0).
-    K (tokens) are rotated by their displacement (delta_x, delta_y).
-    """
-    
-    def __init__(
-        self,
-        dim_query: int,
-        dim_context: int,
-        dim_out: int,
-        heads: int = 8,
-        dim_head: int = 64,
-        dropout: float = 0.0,
-        use_rope: bool = True,
-        rope_base: float = 1000.0,        # Updated to 1000 for MNIST/Spatial stability
-        rope_reference_gsd: float = 0.2,
-        rope_learnable_scale: bool = True,
-    ):
-        super().__init__()
-        # 2D RoPE needs dim_head to be divisible by 4 (2 per axis, sin/cos for each)
-        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for Axial 2D RoPE"
-        
-        self.heads = heads
-        self.dim_head = dim_head
-        self.scale = dim_head ** -0.5
-        self.use_rope = use_rope
-        
-        inner_dim = heads * dim_head
-        
-        self.to_q = nn.Linear(dim_query, inner_dim, bias=False)
-        self.to_k = nn.Linear(dim_context, inner_dim, bias=False)
-        self.to_v = nn.Linear(dim_context, inner_dim, bias=False)
-        self.to_out = nn.Linear(inner_dim, dim_out)
-        self.dropout = nn.Dropout(dropout)
-        
-        if use_rope:
-            # IMPORTANT: Ensure your LocalRoPE2D implementation 
-            # handles Axial (independent X/Y) rotations.
-            self.rope = LocalRoPE2D(
-                dim_head=dim_head,
-                base=rope_base,
-                reference_gsd=rope_reference_gsd,
-                learnable_scale=rope_learnable_scale,
-                num_heads=heads,
-            )
-        else:
-            self.rope = None
-    
-    def forward(
-        self,
-        x: torch.Tensor,        # [B, L, dim_query] (Latents)
-        context: torch.Tensor,  # [B, L, k, dim_context] (Sampleled Tokens)
-        mask: Optional[torch.Tensor] = None,
-        delta_x: Optional[torch.Tensor] = None, # [B, L, k]
-        delta_y: Optional[torch.Tensor] = None, # [B, L, k]
-        gsd: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B, L, _ = x.shape
-        k_samples = context.shape[2]
-        H, d = self.heads, self.dim_head
-        
-        # 1. Project to Q, K, V
-        q = self.to_q(x).view(B, L, H, d)
-        K = self.to_k(context).view(B, L, k_samples, H, d)
-        V = self.to_v(context).view(B, L, k_samples, H, d)
-        
-        # 2. Apply Axial RoPE
-        # We rotate K by (delta_x, delta_y). Q stays at (0,0) rotationally.
-        if self.use_rope and self.rope is not None and delta_x is not None:
-            # forward_cross should apply independent X-rotation to first d/2 
-            # and Y-rotation to second d/2 of the dim_head.
-            q, K = self.rope.forward_cross(q, K, delta_x, delta_y, gsd=gsd)
-        
-        # 3. Attention calculation
-        # [B, L, H, d] @ [B, L, k, H, d] -> [B, L, H, k]
-        scores = torch.einsum('b l h d, b l k h d -> b l h k', q, K) * self.scale
-        
-        if mask is not None:
-            # mask shape is [B, L, k]
-            scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
-        
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-        
-        # 4. Weighted sum of values
-        # [B, L, H, k] @ [B, L, k, H, d] -> [B, L, H, d]
-        out = torch.einsum('b l h k, b l k h d -> b l h d', attn, V)
-        
-        # 5. Final projection
-        return self.to_out(out.reshape(B, L, H * d))
-
-
-# =============================================================================
-# SELF-ATTENTION WITH LOCAL ROPE
-# =============================================================================
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
-
 class SelfAttentionRoPE(nn.Module):
     """
-    Optimized Self-attention with 2D RoPE for spatial latents.
-    Uses Flash Attention (scaled_dot_product_attention) for performance.
+    Self-attention with 2D RoPE using physical compression.
     """
     
     def __init__(
@@ -1244,12 +1162,13 @@ class SelfAttentionRoPE(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         use_rope: bool = True,
-        rope_base: float = 1000.0, # Increased for smoother spatial gradients
+        rope_base: float = 10000.0,
+        rope_compression_scale: float = 50.0,
         rope_learnable_scale: bool = True,
     ):
         super().__init__()
         assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
-        rope_base=1000.0
+        
         self.heads = heads
         self.dim_head = dim_head
         self.use_rope = use_rope
@@ -1264,7 +1183,7 @@ class SelfAttentionRoPE(nn.Module):
             self.rope = LocalRoPE2D(
                 dim_head=dim_head,
                 base=rope_base,
-                reference_gsd=0.2,
+                compression_scale=rope_compression_scale,
                 learnable_scale=rope_learnable_scale,
                 num_heads=heads,
             )
@@ -1274,25 +1193,25 @@ class SelfAttentionRoPE(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        pos_x: Optional[torch.Tensor] = None,
-        pos_y: Optional[torch.Tensor] = None,
+        pos_x: Optional[torch.Tensor] = None,  # [B, N] in METERS
+        pos_y: Optional[torch.Tensor] = None,  # [B, N] in METERS
         num_spatial: Optional[int] = None,
     ) -> torch.Tensor:
         B, N, _ = x.shape
         H, d = self.heads, self.dim_head
         
-        # 1. Generate Q, K, V
+        # Generate Q, K, V
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = [t.view(B, N, H, d) for t in qkv]
         
-        # 2. Apply RoPE (Rotary Positional Embeddings)
+        # Apply RoPE with physical compression
         if self.use_rope and self.rope is not None and pos_x is not None:
-            # Handle hybrid latents (Spatial + Global)
             if num_spatial is not None and num_spatial < N:
+                # Hybrid: spatial + global latents
                 q_spatial, q_global = q[:, :num_spatial], q[:, num_spatial:]
                 k_spatial, k_global = k[:, :num_spatial], k[:, num_spatial:]
                 
-                # Only spatial latents get geometric rotation
+                # Only spatial latents get RoPE
                 q_spatial, k_spatial = self.rope.forward_self(
                     q_spatial, k_spatial, pos_x, pos_y
                 )
@@ -1302,25 +1221,117 @@ class SelfAttentionRoPE(nn.Module):
             else:
                 q, k = self.rope.forward_self(q, k, pos_x, pos_y)
         
-        # 3. Flash Attention / Scaled Dot Product Attention
-        # Standard input for SDPA: [B, H, N, d]
+        # Flash Attention
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # SDPA is equivalent to: (Q @ K.T) / sqrt(d) -> Softmax -> Dropout -> V
-        # It is much faster and more memory efficient for N=784
         out = F.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=None, 
+            q, k, v,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False
         )
         
-        # 4. Final Projection
-        # [B, H, N, d] -> [B, N, H*d]
         out = out.transpose(1, 2).reshape(B, N, H * d)
         return self.to_out(out)
+
+class LocalCrossAttentionRoPE(nn.Module):
+    """
+    Cross-attention with 2D RoPE using physical compression.
+    
+    Architecture:
+    - Q: latents → to_q → Q (no RoPE, treated as origin)
+    - K: tokens → to_k → K → RoPE(K, delta) → K_rotated
+    - V: tokens → to_v → V (no position encoding)
+    
+    The compression function ensures multi-resolution compatibility:
+    same physical distance → same RoPE rotation.
+    """
+    
+    def __init__(
+        self,
+        dim_query: int,
+        dim_context: int,
+        dim_out: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        # RoPE parameters
+        use_rope: bool = True,
+        rope_base: float = 10000.0,
+        rope_compression_scale: float = 50.0,
+        rope_learnable_scale: bool = True,
+        # Legacy parameters (kept for compatibility)
+        rope_reference_gsd: float = 0.2,
+    ):
+        super().__init__()
+        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
+        
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.use_rope = use_rope
+        
+        inner_dim = heads * dim_head
+        
+        # Projections
+        self.to_q = nn.Linear(dim_query, inner_dim, bias=False)
+        self.to_k = nn.Linear(dim_context, inner_dim, bias=False)
+        self.to_v = nn.Linear(dim_context, inner_dim, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim_out)
+        self.dropout = nn.Dropout(dropout)
+        
+        # RoPE module
+        if use_rope:
+            self.rope = LocalRoPE2D(
+                dim_head=dim_head,
+                base=rope_base,
+                compression_scale=rope_compression_scale,
+                learnable_scale=rope_learnable_scale,
+                num_heads=heads,
+            )
+        else:
+            self.rope = None
+    
+    def forward(
+        self,
+        x: torch.Tensor,        # [B, L, dim_query] latents
+        context: torch.Tensor,  # [B, L, k, dim_context] sampled tokens
+        mask: Optional[torch.Tensor] = None,  # [B, L, k]
+        delta_x: Optional[torch.Tensor] = None,  # [B, L, k] in meters
+        delta_y: Optional[torch.Tensor] = None,  # [B, L, k] in meters
+        gsd: Optional[torch.Tensor] = None,  # Unused, kept for API compatibility
+    ) -> torch.Tensor:
+        B, L, _ = x.shape
+        k_samples = context.shape[2]
+        H, d = self.heads, self.dim_head
+        
+        # =================================================================
+        # Project Q, K, V
+        # =================================================================
+        q = self.to_q(x).view(B, L, H, d)              # [B, L, H, d]
+        K = self.to_k(context).view(B, L, k_samples, H, d)  # [B, L, k, H, d]
+        V = self.to_v(context).view(B, L, k_samples, H, d)  # [B, L, k, H, d]
+        
+        # =================================================================
+        # Apply RoPE rotation on K only
+        # =================================================================
+        if self.use_rope and self.rope is not None and delta_x is not None:
+            q, K = self.rope.forward_cross(q, K, delta_x, delta_y)
+        
+        # =================================================================
+        # Attention computation
+        # =================================================================
+        scores = torch.einsum('b l h d, b l k h d -> b l h k', q, K) * self.scale
+        
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
+        
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        out = torch.einsum('b l h k, b l k h d -> b l h d', attn, V)
+        
+        return self.to_out(out.reshape(B, L, H * d))
 
 
 # =============================================================================
@@ -1354,3 +1365,118 @@ class PreNormWithPositions(nn.Module):
             return self.fn(x, positions=positions, num_spatial=num_spatial, **kwargs)
         return self.fn(x, **kwargs)
 
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
+
+class TokenEncoder(nn.Module):
+    """
+    Compresses raw sensor tokens into a semantic bottleneck.
+    Saves VRAM by projecting context to a fixed dim (64) before attention.
+    """
+    def __init__(self, dim_in: int, dim_out: int = 64):
+        super().__init__()
+        hidden = max(dim_in, dim_out) * 2
+        self.mlp = nn.Sequential(
+            nn.Linear(dim_in, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim_out),
+            nn.LayerNorm(dim_out)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, k, dim_in]
+        B, L, k, D = x.shape
+        x_flat = x.reshape(-1, D)
+        return self.mlp(x_flat).view(B, L, k, -1)
+    
+class LocalCrossAttentionRoPE(nn.Module):
+    """
+    Cross-attention with Physical Distance RoPE.
+    
+    Pipeline:
+    1. Projections: Q (from query), K & V (from context)
+    2. RoPE: Apply physical compression (meters) to K
+    3. Attention: Weighted sum
+    """
+    def __init__(
+        self,
+        dim_query: int,
+        dim_context: int,
+        dim_out: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        use_rope: bool = True,
+        rope_base: float = 10000.0,
+        rope_compression_scale: float = 10.0,
+        rope_learnable_scale: bool = True,
+    ):
+        super().__init__()
+        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for Axial 2D RoPE"
+        
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = dim_head ** -0.5
+        self.use_rope = use_rope
+
+        inner_dim = heads * dim_head
+
+        # Linear Projections (direct from context)
+        self.to_q = nn.Linear(dim_query, inner_dim, bias=False)
+        self.to_k = nn.Linear(dim_context, inner_dim, bias=False)
+        self.to_v = nn.Linear(dim_context, inner_dim, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim_out)
+        self.dropout = nn.Dropout(dropout)
+
+        # Physical RoPE Module
+        if use_rope:
+            self.rope = LocalRoPE2D(
+                dim_head=dim_head,
+                base=rope_base,
+                compression_scale=rope_compression_scale,
+                learnable_scale=rope_learnable_scale,
+                num_heads=heads,
+            )
+        else:
+            self.rope = None
+
+    def forward(
+        self,
+        x: torch.Tensor,        # [B, L, dim_query]
+        context: torch.Tensor,  # [B, L, k, dim_context]
+        mask: Optional[torch.Tensor] = None,
+        delta_x: Optional[torch.Tensor] = None,  # [B, L, k] in meters
+        delta_y: Optional[torch.Tensor] = None,  # [B, L, k] in meters
+        gsd: Optional[torch.Tensor] = None,      # Unused
+    ) -> torch.Tensor:
+        B, L, _ = x.shape
+        k_samples = context.shape[2]
+        H, d = self.heads, self.dim_head
+
+        # Project to attention space
+        q = self.to_q(x).view(B, L, H, d)
+        K = self.to_k(context).view(B, L, k_samples, H, d)
+        V = self.to_v(context).view(B, L, k_samples, H, d)
+
+        # Apply Physical Distance RoPE
+        if self.use_rope and self.rope is not None and delta_x is not None:
+            q, K = self.rope.forward_cross(q, K, delta_x, delta_y)
+
+        # Attention scores
+        scores = torch.einsum('b l h d, b l k h d -> b l h k', q, K) * self.scale
+
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
+
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+
+        # Aggregate values
+        out = torch.einsum('b l h k, b l k h d -> b l h d', attn, V)
+
+        return self.to_out(out.reshape(B, L, H * d))
