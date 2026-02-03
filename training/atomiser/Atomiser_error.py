@@ -4,7 +4,7 @@ Atomiser Model with Local RoPE for Positional Encoding
 Key Features:
 - Local RoPE: Q at origin (unchanged), K rotated by relative position
 - Resolution-aware: log-scale GSD modulation
-- 37x faster than Fourier+MLP approach
+- Modular encode() with separate cross/self attention steps
 """
 
 import torch
@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import math
 from functools import wraps
+from dataclasses import dataclass
 from einops import repeat, rearrange
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -23,29 +24,16 @@ from typing import Optional, Tuple, List, Dict, Any
 
 from training.utils.token_building.processor import TokenProcessor
 
-from .augmented_qk import (
-    SelfAttentionWithAugmentedQK,
-    PreNormAugmentedQK,
-)
-
 from .nn_comp import (
     PreNorm, 
     SelfAttention, 
     FeedForward, 
     LatentAttentionPooling, 
     PreNormWithPositions,
-    LatentPositionEncoder
-)
-
-from .self_attn_cart import(
-    PreNormTargeting,
-    TargetingSelfAttention,
 )
 
 from .RPE import (
     LocalCrossAttentionRoPE,
-    PreNormRPEConcat,
-    SelfAttentionRPEConcat,
     SelfAttentionRoPE,
     PreNormRoPE
 )
@@ -55,34 +43,16 @@ from .RPE_gaussian import (
     PreNormRoPEGaussian
 )
 
-from .displacement import (
-    create_position_updater,
-    PositionUpdateStrategy,
-    compute_displacement_stats,
-)
-
 from .gaussian_bias import (
     SelfAttentionWithGaussianBias
 )
 
 from .geographic_pruning import (
     GeographicPruning,
-    create_geographic_pruning,
-)
-
-from .error_guided_displacement import (
-    ErrorGuidedDisplacement,
-    create_error_guided_displacement,
-)
-
-from .gravity_displacement import (
-    GravityDisplacement,
-    create_gravity_displacement,
 )
 
 from .hybrid_self_attention import (
     HybridSelfAttention,
-    create_hybrid_self_attention,
 )
 
 
@@ -106,6 +76,16 @@ def cache_fn(f):
     return cached_fn
 
 
+@dataclass
+class EncoderOutput:
+    """Structured output from encoder."""
+    latents: torch.Tensor
+    coords: torch.Tensor
+    trajectory: Optional[List[torch.Tensor]] = None
+    displacement_stats: Optional[Dict[str, Any]] = None
+    predicted_errors: Optional[List[torch.Tensor]] = None
+
+
 # =============================================================================
 # MAIN ATOMISER CLASS
 # =============================================================================
@@ -125,24 +105,20 @@ class Atomiser_error(pl.LightningModule):
         # 1. INPUT PROCESSOR
         # =====================================================================
         self.input_processor = TokenProcessor(config, lookup_table)
-        self.geo_pruning = dict()
+        self.geo_pruning = nn.ModuleDict()
         
         # =====================================================================
-        # 2. LATENT CONFIGURATION
-        # =====================================================================
-        self.spatial_latents_per_row = config["Atomiser"]["spatial_latents"]
-        self.num_spatial_latents = self.spatial_latents_per_row ** 2
-        self.num_global_latents = config["Atomiser"].get("global_latents", 0)
-        self.num_latents = self.num_spatial_latents + self.num_global_latents
-        self.latent_surface = config["Atomiser"].get("latent_surface", 103.0)
-        
-        # =====================================================================
-        # 3. DIMENSIONS
+        # 2. DIMENSIONS
         # =====================================================================
         self.input_dim = self.input_processor.get_encoder_output_dim()
         self.query_dim_recon = self.input_processor.get_decoder_output_dim()
         self.latent_dim = config["Atomiser"].get("latent_dim", self.input_dim)
         self.decoder_pe_dim = self.input_processor.pos_encoder.get_output_dim()
+        
+        # =====================================================================
+        # 3. GLOBAL LATENTS (shared across modalities)
+        # =====================================================================
+        self.num_global_latents = config["Atomiser"].get("global_latents", 0)
         
         # =====================================================================
         # 4. MODEL ARCHITECTURE PARAMETERS
@@ -158,106 +134,53 @@ class Atomiser_error(pl.LightningModule):
         self.self_per_cross_attn = config["Atomiser"]["self_per_cross_attn"]
         self.num_classes = config["trainer"]["num_classes"]
         
-        # Geographic attention parameters
-        self.geo_m_train = config["Atomiser"].get("geo_m_train", 500)
-        self.geo_m_val = config["Atomiser"].get("geo_m_val", 500)
-        
         # Decoder parameters
         self.decoder_k_spatial = config["Atomiser"].get("decoder_k_spatial", 4)
         
         # =====================================================================
-        # 5. MEMORY OPTIMIZATION
-        # =====================================================================
-        self.use_checkpoint = config["Atomiser"].get("use_checkpoint", False)
-        
-        # =====================================================================
-        # 6. ROPE CONFIGURATION
+        # 5. ROPE CONFIGURATION
         # =====================================================================
         self.encoder_use_rpe = config["Atomiser"]["RPE"].get("encoder_use_rpe", False)
         self.decoder_use_rpe = config["Atomiser"]["RPE"].get("decoder_use_rpe", False)
         self.use_rpe = config["Atomiser"]["RPE"].get("selfattn_use_rpe", False)
-        
-        self.rope_reference_gsd = config["Atomiser"].get("rope_reference_gsd", 0.2)
         self.rope_learnable_scale = config["Atomiser"].get("rope_learnable_scale", True)
         
         # =====================================================================
-        # 7. SELF-ATTENTION MODE
+        # 6. SELF-ATTENTION MODE
         # =====================================================================
         self.use_gaussian_bias = config["Atomiser"].get("use_gaussian_bias", False)
         self.gaussian_sigma = config["Atomiser"].get("gaussian_sigma", 9.0)
         self.learnable_sigma = config["Atomiser"].get("learnable_sigma", True)
         self.use_hybrid_self_attention = config["Atomiser"].get("use_hybrid_self_attention", False)
         self.self_attn_k = config["Atomiser"].get("self_attn_k", 64)
-        self.latent_spacing = self.latent_surface / (self.spatial_latents_per_row - 1)
-
-        self.use_augmented_qk = config["Atomiser"].get("use_augmented_qk", False)
-        self.augmented_qk_num_bands = config["Atomiser"].get("augmented_qk_num_bands", 32)
-        self.augmented_qk_max_freq = config["Atomiser"].get("augmented_qk_max_freq", 32.0)
-        self.augmented_qk_compression_scale = config["Atomiser"].get("augmented_qk_compression_scale", 50.0)
-        self.augmented_qk_include_gsd = config["Atomiser"].get("augmented_qk_include_gsd", True)
-        self.augmented_qk_reference_gsd = config["Atomiser"].get("augmented_qk_reference_gsd", 1.0)
-
-        self.use_targeting_self_attention = config["Atomiser"].get("use_targeting_self_attention", False)
-        self.targeting_num_bands = config["Atomiser"].get("targeting_num_bands", 32)
-        self.targeting_max_freq = config["Atomiser"].get("targeting_max_freq", 32.0)
-        self.targeting_normalize_scale = config["Atomiser"].get("targeting_normalize_scale", self.latent_surface / 2)
         
         # =====================================================================
-        # 8. DISPLACEMENT STRATEGY
-        # =====================================================================
-        self.use_displacement = config["Atomiser"].get("use_displacement", False)
-        self.position_strategy = config["Atomiser"].get("position_strategy", "mlp")
-        self.max_displacement = config["Atomiser"].get("max_displacement", 3.0)
-        self.min_displacement = config["Atomiser"].get("min_displacement", 0.5)
-        self.share_displacement_weights = config["Atomiser"].get("share_displacement_weights", True)
-        self.stable_depth = config["Atomiser"].get("stable_depth", 0)
-        
-        self.use_error_guided_displacement = config["Atomiser"].get("use_error_guided_displacement", False)
-        self.share_error_predictor_weights = config["Atomiser"].get("share_error_predictor_weights", True)
-        
-        self.use_gravity_displacement = config["Atomiser"].get("use_gravity_displacement", False)
-        self.repulsion_strength = config["Atomiser"].get("repulsion_strength", 0.5)
-        self.gravity_power = config["Atomiser"].get("gravity_power", 2.0)
-        self.error_offset = config["Atomiser"].get("error_offset", 0.1)
-        self.danger_zone_divisor = config["Atomiser"].get("danger_zone_divisor", 2.0)
-        
-        self.use_density_spreading = config["Atomiser"].get("use_density_spreading", True)
-        self.density_iters = config["Atomiser"].get("density_iters", 3)
-        self.density_sigma_mult = config["Atomiser"].get("density_sigma_mult", 0.5)
-        self.density_step_mult = config["Atomiser"].get("density_step_mult", 0.1)
-        self.max_density_step_mult = config["Atomiser"].get("max_density_step_mult", 0.25)
-        
-        # =====================================================================
-        # 9. PREDICTOR-ONLY MODE
-        # =====================================================================
-        self.predictor_only = config["Atomiser"].get("predictor_only", False)
-        
-        # =====================================================================
-        # 10. INITIALIZE COMPONENTS
+        # 7. INITIALIZE COMPONENTS
         # =====================================================================
         self._init_latents()
         self._init_geographic_pruning()
-        self._init_displacement_updater()
         self._init_encoder_layers()
         self._init_decoder()
         self._init_classifier()
-        
-        if self.predictor_only:
-            self._apply_predictor_only_mode()
+
+    # =========================================================================
+    # Initialization
+    # =========================================================================
 
     def _init_latents(self):
-        """Initialize learnable latent vectors."""        
+        """Initialize learnable latent vectors (shared across modalities)."""
         self.spatial_latent_content = nn.Parameter(torch.randn(self.latent_dim))
         nn.init.trunc_normal_(self.spatial_latent_content, std=0.02, a=-2., b=2.)
 
-        self.global_latents = nn.Parameter(torch.randn(self.num_global_latents, self.latent_dim))
-        nn.init.trunc_normal_(self.global_latents, std=0.02, a=-2., b=2.)
+        if self.num_global_latents > 0:
+            self.global_latents = nn.Parameter(torch.randn(self.num_global_latents, self.latent_dim))
+            nn.init.trunc_normal_(self.global_latents, std=0.02, a=-2., b=2.)
+        else:
+            self.register_buffer('global_latents', None)
 
     def _init_geographic_pruning(self):
-        """Initialize geographic pruning module."""
-        for grid_name in self.config["latent_grids"]:
-            grid_options = self.config["latent_grids"][grid_name]
-            
+        """Initialize geographic pruning module for each modality."""
+        for grid_name, grid_options in self.config["latent_grids"].items():
             span = grid_options["span"]
             latents_per_row = grid_options["latents"]
             spacing = span / (latents_per_row - 1)
@@ -265,74 +188,19 @@ class Atomiser_error(pl.LightningModule):
             
             self.geo_pruning[grid_name] = GeographicPruning(
                 geometry=self.input_processor.geometry,
-                num_spatial_latents=latents_per_row**2,
+                num_spatial_latents=latents_per_row ** 2,
                 geo_k=grid_options["geo_k"],
                 default_sigma=auto_sigma,
             )
 
-    def get_spatial_latents(self, batch_size: int, grid_options: dict) -> torch.Tensor:
-        """Initialize spatial latents."""
-        return repeat(self.spatial_latent_content, 'd -> b n d', b=batch_size, n=grid_options["latents"]**2)
-    
-    def get_global_latents(self, batch_size: int) -> torch.Tensor:
-        """Initialize global latents."""
-        return repeat(self.global_latents, 'n d -> b n d', b=batch_size)
-    
-    def _init_displacement_updater(self):
-        """Initialize the position update strategy from config."""
-        self.error_displacement = None
-        self.gravity_displacement = None
-        self.position_updater = None
-        
-        if self.use_gravity_displacement:
-            self.gravity_displacement = GravityDisplacement(
-                latent_dim=self.latent_dim,
-                num_latents_per_row=self.spatial_latents_per_row,
-                max_displacement=self.max_displacement,
-                min_displacement=self.min_displacement,
-                repulsion_strength=self.repulsion_strength,
-                gravity_power=self.gravity_power,
-                depth=self.depth,
-                share_weights=self.share_error_predictor_weights,
-                latent_surface=self.latent_surface,
-                error_offset=self.error_offset,
-                danger_zone_divisor=self.danger_zone_divisor,
-                use_density_spreading=self.use_density_spreading,
-                density_iters=self.density_iters,
-                density_sigma_mult=self.density_sigma_mult,
-                density_step_mult=self.density_step_mult,
-                max_density_step_mult=self.max_density_step_mult,
-                freeze_boundary=self.config["Atomiser"].get("freeze_boundary", False)
-            )
-        elif self.use_error_guided_displacement:
-            self.error_displacement = ErrorGuidedDisplacement(
-                latent_dim=self.latent_dim,
-                num_latents_per_row=self.spatial_latents_per_row,
-                max_displacement=self.max_displacement,
-                min_displacement=self.min_displacement,
-                depth=self.depth,
-                share_weights=self.share_error_predictor_weights,
-                latent_surface=self.latent_surface,
-            )
-        elif self.use_displacement:
-            displacement_config = {
-                "use_displacement": self.use_displacement,
-                "position_strategy": self.position_strategy,
-                "latent_dim": self.latent_dim,
-                "depth": self.depth,
-                "max_displacement": self.max_displacement,
-                "share_displacement_weights": self.share_displacement_weights,
-                "num_spatial_latents": self.num_spatial_latents,
-            }
-            self.position_updater = create_position_updater(displacement_config)
-    
     def _init_encoder_layers(self):
-        """Initialize encoder layers with Local RoPE using compression."""
+        """Initialize encoder layers with Local RoPE."""
         
         self_rope_compression_scale = self.config["RoPE"].get("self_compression_scale", 50.0)
-        cross_rope_compression_scale = self.config["RoPE"].get("cross_compression_scale", 50.0)
+        cross_rope_compression_scale = self.config["RoPE"].get("cross_compression_scale", 10.0)
         rope_base = self.config["RoPE"].get("base", 10000.0)
         
+        # Cross-attention factory
         get_cross_attn = cache_fn(lambda: PreNorm(
             self.latent_dim,
             LocalCrossAttentionRoPE(
@@ -344,7 +212,7 @@ class Atomiser_error(pl.LightningModule):
                 dropout=self.attn_dropout,
                 use_rope=self.encoder_use_rpe,
                 rope_base=rope_base,
-                rope_compression_scale=10,
+                rope_compression_scale=cross_rope_compression_scale,
                 rope_learnable_scale=self.rope_learnable_scale,
             )
         ))
@@ -354,120 +222,12 @@ class Atomiser_error(pl.LightningModule):
             FeedForward(self.latent_dim, dropout=self.ff_dropout)
         ))
 
-        # =========================================================================
-        # Self-Attention Configuration
-        # =========================================================================
+        # Self-attention factory (depends on mode)
+        get_latent_attn, get_latent_ff = self._create_self_attention_factories(
+            rope_base, self_rope_compression_scale
+        )
         
-        if self.use_hybrid_self_attention:
-            self.hybrid_self_attn = HybridSelfAttention(
-                dim=self.latent_dim,
-                k=self.self_attn_k,
-                heads=self.latent_heads,
-                dim_head=self.latent_dim_head,
-                ff_mult=4,
-                dropout=self.attn_dropout,
-                use_rpe=self.use_rpe,
-                use_gaussian_bias=self.use_gaussian_bias,
-                sigma_init=self.gaussian_sigma,
-                learnable_sigma=self.learnable_sigma,
-                num_blocks=self.self_per_cross_attn,
-                has_global=self.num_global_latents > 0,
-                share_weights=self.weight_tie_layers,
-                rpe_num_bands=self.config["latent_config"].get("latent_pos_num_bands", 32),
-                rpe_max_freq=self.config["latent_config"].get("latent_pos_max_freq", 32),
-                rpe_normalize_scale=self.latent_spacing,
-            )
-            get_latent_attn = None
-            get_latent_ff = None
-
-        elif self.use_rpe and self.use_gaussian_bias:
-            self.hybrid_self_attn = None
-            
-            get_latent_attn = cache_fn(lambda: PreNormRoPEGaussian(
-                self.latent_dim,
-                SelfAttentionRoPEWithGaussianBias(
-                    dim=self.latent_dim,
-                    heads=self.latent_heads,
-                    dim_head=self.latent_dim_head,
-                    dropout=self.attn_dropout,
-                    use_rope=True,
-                    rope_base=rope_base,
-                    rope_compression_scale=self_rope_compression_scale,
-                    rope_learnable_scale=self.rope_learnable_scale,
-                    use_gaussian_bias=True,
-                    sigma=self.gaussian_sigma,
-                    learnable_sigma=self.learnable_sigma,
-                )
-            ))
-            
-            get_latent_ff = cache_fn(lambda: PreNorm(
-                self.latent_dim,
-                FeedForward(self.latent_dim, dropout=self.ff_dropout)
-            ))
-
-        elif self.use_rpe:
-            self.hybrid_self_attn = None
-            
-            get_latent_attn = cache_fn(lambda: PreNormRoPE(
-                self.latent_dim,
-                SelfAttentionRoPE(
-                    dim=self.latent_dim,
-                    heads=self.latent_heads,
-                    dim_head=self.latent_dim_head,
-                    dropout=self.attn_dropout,
-                    use_rope=True,
-                    rope_base=rope_base,
-                    rope_compression_scale=self_rope_compression_scale,
-                    rope_learnable_scale=self.rope_learnable_scale,
-                )
-            ))
-            
-            get_latent_ff = cache_fn(lambda: PreNorm(
-                self.latent_dim,
-                FeedForward(self.latent_dim, dropout=self.ff_dropout)
-            ))
-            
-        elif self.use_gaussian_bias:
-            self.hybrid_self_attn = None
-            
-            get_latent_attn = cache_fn(lambda: PreNormWithPositions(
-                self.latent_dim,
-                SelfAttentionWithGaussianBias(
-                    dim=self.latent_dim,
-                    heads=self.latent_heads,
-                    dim_head=self.latent_dim_head,
-                    dropout=self.attn_dropout,
-                    sigma=self.gaussian_sigma,
-                    learnable_sigma=self.learnable_sigma
-                )
-            ))
-            
-            get_latent_ff = cache_fn(lambda: PreNorm(
-                self.latent_dim,
-                FeedForward(self.latent_dim, dropout=self.ff_dropout)
-            ))
-            
-        else:
-            self.hybrid_self_attn = None
-            
-            get_latent_attn = cache_fn(lambda: PreNorm(
-                self.latent_dim,
-                SelfAttention(
-                    dim=self.latent_dim,
-                    heads=self.latent_heads,
-                    dim_head=self.latent_dim_head,
-                    dropout=self.attn_dropout,
-                )
-            ))
-            
-            get_latent_ff = cache_fn(lambda: PreNorm(
-                self.latent_dim,
-                FeedForward(self.latent_dim, dropout=self.ff_dropout)
-            ))
-        
-        # =========================================================================
-        # Build Encoder Layers
-        # =========================================================================
+        # Build encoder layers
         self.encoder_layers = nn.ModuleList([])
         
         for layer_idx in range(self.depth):
@@ -489,10 +249,99 @@ class Atomiser_error(pl.LightningModule):
             
             self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns]))
 
-    def _init_decoder(self):
-        """Initialize decoder with Local RoPE using compression."""
+    def _create_self_attention_factories(self, rope_base: float, compression_scale: float):
+        """Create self-attention factories based on configuration."""
         
-        rope_compression_scale = self.config["RoPE"].get("compression_scale", 50.0)
+        # Compute latent spacing for hybrid attention (use first modality as reference)
+        first_modality = next(iter(self.config["latent_grids"].values()))
+        latent_spacing = first_modality["span"] / (first_modality["latents"] - 1)
+        
+        if self.use_hybrid_self_attention:
+            self.hybrid_self_attn = HybridSelfAttention(
+                dim=self.latent_dim,
+                k=self.self_attn_k,
+                heads=self.latent_heads,
+                dim_head=self.latent_dim_head,
+                ff_mult=4,
+                dropout=self.attn_dropout,
+                use_rpe=self.use_rpe,
+                use_gaussian_bias=self.use_gaussian_bias,
+                sigma_init=self.gaussian_sigma,
+                learnable_sigma=self.learnable_sigma,
+                num_blocks=self.self_per_cross_attn,
+                has_global=self.num_global_latents > 0,
+                share_weights=self.weight_tie_layers,
+                rpe_normalize_scale=latent_spacing,
+            )
+            return None, None
+
+        self.hybrid_self_attn = None
+
+        if self.use_rpe and self.use_gaussian_bias:
+            get_latent_attn = cache_fn(lambda: PreNormRoPEGaussian(
+                self.latent_dim,
+                SelfAttentionRoPEWithGaussianBias(
+                    dim=self.latent_dim,
+                    heads=self.latent_heads,
+                    dim_head=self.latent_dim_head,
+                    dropout=self.attn_dropout,
+                    use_rope=True,
+                    rope_base=rope_base,
+                    rope_compression_scale=compression_scale,
+                    rope_learnable_scale=self.rope_learnable_scale,
+                    use_gaussian_bias=True,
+                    sigma=self.gaussian_sigma,
+                    learnable_sigma=self.learnable_sigma,
+                )
+            ))
+        elif self.use_rpe:
+            get_latent_attn = cache_fn(lambda: PreNormRoPE(
+                self.latent_dim,
+                SelfAttentionRoPE(
+                    dim=self.latent_dim,
+                    heads=self.latent_heads,
+                    dim_head=self.latent_dim_head,
+                    dropout=self.attn_dropout,
+                    use_rope=True,
+                    rope_base=rope_base,
+                    rope_compression_scale=compression_scale,
+                    rope_learnable_scale=self.rope_learnable_scale,
+                )
+            ))
+        elif self.use_gaussian_bias:
+            get_latent_attn = cache_fn(lambda: PreNormWithPositions(
+                self.latent_dim,
+                SelfAttentionWithGaussianBias(
+                    dim=self.latent_dim,
+                    heads=self.latent_heads,
+                    dim_head=self.latent_dim_head,
+                    dropout=self.attn_dropout,
+                    sigma=self.gaussian_sigma,
+                    learnable_sigma=self.learnable_sigma
+                )
+            ))
+        else:
+            get_latent_attn = cache_fn(lambda: PreNorm(
+                self.latent_dim,
+                SelfAttention(
+                    dim=self.latent_dim,
+                    heads=self.latent_heads,
+                    dim_head=self.latent_dim_head,
+                    dropout=self.attn_dropout,
+                )
+            ))
+        
+        get_latent_ff = cache_fn(lambda: PreNorm(
+            self.latent_dim,
+            FeedForward(self.latent_dim, dropout=self.ff_dropout)
+        ))
+        
+        return get_latent_attn, get_latent_ff
+
+    def _init_decoder(self):
+        """Initialize decoder with Local RoPE."""
+        
+        rope_compression_scale = self.config["RoPE"].get("cross_compression_scale", 10.0)
         rope_base = self.config["RoPE"].get("base", 10000.0)
         
         if self.decoder_use_rpe:
@@ -509,7 +358,7 @@ class Atomiser_error(pl.LightningModule):
             dropout=self.attn_dropout,
             use_rope=self.decoder_use_rpe,
             rope_base=rope_base,
-            rope_compression_scale=10,
+            rope_compression_scale=rope_compression_scale,
             rope_learnable_scale=self.rope_learnable_scale,
         )
         
@@ -543,411 +392,301 @@ class Atomiser_error(pl.LightningModule):
             self.to_logits = nn.Identity()
 
     # =========================================================================
-    # Predictor-Only Mode
-    # =========================================================================
-    
-    def _apply_predictor_only_mode(self):
-        """Freeze all model components EXCEPT the error predictor."""
-        has_error_predictor = (
-            self.gravity_displacement is not None or 
-            self.error_displacement is not None
-        )
-        
-        if not has_error_predictor:
-            raise ValueError(
-                "predictor_only=True requires use_gravity_displacement=True or "
-                "use_error_guided_displacement=True!"
-            )
-        
-        total_params_before = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        self.freeze_all()
-        self._unfreeze_error_predictor_only()
-        total_params_after = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        print(f"[Atomiser] Predictor-only mode: {total_params_before:,} → {total_params_after:,} trainable params")
-    
-    def freeze_all(self):
-        for param in self.parameters():
-            param.requires_grad = False
-    
-    def unfreeze_all(self):
-        for param in self.parameters():
-            param.requires_grad = True
-    
-    def _unfreeze_error_predictor_only(self):
-        if self.gravity_displacement is not None:
-            if self.gravity_displacement.share_weights:
-                for param in self.gravity_displacement.error_predictor.parameters():
-                    param.requires_grad = True
-            else:
-                for predictor in self.gravity_displacement.error_predictors:
-                    for param in predictor.parameters():
-                        param.requires_grad = True
-        
-        if self.error_displacement is not None:
-            if self.error_displacement.share_weights:
-                for param in self.error_displacement.error_predictor.parameters():
-                    param.requires_grad = True
-            else:
-                for predictor in self.error_displacement.error_predictors:
-                    for param in predictor.parameters():
-                        param.requires_grad = True
-
-    # =========================================================================
-    # Coordinate Utilities
+    # Latent & Coordinate Initialization
     # =========================================================================
 
-    def _get_default_latent_coords(self, batch_size: int, device: torch.device, config: dict) -> torch.Tensor:
-        grid = self.input_processor.geometry.get_default_latent_grid(config)
-        return grid.unsqueeze(0).expand(batch_size, -1, -1).clone()
+    def get_spatial_latents(self, batch_size: int, grid_config: dict) -> torch.Tensor:
+        """Initialize spatial latents for a given grid configuration."""
+        num_latents = grid_config["latents"] ** 2
+        return repeat(self.spatial_latent_content, 'd -> b n d', b=batch_size, n=num_latents)
     
-    def _aggregate_displacement_stats(
+    def get_global_latents(self, batch_size: int) -> Optional[torch.Tensor]:
+        """Initialize global latents (shared across modalities)."""
+        if self.global_latents is None:
+            return None
+        return repeat(self.global_latents, 'n d -> b n d', b=batch_size)
+
+    def get_default_coords(self, batch_size: int, device: torch.device, grid_config: dict) -> torch.Tensor:
+        """Get default latent coordinates for a modality."""
+        grid = self.input_processor.geometry.get_default_latent_grid(grid_config)
+        return grid.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device)
+
+    def combine_latents(
         self, 
-        stats_list: List[Dict[str, Any]], 
-        trajectory: Optional[List[torch.Tensor]] = None
-    ) -> Dict[str, Any]:
-        aggregated = {
-            'per_layer': stats_list,
-            'stable_depth': self.stable_depth,
-        }
-        
-        enabled_stats = [s for s in stats_list if s.get('displacement_enabled', True)]
-        mean_mags = [s['mean_magnitude'] for s in enabled_stats]
-        max_mags = [s['max_magnitude'] for s in enabled_stats]
-        
-        aggregated['mean_displacement_per_layer'] = mean_mags
-        aggregated['cumulative_mean_displacement'] = sum(mean_mags) if mean_mags else 0.0
-        aggregated['max_single_layer_displacement'] = max(max_mags) if max_mags else 0.0
-        aggregated['num_displacement_layers'] = len(enabled_stats)
-        
-        if trajectory is not None and len(trajectory) > 1:
-            total_disp = trajectory[-1] - trajectory[0]
-            total_mag = torch.norm(total_disp, dim=-1)
-            aggregated['total_displacement'] = {
-                'mean': total_mag.mean().item(),
-                'max': total_mag.max().item(),
-                'std': total_mag.std().item(),
-            }
-        
-        return aggregated
-
-    # =========================================================================
-    # Encode
-    # =========================================================================
-
-    def encode(
-        self,
-        tokens: torch.Tensor,
-        mask: torch.Tensor,
-        latents_coords: Optional[torch.Tensor] = None,
-        training: bool = True,
-        return_trajectory: bool = False,
-        return_displacement_stats: bool = False,
-        return_predicted_errors: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]], Optional[Dict[str, Any]], Optional[List[torch.Tensor]]]:
-        """
-        Encode tokens into latent representations.
-        
-        Args:
-            tokens: [B, N, token_dim] input tokens
-            mask: [B, N] boolean mask (True = valid)
-            latents_coords: Optional initial latent coordinates
-            training: Whether in training mode (affects subsampling)
-            return_trajectory: Whether to return position trajectory
-            return_displacement_stats: Whether to return displacement statistics
-            return_predicted_errors: Whether to return predicted errors
-        
-        Returns:
-            latents: [B, L, D] final latent representations
-            current_coords: [B, L_spatial, 2] final latent coordinates
-            trajectory: Optional list of coordinate tensors
-            disp_stats: Optional displacement statistics dict
-            predicted_errors: Optional list of predicted error tensors
-        """
-        B = tokens.shape[0]
-        L_spatial = self.num_spatial_latents
-        device = tokens.device
-        
-        modality = "FLAIR"
-
-        del latents_coords
-        latents_coords=None
-
-        # Initialize coordinates
-        if latents_coords is not None:
-            current_coords = latents_coords.clone()
-        else:
-            current_coords = self._get_default_latent_coords(
-                B, device, self.config["latent_grids"][modality]
-            )
-        
-        # Initialize latents
-        spatial_latents = self.get_spatial_latents(B, self.config["latent_grids"][modality])
-        global_latents = self.get_global_latents(B)
-        
+        spatial_latents: torch.Tensor, 
+        global_latents: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Combine spatial and global latents."""
         if global_latents is not None:
-            latents = torch.cat([spatial_latents, global_latents], dim=1)
-        else:
-            latents = spatial_latents
-        
-        initial_spatial_latents = latents[:, :L_spatial, :].clone()
+            return torch.cat([spatial_latents, global_latents], dim=1)
+        return spatial_latents
 
-        # Tracking lists
-        trajectory = [current_coords.clone()] if return_trajectory else None
-        all_displacements = [] if return_displacement_stats else None
-        predicted_errors_list = [] if return_predicted_errors else None
+    # =========================================================================
+    # Token Sampling
+    # =========================================================================
 
-        # Geographic pruning
-        geo_tokens, geo_masks, _ = self.geo_pruning[modality](
-            tokens, mask, current_coords, id_modality=modality
-        )
-        
+    def _sample_tokens(
+        self, 
+        geo_tokens: torch.Tensor, 
+        geo_masks: torch.Tensor, 
+        grid_config: dict,
+        training: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample tokens from geographic pruning output."""
         k = geo_tokens.shape[2]
-
-        # Cache lookup tables
-        token_centers_lut = None
-        gsd_lut = None
-        
-        if self.encoder_use_rpe:
-            _, _, token_centers_lut = self.input_processor.geometry.get_integral_constants()
-            if hasattr(self.input_processor, 'get_gsd_lut'):
-                gsd_lut = self.input_processor.get_gsd_lut()
-
-        # Subsampling configuration
-        geo_train_k = self.config["latent_grids"][modality].get("train_k", 500)
-        geo_val_k = self.config["latent_grids"][modality].get("val_k", 500)
-        
-        m = geo_train_k if training else geo_val_k
+        m = grid_config.get("train_k", 500) if training else grid_config.get("val_k", 500)
         m = min(m, k)
         
-        # Pre-generate random permutations for subsampling
         if m < k:
-            all_perms = [torch.randperm(k, device=device)[:m] for _ in range(self.depth)]
-        else:
-            all_perms = [None] * self.depth
+            perm = torch.randperm(k, device=geo_tokens.device)[:m]
+            return geo_tokens[:, :, perm, :], geo_masks[:, :, perm]
         
-        num_layers = len(self.encoder_layers)
-        
-        # Encoder layers
-        for layer_idx, (cross_attn, cross_ff, self_attns) in enumerate(self.encoder_layers):
-            perm = all_perms[layer_idx]
-            
-            latents, new_coords, predicted_error = self._encode_single_layer(
-                latents,
-                current_coords,
-                initial_spatial_latents,
-                geo_tokens,
-                geo_masks,
-                perm,
-                token_centers_lut,
-                gsd_lut,
-                layer_idx,
-                cross_attn,
-                cross_ff,
-                self_attns,
-                training,
-            )
-            
-            # Store predicted error
-            if return_predicted_errors and predicted_error is not None:
-                predicted_errors_list.append(predicted_error)
-            
-            # Track displacement statistics
-            if return_displacement_stats:
-                displacement = new_coords - current_coords
-                disp_magnitude = torch.norm(displacement, dim=-1)
-                displacement_enabled = layer_idx < (self.depth - self.stable_depth)
-                all_displacements.append({
-                    'layer': layer_idx,
-                    'displacement_enabled': displacement_enabled,
-                    'mean_magnitude': disp_magnitude.mean().item(),
-                    'max_magnitude': disp_magnitude.max().item(),
-                    'std_magnitude': disp_magnitude.std().item(),
-                })
-            
-            # Update coordinates
-            current_coords = new_coords
-            
-            # Record trajectory
-            if return_trajectory:
-                trajectory.append(current_coords.clone())
-            
-            # Re-compute geographic pruning for next layer (if coords changed)
-            if layer_idx < num_layers - 1:
-                displacement_enabled = layer_idx < (self.depth - self.stable_depth)
-                should_reprune = displacement_enabled and (
-                    self.use_gravity_displacement or 
-                    self.use_error_guided_displacement or 
-                    self.position_updater is not None
-                )
-                
-                if should_reprune:
-                    del geo_tokens, geo_masks
-                    
-                    geo_tokens, geo_masks, _ = self.geo_pruning[modality](
-                        tokens, mask, current_coords, id_modality=modality
-                    )
-                    
-                    k = geo_tokens.shape[2]
-                    m = geo_train_k if training else geo_val_k
-                    m = min(m, k)
+        return geo_tokens, geo_masks
 
-                    if m < k and layer_idx + 1 < num_layers:
-                        all_perms[layer_idx + 1] = torch.randperm(k, device=device)[:m]
-        
-        # Aggregate displacement stats
-        final_disp_stats = None
-        if return_displacement_stats and all_displacements:
-            final_disp_stats = self._aggregate_displacement_stats(all_displacements, trajectory)
-        
-        return latents, current_coords, trajectory, final_disp_stats, predicted_errors_list
+    # =========================================================================
+    # Compute Deltas (for RoPE)
+    # =========================================================================
 
-    def _encode_single_layer(
-        self,
-        latents: torch.Tensor,
-        current_coords: torch.Tensor,
-        initial_spatial_latents: torch.Tensor,
-        geo_tokens: torch.Tensor,
-        geo_masks: torch.Tensor,
-        perm: Optional[torch.Tensor],
-        token_centers_lut: Optional[torch.Tensor],
-        gsd_lut: Optional[torch.Tensor],
-        layer_idx: int,
-        cross_attn: nn.Module,
-        cross_ff: nn.Module,
-        self_attns: Optional[nn.ModuleList],
-        training: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Single encoder layer."""
-        B = latents.shape[0]
-        L_spatial = self.num_spatial_latents
+    def _compute_deltas(
+        self, 
+        sampled_tokens: torch.Tensor, 
+        coords: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Compute relative positions and GSD for RoPE."""
+        if not self.encoder_use_rpe:
+            return None, None, None
         
-        # Sample tokens
-        if perm is not None:
-            sampled_tokens = geo_tokens[:, :, perm, :]
-            sampled_masks = geo_masks[:, :, perm]
-        else:
-            sampled_tokens = geo_tokens
-            sampled_masks = geo_masks
+        _, _, token_centers_lut = self.input_processor.geometry.get_integral_constants()
         
-        processed_tokens = self.input_processor.process_data_for_encoder(
-            sampled_tokens, sampled_masks, latent_positions=current_coords
-        )
+        token_x_idx = sampled_tokens[:, :, :, 1].long()
+        token_y_idx = sampled_tokens[:, :, :, 2].long()
+        token_x = token_centers_lut[token_x_idx]
+        token_y = token_centers_lut[token_y_idx]
         
-        latents_spatial = latents[:, :L_spatial, :]
-        latents_global = latents[:, L_spatial:, :] if self.num_global_latents > 0 else None
+        delta_x = token_x - coords[:, :, 0:1]
+        delta_y = token_y - coords[:, :, 1:2]
         
-        # Compute position and GSD for RoPE (cross-attention)
-        delta_x = None
-        delta_y = None
+        # GSD (optional)
         gsd = None
-        
-        if self.encoder_use_rpe and token_centers_lut is not None:
-            token_x_idx = sampled_tokens[:, :, :, 1].long()
-            token_y_idx = sampled_tokens[:, :, :, 2].long()
-            token_x = token_centers_lut[token_x_idx]
-            token_y = token_centers_lut[token_y_idx]
-            
-            delta_x = token_x - current_coords[:, :, 0:1]
-            delta_y = token_y - current_coords[:, :, 1:2]
-            
+        if hasattr(self.input_processor, 'get_gsd_lut'):
+            gsd_lut = self.input_processor.get_gsd_lut()
             if gsd_lut is not None:
                 band_idx = sampled_tokens[:, :, :, 0].long()
                 gsd = gsd_lut[band_idx]
         
-        # Cross-attention
-        spatial_out = cross_attn(
-            latents_spatial,
+        return delta_x, delta_y, gsd
+
+    # =========================================================================
+    # Attention Steps (Modular)
+    # =========================================================================
+
+    def _cross_attention_step(
+        self,
+        latents: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+        sampled_masks: torch.Tensor,
+        coords: torch.Tensor,
+        cross_attn: nn.Module,
+        cross_ff: nn.Module,
+        L_spatial: int,
+    ) -> torch.Tensor:
+        """Single cross-attention step: latents attend to tokens."""
+        
+        # Process tokens
+        processed_tokens = self.input_processor.process_data_for_encoder(
+            sampled_tokens, sampled_masks, latent_positions=coords
+        )
+        
+        # Compute deltas for RoPE
+        delta_x, delta_y, gsd = self._compute_deltas(sampled_tokens, coords)
+        
+        # Cross-attention on spatial latents only
+        spatial = latents[:, :L_spatial]
+        spatial = cross_attn(
+            spatial,
             context=processed_tokens,
             mask=~sampled_masks,
             delta_x=delta_x,
             delta_y=delta_y,
             gsd=gsd,
-        )
+        ) + spatial
+        spatial = cross_ff(spatial) + spatial
         
-        latents_spatial = spatial_out + latents_spatial
-        latents_spatial = cross_ff(latents_spatial) + latents_spatial
-        
-        if latents_global is not None:
-            latents = torch.cat([latents_spatial, latents_global], dim=1)
-        else:
-            latents = latents_spatial
-        
-        # Self-attention
-        if self.use_hybrid_self_attention:
-            hybrid_cache = self.hybrid_self_attn.compute_cache(current_coords)
-            latents = self.hybrid_self_attn(latents, hybrid_cache, num_spatial=L_spatial)
-        
-        elif self.use_rpe:
-            px = current_coords[..., 0]
-            py = current_coords[..., 1]
+        # Recombine with global latents
+        return torch.cat([spatial, latents[:, L_spatial:]], dim=1)
 
-            for self_attn, self_ff in self_attns:
-                latents = self_attn(
-                    latents,
-                    pos_x=px,
-                    pos_y=py,
-                    num_spatial=L_spatial
-                ) + latents
-                latents = self_ff(latents) + latents
+    def _self_attention_step(
+        self,
+        latents: torch.Tensor,
+        coords: torch.Tensor,
+        self_attns: Optional[nn.ModuleList],
+        L_spatial: int,
+    ) -> torch.Tensor:
+        """Single self-attention step: latents attend to each other."""
         
-        elif self.use_gaussian_bias:
-            for self_attn, self_ff in self_attns:
-                latents = self_attn(latents, positions=current_coords, num_spatial=L_spatial) + latents
-                latents = self_ff(latents) + latents
+        if self.use_hybrid_self_attention:
+            hybrid_cache = self.hybrid_self_attn.compute_cache(coords)
+            return self.hybrid_self_attn(latents, hybrid_cache, num_spatial=L_spatial)
         
+        if self.use_rpe or self.use_gaussian_bias:
+            px = coords[..., 0]
+            py = coords[..., 1]
+            
+            for self_attn, self_ff in self_attns:
+                if self.use_rpe:
+                    latents = self_attn(latents, pos_x=px, pos_y=py, num_spatial=L_spatial) + latents
+                else:
+                    latents = self_attn(latents, positions=coords, num_spatial=L_spatial) + latents
+                latents = self_ff(latents) + latents
         else:
             for self_attn, self_ff in self_attns:
                 latents = self_attn(latents) + latents
                 latents = self_ff(latents) + latents
         
-        # Displacement
-        latents_spatial = latents[:, :L_spatial, :]
-        displacement_enabled = layer_idx < (self.depth - self.stable_depth)
-        predicted_error = None
+        return latents
+
+    # =========================================================================
+    # Main Encode
+    # =========================================================================
+    def prepare_cross_attention_step(self,geo_tuple,layers,L_spatial, training,latents):
+        geo_tokens, geo_masks, grid_config,latent_coords = geo_tuple
+        sampled_tokens, sampled_masks = self._sample_tokens(
+            geo_tokens, geo_masks, grid_config, training
+        )
         
-        if displacement_enabled and self.use_gravity_displacement:
-            new_coords, displacement, predicted_error = self.gravity_displacement(
-                latents_spatial, current_coords, layer_idx
-            )
-        elif displacement_enabled and self.use_error_guided_displacement:
-            new_coords, displacement, predicted_error = self.error_displacement(
-                latents_spatial, current_coords, layer_idx
-            )
-        elif displacement_enabled and self.position_updater is not None:
-            new_coords, displacement = self.position_updater(
-                latents_spatial, current_coords, layer_idx
-            )
+        cross_attn, cross_ff=layers
+        latents = self._cross_attention_step(
+            latents, sampled_tokens, sampled_masks, latent_coords,
+            cross_attn, cross_ff, L_spatial
+        )
+
+        return latents
+
+    
+
+    def encode(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+        modality: str = "FLAIR",
+        initial_coords: Optional[torch.Tensor] = None,
+        do_cross_attention: bool = True,
+        do_self_attention: bool = True,
+        num_layers: Optional[int] = None,
+        training: bool = True,
+        return_trajectory: bool = False,
+    ) -> EncoderOutput:
+        """
+        Encode tokens into latent representations.
+        
+        Args:
+            tokens: [B, N, token_dim] input tokens
+            mask: [B, N] boolean mask (True = masked/invalid)
+            modality: Which modality config to use (e.g., "FLAIR", "S2")
+            initial_coords: Optional initial latent coordinates [B, L_spatial, 2]
+            do_cross_attention: Whether to perform cross-attention
+            do_self_attention: Whether to perform self-attention
+            num_layers: Override number of layers (default: self.depth)
+            training: Whether in training mode (affects token sampling)
+            return_trajectory: Whether to return coordinate trajectory
+        
+        Returns:
+            EncoderOutput with latents, coords, and optional trajectory
+        """
+        # =========================================
+        # 1. GET MODALITY CONFIG
+        # =========================================
+      
+        grid_config = self.config["latent_grids"][modality]
+        
+        L_spatial = grid_config["latents"] ** 2
+        
+        B = tokens.shape[0]
+        device = tokens.device
+        
+        # =========================================
+        # 2. INITIALIZE LATENTS & COORDS
+        # =========================================
+        spatial_latents = self.get_spatial_latents(B, grid_config)
+        global_latents = self.get_global_latents(B)
+        latents = self.combine_latents(spatial_latents, global_latents)
+        del initial_coords
+        initial_coords=None
+        if initial_coords is not None:
+            coords = initial_coords.clone()
         else:
-            new_coords = current_coords
+            coords = self.get_default_coords(B, device, grid_config)
         
-        # Reset spatial latents if displacement enabled
-        if displacement_enabled and (
-            self.use_gravity_displacement or 
-            self.use_error_guided_displacement or 
-            self.position_updater is not None
-        ):
-            latents = torch.cat([
-                initial_spatial_latents.clone(),
-                latents[:, L_spatial:, :]
-            ], dim=1)
+        #pruning
+        geo_tokens, geo_masks, _ = self.geo_pruning[modality](tokens, mask, coords, id_modality=modality)
         
-        return latents, new_coords, predicted_error
+        #traj tracking
+        trajectory = [coords.clone()] if return_trajectory else None
+        
+        #layer loop
+        depth = num_layers if num_layers is not None else self.depth
+        
+        for layer_idx in range(depth):
+            cross_attn, cross_ff, self_attns = self.encoder_layers[layer_idx]
+            
+            # Sample tokens
+            #sampled_tokens, sampled_masks = self._sample_tokens(
+            #    geo_tokens, geo_masks, grid_config, training
+            #)
+
+            geo_tuple=geo_tokens, geo_masks, grid_config,coords
+            latents=self.prepare_cross_attention_step(geo_tuple,(cross_attn, cross_ff),L_spatial, training,latents)
+            
+            # Cross-attention: latents ← tokens
+            #if do_cross_attention:
+            #    latents = self._cross_attention_step(
+            #        latents, sampled_tokens, sampled_masks, coords,
+            #        cross_attn, cross_ff, L_spatial
+            #    )
+            
+            # Self-attention: latents ↔ latents
+            if do_self_attention:
+                latents = self._self_attention_step(
+                    latents, coords, self_attns, L_spatial
+                )
+            
+            # Record trajectory
+            if return_trajectory:
+                trajectory.append(coords.clone())
+        
+        return EncoderOutput(
+            latents=latents,
+            coords=coords,
+            trajectory=trajectory,
+        )
+
+    # =========================================================================
+    # Reconstruct
+    # =========================================================================
 
     def reconstruct(
         self, 
         latents: torch.Tensor, 
         latents_coords: torch.Tensor, 
         query_tokens: torch.Tensor, 
-        query_mask: torch.Tensor
+        query_mask: torch.Tensor,
+        L_spatial: Optional[int] = None,
     ) -> torch.Tensor:
-        """Reconstruct query tokens using spatial latents with Local RoPE."""
+        """Reconstruct query tokens using spatial latents."""
+        
         B, N, _ = query_tokens.shape
-        L_spatial = self.num_spatial_latents
         device = latents.device
         D = latents.shape[-1]
         k = self.decoder_k_spatial
+
+
         
+        
+        # Infer L_spatial if not provided
+        if L_spatial is None:
+            L_spatial = latents_coords.shape[1]
+        
+        # Query features
         query_features, _, _ = self.input_processor.process_data_for_decoder(
             query_tokens, query_mask
         )
@@ -956,13 +695,9 @@ class Atomiser_error(pl.LightningModule):
         query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
         
         # Find k nearest latents
-        dists_sq = (
-            query_coords.unsqueeze(2) - latents_coords.unsqueeze(1)
-        ).pow(2).sum(dim=-1)
-        
-        _, topk_indices = torch.topk(dists_sq, k=k, dim=-1, largest=False)
-        
         spatial_latents = latents[:, :L_spatial, :]
+        dists_sq = (query_coords.unsqueeze(2) - latents_coords.unsqueeze(1)).pow(2).sum(dim=-1)
+        _, topk_indices = torch.topk(dists_sq, k=k, dim=-1, largest=False)
         
         # Gather latents
         flat_indices = topk_indices.reshape(B, N * k)
@@ -975,19 +710,17 @@ class Atomiser_error(pl.LightningModule):
         gathered_coords = torch.gather(latents_coords, dim=1, index=flat_coord_indices)
         selected_latent_coords = gathered_coords.reshape(B, N, k, 2)
         
-        # Compute relative deltas for RoPE
+        # Compute relative deltas
         delta_x = selected_latent_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
         delta_y = selected_latent_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
-
-
-        relative_pe = self.input_processor.pos_encoder(
-            delta_x, delta_y
-        )
+        
+        # Relative position encoding
+        relative_pe = self.input_processor.pos_encoder(delta_x, delta_y)
         
         # Context = latent features + relative PE
         context = torch.cat([selected_latents, relative_pe], dim=-1)
         
-        # Cross-attention with RoPE
+        # Cross-attention
         output = self.decoder_cross_attn(
             query_features,
             context,
@@ -996,12 +729,12 @@ class Atomiser_error(pl.LightningModule):
             gsd=torch.tensor([0.2], device=device),
         )
         
+        # Output head
         output_with_query = torch.cat([output, query_features], dim=-1)
-        predictions = self.output_head(output_with_query)
-        
-        return predictions
+        return self.output_head(output_with_query)
     
     def classify(self, latents: torch.Tensor) -> torch.Tensor:
+        """Classification from latents."""
         return self.to_logits(latents)
 
     # =========================================================================
@@ -1014,71 +747,116 @@ class Atomiser_error(pl.LightningModule):
         mask: torch.Tensor, 
         mae_tokens: Optional[torch.Tensor] = None, 
         mae_tokens_mask: Optional[torch.Tensor] = None, 
-        latents_coords: Optional[torch.Tensor] = None,
+        initial_coords: Optional[torch.Tensor] = None,
         training: bool = True, 
         task: str = "reconstruction",
+        do_cross_attention: bool = True,
+        do_self_attention: bool = True,
         return_trajectory: bool = False,
+        # Backward compatibility (ignored for now)
+        latents_coords: Optional[torch.Tensor] = None,  # Old name for initial_coords
         return_displacement_stats: bool = False,
         return_predicted_errors: bool = False,
     ):
+        """
+        Main forward pass.
+        
+        Args:
+            data: Input tokens [B, N, token_dim]
+            mask: Token mask [B, N]
+            modality: Which modality to use
+            mae_tokens: Query tokens for reconstruction [B, M, token_dim]
+            mae_tokens_mask: Query mask [B, M]
+            initial_coords: Optional initial coordinates
+            training: Training mode flag
+            task: "reconstruction", "classification", "encoder", or "visualization"
+            do_cross_attention: Enable cross-attention
+            do_self_attention: Enable self-attention
+            return_trajectory: Return coordinate trajectory
+            latents_coords: (Deprecated) Use initial_coords instead
+            return_displacement_stats: (Deprecated) Not implemented in refactored version
+            return_predicted_errors: (Deprecated) Not implemented in refactored version
+        """
+        # Backward compatibility: latents_coords -> initial_coords
+        if latents_coords is not None and initial_coords is None:
+            initial_coords = latents_coords
+        
         need_trajectory = return_trajectory or task == "visualization"
-        need_disp_stats = return_displacement_stats or task == "visualization"
-        need_pred_errors = return_predicted_errors or task == "visualization"
-
-        # Encoder
-        latents, final_coords, trajectory, disp_stats, predicted_errors = self.encode(
-            data, mask, latents_coords, training, 
+        modality="FLAIR"
+        # Encode
+        encoder_output = self.encode(
+            data, mask,
+            modality=modality,
+            initial_coords=initial_coords,
+            do_cross_attention=do_cross_attention,
+            do_self_attention=do_self_attention,
+            training=training, 
             return_trajectory=need_trajectory,
-            return_displacement_stats=need_disp_stats,
-            return_predicted_errors=need_pred_errors,
         )
         
+        latents = encoder_output.latents
+        final_coords = encoder_output.coords
+        trajectory = encoder_output.trajectory
+        
+        # Get L_spatial from modality config
+        grid_config = self.config["latent_grids"][modality]
+        L_spatial = grid_config["latents"] ** 2
+        
         if task == "encoder":
-            result = {'latents': latents, 'final_coords': final_coords}
-            if trajectory is not None:
-                result['trajectory'] = trajectory
-            if disp_stats is not None:
-                result['displacement_stats'] = disp_stats
-            if predicted_errors is not None:
-                result['predicted_errors'] = predicted_errors
+            result = {
+                'latents': latents,
+                'final_coords': final_coords,
+                'trajectory': trajectory,
+            }
+            # Backward compatibility: add empty fields
+            if return_displacement_stats:
+                result['displacement_stats'] = None
+            if return_predicted_errors:
+                result['predicted_errors'] = None
             return result
         
-        if task == "reconstruction" or task == "visualization":
+        if task in ("reconstruction", "visualization"):
+            # Chunked reconstruction for memory efficiency
             chunk_size = 10000
             N = mae_tokens.shape[1]
-            
+  
             if N > chunk_size:
                 preds_list = []
                 for i in range(0, N, chunk_size):
                     chunk_tokens = mae_tokens[:, i:i + chunk_size]
                     chunk_mask = mae_tokens_mask[:, i:i + chunk_size]
                     preds_list.append(self.reconstruct(
-                        latents, final_coords, chunk_tokens, chunk_mask
+                        latents, final_coords, chunk_tokens, chunk_mask, L_spatial
                     ))
                 predictions = torch.cat(preds_list, dim=1)
             else:
                 predictions = self.reconstruct(
-                    latents, final_coords, mae_tokens, mae_tokens_mask
+                    latents, final_coords, mae_tokens, mae_tokens_mask, L_spatial
                 )
             
             if task == "visualization":
-                return {
+                result = {
                     'predictions': predictions,
                     'latents': latents,
                     'trajectory': trajectory,
-                    'displacement_stats': disp_stats,
                     'final_coords': final_coords,
-                    'predicted_errors': predicted_errors,
                 }
+                if return_predicted_errors:
+                    result['predicted_errors'] = None
+                if return_displacement_stats:
+                    result['displacement_stats'] = None
+                return result
             
+            # Backward compatibility for return_predicted_errors
             if return_predicted_errors:
                 return {
                     'predictions': predictions,
                     'latents': latents,
                     'final_coords': final_coords,
                     'trajectory': trajectory,
-                    'predicted_errors': predicted_errors,
+                    'predicted_errors': None,
                 }
+            
             return predictions
         
         else:  # classification
@@ -1089,6 +867,8 @@ class Atomiser_error(pl.LightningModule):
     # =========================================================================
     
     def _set_requires_grad(self, module, flag: bool):
+        if module is None:
+            return
         if isinstance(module, torch.Tensor):
             module.requires_grad = flag
         elif hasattr(module, 'parameters'):
@@ -1098,73 +878,35 @@ class Atomiser_error(pl.LightningModule):
     def freeze_encoder(self):
         self._set_requires_grad(self.encoder_layers, False)
         self.spatial_latent_content.requires_grad = False
-        self.global_latents.requires_grad = False
+        if self.global_latents is not None:
+            self.global_latents.requires_grad = False
         self._set_requires_grad(self.input_processor, False)
 
     def unfreeze_encoder(self):
         self._set_requires_grad(self.encoder_layers, True)
         self.spatial_latent_content.requires_grad = True
-        self.global_latents.requires_grad = True
+        if self.global_latents is not None:
+            self.global_latents.requires_grad = True
         self._set_requires_grad(self.input_processor, True)
     
+    def freeze_decoder(self):
+        self._set_requires_grad(self.decoder_cross_attn, False)
+        self._set_requires_grad(self.output_head, False)
+
     def unfreeze_decoder(self):
         self._set_requires_grad(self.decoder_cross_attn, True)
         self._set_requires_grad(self.output_head, True)
-
-    def freeze_decoder(self):
-        """Freeze decoder components for classification-only tasks."""
-        if hasattr(self, 'decoder_cross_attn'):
-            self._set_requires_grad(self.decoder_cross_attn, False)
-        if hasattr(self, 'output_head'):
-            self._set_requires_grad(self.output_head, False)
     
     def freeze_classifier(self):
         self._set_requires_grad(self.to_logits, False)
     
     def unfreeze_classifier(self):
         self._set_requires_grad(self.to_logits, True)
-    
-    def freeze_displacement(self):
-        if self.position_updater is not None:
-            self._set_requires_grad(self.position_updater, False)
-        if self.error_displacement is not None:
-            self._set_requires_grad(self.error_displacement, False)
-        if self.gravity_displacement is not None:
-            self._set_requires_grad(self.gravity_displacement, False)
-    
-    def unfreeze_displacement(self):
-        if self.position_updater is not None:
-            self._set_requires_grad(self.position_updater, True)
-        if self.error_displacement is not None:
-            self._set_requires_grad(self.error_displacement, True)
-        if self.gravity_displacement is not None:
-            self._set_requires_grad(self.gravity_displacement, True)
 
-    # =========================================================================
-    # Trajectory Analysis
-    # =========================================================================
+    def freeze_all(self):
+        for param in self.parameters():
+            param.requires_grad = False
     
-    def compute_trajectory_stats(self, trajectory: List[torch.Tensor]) -> Dict[str, Any]:
-        if trajectory is None or len(trajectory) < 2:
-            return {}
-        
-        stats = {
-            'num_steps': len(trajectory) - 1,
-            'per_step_displacement': [],
-            'cumulative_displacement': [],
-            'stable_depth': self.stable_depth,
-        }
-        
-        initial_coords = trajectory[0]
-        
-        for i in range(1, len(trajectory)):
-            step_disp = (trajectory[i] - trajectory[i-1]).norm(dim=-1).mean().item()
-            cumul_disp = (trajectory[i] - initial_coords).norm(dim=-1).mean().item()
-            
-            stats['per_step_displacement'].append(step_disp)
-            stats['cumulative_displacement'].append(cumul_disp)
-        
-        stats['total_displacement'] = stats['cumulative_displacement'][-1] if stats['cumulative_displacement'] else 0
-        stats['mean_step_displacement'] = sum(stats['per_step_displacement']) / len(stats['per_step_displacement']) if stats['per_step_displacement'] else 0
-        
-        return stats
+    def unfreeze_all(self):
+        for param in self.parameters():
+            param.requires_grad = True
