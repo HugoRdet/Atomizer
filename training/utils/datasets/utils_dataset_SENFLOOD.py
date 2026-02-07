@@ -73,11 +73,7 @@ class Sen1Floods11Dataset(Dataset):
         # Load file lists
         self.s1_image_list, self.s2_image_list, self.label_list = self._load_file_lists()
         self._filter_invalid_samples()
-    
-        
-        print(f"[Sen1Floods11] Split: {mode}")
-        print(f"[Sen1Floods11] Number of samples: {len(self.s1_image_list)}")
-    
+ 
         # Parse band info (expects flat dict with idx field)
         self.bands_info = dataset_config["bands_senflood"]
         self.bandwidths, self.wavelengths, self.band_names = self._parse_bands_info()
@@ -127,6 +123,33 @@ class Sen1Floods11Dataset(Dataset):
     # =========================================================================
     # NORMALIZATION
     # =========================================================================
+    def _filter_invalid_samples(self):
+        """Remove samples with no valid labels (all 255)."""
+        valid_s1, valid_s2, valid_labels = [], [], []
+        skipped = 0
+        
+        print(f"[Sen1Floods11] Filtering invalid samples...")
+        for i in tqdm(range(len(self.label_list)), desc="Checking labels"):
+            try:
+                with rasterio.open(self.label_list[i]) as src:
+                    label = src.read(1)
+                label[label == -1] = 255
+                
+                if (label != 255).sum() > 100:  # At least 100 valid pixels
+                    valid_s1.append(self.s1_image_list[i])
+                    valid_s2.append(self.s2_image_list[i])
+                    valid_labels.append(self.label_list[i])
+                else:
+                    skipped += 1
+            except Exception as e:
+                print(f"[Warning] Could not read {self.label_list[i]}: {e}")
+                skipped += 1
+        
+        print(f"[Sen1Floods11] Skipped {skipped} invalid samples")
+        
+        self.s1_image_list = valid_s1
+        self.s2_image_list = valid_s2
+        self.label_list = valid_labels
     
     def _load_or_compute_normalization(self):
         """Load normalization stats from file, or compute them if not found."""
@@ -363,43 +386,6 @@ class Sen1Floods11Dataset(Dataset):
         indices = torch.full((C, H, W, 1), global_offset, dtype=torch.float32)
         
         return indices
-    
-
-    def _filter_invalid_samples(self):
-        """Remove samples where ALL pixels are ignore_index (255)."""
-        valid_s1 = []
-        valid_s2 = []
-        valid_labels = []
-        skipped = 0
-        
-        print(f"[Sen1Floods11] Checking {len(self.label_list)} samples for valid labels...")
-        
-        for i, label_path in enumerate(self.label_list):
-            try:
-                with rasterio.open(label_path) as src:
-                    label = src.read(1)
-                
-                # Check if ANY pixel has valid label (not -1 and not 255)
-                label[label == -1] = 255
-                valid_pixels = (label != 255).sum()
-                
-                if valid_pixels > 0:
-                    valid_s1.append(self.s1_image_list[i])
-                    valid_s2.append(self.s2_image_list[i])
-                    valid_labels.append(self.label_list[i])
-                else:
-                    skipped += 1
-                    
-            except Exception as e:
-                print(f"[Warning] Could not read {label_path}: {e}")
-                skipped += 1
-        
-        print(f"[Sen1Floods11] Skipped {skipped} samples with no valid labels")
-        
-        self.s1_image_list = valid_s1
-        self.s2_image_list = valid_s2
-        self.label_list = valid_labels
-
 
     def shuffle_arrays(self, arrays: list):
         """Shuffle multiple arrays with the same random permutation."""
@@ -437,10 +423,14 @@ class Sen1Floods11Dataset(Dataset):
 
         # Normalize
         image_s2, image_s1 = self.normalize_image(image_s2, image_s1)
-    
+        
         # Clamp outliers
         image_s2 = torch.clamp(image_s2, -10, 10)
         image_s1 = torch.clamp(image_s1, -10, 10)
+        
+        # Clamp to avoid extreme outliers that could cause NaN
+
+
 
         # =====================================================================
         # Concatenate S2 + S1 to match band idx order (0-12: S2, 13-14: S1)
@@ -464,6 +454,7 @@ class Sen1Floods11Dataset(Dataset):
         query_indices = self.get_position_coordinates_queries(
             image.shape, resolution, table=self.look_up.table_queries
         )
+        
         
         # Expand label to match image shape: [H, W] -> [C, H, W]
         label_expanded = label.unsqueeze(0).expand(image.shape[0], -1, -1)
@@ -491,7 +482,7 @@ class Sen1Floods11Dataset(Dataset):
         # =====================================================================
         # Attention mask (1.0 = ignore, 0.0 = valid)
         # =====================================================================
-
+        attention_mask = torch.zeros(image_tokens.shape[0])
         #attention_mask[image_tokens[:, 4] == 255] = 1.0
         
         # =====================================================================
@@ -499,7 +490,6 @@ class Sen1Floods11Dataset(Dataset):
         # =====================================================================
         queries_mask = torch.zeros(queries.shape[0])
         queries, queries_mask = self.shuffle_arrays([queries, queries_mask])
-        attention_mask = torch.zeros(image_tokens.shape[0])
         
         # Subsample queries
         nb_queries = self.max_tokens_reconstruction
@@ -508,5 +498,8 @@ class Sen1Floods11Dataset(Dataset):
 
         # Placeholder for latent positions
         latent_pos = torch.zeros(1)
+
+        if ((label==255).sum()==label.shape[0]) or ((queries[:,4]==255).sum()==queries.shape[0]):
+            print((label==255).sum(),(queries[:,4]==255).sum())
 
         return image_tokens, attention_mask, queries, queries_mask, label, latent_pos, image

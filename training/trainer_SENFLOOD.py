@@ -9,33 +9,13 @@ Semantic segmentation trainer for flood detection.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # ADD THIS
 import pytorch_lightning as pl
 import torchmetrics
 from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
 
-from training.atomiser.Atomiser_SENFLOOD import Atomiser_Senflood
+from training.atomiser import Atomiser_error
 from training.atomiser.error_supervision import compute_error_supervision
-
-
-class FocalLoss(nn.Module):
-    """Focal Loss for imbalanced classification."""
-    def __init__(self, alpha=0.25, gamma=2.0, ignore_index=255):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.ignore_index = ignore_index
-    
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(
-            inputs, targets, 
-            reduction='none', 
-            ignore_index=self.ignore_index
-        )
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
 
 
 class Model_SenFlood(pl.LightningModule):
@@ -55,6 +35,7 @@ class Model_SenFlood(pl.LightningModule):
         # =====================================================================
         # METRICS
         # =====================================================================
+        # mIoU (Jaccard Index) - ignoring class 255
         self.metric_IoU_train = torchmetrics.JaccardIndex(
             task="multiclass", 
             num_classes=self.num_classes, 
@@ -74,6 +55,7 @@ class Model_SenFlood(pl.LightningModule):
             ignore_index=self.ignore_index
         )
         
+        # Accuracy - ignoring class 255
         self.metric_acc_train = torchmetrics.Accuracy(
             task="multiclass",
             num_classes=self.num_classes,
@@ -96,26 +78,10 @@ class Model_SenFlood(pl.LightningModule):
         # =====================================================================
         # MODEL
         # =====================================================================
-        self.encoder = Atomiser_Senflood(config=self.config, lookup_table=self.lookup_table)
+        self.encoder = Atomiser_error(config=self.config, lookup_table=self.lookup_table)
         
-        # =====================================================================
-        # LOSS - Choose one:
-        # =====================================================================
-        loss_type = config.get("trainer", {}).get("loss", "cross_entropy")
-        
-        if loss_type == "focal":
-            gamma = config.get("trainer", {}).get("focal_gamma", 2.0)
-            alpha = config.get("trainer", {}).get("focal_alpha", 0.25)
-            self.loss = FocalLoss(alpha=alpha, gamma=gamma, ignore_index=self.ignore_index)
-            print(f"[SenFlood Trainer] Using FocalLoss (alpha={alpha}, gamma={gamma})")
-        elif loss_type == "weighted_ce":
-            weights = config.get("trainer", {}).get("class_weights", [1.0, 5.0])
-            class_weights = torch.tensor(weights)
-            self.loss = nn.CrossEntropyLoss(weight=class_weights, ignore_index=self.ignore_index)
-            print(f"[SenFlood Trainer] Using Weighted CrossEntropyLoss (weights={weights})")
-        else:
-            self.loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-            print(f"[SenFlood Trainer] Using CrossEntropyLoss")
+        # Loss with ignore_index
+        self.loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
         
         self.lr = float(config["trainer"]["lr"])
         self.weight_decay = float(config["trainer"]["weight_decay"])
@@ -138,17 +104,13 @@ class Model_SenFlood(pl.LightningModule):
             self.error_normalize = config["Atomiser"].get("error_normalize", True)
             self.error_warmup = config["Atomiser"].get("error_supervision_warmup_epochs", 0)
             self.stable_depth = config["Atomiser"].get("stable_depth", 0)
-            print(f"[SenFlood Trainer] Error supervision ENABLED (lambda={self.lambda_error})")
-        else:
-            print(f"[SenFlood Trainer] Error supervision DISABLED")
-        
-        print(f"[SenFlood Trainer] Initialized (num_classes={self.num_classes}, ignore_index={self.ignore_index})")
+            
 
     # =========================================================================
     # FORWARD
     # =========================================================================
     
-    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos=None,
+    def forward(self, image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos,
                 training=False, task="reconstruction", return_trajectory=False,
                 return_predicted_errors=False):
         return self.encoder(
@@ -188,10 +150,12 @@ class Model_SenFlood(pl.LightningModule):
         labels = mae_tokens[:, :, 4].long()  # [B, N]
         
         # Flatten for loss computation
+        # y_hat: [B, N, num_classes] -> [B*N, num_classes]
+        # labels: [B, N] -> [B*N]
         y_hat_flat = rearrange(y_hat, "b t c -> (b t) c")
         labels_flat = rearrange(labels, "b n -> (b n)")
         
-        # Loss (automatically ignores index 255)
+        # CrossEntropyLoss with ignore_index=255 automatically ignores masked tokens
         class_loss = self.loss(y_hat_flat, labels_flat)
         
         # Error supervision (optional)
@@ -214,7 +178,7 @@ class Model_SenFlood(pl.LightningModule):
             total_loss = class_loss + (self.lambda_error * error_loss)
             self.log('train_error_loss', error_loss, on_step=False, on_epoch=True, logger=True)
         
-        # Update metrics
+        # Update metrics (they also ignore index 255)
         preds = torch.argmax(y_hat, dim=-1)  # [B, N]
         self.metric_IoU_train.update(preds, labels)
         self.metric_acc_train.update(preds, labels)
@@ -222,7 +186,7 @@ class Model_SenFlood(pl.LightningModule):
         # Logging
         self.log('train_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_class_loss', class_loss, on_step=False, on_epoch=True, logger=True)
-
+        
         return total_loss
 
     # =========================================================================
@@ -232,13 +196,13 @@ class Model_SenFlood(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         image, attention_mask, mae_tokens, mae_tokens_mask, _, latents_pos, image_err = batch
         
-        # Forward pass
+        # Forward pass (always get full output for monitoring)
         result = self.forward(
             image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos,
             training=False,
             task="reconstruction",
-            return_trajectory=False,
-            return_predicted_errors=False,
+            return_trajectory=True,
+            return_predicted_errors=True,
         )
         
         # Handle output format
@@ -254,7 +218,7 @@ class Model_SenFlood(pl.LightningModule):
         y_hat_flat = rearrange(y_hat, "b t c -> (b t) c")
         labels_flat = rearrange(labels, "b n -> (b n)")
         
-        # Loss
+        # Loss (ignores masked tokens)
         class_loss = self.loss(y_hat_flat, labels_flat)
         
         # Update metrics
@@ -274,6 +238,7 @@ class Model_SenFlood(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         image, attention_mask, mae_tokens, mae_tokens_mask, _, latents_pos, image_err = batch
         
+        # Forward pass
         result = self.forward(
             image, attention_mask, mae_tokens, mae_tokens_mask, latents_pos,
             training=False,
@@ -287,43 +252,50 @@ class Model_SenFlood(pl.LightningModule):
         
         labels = mae_tokens[:, :, 4].long()
         
+        # Loss
         y_hat_flat = rearrange(y_hat, "b t c -> (b t) c")
         labels_flat = rearrange(labels, "b n -> (b n)")
+        class_loss = self.loss(y_hat_flat, labels_flat)
         
-        loss = self.loss(y_hat_flat, labels_flat)
-        
+        # Update metrics
         preds = torch.argmax(y_hat, dim=-1)
         self.metric_IoU_test.update(preds, labels)
         self.metric_acc_test.update(preds, labels)
         
-        self.log('test_loss', loss, on_step=False, on_epoch=True, logger=True)
-        return loss
+        self.log('test_loss', class_loss, on_step=False, on_epoch=True, logger=True)
+        
+        return class_loss
 
     # =========================================================================
     # EPOCH END HOOKS
     # =========================================================================
     
     def on_train_epoch_end(self):
+        # Compute and log metrics
         train_iou = self.metric_IoU_train.compute()
         train_acc = self.metric_acc_train.compute()
         
         self.log("train_mIoU", train_iou, on_epoch=True, prog_bar=True, logger=True)
         self.log("train_accuracy", train_acc, on_epoch=True, prog_bar=True, logger=True)
         
+        # Reset metrics
         self.metric_IoU_train.reset()
         self.metric_acc_train.reset()
 
     def on_validation_epoch_end(self):
+        # Compute and log metrics
         val_iou = self.metric_IoU_val.compute()
         val_acc = self.metric_acc_val.compute()
         
         self.log("val_mIoU", val_iou, on_epoch=True, prog_bar=True, logger=True)
         self.log("val_accuracy", val_acc, on_epoch=True, prog_bar=True, logger=True)
         
+        # Reset metrics
         self.metric_IoU_val.reset()
         self.metric_acc_val.reset()
 
     def on_test_epoch_end(self):
+        # Compute per-class metrics for detailed analysis
         test_iou_per_class = self.metric_IoU_test.compute()
         test_acc_per_class = self.metric_acc_test.compute()
         
@@ -337,19 +309,27 @@ class Model_SenFlood(pl.LightningModule):
             self.log(f"test_IoU_{name}", test_iou_per_class[i], on_epoch=True, logger=True)
             self.log(f"test_acc_{name}", test_acc_per_class[i], on_epoch=True, logger=True)
         
-        # Print results
-        print(f"\n{'='*60}")
-        print(f"TEST RESULTS")
-        print(f"{'='*60}")
-        print(f"  mIoU:     {test_iou_per_class.mean():.4f}")
-        print(f"  Accuracy: {test_acc_per_class.mean():.4f}")
-        print(f"  Per-class IoU:")
-        for i, name in enumerate(class_names):
-            print(f"    {name}: {test_iou_per_class[i]:.4f}")
-        print(f"{'='*60}\n")
+
         
+        # Reset metrics
         self.metric_IoU_test.reset()
         self.metric_acc_test.reset()
+
+    # =========================================================================
+    # MODEL SAVE/LOAD
+    # =========================================================================
+    
+    def save_model(self, name=None):
+        suffix = f"_{name}" if name else ""
+        file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
+        torch.save(self.encoder.state_dict(), file_path)
+        print(f"[SenFlood] Model saved to {file_path}")
+        
+    def load_model(self, name=None):
+        suffix = f"_{name}" if name else ""
+        file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
+        self.encoder.load_state_dict(torch.load(file_path, weights_only=True))
+        print(f"[SenFlood] Model loaded from {file_path}")
 
     # =========================================================================
     # OPTIMIZER
@@ -378,19 +358,3 @@ class Model_SenFlood(pl.LightningModule):
                 "interval": "step",
             },
         }
-
-    # =========================================================================
-    # MODEL SAVE/LOAD
-    # =========================================================================
-    
-    def save_model(self, name=None):
-        suffix = f"_{name}" if name else ""
-        file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
-        torch.save(self.encoder.state_dict(), file_path)
-        print(f"[SenFlood] Model saved to {file_path}")
-        
-    def load_model(self, name=None):
-        suffix = f"_{name}" if name else ""
-        file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
-        self.encoder.load_state_dict(torch.load(file_path, weights_only=True))
-        print(f"[SenFlood] Model loaded from {file_path}")

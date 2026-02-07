@@ -211,3 +211,5 @@ figures/*.png
 # Ignore Python cache
 __pycache__/
 *.pyc
+*.cp
+*.pt
