@@ -15,6 +15,7 @@ import torchvision.transforms as T
 import pytorch_lightning as pl
 import einops as einops
 from torch.utils.data import Dataset, DataLoader, Sampler
+from .utils_dataset_SENFLOOD import Sen1Floods11Dataset
 import h5py
 from tqdm import tqdm
 import random
@@ -162,10 +163,12 @@ class UnifiedDataModule(pl.LightningDataModule):
             self.train_file = path + "_train.h5"
             self.val_file = path + "_val.h5"
             self.test_file = path + "_test.h5"
-        else:
-            self.train_file = None
-            self.val_file = None
-            self.test_file = None
+        
+        if dataset_class==Sen1Floods11Dataset:
+            self.train_file = path
+            self.val_file = path 
+            self.test_file = path
+
         
         # MNISTSparseCanvas specific params
         self.canvas_size = canvas_size

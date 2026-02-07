@@ -82,8 +82,6 @@ class FLAIR_MAE_err(Dataset):
         self.fixed_size = fixed_size
         self.fixed_resolution = fixed_resolution
         self.bands_info = dataset_config
-        self.bandwidths = torch.zeros(5)
-        self.wavelengths = torch.zeros(5)
         self.config_model = config_model
         self.nb_tokens = self.config_model["trainer"]["max_tokens"]
         self.max_tokens_reconstruction = self.config_model["trainer"]["max_tokens_reconstruction"]
@@ -97,7 +95,9 @@ class FLAIR_MAE_err(Dataset):
             aspect_ratio_range=self.config_model["masking_MAE"]["aspect_ratio_range"]    
         )
 
-        self.prepare_band_infos()
+        # Parse band info and pre-compute spectral indices
+        self.bandwidths, self.wavelengths, self.band_names = self._parse_bands_info()
+        self.spectral_indices = self._build_spectral_indices()
         
         if modality_mode == None:
             self.modality_mode = mode
@@ -122,6 +122,68 @@ class FLAIR_MAE_err(Dataset):
         """Initialize file and get number of samples."""
         with h5py.File(self.file_path, 'r') as f:
             self.num_samples = len(f.keys()) // 8  # Number of samples
+
+    def _parse_bands_info(self):
+        """
+        Parse bands_info dict, sorted by idx field.
+        
+        Returns:
+            bandwidths: Tensor [num_bands]
+            wavelengths: Tensor [num_bands]
+            band_names: List of band names in order
+        """
+        all_bands = []
+        
+        # Get the FLAIR band info
+        flair_bands = self.bands_info.get("bands_FLAIR_info", {})
+        
+        for band_name, band_data in flair_bands.items():
+            if "bandwidth" not in band_data or "central_wavelength" not in band_data:
+                continue
+            if "idx" not in band_data:
+                raise ValueError(f"Band {band_name} missing 'idx' field")
+                
+            all_bands.append({
+                "idx": band_data["idx"],
+                "bandwidth": band_data["bandwidth"],
+                "central_wavelength": band_data["central_wavelength"],
+                "name": band_name,
+            })
+        
+        # Sort by idx to match tensor order
+        all_bands = sorted(all_bands, key=lambda x: x["idx"])
+        
+        # Extract as tensors
+        bandwidths = torch.tensor(
+            [b["bandwidth"] for b in all_bands], dtype=torch.float32
+        )
+        wavelengths = torch.tensor(
+            [b["central_wavelength"] for b in all_bands], dtype=torch.float32
+        )
+        band_names = [b["name"] for b in all_bands]
+        
+        # Debug print
+        print(f"[FLAIR_MAE_err] Band order:")
+        for b in all_bands:
+            marker = " (abstract)" if b["bandwidth"] < 0 or b["central_wavelength"] < 0 else ""
+            print(f"  idx={b['idx']:2d}: {b['name']:4s} -> bw={b['bandwidth']:4d}, wl={b['central_wavelength']:4d}{marker}")
+        
+        return bandwidths, wavelengths, band_names
+
+    def _build_spectral_indices(self):
+        """Map local band order to global spectral indices (called once)."""
+        indices = []
+        for i, (bw, wl) in enumerate(zip(self.bandwidths, self.wavelengths)):
+            key = (int(bw.item()), int(wl.item()))
+            if key not in self.look_up.table_wave:
+                raise KeyError(
+                    f"Band {self.band_names[i]} with key {key} not found in lookup table. "
+                    f"Available keys: {list(self.look_up.table_wave.keys())}"
+                )
+            indices.append(self.look_up.table_wave[key])
+        
+        print(f"[FLAIR_MAE_err] Spectral indices: {indices}")
+        return torch.tensor(indices, dtype=torch.long)
 
     def _precompute_oracle_positions(self):
      
@@ -188,16 +250,6 @@ class FLAIR_MAE_err(Dataset):
     def reset_modality_mode(self):
         self.modality_mode = self.original_mode
 
-    def prepare_band_infos(self):
-        res_band=[]
-        res_wave=[]
-        for idx, band in enumerate(self.bands_info["bands_FLAIR_info"]):
-            band_data = self.bands_info["bands_FLAIR_info"][band]
-            res_band.append(band_data["bandwidth"])
-            res_wave.append(band_data["central_wavelength"])
-        self.bandwidths=torch.Tensor(res_band)
-        self.wavelengths=torch.Tensor(res_wave)
-
     def get_position_coordinates(self, image_shape, new_resolution, table=None):
         image_size = image_shape[-1]
         channels_size = image_shape[0]
@@ -239,18 +291,13 @@ class FLAIR_MAE_err(Dataset):
         return indices
     
     def get_wavelengths_coordinates(self, image_shape):
-        image_size = image_shape[-1]
-        channels_size = image_shape[0]
-
-        idxs_bandwidths = []
+        """Efficient: expand pre-computed spectral indices to all pixels."""
+        C, H, W = image_shape[0], image_shape[-2], image_shape[-1]
         
-        for idx_b in range(self.bandwidths.shape[0]):
-            idxs_bandwidths.append(self.look_up.table_wave[(int(self.bandwidths[idx_b].item()), int(self.wavelengths[idx_b].item()))])
-            
-        idxs_bandwidths = torch.tensor(idxs_bandwidths).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        idxs_bandwidths = einops.repeat(idxs_bandwidths, "b h w c -> b (h h1) (w w1) c", h1=image_size, w1=image_size)
-        
-        return idxs_bandwidths
+        # [C] -> [C, H, W, 1]: each band's index repeated for all its pixels
+        # Use repeat_interleave for flat output, then reshape
+        flat_indices = self.spectral_indices.repeat_interleave(H * W)  # [C * H * W]
+        return flat_indices.view(C, H, W, 1)
     
     def shuffle_arrays(self, arrays: list):
         tmp_rand = torch.randperm(arrays[0].shape[0])
@@ -321,6 +368,17 @@ class FLAIR_MAE_err(Dataset):
         f = self._ensure_h5_open()
 
         im_aerial = torch.tensor(f[f'img_aerial_{idx}'][:], dtype=torch.float32)  # [5,512,512]
+
+        #im_sen = torch.tensor(f[f'img_sen_{idx}'][:], dtype=torch.float32)  # [5,512,512]
+        
+        #db.create_dataset(f'img_aerial_{idx_img}', data=im_aer)
+        #db.create_dataset(f'img_sen_{idx_img}', data=sen_spatch)
+        #db.create_dataset(f'days_{idx_img}', data=days)
+        #db.create_dataset(f'months_{idx_img}', data=months)
+        #db.create_dataset(f'years_{idx_img}', data=years)
+        #db.create_dataset(f'mask_{idx_img}',data=mask)
+        #db.create_dataset(f'sen_mask_{idx_img}',data=sen_mask)
+        #db.create_dataset(f'aerial_mtd_{idx_img}',data=aerial_date)
         
         # Get precomputed oracle positions (fast lookup!)
         latent_pos =self.oracle_positions[idx].clone()  # [L, 2]
@@ -428,4 +486,3 @@ class FLAIR_MAE_err(Dataset):
         latent_pos=latent_pos[:625]
 
         return image_to_return, image, attention_mask, queries, queries_mask, label, latent_pos,image_err
-

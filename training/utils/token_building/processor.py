@@ -56,15 +56,8 @@ class TokenProcessor(nn.Module):
         )
         self._decoder_out_dim = self.spectral_encoder.out_dim
         
-        # 5. Validate configuration
-        self._validate_config()
+
     
-    def _validate_config(self):
-        """Validate that required config keys exist."""
-        required_keys = ["spatial_latents", "latent_surface"]
-        for key in required_keys:
-            if key not in self.config["Atomiser"]:
-                raise ValueError(f"Missing required config key: Atomiser.{key}")
 
     @property
     def encoder_output_dim(self) -> int:
@@ -142,7 +135,7 @@ class TokenProcessor(nn.Module):
 
         
         # A. Positional: [B, L, m, pos_dim]
-        pos_features = self.pos_encoder(delta_x, delta_y)
+        pos_features = self.pos_encoder(delta_x, delta_y,compression_scale=physical_scale)
         if len(pos_features.shape)<4:
             pos_features=pos_features.unsqueeze(-2)
 

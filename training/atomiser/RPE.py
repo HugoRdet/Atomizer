@@ -10,8 +10,6 @@ from torch.utils.checkpoint import checkpoint
 from training.utils.token_building.fourier_features import fourier_encode
 
 
-
-
 class PairwiseRPEEncoder(nn.Module):
     """
     Computes pairwise relative position encodings using Fourier features.
@@ -95,7 +93,7 @@ class SelfAttentionRPEConcat(nn.Module):
         # RPE parameters
         rpe_num_bands: int = 32,
         rpe_max_freq: float = 32.0,
-        rpe_normalize_scale: float = 7.8,
+        rpe_normalize_scale: float = 10.0,
     ):
         super().__init__()
         
@@ -105,10 +103,8 @@ class SelfAttentionRPEConcat(nn.Module):
         self.scale = dim_head ** -0.5
         
         inner_dim = heads * dim_head
-        rpe_normalize_scale=7.8
-        rpe_num_bands= 16
-        rpe_max_freq= 16
         
+        # FIX: Use the parameters passed in, don't override them!
         # RPE encoder
         self.rpe_encoder = PairwiseRPEEncoder(
             num_bands=rpe_num_bands,
@@ -373,6 +369,7 @@ class PreNormRPEConcat(nn.Module):
             gsd=gsd
         )
 
+
 # =============================================================================
 # CARTESIAN RPE MODULE (Standalone, reusable)
 # =============================================================================
@@ -441,8 +438,6 @@ class CartesianRPE(nn.Module):
         device = query_pos.device
         dtype = query_pos.dtype
 
-
-        
         # Compute pairwise deltas: key - query (for each query, relative position of each key)
         # query_pos: [B, N_q, 1, 2]
         # key_pos:   [B, 1, N_k, 2]
@@ -909,7 +904,6 @@ def create_self_attention_with_rpe(
         rpe_type: "cartesian" (Fourier bias), "rope" (rotation), or "none"
     """
     if rpe_type == "cartesian":
-        
         return SelfAttentionCartesianRPE(
             dim=dim,
             heads=heads,
@@ -918,11 +912,10 @@ def create_self_attention_with_rpe(
             use_rpe=True,
             rpe_num_bands=rpe_num_bands,
             rpe_max_freq=rpe_max_freq,
-            rpe_normalize_scale=100,
+            rpe_normalize_scale=rpe_normalize_scale,  # FIX: Use parameter, not hardcoded!
             include_gsd=include_gsd,
         )
     elif rpe_type == "rope":
-
         return SelfAttentionRoPE(
             dim=dim,
             heads=heads,
@@ -945,6 +938,7 @@ def create_self_attention_with_rpe(
 # =============================================================================
 # LOCAL ROPE 2D
 # =============================================================================
+
 class LocalRoPE2D(nn.Module):
     """
     2D RoPE with physical distance encoding using compression.
@@ -1147,9 +1141,11 @@ class LocalRoPE2D(nn.Module):
         
         return x_rotated
 
+
 # =============================================================================
-# CROSS-ATTENTION WITH LOCAL ROPE
+# SELF-ATTENTION WITH ROPE
 # =============================================================================
+
 class SelfAttentionRoPE(nn.Module):
     """
     Self-attention with 2D RoPE using physical compression.
@@ -1196,9 +1192,16 @@ class SelfAttentionRoPE(nn.Module):
         pos_x: Optional[torch.Tensor] = None,  # [B, N] in METERS
         pos_y: Optional[torch.Tensor] = None,  # [B, N] in METERS
         num_spatial: Optional[int] = None,
+        positions: Optional[torch.Tensor] = None,  # [B, N, 2] alternative format
+        gsd: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, _ = x.shape
         H, d = self.heads, self.dim_head
+        
+        # Handle positions in [B, N, 2] format
+        if positions is not None and pos_x is None:
+            pos_x = positions[..., 0]
+            pos_y = positions[..., 1]
         
         # Generate Q, K, V
         qkv = self.to_qkv(x).chunk(3, dim=-1)
@@ -1213,7 +1216,7 @@ class SelfAttentionRoPE(nn.Module):
                 
                 # Only spatial latents get RoPE
                 q_spatial, k_spatial = self.rope.forward_self(
-                    q_spatial, k_spatial, pos_x, pos_y
+                    q_spatial, k_spatial, pos_x[:, :num_spatial], pos_y[:, :num_spatial]
                 )
                 
                 q = torch.cat([q_spatial, q_global], dim=1)
@@ -1233,6 +1236,11 @@ class SelfAttentionRoPE(nn.Module):
         
         out = out.transpose(1, 2).reshape(B, N, H * d)
         return self.to_out(out)
+
+
+# =============================================================================
+# CROSS-ATTENTION WITH LOCAL ROPE
+# =============================================================================
 
 class LocalCrossAttentionRoPE(nn.Module):
     """
@@ -1346,9 +1354,9 @@ class PreNormRoPE(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.fn = fn
     
-    def forward(self, x, pos_x=None, pos_y=None, num_spatial=None, **kwargs):
+    def forward(self, x, pos_x=None, pos_y=None, num_spatial=None, positions=None, **kwargs):
         x = self.norm(x)
-        return self.fn(x, pos_x=pos_x, pos_y=pos_y, num_spatial=num_spatial, **kwargs)
+        return self.fn(x, pos_x=pos_x, pos_y=pos_y, num_spatial=num_spatial, positions=positions, **kwargs)
 
 
 class PreNormWithPositions(nn.Module):
@@ -1366,12 +1374,9 @@ class PreNormWithPositions(nn.Module):
         return self.fn(x, **kwargs)
 
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-from typing import Optional, Tuple
+# =============================================================================
+# TOKEN ENCODER (for VRAM efficiency)
+# =============================================================================
 
 class TokenEncoder(nn.Module):
     """
@@ -1393,90 +1398,3 @@ class TokenEncoder(nn.Module):
         B, L, k, D = x.shape
         x_flat = x.reshape(-1, D)
         return self.mlp(x_flat).view(B, L, k, -1)
-    
-class LocalCrossAttentionRoPE(nn.Module):
-    """
-    Cross-attention with Physical Distance RoPE.
-    
-    Pipeline:
-    1. Projections: Q (from query), K & V (from context)
-    2. RoPE: Apply physical compression (meters) to K
-    3. Attention: Weighted sum
-    """
-    def __init__(
-        self,
-        dim_query: int,
-        dim_context: int,
-        dim_out: int,
-        heads: int = 8,
-        dim_head: int = 64,
-        dropout: float = 0.0,
-        use_rope: bool = True,
-        rope_base: float = 10000.0,
-        rope_compression_scale: float = 10.0,
-        rope_learnable_scale: bool = True,
-    ):
-        super().__init__()
-        assert dim_head % 4 == 0, "dim_head must be divisible by 4 for Axial 2D RoPE"
-        
-        self.heads = heads
-        self.dim_head = dim_head
-        self.scale = dim_head ** -0.5
-        self.use_rope = use_rope
-
-        inner_dim = heads * dim_head
-
-        # Linear Projections (direct from context)
-        self.to_q = nn.Linear(dim_query, inner_dim, bias=False)
-        self.to_k = nn.Linear(dim_context, inner_dim, bias=False)
-        self.to_v = nn.Linear(dim_context, inner_dim, bias=False)
-        self.to_out = nn.Linear(inner_dim, dim_out)
-        self.dropout = nn.Dropout(dropout)
-
-        # Physical RoPE Module
-        if use_rope:
-            self.rope = LocalRoPE2D(
-                dim_head=dim_head,
-                base=rope_base,
-                compression_scale=rope_compression_scale,
-                learnable_scale=rope_learnable_scale,
-                num_heads=heads,
-            )
-        else:
-            self.rope = None
-
-    def forward(
-        self,
-        x: torch.Tensor,        # [B, L, dim_query]
-        context: torch.Tensor,  # [B, L, k, dim_context]
-        mask: Optional[torch.Tensor] = None,
-        delta_x: Optional[torch.Tensor] = None,  # [B, L, k] in meters
-        delta_y: Optional[torch.Tensor] = None,  # [B, L, k] in meters
-        gsd: Optional[torch.Tensor] = None,      # Unused
-    ) -> torch.Tensor:
-        B, L, _ = x.shape
-        k_samples = context.shape[2]
-        H, d = self.heads, self.dim_head
-
-        # Project to attention space
-        q = self.to_q(x).view(B, L, H, d)
-        K = self.to_k(context).view(B, L, k_samples, H, d)
-        V = self.to_v(context).view(B, L, k_samples, H, d)
-
-        # Apply Physical Distance RoPE
-        if self.use_rope and self.rope is not None and delta_x is not None:
-            q, K = self.rope.forward_cross(q, K, delta_x, delta_y)
-
-        # Attention scores
-        scores = torch.einsum('b l h d, b l k h d -> b l h k', q, K) * self.scale
-
-        if mask is not None:
-            scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
-
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-
-        # Aggregate values
-        out = torch.einsum('b l h k, b l k h d -> b l h d', attn, V)
-
-        return self.to_out(out.reshape(B, L, H * d))

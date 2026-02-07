@@ -5,3 +5,4 @@ from .trainer_MAE_err import*
 from .trainer_FLAIR import*
 from .trainer_MNIST import*
 from .mlp_mnist import*
+from .trainer_SENFLOOD import*
