@@ -491,14 +491,13 @@ class Atomiser_Senflood(pl.LightningModule):
         L_spatial: int,
     ) -> torch.Tensor:
         """Single cross-attention step: latents attend to tokens."""
+
+
         
-   
-        
+        # Process tokens
         processed_tokens = self.input_processor.process_data_for_encoder(
             sampled_tokens, sampled_masks, latent_positions=coords
         )
-
-        
         
         # Compute deltas for RoPE
         delta_x, delta_y, gsd = self._compute_deltas(sampled_tokens, coords)
@@ -514,9 +513,6 @@ class Atomiser_Senflood(pl.LightningModule):
             gsd=gsd,
         ) + spatial
         spatial = cross_ff(spatial) + spatial
-
-
-      
         
         # Recombine with global latents
         return torch.cat([spatial, latents[:, L_spatial:]], dim=1)
@@ -548,8 +544,6 @@ class Atomiser_Senflood(pl.LightningModule):
             for self_attn, self_ff in self_attns:
                 latents = self_attn(latents) + latents
                 latents = self_ff(latents) + latents
-
-        
         
         return latents
 
@@ -558,6 +552,7 @@ class Atomiser_Senflood(pl.LightningModule):
     # =========================================================================
     def prepare_cross_attention_step(self,geo_tuple,layers,L_spatial, training,latents):
         geo_tokens, geo_masks, grid_config,latent_coords = geo_tuple
+        
         sampled_tokens, sampled_masks = self._sample_tokens(
             geo_tokens, geo_masks, grid_config, training
         )
@@ -622,15 +617,11 @@ class Atomiser_Senflood(pl.LightningModule):
             coords = initial_coords.clone()
         else:
             coords = self.get_default_coords(B, device, grid_config)
-            
         
         
-
         #pruning
         geo_tokens, geo_masks, _ = self.geo_pruning[modality](tokens, mask, coords, id_modality=modality)
         
-        
-
         #traj tracking
         trajectory = [coords.clone()] if return_trajectory else None
         
@@ -712,17 +703,13 @@ class Atomiser_Senflood(pl.LightningModule):
         # Compute relative deltas
         delta_x = selected_latent_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
         delta_y = selected_latent_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
-
-
-        
         
         # Relative position encoding
         relative_pe = self.input_processor.pos_encoder(delta_x, delta_y)
         
         # Context = latent features + relative PE
         context = torch.cat([selected_latents, relative_pe], dim=-1)
-
-    
+        
         # Cross-attention
         output = self.decoder_cross_attn(
             query_features,
@@ -784,7 +771,7 @@ class Atomiser_Senflood(pl.LightningModule):
         
         need_trajectory = return_trajectory or task == "visualization"
         modality="SENFLOOD"
-        
+        # Encode
         encoder_output = self.encode(
             data, mask,
             modality=modality,
@@ -792,9 +779,6 @@ class Atomiser_Senflood(pl.LightningModule):
             training=training, 
             return_trajectory=need_trajectory,
         )
-
-
-        
         
         latents = encoder_output.latents
         final_coords = encoder_output.coords
@@ -821,10 +805,8 @@ class Atomiser_Senflood(pl.LightningModule):
             # Chunked reconstruction for memory efficiency
             chunk_size = 10000
             N = mae_tokens.shape[1]
-       
   
             if N > chunk_size:
-                
                 preds_list = []
                 for i in range(0, N, chunk_size):
                     chunk_tokens = mae_tokens[:, i:i + chunk_size]
@@ -832,19 +814,11 @@ class Atomiser_Senflood(pl.LightningModule):
                     preds_list.append(self.reconstruct(
                         latents, final_coords, chunk_tokens, chunk_mask, L_spatial
                     ))
-
-                
                 predictions = torch.cat(preds_list, dim=1)
-
-            
             else:
-
-            
                 predictions = self.reconstruct(
                     latents, final_coords, mae_tokens, mae_tokens_mask, L_spatial
                 )
-
-            
             
             if task == "visualization":
                 result = {
@@ -868,7 +842,6 @@ class Atomiser_Senflood(pl.LightningModule):
                     'trajectory': trajectory,
                     'predicted_errors': None,
                 }
-            
             
             return predictions
         

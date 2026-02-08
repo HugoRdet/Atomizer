@@ -36,6 +36,10 @@ import random
 import argparse
 
 from training.utils.token_building.processor import TokenProcessor
+from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSenFlood
+
+
+
 
 # =============================================================================
 # ARGS
@@ -144,17 +148,29 @@ checkpoint_val_mod_train = ModelCheckpoint(
     verbose=True,
 )
 
-callbacks = [accumulator, checkpoint_val_mod_train]
+
 
 # Atomizer-specific callbacks (U-Net doesn't need these)
-if not is_unet:
-    reconstruction_callback = MAE_err_CustomVisualizationCallback(config=config_model)
-    gravity_callback = ErrorLandscapeVisualizationCallback(config=config_model)
-    callbacks.extend([reconstruction_callback, gravity_callback])
+#if not is_unet:
+#    reconstruction_callback = MAE_err_CustomVisualizationCallback(config=config_model)
+#    gravity_callback = ErrorLandscapeVisualizationCallback(config=config_model)
+#    callbacks.extend([reconstruction_callback, gravity_callback])
 
 # =============================================================================
 # TRAINER
 # =============================================================================
+
+#tokens_ass_viz=TokenAssignmentCallbackSenFlood(
+#        log_every_n_epochs=5,
+#        sample_indices=[0],
+#        save_dir="./viz_token_assignment",
+#        use_wandb=True
+#    )
+
+#
+
+callbacks = [accumulator, checkpoint_val_mod_train]
+
 trainer = Trainer(
     strategy="ddp_find_unused_parameters_true" if not is_unet else "auto",
     devices=-1,

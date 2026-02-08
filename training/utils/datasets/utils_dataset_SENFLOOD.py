@@ -372,7 +372,7 @@ class Sen1Floods11Dataset(Dataset):
         C, H, W = image_shape[0], image_shape[-2], image_shape[-1]
 
         # Use fixed resolution for latents
-        resolution_latents = 0.2  # m
+        resolution_latents = 10  # m
         res_key = int(resolution_latents * 1000)
         
         # Check if key exists, fallback to actual resolution if not
@@ -498,8 +498,5 @@ class Sen1Floods11Dataset(Dataset):
 
         # Placeholder for latent positions
         latent_pos = torch.zeros(1)
-
-        if ((label==255).sum()==label.shape[0]) or ((queries[:,4]==255).sum()==queries.shape[0]):
-            print((label==255).sum(),(queries[:,4]==255).sum())
 
         return image_tokens, attention_mask, queries, queries_mask, label, latent_pos, image

@@ -493,12 +493,6 @@ class Atomiser_error(pl.LightningModule):
         """Single cross-attention step: latents attend to tokens."""
 
 
-        print(f"\n[MASK DEBUG - CrossAttn]")
-        print(f"  sampled_masks shape: {sampled_masks.shape}")
-        print(f"  sampled_masks dtype: {sampled_masks.dtype}")
-        print(f"  sampled_masks True count: {sampled_masks.sum().item()}")
-        print(f"  sampled_masks False count: {(~sampled_masks).sum().item()}")
-        print(f"  ~sampled_masks (passed to attn) True count: {(~sampled_masks).sum().item()}")
         
         # Process tokens
         processed_tokens = self.input_processor.process_data_for_encoder(

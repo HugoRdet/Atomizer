@@ -158,47 +158,130 @@ class SensorGeometry(nn.Module):
         )
 
     def _init_latent_grid(self):
+        """
+        Initialize latent grids for each modality.
+        
+        - Square grid: latents at cell centers (all cells same size)
+        - Hexagonal grid: staggered rows for better coverage
+        """
         configs = self.config["latent_grids"]
 
         for key, tmp_config in configs.items():
             # 1. Physical Parameters
             total_span = tmp_config["span"]
             num_latents = tmp_config["latents"]
+            hexagonal = tmp_config.get("hexagonal", False)
             
-            # Determine N per side (handling total count vs side count)
+            # Determine N per side
             if num_latents > 100:
                 n = int(math.sqrt(num_latents))
             else:
                 n = int(num_latents)
-
-            # 2. CALCULATE STEP AND OFFSET
-            # Each latent covers exactly this much distance:
-            step = total_span / n 
+            hexagonal=True
+            if hexagonal:
+                # Hexagonal: boundary-inclusive for interlocking
+                half_span = total_span / 2.0
+                grid = self._create_hexagonal_grid(n, half_span)
+            else:
+                # Square: cell centers (all cells same size)
+                step = total_span / n
+                start_pos = -total_span / 2.0 + step / 2.0
+                end_pos = total_span / 2.0 - step / 2.0
+                grid = self._create_square_grid(n, start_pos, end_pos)
             
-            # To center the latents within their partitions:
-            # The first point is at (-total_span/2 + step/2)
-            # The last point is at (total_span/2 - step/2)
-            start_pos = -total_span / 2.0 + step / 2.0
-            end_pos = total_span / 2.0 - step / 2.0
-            
-            # 3. Generate Coordinates
-            # This ensures exactly 'n' points spaced by 'step'
-            coords = torch.linspace(start_pos, end_pos, n)
-            
-            # 4. Create Meshgrid & Flatten
-            grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
-            
-            # Stack as [L, 2] -> [x, y]
-            grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
-            
-            # 5. Dynamic Buffer Naming
+            # 3. Dynamic Buffer Naming
             res_key = int(round(tmp_config["resolution"] * 1000))
             size_key = int(tmp_config["pixel_size"])
             buffer_name = f"latent_grid_{res_key}_{size_key}"
             
             self.register_buffer(buffer_name, grid)
             
-         
+            # Print info
+            print(f"[SensorGeometry] Latent grid '{key}': {grid.shape[0]} latents")
+            print(f"  X range: [{grid[:, 0].min():.1f}, {grid[:, 0].max():.1f}]")
+            print(f"  Y range: [{grid[:, 1].min():.1f}, {grid[:, 1].max():.1f}]")
+            print(f"  Layout: {'hexagonal' if hexagonal else 'square'} ({n}x{n})")
+
+    def _create_square_grid(self, n: int, start_pos: float, end_pos: float) -> torch.Tensor:
+        """
+        Create a square grid with latents at cell centers.
+        
+        All Voronoi cells have equal size (including edges).
+        
+        Example (n=4, span=100):
+            step = 25
+            positions: -37.5, -12.5, +12.5, +37.5
+            
+            ┌────┬────┬────┬────┐
+            │ ●  │ ●  │ ●  │ ●  │  Each cell is 25×25
+            ├────┼────┼────┼────┤
+            │ ●  │ ●  │ ●  │ ●  │
+            ├────┼────┼────┼────┤
+            │ ●  │ ●  │ ●  │ ●  │
+            ├────┼────┼────┼────┤
+            │ ●  │ ●  │ ●  │ ●  │
+            └────┴────┴────┴────┘
+        
+        Returns:
+            grid: [n*n, 2] tensor of (x, y) coordinates
+        """
+        coords = torch.linspace(start_pos, end_pos, n)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
+        grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
+        
+        return grid
+
+    def _create_hexagonal_grid(self, n: int, half_span: float) -> torch.Tensor:
+        """
+        Create a hexagonal grid with staggered rows.
+        
+        All latents stay within [-half_span, +half_span].
+        
+        Even rows: from -half_span to +half_span
+        Odd rows:  from -half_span + offset to +half_span - offset (compressed)
+        
+        Example (n=5):
+            Row 0: ●     ●     ●     ●     ●      (full span)
+            Row 1:   ●    ●    ●    ●    ●        (compressed, offset)
+            Row 2: ●     ●     ●     ●     ●      (full span)
+            Row 3:   ●    ●    ●    ●    ●        (compressed, offset)
+            Row 4: ●     ●     ●     ●     ●      (full span)
+        
+        Returns:
+            grid: [n*n, 2] tensor of (x, y) coordinates
+        """
+        # Spacing
+        step_x = (2 * half_span) / (n - 1) if n > 1 else 0
+        step_y = (2 * half_span) / (n - 1) if n > 1 else 0
+        
+        # Offset for odd rows
+        offset = step_x / 2
+        
+        grid_points = []
+        
+        for row_idx in range(n):
+            y = -half_span + row_idx * step_y
+            
+            if row_idx % 2 == 0:
+                # Even rows: full span
+                x_start = -half_span
+                x_end = half_span
+            else:
+                # Odd rows: compressed to stay within bounds
+                x_start = -half_span + offset
+                x_end = half_span - offset
+            
+            # Use linspace to get exactly n latents in range
+            x_coords = torch.linspace(x_start, x_end, n)
+            
+            for x in x_coords:
+                grid_points.append([x.item(), y])
+        
+        grid = torch.tensor(grid_points, dtype=torch.float32)
+        
+        return grid
+
+
 
     # =========================================================================
     # PUBLIC API (Optimized)
@@ -228,7 +311,7 @@ class SensorGeometry(nn.Module):
         res_key = int(round(config["resolution"] * 1000))
         size_key= int(config["pixel_size"])
         buffer_name = f"latent_grid_{res_key}_{size_key}"
-
+        
 
         
         

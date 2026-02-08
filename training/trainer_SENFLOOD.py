@@ -14,7 +14,7 @@ import torchmetrics
 from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
 
-from training.atomiser import Atomiser_error
+from training.atomiser import Atomiser_Senflood
 from training.atomiser.error_supervision import compute_error_supervision
 
 
@@ -78,7 +78,7 @@ class Model_SenFlood(pl.LightningModule):
         # =====================================================================
         # MODEL
         # =====================================================================
-        self.encoder = Atomiser_error(config=self.config, lookup_table=self.lookup_table)
+        self.encoder = Atomiser_Senflood(config=self.config, lookup_table=self.lookup_table)
         
         # Loss with ignore_index
         self.loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)

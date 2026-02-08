@@ -221,6 +221,22 @@ class SpectralEncoder(nn.Module):
                 device=channel_indices.device
             )
         
+        # DEBUG: Check for out-of-bounds indices
+        max_idx = channel_indices.max().item()
+        min_idx = channel_indices.min().item()
+        codebook_size = self.physics_codebook.shape[0]
+        
+        if max_idx >= codebook_size or min_idx < 0:
+            print(f"[SpectralEncoder] ERROR: Index out of bounds!")
+            print(f"  channel_indices range: [{min_idx}, {max_idx}]")
+            print(f"  codebook size: {codebook_size}")
+            print(f"  channel_indices shape: {channel_indices.shape}")
+            print(f"  channel_indices dtype: {channel_indices.dtype}")
+            # Force sync to get proper error location
+            torch.cuda.synchronize()
+            raise IndexError(f"channel_indices [{min_idx}, {max_idx}] out of bounds for codebook size {codebook_size}")
+        
+        
         # Start with physics lookup (includes zeros for abstract channels)
         embeddings = self.physics_codebook[channel_indices]  # [..., out_dim]
         
