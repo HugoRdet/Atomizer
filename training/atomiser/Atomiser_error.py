@@ -621,6 +621,8 @@ class Atomiser_error(pl.LightningModule):
         
         #pruning
         geo_tokens, geo_masks, _ = self.geo_pruning[modality](tokens, mask, coords, id_modality=modality)
+
+        print(geo_tokens.shape)
         
         #traj tracking
         trajectory = [coords.clone()] if return_trajectory else None
@@ -635,7 +637,6 @@ class Atomiser_error(pl.LightningModule):
             latents=self.prepare_cross_attention_step(geo_tuple,(cross_attn, cross_ff),L_spatial, training,latents)
             
             # Self-attention: latents ↔ latents
-          
             latents = self._self_attention_step(
                 latents, coords, self_attns, L_spatial
             )

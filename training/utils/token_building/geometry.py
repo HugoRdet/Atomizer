@@ -10,13 +10,15 @@ class SensorGeometry(nn.Module):
     The Physics Engine (The Map).
     
     Responsibilities:
-    1. Manage physical constants (latent spacing, GSD).
+    1. Manage physical constants (GSD).
     2. Convert token indices to physical coordinates (meters).
-    3. Generate the default latent grid.
-    4. Provide geometry data for Decoder Biases.
+    3. Provide geometry data for encoder/decoder biases.
     
     PERFORMANCE: All constants are pre-computed in __init__ to avoid
     repeated tensor creation during forward pass.
+    
+    NOTE: Latent grid generation has moved to Atomiser._compute_latent_grid()
+    which derives everything from runtime grid_config.
     """
     
     def __init__(self, config: Dict[str, Any], lookup_table: Any):
@@ -25,59 +27,31 @@ class SensorGeometry(nn.Module):
         self.lookup_table = lookup_table
         
         # --- Constants from Config ---
-        self.spatial_latents_per_row = config["Atomiser"]["spatial_latents"] 
+        # These are used by _init_modality_buffers() and get_decoder_bias_legacy().
+        # Made optional for forward compatibility — will be removed once those
+        # methods are updated to use runtime grid_config.
+        self.spatial_latents_per_row = config["Atomiser"].get("spatial_latents", 10)
         self.num_spatial_latents = self.spatial_latents_per_row ** 2
-        self.latent_surface = config["Atomiser"].get("latent_surface", 103.0)
+        self.latent_surface = config["Atomiser"].get("latent_surface", 5120.0)
         
-        # Distance between adjacent latents
         if self.spatial_latents_per_row > 1:
             self.default_spacing = self.latent_surface / (self.spatial_latents_per_row - 1)
         else:
             self.default_spacing = self.latent_surface
             
         # Reference GSD
-        self.default_gsd = config["Atomiser"].get("gsd", 0.2)
+        self.default_gsd = config["Atomiser"].get("gsd", 10.0)
         
         # --- Pre-compute Constants (PERFORMANCE) ---
-        # These are used in _precompute_integral_lut - compute once, not every call
         self.register_buffer("_sqrt_2", torch.tensor(math.sqrt(2.0)))
         
         # --- Initialize Lookup Tables ---
         self._init_token_geometry_buffers()
         self._init_modality_buffers()
-        self._init_latent_grid()
 
-
-    def get_query_pixel_coords(
-        self, 
-        query_tokens: torch.Tensor, 
-        image_size: int = 512
-    ) -> torch.Tensor:
-        """
-        Convert query token metadata into global pixel (x, y) coordinates.
-        
-        Args:
-            query_tokens: [B, N, 6] or [B, N, D] tokens where index 1,2 are 
-                          spatial indices mapping to meters.
-            image_size: The target image resolution (default 512).
-            
-        Returns:
-            pixel_coords: [B, N, 2] tensor of long integers (x, y) 
-                          clamped to [0, image_size-1].
-        """
-        # 1. Convert the token metadata indices into meters (x, y)
-        # Uses the pre-registered 'token_centers_lookup' buffer
-        meter_coords = self.get_token_centers(query_tokens) # [B, N, 2]
-        
-        # 2. Project meters into pixel space
-        # We reuse your existing meters_to_pixels logic
-        pixel_coords = self.meters_to_pixels(
-            meter_coords, 
-            image_size=image_size, 
-            gsd=None  # Uses self.default_gsd
-        )
-        
-        return pixel_coords
+    # =========================================================================
+    # INITIALIZATION
+    # =========================================================================
 
     def _init_token_geometry_buffers(self):
         """Create lookup tables for token index -> physical coordinates."""
@@ -86,7 +60,6 @@ class SensorGeometry(nn.Module):
         centers = torch.zeros(max_global_index, dtype=torch.float32)
         gsds = torch.zeros(max_global_index, dtype=torch.float32)
         
-        # Track token width (assume uniform within modality, use first)
         first_token_width = None
 
         for modality in tqdm(self.lookup_table.modalities, desc="Initializing Geometry"):
@@ -105,14 +78,12 @@ class SensorGeometry(nn.Module):
             centers[start_idx:start_idx + image_size] = modality_centers
             gsds[start_idx:start_idx + image_size] = resolution
             
-            # Capture token width from first modality with >1 pixel
             if first_token_width is None and image_size > 1:
                 first_token_width = (modality_centers[1] - modality_centers[0]).abs().item()
 
         self.register_buffer("token_centers_lookup", centers)
         self.register_buffer("token_gsd_lookup", gsds)
         
-        # Pre-compute token width and half-width (PERFORMANCE)
         if first_token_width is None:
             first_token_width = 1.0
         self.register_buffer("_token_width", torch.tensor(first_token_width))
@@ -157,134 +128,8 @@ class SensorGeometry(nn.Module):
             persistent=False
         )
 
-    def _init_latent_grid(self):
-        """
-        Initialize latent grids for each modality.
-        
-        - Square grid: latents at cell centers (all cells same size)
-        - Hexagonal grid: staggered rows for better coverage
-        """
-        configs = self.config["latent_grids"]
-
-        for key, tmp_config in configs.items():
-            # 1. Physical Parameters
-            total_span = tmp_config["span"]
-            num_latents = tmp_config["latents"]
-            hexagonal = tmp_config.get("hexagonal", False)
-            
-            # Determine N per side
-            if num_latents > 100:
-                n = int(math.sqrt(num_latents))
-            else:
-                n = int(num_latents)
-            hexagonal=True
-            if hexagonal:
-                # Hexagonal: boundary-inclusive for interlocking
-                half_span = total_span / 2.0
-                grid = self._create_hexagonal_grid(n, half_span)
-            else:
-                # Square: cell centers (all cells same size)
-                step = total_span / n
-                start_pos = -total_span / 2.0 + step / 2.0
-                end_pos = total_span / 2.0 - step / 2.0
-                grid = self._create_square_grid(n, start_pos, end_pos)
-            
-            # 3. Dynamic Buffer Naming
-            res_key = int(round(tmp_config["resolution"] * 1000))
-            size_key = int(tmp_config["pixel_size"])
-            buffer_name = f"latent_grid_{res_key}_{size_key}"
-            
-            self.register_buffer(buffer_name, grid)
-            
-            # Print info
-            print(f"[SensorGeometry] Latent grid '{key}': {grid.shape[0]} latents")
-            print(f"  X range: [{grid[:, 0].min():.1f}, {grid[:, 0].max():.1f}]")
-            print(f"  Y range: [{grid[:, 1].min():.1f}, {grid[:, 1].max():.1f}]")
-            print(f"  Layout: {'hexagonal' if hexagonal else 'square'} ({n}x{n})")
-
-    def _create_square_grid(self, n: int, start_pos: float, end_pos: float) -> torch.Tensor:
-        """
-        Create a square grid with latents at cell centers.
-        
-        All Voronoi cells have equal size (including edges).
-        
-        Example (n=4, span=100):
-            step = 25
-            positions: -37.5, -12.5, +12.5, +37.5
-            
-            ┌────┬────┬────┬────┐
-            │ ●  │ ●  │ ●  │ ●  │  Each cell is 25×25
-            ├────┼────┼────┼────┤
-            │ ●  │ ●  │ ●  │ ●  │
-            ├────┼────┼────┼────┤
-            │ ●  │ ●  │ ●  │ ●  │
-            ├────┼────┼────┼────┤
-            │ ●  │ ●  │ ●  │ ●  │
-            └────┴────┴────┴────┘
-        
-        Returns:
-            grid: [n*n, 2] tensor of (x, y) coordinates
-        """
-        coords = torch.linspace(start_pos, end_pos, n)
-        grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
-        grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
-        
-        return grid
-
-    def _create_hexagonal_grid(self, n: int, half_span: float) -> torch.Tensor:
-        """
-        Create a hexagonal grid with staggered rows.
-        
-        All latents stay within [-half_span, +half_span].
-        
-        Even rows: from -half_span to +half_span
-        Odd rows:  from -half_span + offset to +half_span - offset (compressed)
-        
-        Example (n=5):
-            Row 0: ●     ●     ●     ●     ●      (full span)
-            Row 1:   ●    ●    ●    ●    ●        (compressed, offset)
-            Row 2: ●     ●     ●     ●     ●      (full span)
-            Row 3:   ●    ●    ●    ●    ●        (compressed, offset)
-            Row 4: ●     ●     ●     ●     ●      (full span)
-        
-        Returns:
-            grid: [n*n, 2] tensor of (x, y) coordinates
-        """
-        # Spacing
-        step_x = (2 * half_span) / (n - 1) if n > 1 else 0
-        step_y = (2 * half_span) / (n - 1) if n > 1 else 0
-        
-        # Offset for odd rows
-        offset = step_x / 2
-        
-        grid_points = []
-        
-        for row_idx in range(n):
-            y = -half_span + row_idx * step_y
-            
-            if row_idx % 2 == 0:
-                # Even rows: full span
-                x_start = -half_span
-                x_end = half_span
-            else:
-                # Odd rows: compressed to stay within bounds
-                x_start = -half_span + offset
-                x_end = half_span - offset
-            
-            # Use linspace to get exactly n latents in range
-            x_coords = torch.linspace(x_start, x_end, n)
-            
-            for x in x_coords:
-                grid_points.append([x.item(), y])
-        
-        grid = torch.tensor(grid_points, dtype=torch.float32)
-        
-        return grid
-
-
-
     # =========================================================================
-    # PUBLIC API (Optimized)
+    # PUBLIC API — Token Coordinates
     # =========================================================================
 
     def get_token_centers(self, token_data: torch.Tensor) -> torch.Tensor:
@@ -292,7 +137,6 @@ class SensorGeometry(nn.Module):
         x_idx = token_data[..., 1].long()
         y_idx = token_data[..., 2].long()
         
-        # Direct indexing - buffer is already on correct device
         x_meters = self.token_centers_lookup[x_idx]
         y_meters = self.token_centers_lookup[y_idx]
         
@@ -302,24 +146,6 @@ class SensorGeometry(nn.Module):
         """Get GSD for tokens."""
         x_idx = token_data[..., 1].long()
         return self.token_gsd_lookup[x_idx]
-
-    def get_default_latent_grid(self, config) -> torch.Tensor:
-        """
-        Get the pre-computed latent grid based on resolution.
-        """
-        # Use single quotes inside the bracket to avoid breaking the f-string
-        res_key = int(round(config["resolution"] * 1000))
-        size_key= int(config["pixel_size"])
-        buffer_name = f"latent_grid_{res_key}_{size_key}"
-        
-
-        
-        
-        if hasattr(self, buffer_name):
-            return getattr(self, buffer_name)
-        else:
-            raise AttributeError(f"Latent grid for resolution {res_key}mm not found. "
-                                f"Was it initialized in _init_latent_grid?")
 
     def get_physical_scale(self, token_data: torch.Tensor) -> torch.Tensor:
         """Get normalization scale for input batch."""
@@ -345,41 +171,21 @@ class SensorGeometry(nn.Module):
         """
         return self._sqrt_2, self._half_token_width, self.token_centers_lookup
 
-    def get_decoder_bias(self, query_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get geometry data for decoder attention (centers only)."""
-        token_coords = self.get_token_centers(query_tokens)
-        B = query_tokens.shape[0]
-        latent_coords = self.latent_grid.unsqueeze(0).expand(B, -1, -1)
-        return token_coords, latent_coords
-
-    def get_decoder_bias_legacy(
+    def get_query_pixel_coords(
         self, 
-        query_tokens: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Legacy bias format: edge bounds."""
-        B, N, _ = query_tokens.shape
-        device = query_tokens.device
-        
-        x_idx = query_tokens[..., 1].long()
-        y_idx = query_tokens[..., 2].long()
-        
-        x_center = self.token_centers_lookup[x_idx]
-        y_center = self.token_centers_lookup[y_idx]
-        gsd = self.token_gsd_lookup[x_idx]
-        
-        half_gsd = gsd / 2.0
-        x_edges = torch.stack([x_center - half_gsd, x_center + half_gsd], dim=-1)
-        y_edges = torch.stack([y_center - half_gsd, y_center + half_gsd], dim=-1)
-        token_bias = torch.stack([x_edges, y_edges], dim=-2)
-        
-        half_extent = self.latent_surface / 2.0
-        latent_1d = torch.linspace(-half_extent, half_extent, 
-                                   self.spatial_latents_per_row, device=device)
-        gsd_col = torch.full((self.spatial_latents_per_row,), self.default_gsd, device=device)
-        latent_bias_1d = torch.stack([latent_1d, gsd_col], dim=-1)
-        latent_bias = latent_bias_1d.unsqueeze(0).expand(B, -1, -1)
-        
-        return token_bias, latent_bias
+        query_tokens: torch.Tensor, 
+        image_size: int = 512
+    ) -> torch.Tensor:
+        """
+        Convert query token metadata into global pixel (x, y) coordinates.
+        """
+        meter_coords = self.get_token_centers(query_tokens)
+        pixel_coords = self.meters_to_pixels(meter_coords, image_size=image_size, gsd=None)
+        return pixel_coords
+
+    # =========================================================================
+    # PUBLIC API — Encoder/Decoder Biases
+    # =========================================================================
 
     def get_encoder_bias(
         self, 
@@ -405,12 +211,48 @@ class SensorGeometry(nn.Module):
         if latent_positions is not None:
             latent_bias = latent_positions
         else:
-            latent_bias = self.latent_grid.unsqueeze(0).expand(B, -1, -1)
+            raise ValueError(
+                "latent_positions must be provided. "
+                "Latent grid is now computed at runtime by Atomiser._compute_latent_grid()."
+            )
+        
+        return token_bias, latent_bias
+
+    def get_decoder_bias_legacy(
+        self, 
+        query_tokens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Legacy bias format: edge bounds.
+        
+        TODO: Remove once decoder is updated to use runtime latent coords.
+        """
+        B, N, _ = query_tokens.shape
+        device = query_tokens.device
+        
+        x_idx = query_tokens[..., 1].long()
+        y_idx = query_tokens[..., 2].long()
+        
+        x_center = self.token_centers_lookup[x_idx]
+        y_center = self.token_centers_lookup[y_idx]
+        gsd = self.token_gsd_lookup[x_idx]
+        
+        half_gsd = gsd / 2.0
+        x_edges = torch.stack([x_center - half_gsd, x_center + half_gsd], dim=-1)
+        y_edges = torch.stack([y_center - half_gsd, y_center + half_gsd], dim=-1)
+        token_bias = torch.stack([x_edges, y_edges], dim=-2)
+        
+        half_extent = self.latent_surface / 2.0
+        latent_1d = torch.linspace(-half_extent, half_extent, 
+                                   self.spatial_latents_per_row, device=device)
+        gsd_col = torch.full((self.spatial_latents_per_row,), self.default_gsd, device=device)
+        latent_bias_1d = torch.stack([latent_1d, gsd_col], dim=-1)
+        latent_bias = latent_bias_1d.unsqueeze(0).expand(B, -1, -1)
         
         return token_bias, latent_bias
 
     # =========================================================================
-    # COORDINATE CONVERSION (for error-guided displacement)
+    # COORDINATE CONVERSION
     # =========================================================================
 
     def meters_to_pixels(
@@ -424,44 +266,14 @@ class SensorGeometry(nn.Module):
         
         Assumes image is centered at origin, spanning [-extent/2, extent/2] meters
         where extent = image_size * gsd.
-        
-        Args:
-            coords_meters: [..., 2] coordinates in meters (x, y)
-                Can be any shape as long as last dimension is 2.
-                Examples: [B, L, 2], [B, depth, L, 2], [B, depth, L, num_samples, 2]
-            image_size: image dimension in pixels (default 512)
-            gsd: ground sample distance in meters/pixel (default: self.default_gsd)
-        
-        Returns:
-            coords_pixels: [..., 2] coordinates in pixels (long integers)
-                Same shape as input, clamped to [0, image_size-1]
-        
-        Example:
-            >>> geometry = SensorGeometry(config, lookup_table)
-            >>> # Latent at origin (0, 0) meters → center of image (256, 256) pixels
-            >>> coords_m = torch.tensor([[[0.0, 0.0]]])  # [1, 1, 2]
-            >>> coords_px = geometry.meters_to_pixels(coords_m)
-            >>> # coords_px ≈ [[[256, 256]]]
-            
-            >>> # Latent at (-51.2, -51.2) meters → corner (0, 0) pixels
-            >>> coords_m = torch.tensor([[[-51.2, -51.2]]])
-            >>> coords_px = geometry.meters_to_pixels(coords_m)
-            >>> # coords_px = [[[0, 0]]]
         """
         if gsd is None:
             gsd = self.default_gsd
         
-        # Physical extent of the image
-        extent = image_size * gsd  # 512 * 0.2 = 102.4 meters
-        half_extent = extent / 2.0  # 51.2 meters
+        extent = image_size * gsd
+        half_extent = extent / 2.0
         
-        # Convert: meters → pixels
-        # Origin (0,0) in meters → center of image (image_size/2) in pixels
-        # -half_extent in meters → 0 in pixels
-        # +half_extent in meters → image_size in pixels
         coords_pixels = (coords_meters + half_extent) / gsd
-        
-        # Round to integers and clamp to valid range
         coords_pixels = coords_pixels.round().long()
         coords_pixels = coords_pixels.clamp(0, image_size - 1)
         
@@ -473,28 +285,14 @@ class SensorGeometry(nn.Module):
         image_size: int = 512,
         gsd: Optional[float] = None,
     ) -> torch.Tensor:
-        """
-        Convert coordinates from pixel indices to meters.
-        
-        Inverse of meters_to_pixels().
-        
-        Args:
-            coords_pixels: [..., 2] coordinates in pixels (x, y)
-            image_size: image dimension in pixels (default 512)
-            gsd: ground sample distance in meters/pixel (default: self.default_gsd)
-        
-        Returns:
-            coords_meters: [..., 2] coordinates in meters
-        """
+        """Convert coordinates from pixel indices to meters."""
         if gsd is None:
             gsd = self.default_gsd
         
         extent = image_size * gsd
         half_extent = extent / 2.0
         
-        # Convert: pixels → meters
         coords_meters = coords_pixels.float() * gsd - half_extent
-        
         return coords_meters
 
     def sample_grid_around_positions(
@@ -504,50 +302,17 @@ class SensorGeometry(nn.Module):
         spacing: int = 2,
         image_size: int = 512,
     ) -> torch.Tensor:
-        """
-        Sample a grid of points around each position.
-        
-        Creates a grid_size × grid_size grid of sample points centered 
-        at each input position.
-        
-        Args:
-            coords_pixels: [..., 2] center coordinates in pixels
-                Examples: [B, L, 2], [B, depth, L, 2]
-            grid_size: number of points per dimension (e.g., 3 → 3×3 = 9 points)
-            spacing: distance between grid points in pixels
-            image_size: image dimension for clamping (default 512)
-        
-        Returns:
-            sample_coords: [..., grid_size², 2] sample coordinates in pixels
-                Example: [B, L, 2] → [B, L, 9, 2] for grid_size=3
-        
-        Example:
-            >>> coords = torch.tensor([[[256, 256]]])  # [1, 1, 2]
-            >>> samples = geometry.sample_grid_around_positions(coords, grid_size=3, spacing=2)
-            >>> # samples[0, 0] contains 9 points:
-            >>> # (254,254), (254,256), (254,258),
-            >>> # (256,254), (256,256), (256,258),
-            >>> # (258,254), (258,256), (258,258)
-        """
+        """Sample a grid of points around each position."""
         device = coords_pixels.device
-        original_shape = coords_pixels.shape[:-1]  # [...] without the 2
         
-        # Create grid offsets: [-spacing, 0, spacing] for grid_size=3
         half_grid = (grid_size - 1) // 2
         offsets_1d = torch.arange(-half_grid, half_grid + 1, device=device) * spacing
         
-        # Create 2D grid of offsets: [grid_size², 2]
         grid_y, grid_x = torch.meshgrid(offsets_1d, offsets_1d, indexing='ij')
-        offsets = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)  # [grid_size², 2]
-        num_samples = offsets.shape[0]
+        offsets = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
         
-        # Expand coords to [..., 1, 2] and offsets to [1, ..., grid_size², 2]
-        coords_expanded = coords_pixels.unsqueeze(-2)  # [..., 1, 2]
-        
-        # Broadcast addition: [..., 1, 2] + [grid_size², 2] → [..., grid_size², 2]
+        coords_expanded = coords_pixels.unsqueeze(-2)
         sample_coords = coords_expanded + offsets
-        
-        # Clamp to valid image range
         sample_coords = sample_coords.clamp(0, image_size - 1)
         
         return sample_coords
@@ -557,63 +322,25 @@ class SensorGeometry(nn.Module):
         image_err: torch.Tensor,
         sample_coords: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Extract query tokens from image at given pixel positions.
-        
-        For each position, extracts tokens for ALL channels (bands).
-        
-        Args:
-            image_err: [B, C, H, W, 6] full image with metadata
-            sample_coords: [B, ..., 2] pixel coordinates (x, y)
-                Can be any shape, e.g., [B, L, 2] or [B, depth, L, num_samples, 2]
-        
-        Returns:
-            query_tokens: [B, num_queries, 6] where num_queries = prod(sample_shape) * C
-            ground_truth: [B, num_queries] reflectance values at those positions
-            original_shape: tuple of the shape between B and 2 in sample_coords
-                (useful for reshaping error back to per-latent format)
-        
-        Example:
-            >>> sample_coords = torch.tensor([[[256, 256], [100, 100]]])  # [1, 2, 2]
-            >>> tokens, gt, shape = geometry.extract_query_tokens_from_image(image_err, sample_coords)
-            >>> # tokens.shape = [1, 2*5, 6] = [1, 10, 6] (2 positions × 5 channels)
-            >>> # shape = (2,)
-        """
+        """Extract query tokens from image at given pixel positions."""
         B, C, H, W, metadata_dim = image_err.shape
         device = image_err.device
         
-        # Flatten sample coordinates: [B, ..., 2] → [B, N, 2]
-        original_shape = sample_coords.shape[1:-1]  # everything between B and 2
-        N = sample_coords[..., 0].numel() // B  # number of positions per batch
+        original_shape = sample_coords.shape[1:-1]
+        N = sample_coords[..., 0].numel() // B
         sample_coords_flat = sample_coords.view(B, N, 2)
         
-        # Get pixel indices
-        px_x = sample_coords_flat[..., 0].long()  # [B, N]
-        px_y = sample_coords_flat[..., 1].long()  # [B, N]
+        px_x = sample_coords_flat[..., 0].long().clamp(0, W - 1)
+        px_y = sample_coords_flat[..., 1].long().clamp(0, H - 1)
         
-        # Clamp to valid range
-        px_x = px_x.clamp(0, W - 1)
-        px_y = px_y.clamp(0, H - 1)
+        px_x_exp = px_x.unsqueeze(-1).expand(-1, -1, C)
+        px_y_exp = px_y.unsqueeze(-1).expand(-1, -1, C)
         
-        # Extract tokens for all channels at each position
-        # We need: image_err[b, c, y, x, :] for all b, all c, all (x,y) pairs
-        
-        # Expand indices for all channels: [B, N] → [B, N, C]
-        px_x_exp = px_x.unsqueeze(-1).expand(-1, -1, C)  # [B, N, C]
-        px_y_exp = px_y.unsqueeze(-1).expand(-1, -1, C)  # [B, N, C]
-        
-        # Create batch and channel indices
         batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(-1, N, C)
         channel_idx = torch.arange(C, device=device).view(1, 1, C).expand(B, N, -1)
         
-        # Index into image_err: [B, C, H, W, 6]
-        # Result: [B, N, C, 6]
         tokens = image_err[batch_idx, channel_idx, px_y_exp, px_x_exp, :]
-        
-        # Reshape to [B, N*C, 6]
         query_tokens = tokens.view(B, N * C, metadata_dim)
-        
-        # Ground truth is the reflectance (index 0)
-        ground_truth = query_tokens[..., 0]  # [B, N*C]
+        ground_truth = query_tokens[..., 0]
         
         return query_tokens, ground_truth, original_shape

@@ -3,30 +3,52 @@ import pytorch_lightning as pl
 
 
 # =============================================================================
+# TOKEN FORMAT
+# =============================================================================
+# Token layout: [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
+#                 0      1  2       3          4        5            6             7
+TOKEN_VALUE_IDX      = 0
+TOKEN_X_IDX          = 1
+TOKEN_Y_IDX          = 2
+TOKEN_SPECTRAL_IDX   = 3
+TOKEN_LABEL_IDX      = 4
+TOKEN_QUERY_IDX      = 5
+TOKEN_RESOLUTION_IDX = 6
+TOKEN_TIME_IDX       = 7
+TOKEN_DIM            = 8
+
+
+# =============================================================================
+# SPECIAL INDICES (reserved, model uses learnable embeddings for these)
+# =============================================================================
+LEARNED_RESOLUTION_IDX = 0   # Non-optical modalities (SAR, DEM, slope, etc.)
+LEARNED_TIME_IDX       = 0   # Datasets without temporal dimension
+
+
+# =============================================================================
 # ABSTRACT CHANNEL DEFINITIONS
 # =============================================================================
 # Abstract channels use NEGATIVE bandwidth AND central_wavelength values.
-# These match what's defined in the YAML config file.
 # Key format: (int(bandwidth), int(central_wavelength))
 
 ABSTRACT_CHANNELS = {
-    # Sentinel-1 SAR polarizations (as defined in YAML)
-    "VV": {"bandwidth": -1, "central_wavelength": -1},   # key = (-1, -1)
-    "VH": {"bandwidth": -2, "central_wavelength": -2},   # key = (-2, -2)
-    
+    # Sentinel-1 SAR polarizations
+    "VV": {"bandwidth": -1, "central_wavelength": -1},
+    "VH": {"bandwidth": -2, "central_wavelength": -2},
+
     # Elevation / DEM
     "ELEVATION": {"bandwidth": -10, "central_wavelength": -10},
-    "DEM": {"bandwidth": -10, "central_wavelength": -10},  # Alias
-    
+    "DEM":       {"bandwidth": -10, "central_wavelength": -10},  # Alias
+
     # Slope / Aspect
-    "SLOPE": {"bandwidth": -11, "central_wavelength": -11},
+    "SLOPE":  {"bandwidth": -11, "central_wavelength": -11},
     "ASPECT": {"bandwidth": -12, "central_wavelength": -12},
-    
+
     # Indices
-    "NDVI": {"bandwidth": -20, "central_wavelength": -20},
-    "NDWI": {"bandwidth": -21, "central_wavelength": -21},
+    "NDVI":  {"bandwidth": -20, "central_wavelength": -20},
+    "NDWI":  {"bandwidth": -21, "central_wavelength": -21},
     "MNDWI": {"bandwidth": -22, "central_wavelength": -22},
-    
+
     # Generic placeholders
     "ABSTRACT_1": {"bandwidth": -100, "central_wavelength": -100},
     "ABSTRACT_2": {"bandwidth": -101, "central_wavelength": -101},
@@ -44,25 +66,44 @@ class Lookup_encoding(pl.LightningModule):
         self.pixel_coords_table = None
         self.table_wave = None
         self.table_queries = None
+        self.table_resolution = None
+        self.table_time = None
         self.nb_tokens_queries = config_model["Atomiser"]["spatial_latents"]
-        
-        # Track abstract channels for debugging/inspection
-        self.abstract_channel_indices = {}  # name -> idx
+
+        # Track abstract channels
+        self.abstract_channel_indices = {}
 
         self.init_config()
         self.init_lookup_table()
-        self.init_pixel_coords_table() 
+        self.init_pixel_coords_table()
         self.init_lookup_table_wave()
         self.init_queries_lookup_table()
+        self.init_resolution_lookup_table()
+        self.init_time_lookup_table()
+
+    # =========================================================================
+    # MODALITY CONFIG
+    # =========================================================================
 
     def init_config(self):
         modalities = []
-        # Manual entry for 0.2m GSD and 512x512 size
         modalities.append((0.2, 512))
         modalities.append((10, 512))
         modalities.append((0.2, 28))
+        modalities.append((30, 512))
+        modalities.append((10, 240))
+        modalities.append((20, 120))
+        modalities.append((60, 40))
+        modalities.append((10, 120))
+        modalities.append((20, 60))
+        modalities.append((60, 20))
+        
         self.modalities = modalities
-    
+
+    # =========================================================================
+    # POSITION LOOKUP
+    # =========================================================================
+
     def init_lookup_table(self):
         table = dict()
         idx_torch_array = 0
@@ -74,47 +115,36 @@ class Lookup_encoding(pl.LightningModule):
         self.table = table
 
     def init_pixel_coords_table(self):
-        """
-        Initializes a lookup table that maps each modality to a 
-        static global (x, y) coordinate grid.
-        """
         coords_table = dict()
-        
         for resolution, size in self.modalities:
             res_key = int(resolution * 1000)
-            
             grid_y, grid_x = torch.meshgrid(
                 torch.arange(size, dtype=torch.float32),
                 torch.arange(size, dtype=torch.float32),
-                indexing='ij'
+                indexing='ij',
             )
-            
             coords = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
             coords_table[(res_key, size)] = coords
-            
         self.pixel_coords_table = coords_table
 
     def get_pixel_coords(self, resolution, size):
-        """
-        Returns the (x, y) global coordinates for a given resolution and image size.
-        """
         res_key = int(resolution * 1000)
         key = (res_key, size)
-        
         if key not in self.pixel_coords_table:
             raise ValueError(f"Coords for resolution {resolution} and size {size} not found.")
-            
         return self.pixel_coords_table[key]
 
     def get_grid_pos(self, resolution, size):
-        """Original 1D index getter (kept for backward compatibility)"""
         res_key = int(resolution * 1000)
         key = (res_key, size)
         if key not in self.table:
             raise ValueError(f"Resolution {res_key} and size {size} not found.")
-        
         idx = self.table[key]
         return torch.arange(idx, idx + size, dtype=torch.float32)
+
+    # =========================================================================
+    # QUERY LOOKUP
+    # =========================================================================
 
     def init_queries_lookup_table(self):
         table = dict()
@@ -125,144 +155,257 @@ class Lookup_encoding(pl.LightningModule):
             idx_torch_array += self.nb_tokens_queries
         self.table_queries = table
 
+    # =========================================================================
+    # WAVELENGTH / SPECTRAL LOOKUP
+    # =========================================================================
+
     def init_lookup_table_wave(self):
-        """
-        Initialize wavelength lookup table from bands_info.
-        
-        Handles both:
-        - Physical bands (bandwidth > 0 AND central_wavelength > 0)
-        - Abstract channels (bandwidth < 0 OR central_wavelength < 0)
-        """
         table = dict()
         idx_torch_array = 0
-        
+
         for sat in self.bands_info:
             sat_content = self.bands_info[sat]
             for band in sat_content:
                 band_content = sat_content[band]
-                
+
                 if "bandwidth" not in band_content or "central_wavelength" not in band_content:
                     continue
-                
+
                 bandwidth = band_content["bandwidth"]
                 central_wavelength = band_content["central_wavelength"]
                 key = (int(bandwidth), int(central_wavelength))
-                
+
                 if key not in table:
                     table[key] = idx_torch_array
-                    
-                    # Track abstract channels (negative bandwidth OR central_wavelength)
+
                     if bandwidth < 0 or central_wavelength < 0:
-                        # Find the name by matching both bandwidth and central_wavelength
                         for name, info in ABSTRACT_CHANNELS.items():
-                            if (info["bandwidth"] == int(bandwidth) and 
-                                info["central_wavelength"] == int(central_wavelength)):
+                            if (info["bandwidth"] == int(bandwidth)
+                                    and info["central_wavelength"] == int(central_wavelength)):
                                 self.abstract_channel_indices[name] = idx_torch_array
                                 break
-                    
+
                     idx_torch_array += 1
-        
+
         self.table_wave = table
-        
-        # Print summary
+
         n_physical = sum(1 for k in table if k[1] >= 0)
         n_abstract = sum(1 for k in table if k[1] < 0)
-        print(f"[Lookup] table_wave: {len(table)} entries ({n_physical} physical, {n_abstract} abstract)")
+        print(f"[Lookup] table_wave: {len(table)} entries "
+              f"({n_physical} physical, {n_abstract} abstract)")
         if self.abstract_channel_indices:
             print(f"[Lookup] Abstract channels: {self.abstract_channel_indices}")
 
     # =========================================================================
-    # ABSTRACT CHANNEL REGISTRATION
+    # RESOLUTION LOOKUP
     # =========================================================================
-    
-    def register_abstract_channel(self, channel_name: str) -> int:
+
+    def init_resolution_lookup_table(self):
         """
-        Register an abstract channel and return its index.
-        
+        Build a lookup from GSD (m/px) → resolution index.
+
+        Index 0 is reserved for LEARNED_RESOLUTION_IDX (non-optical modalities
+        like SAR, DEM, etc.). Physical optical resolutions get indices ≥ 1.
+
+        Key: int(resolution * 1000)  (e.g., 10m → 10000, 0.2m → 200)
+        """
+        table = dict()
+        # Index 0 reserved for learned (non-optical)
+        idx = 1
+
+        # Collect unique resolutions from modalities
+        seen_resolutions = set()
+        for resolution, _ in self.modalities:
+            res_key = int(resolution * 1000)
+            if res_key not in seen_resolutions:
+                seen_resolutions.add(res_key)
+                table[res_key] = idx
+                idx += 1
+
+        self.table_resolution = table
+        self.num_resolution_indices = idx  # total count (including index 0)
+
+        print(f"[Lookup] table_resolution: {len(table)} optical entries + "
+              f"1 learned (idx=0). Total = {self.num_resolution_indices}")
+        for res_key, res_idx in sorted(table.items()):
+            gsd = res_key / 1000
+            print(f"  {gsd:>8.1f} m/px → idx {res_idx}")
+
+    def get_resolution_idx(self, resolution: float) -> int:
+        """
+        Get the resolution index for a given GSD.
+
         Args:
-            channel_name: Name of the abstract channel (e.g., "VV", "VH", "ELEVATION")
-            
+            resolution: Ground sample distance in m/px.
+
         Returns:
-            Index in the wavelength lookup table
+            Integer index. Returns LEARNED_RESOLUTION_IDX (0) if the
+            resolution is not registered (e.g. non-optical modality).
         """
+        res_key = int(resolution * 1000)
+        return self.table_resolution.get(res_key, LEARNED_RESOLUTION_IDX)
+
+    def register_resolution(self, resolution: float) -> int:
+        """
+        Register a new resolution and return its index.
+        Idempotent: returns existing index if already registered.
+        """
+        res_key = int(resolution * 1000)
+        if res_key in self.table_resolution:
+            return self.table_resolution[res_key]
+
+        new_idx = self.num_resolution_indices
+        self.table_resolution[res_key] = new_idx
+        self.num_resolution_indices += 1
+
+        gsd = res_key / 1000
+        print(f"[Lookup] Registered resolution {gsd} m/px → idx {new_idx}")
+        return new_idx
+
+    # =========================================================================
+    # TIME LOOKUP
+    # =========================================================================
+
+    def init_time_lookup_table(self):
+        """
+        Build a lookup from time identifiers → time index.
+
+        Index 0 is reserved for LEARNED_TIME_IDX (datasets without temporal
+        dimension, i.e. single-date observations).
+
+        Time keys can be anything hashable — typically:
+          - int day-of-year (1–365)
+          - str ISO date "2021-06-15"
+          - int sequential timestep (1, 2, 3, …)
+
+        Starts empty; datasets register their timesteps at init.
+        """
+        self.table_time = dict()
+        self.num_time_indices = 1  # index 0 reserved for learned
+
+        print(f"[Lookup] table_time: initialized (idx=0 reserved for learned/no-time)")
+
+    def get_time_idx(self, time_key) -> int:
+        """
+        Get the time index for a given time key.
+
+        Args:
+            time_key: Hashable time identifier (int, str, tuple, etc.)
+
+        Returns:
+            Integer index. Returns LEARNED_TIME_IDX (0) if not registered.
+        """
+        return self.table_time.get(time_key, LEARNED_TIME_IDX)
+
+    def register_time(self, time_key) -> int:
+        """
+        Register a new time key and return its index.
+        Idempotent: returns existing index if already registered.
+
+        Args:
+            time_key: Hashable identifier — e.g. "2021-06-15", 172 (DOY),
+                      or a sequential timestep number.
+
+        Returns:
+            Integer index (≥ 1).
+        """
+        if time_key in self.table_time:
+            return self.table_time[time_key]
+
+        new_idx = self.num_time_indices
+        self.table_time[time_key] = new_idx
+        self.num_time_indices += 1
+        return new_idx
+
+    def register_times(self, time_keys) -> list:
+        """
+        Batch-register multiple time keys. Returns list of indices.
+
+        Args:
+            time_keys: Iterable of hashable time identifiers.
+
+        Returns:
+            List of integer indices.
+        """
+        indices = []
+        for key in time_keys:
+            indices.append(self.register_time(key))
+
+        print(f"[Lookup] Registered {len(indices)} time steps "
+              f"(total = {self.num_time_indices})")
+        return indices
+
+    # =========================================================================
+    # ABSTRACT CHANNEL HELPERS
+    # =========================================================================
+
+    def register_abstract_channel(self, channel_name: str) -> int:
         if channel_name not in ABSTRACT_CHANNELS:
             raise ValueError(
                 f"Unknown abstract channel: {channel_name}. "
-                f"Known channels: {list(ABSTRACT_CHANNELS.keys())}"
+                f"Known: {list(ABSTRACT_CHANNELS.keys())}"
             )
-        
+
         info = ABSTRACT_CHANNELS[channel_name]
         key = (int(info["bandwidth"]), int(info["central_wavelength"]))
-        
-        # Check if already registered
+
         if key in self.table_wave:
             return self.table_wave[key]
-        
-        # Register new
+
         new_idx = len(self.table_wave)
         self.table_wave[key] = new_idx
         self.abstract_channel_indices[channel_name] = new_idx
-        
         print(f"[Lookup] Registered abstract channel '{channel_name}' at index {new_idx}")
         return new_idx
-    
+
     def get_abstract_channel_idx(self, channel_name: str) -> int:
-        """
-        Get the index for a registered abstract channel.
-        
-        Args:
-            channel_name: Name of the abstract channel
-            
-        Returns:
-            Index in the wavelength lookup table
-            
-        Raises:
-            KeyError if channel not registered
-        """
         if channel_name not in self.abstract_channel_indices:
             raise KeyError(
                 f"Abstract channel '{channel_name}' not registered. "
-                f"Registered channels: {list(self.abstract_channel_indices.keys())}"
+                f"Registered: {list(self.abstract_channel_indices.keys())}"
             )
         return self.abstract_channel_indices[channel_name]
-    
+
     def get_wave_idx(self, bandwidth: int, central_wavelength: int) -> int:
-        """
-        Get index for a wavelength specification.
-        
-        Args:
-            bandwidth: Band bandwidth in nm (int)
-            central_wavelength: Central wavelength in nm (int), negative for abstract
-            
-        Returns:
-            Index in the wavelength lookup table
-        """
         key = (bandwidth, central_wavelength)
         if key not in self.table_wave:
             raise KeyError(f"Wavelength key {key} not found in table_wave")
         return self.table_wave[key]
-    
+
     def is_abstract_channel(self, idx: int) -> bool:
-        """Check if an index corresponds to an abstract channel."""
         for key, table_idx in self.table_wave.items():
             if table_idx == idx:
-                # Abstract if either bandwidth or central_wavelength is negative
                 return key[0] < 0 or key[1] < 0
         return False
 
+    def is_non_optical_band(self, bandwidth: int, central_wavelength: int) -> bool:
+        """Check whether a band should use LEARNED_RESOLUTION_IDX."""
+        return bandwidth < 0 or central_wavelength < 0
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+
+    def print_summary(self):
+        print("\n" + "=" * 60)
+        print("LOOKUP TABLE SUMMARY")
+        print("=" * 60)
+        print(f"  Position modalities:  {len(self.modalities)}")
+        print(f"  Spectral entries:     {len(self.table_wave)}")
+        print(f"  Resolution entries:   {self.num_resolution_indices} "
+              f"(1 learned + {self.num_resolution_indices - 1} optical)")
+        print(f"  Time entries:         {self.num_time_indices} "
+              f"(1 learned + {self.num_time_indices - 1} registered)")
+        if self.abstract_channel_indices:
+            print(f"  Abstract channels:    {self.abstract_channel_indices}")
+        print("=" * 60 + "\n")
+
 
 # =============================================================================
-# HELPER FUNCTION FOR BANDS_INFO CONFIGURATION
+# HELPER FUNCTIONS
 # =============================================================================
 
 def create_sen1floods11_bands_info() -> dict:
-    """
-    Create bands_info dictionary for Sen1Floods11 dataset.
-    
-    Includes:
-    - Sentinel-2: 13 optical bands
-    - Sentinel-1: VV, VH (SAR) as abstract channels
-    """
     bands_info = {
         "bands_sen2_info": {
             "B01": {"bandwidth": 20, "central_wavelength": 443},
@@ -280,7 +423,6 @@ def create_sen1floods11_bands_info() -> dict:
             "B12": {"bandwidth": 180, "central_wavelength": 2202},
         },
         "bands_sen1_info": {
-            # SAR bands - use abstract channel definitions
             "VV": {
                 "bandwidth": ABSTRACT_CHANNELS["VV"]["bandwidth"],
                 "central_wavelength": ABSTRACT_CHANNELS["VV"]["central_wavelength"],
@@ -295,11 +437,7 @@ def create_sen1floods11_bands_info() -> dict:
 
 
 def create_multimodal_bands_info(include_elevation: bool = False) -> dict:
-    """
-    Create bands_info with S1 + S2 + optional elevation.
-    """
     bands_info = create_sen1floods11_bands_info()
-    
     if include_elevation:
         bands_info["bands_dem_info"] = {
             "ELEVATION": {
@@ -307,5 +445,4 @@ def create_multimodal_bands_info(include_elevation: bool = False) -> dict:
                 "central_wavelength": ABSTRACT_CHANNELS["ELEVATION"]["central_wavelength"],
             },
         }
-    
     return bands_info

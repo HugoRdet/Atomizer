@@ -1,45 +1,50 @@
-from training.perceiver import *
-from training.utils import *
-from training.losses import *
-from training.utils.callbacks import *
-from training.utils.datasets import*
-from training.VIT import *
-from training.ResNet import *
-from collections import defaultdict
-from training import *
+"""
+Sen1Floods11 Training Script (v2)
+=================================
+Uses grouped-token batch format:
+    batch = {
+        "groups": {res: {"tokens": [B,N,6], "mask": [B,N], "shape": (C,H,W)}},
+        "queries":      [B, M, 6],
+        "queries_mask":  [B, M],
+        "label":         [B, H, W],
+        "target_resolution": float,
+        "image":         [B, C, H, W],
+    }
+"""
+
+# =============================================================================
+# IMPORTS
+# =============================================================================
 import os
-from sklearn.metrics import average_precision_score
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, GradientAccumulationScheduler
+import time
+import argparse
 import torch
 import numpy as np
-from torch import nn, einsum
-import torch.nn.functional as F
-import einops as einops
-from einops import rearrange, repeat
-from einops.layers.torch import Reduce
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.profilers import PyTorchProfiler
-from torch.profiler import ProfilerActivity
-from pytorch_lightning.callbacks import LearningRateFinder
-import matplotlib.pyplot as plt
-from fvcore.nn import FlopCountAnalysis
-import time
-from configilm import util
-util.MESSAGE_LEVEL = util.MessageLevel.INFO
+from collections import defaultdict
+
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    GradientAccumulationScheduler,
+    LearningRateMonitor,
+)
 
 seed_everything(42, workers=True)
-from configilm.extra.DataSets import BENv2_DataSet
-from configilm.extra.DataModules import BENv2_DataModule
-import random
-import argparse
 
-from training.utils.token_building.processor import TokenProcessor
+# --- Project imports ---
+from training.utils import read_yaml
+from training.utils import Lookup_encoding
+
+# v2 classes (grouped token format)
+from training.trainer_SENFLOOD import Model_SenFlood
+from training.utils.datasets.utils_dataset_SENFLOOD import Sen1Floods11Dataset
+from training.utils.datasets.dataloaders import UnifiedDataModule
+from training.utils.datasets.token_grouping import collate_grouped
+
+# U-Net fallback (unchanged)
+from training.unet.model_unet_senflood import Model_UNet_SenFlood
 from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSenFlood
-
-
-
 
 # =============================================================================
 # ARGS
@@ -53,24 +58,14 @@ args = parser.parse_args()
 xp_name = args.xp_name
 config_model = read_yaml("./training/configs/" + args.config_model)
 configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
-bands_yaml       = "./data/bands_info/bands.yaml"
+bands_yaml = "./data/bands_info/bands.yaml"
 
 is_unet = config_model["encoder"] == "UNET"
 
 # =============================================================================
-# LOOKUP TABLE & TRANSFORMS (needed for both, but processor only for Atomizer)
+# LOOKUP TABLE
 # =============================================================================
 lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
-
-modalities_trans = modalities_transformations_config(
-    configs_dataset, 
-    model=config_model["encoder"], 
-    name_config=args.dataset_name
-)
-
-input_processor = None
-if not is_unet:
-    input_processor = TokenProcessor(config_model, lookup_table)
 
 # =============================================================================
 # WANDB
@@ -81,7 +76,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     wandb.init(
         name=config_model["encoder"],
         project="SenFlood",
-        config=config_model
+        config=config_model,
     )
     wandb_logger = WandbLogger(project="SenFlood")
     wandb.define_metric("train_loss", step_metric="trainer/global_step")
@@ -91,29 +86,17 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # MODEL
 # =============================================================================
 if is_unet:
-    from training.unet.model_unet_senflood import Model_UNet_SenFlood
     model = Model_UNet_SenFlood(
         config=config_model,
         wand=True,
         name=xp_name,
     )
 else:
-    checkpoint_path = "./checkpoints/Atomiserxp_20260205_010115_lviu-val_loss-epoch=83-val_loss=0.0597.ckpt"
-    # Option 1: Load checkpoint with strict=False (recommended)
-    #model =  Model_SenFlood.load_from_checkpoint(
-    #    checkpoint_path,
-    #    strict=False,  # Allow missing keys (displacement MLP is new)
-    #    config=config_model,
-    #    wand=True,
-    #    name=xp_name,
-    #    transform=input_processor,
-    #    lookup_table=lookup_table
-    #)
     model = Model_SenFlood(
-        config_model,
+        config=config_model,
         wand=True,
         name=xp_name,
-        transform=input_processor,
+        transform=None,           # encoder creates its own TokenProcessor
         lookup_table=lookup_table,
     )
 
@@ -121,10 +104,10 @@ else:
 # DATA MODULE
 # =============================================================================
 data_module = UnifiedDataModule(
-    f"./data/SENFLOOD",
+    path="./data/SENFLOOD",
     batch_size=config_model["dataset"]["batchsize"],
     num_workers=4,
-    trans_modalities=modalities_trans,
+    trans_modalities=None,        # v2 dataset handles tokenization internally
     trans_tokens=None,
     model=config_model["encoder"],
     dataset_config=read_yaml(bands_yaml),
@@ -139,38 +122,30 @@ data_module = UnifiedDataModule(
 lr_monitor = LearningRateMonitor(logging_interval="step")
 accumulator = GradientAccumulationScheduler(scheduling={0: 1})
 
-checkpoint_val_mod_train = ModelCheckpoint(
+checkpoint_val = ModelCheckpoint(
     dirpath="./checkpoints/",
     filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_loss:.4f}}",
-    monitor="val_loss",
-    mode="min",
+    monitor="val_mIoU",
+    mode="max",
     save_top_k=1,
     verbose=True,
 )
 
 
+token_assign=TokenAssignmentCallbackSenFlood(
+        log_every_n_epochs= 1,
+        sample_indices=[0],
+        save_dir= "./viz_token_assignment",
+        use_wandb= True,
+    )
 
-# Atomizer-specific callbacks (U-Net doesn't need these)
-#if not is_unet:
-#    reconstruction_callback = MAE_err_CustomVisualizationCallback(config=config_model)
-#    gravity_callback = ErrorLandscapeVisualizationCallback(config=config_model)
-#    callbacks.extend([reconstruction_callback, gravity_callback])
+#token_assign
+
+callbacks = [accumulator, checkpoint_val, lr_monitor]
 
 # =============================================================================
 # TRAINER
 # =============================================================================
-
-#tokens_ass_viz=TokenAssignmentCallbackSenFlood(
-#        log_every_n_epochs=5,
-#        sample_indices=[0],
-#        save_dir="./viz_token_assignment",
-#        use_wandb=True
-#    )
-
-#
-
-callbacks = [accumulator, checkpoint_val_mod_train]
-
 trainer = Trainer(
     strategy="ddp_find_unused_parameters_true" if not is_unet else "auto",
     devices=-1,
@@ -189,59 +164,72 @@ trainer = Trainer(
 trainer.fit(model, datamodule=data_module)
 trainer.test(model, datamodule=data_module)
 
+
 # =============================================================================
 # MEASURE COMPLEXITY
 # =============================================================================
+
+def _batch_to_device(batch: dict, device) -> dict:
+    """Recursively move a nested batch dict to device."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device)
+        elif isinstance(v, dict):
+            out[k] = _batch_to_device(v, device)
+        else:
+            out[k] = v  # scalars, tuples, strings — keep as-is
+    return out
+
+
 if os.environ.get("LOCAL_RANK", "0") == "0":
-    print("\n" + "="*80)
+    from fvcore.nn import FlopCountAnalysis
+
+    print("\n" + "=" * 80)
     print("MEASURING MODEL COMPLEXITY")
-    print("="*80 + "\n")
-    
+    print("=" * 80 + "\n")
+
     data_module.setup("test")
     test_dataset = data_module.test_dataset
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     model.eval()
-    
+
     num_samples = min(25, len(test_dataset))
     samples = [test_dataset[i] for i in range(num_samples)]
-    
+
     results = []
-    
+
     for input_size in [512]:
         print(f"\nTesting input size: {input_size}x{input_size}")
-        
+
         if is_unet:
             # ============= U-Net: simple image input =============
             image_0, label_0 = samples[0]
             image_0 = image_0.unsqueeze(0).to(device)
-            
-            # Warmup
+
             with torch.no_grad():
                 _ = model(image_0)
-            
-            # FLOPs
+
             image_1, _ = samples[1]
             image_1 = image_1.unsqueeze(0).to(device)
-            
+
             try:
                 with torch.no_grad():
                     flops = FlopCountAnalysis(model, (image_1,))
                     gflops = flops.total() / 1e9
             except Exception as e:
-                print(f"FLOPs measurement failed: {e}")
+                print(f"  FLOPs measurement failed: {e}")
                 gflops = -1
-            
+
             # Inference time
-            num_warmup = 3
-            num_runs = 20
-            
+            num_warmup, num_runs = 3, 20
             with torch.no_grad():
                 for i in range(num_warmup):
                     img, _ = samples[i % num_samples]
                     _ = model(img.unsqueeze(0).to(device))
-                
+
                 torch.cuda.synchronize()
                 start = time.time()
                 for i in range(num_runs):
@@ -250,76 +238,56 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
                     _ = model(img.unsqueeze(0).to(device))
                     torch.cuda.synchronize()
                 end = time.time()
-            
+
             avg_time_ms = (end - start) / num_runs * 1000
-            num_tokens = 15 * input_size * input_size  # for comparison
-            
+            num_tokens = 15 * input_size * input_size
+
         else:
-            # ============= Atomizer: token input =============
-            image_tokens, attention_mask, queries, queries_mask, label, latent_pos, image = samples[0]
-            
-            image_tokens = image_tokens.unsqueeze(0).to(device)
-            attention_mask = attention_mask.unsqueeze(0).to(device)
-            queries = queries.unsqueeze(0).to(device)
-            queries_mask = queries_mask.unsqueeze(0).to(device)
-            latent_pos_d = latent_pos.unsqueeze(0).to(device)
-            
+            # ============= Atomizer: grouped dict batch =============
+            # Collate single sample into batch-of-1
+            batch_0 = collate_grouped([samples[0]])
+            batch_0 = _batch_to_device(batch_0, device)
+
             # Warmup
             with torch.no_grad():
-                _ = model(image_tokens, attention_mask, queries, queries_mask, latent_pos_d)
-            
+                _ = model(batch_0)
+
             # FLOPs
-            image_tokens_2, attention_mask_2, queries_2, queries_mask_2, _, latent_pos_2, _ = samples[1]
-            image_tokens_2 = image_tokens_2.unsqueeze(0).to(device)
-            attention_mask_2 = attention_mask_2.unsqueeze(0).to(device)
-            queries_2 = queries_2.unsqueeze(0).to(device)
-            queries_mask_2 = queries_mask_2.unsqueeze(0).to(device)
-            latent_pos_d = latent_pos_2.unsqueeze(0).to(device)
-            
+            batch_1 = collate_grouped([samples[1]])
+            batch_1 = _batch_to_device(batch_1, device)
+
             try:
                 with torch.no_grad():
-                    flops = FlopCountAnalysis(
-                        model,
-                        (image_tokens_2, attention_mask_2, queries_2, queries_mask_2, latent_pos_d)
-                    )
+                    flops = FlopCountAnalysis(model, (batch_1,))
                     gflops = flops.total() / 1e9
             except Exception as e:
-                print(f"FLOPs measurement failed: {e}")
+                print(f"  FLOPs measurement failed: {e}")
                 gflops = -1
-            
+
             # Inference time
-            num_warmup = 3
-            num_runs = 20
-            
+            num_warmup, num_runs = 3, 20
             with torch.no_grad():
                 for i in range(num_warmup):
-                    img_tok, att_mask, qry, qry_mask, _, lp, _ = samples[i % num_samples]
-                    _ = model(
-                        img_tok.unsqueeze(0).to(device),
-                        att_mask.unsqueeze(0).to(device),
-                        qry.unsqueeze(0).to(device),
-                        qry_mask.unsqueeze(0).to(device),
-                        lp.unsqueeze(0).to(device)
-                    )
-                
+                    b = collate_grouped([samples[i % num_samples]])
+                    b = _batch_to_device(b, device)
+                    _ = model(b)
+
                 torch.cuda.synchronize()
                 start = time.time()
                 for i in range(num_runs):
                     idx = (i + num_warmup) % num_samples
-                    img_tok, att_mask, qry, qry_mask, _, lp, _ = samples[idx]
-                    _ = model(
-                        img_tok.unsqueeze(0).to(device),
-                        att_mask.unsqueeze(0).to(device),
-                        qry.unsqueeze(0).to(device),
-                        qry_mask.unsqueeze(0).to(device),
-                        lp.unsqueeze(0).to(device)
-                    )
+                    b = collate_grouped([samples[idx]])
+                    b = _batch_to_device(b, device)
+                    _ = model(b)
                     torch.cuda.synchronize()
                 end = time.time()
-            
+
             avg_time_ms = (end - start) / num_runs * 1000
-            num_tokens = image_tokens.shape[1]
-        
+
+            # Count tokens from the first group
+            first_res = next(iter(batch_0["groups"]))
+            num_tokens = batch_0["groups"][first_res]["tokens"].shape[1]
+
         results.append({
             "input_size": input_size,
             "gsd_target": 10,
@@ -327,19 +295,20 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
             "gflops": gflops,
             "inference_time_ms": avg_time_ms,
         })
-        
+
+        print(f"  Tokens: {num_tokens}")
         print(f"  GFLOPs: {gflops:.2f}")
         print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
-    
-    # Print summary
-    print("\n" + "="*80)
+
+    # Summary
+    print("\n" + "=" * 80)
     print(f"COMPLEXITY SUMMARY ({config_model['encoder']})")
-    print("="*80)
-    print(f"{'Input':<10} {'GSD':<8} {'GFLOPs':<12} {'Time (ms)':<12}")
-    print("-"*80)
+    print("=" * 80)
+    print(f"{'Input':<10} {'Tokens':<12} {'GFLOPs':<12} {'Time (ms)':<12}")
+    print("-" * 50)
     for r in results:
-        print(f"{r['input_size']:<10} {r['gsd_target']:<8} {r['gflops']:<12.2f} {r['inference_time_ms']:<12.2f}")
-    print("="*80)
+        print(f"{r['input_size']:<10} {r['num_tokens']:<12} {r['gflops']:<12.2f} {r['inference_time_ms']:<12.2f}")
+    print("=" * 80)
 
 # =============================================================================
 # SAVE WANDB RUN ID

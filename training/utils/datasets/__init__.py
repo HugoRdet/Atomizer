@@ -8,3 +8,4 @@ from .utils_dataset import*
 from .utils_dataset_MNIST import*
 from .utils_dataset_TinyBigEarthNet import*
 from .utils_dataset_BURNSCARS import*
+from .utils_dataset_MADOS import*
