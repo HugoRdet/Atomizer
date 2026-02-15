@@ -1,28 +1,31 @@
 """
-Sen1Floods11 Trainer for Atomizer
-=================================
+Sen1Floods11 / MADOS Trainer for Atomizer
+==========================================
 
-Semantic segmentation trainer for flood detection.
-- 2 classes: No Flood (0), Flood (1)
-- Ignore index: 255
+Semantic segmentation trainer with sliding window inference support.
+
+Config:
+    config["trainer"]["slide"]: bool (default False)
+        If True, val/test datasets return sliding window batches.
+        The trainer detects these via batch["sliding"] == True and
+        processes each crop independently, stitching predictions
+        before computing metrics on the full tile.
 
 Token format (8 columns):
     [value, x, y, spectral_idx, label, query_flag, resolution_idx, time_idx]
-     col 0  1  2       3          4        5             6             7
 
-Expects grouped dict batch from dataloader:
-{
-    "groups": {res: {"tokens": [B,N,8], "mask": [B,N], "shape": (C,H,W)}},
-    "queries":      [B, M, 8],
-    "queries_mask":  [B, M],
-    "label":         [B, H, W],
-    "target_resolution": float,
-    "image":         [B, C, H, W],
-}
+Batch format (normal):
+    groups[res]["tokens"]: [B, N, 8]
+    queries:               [B, M, 8]
+    label:                 [B, H, W]
 
-For Sen1Floods11 (single-date optical):
-    - resolution_idx: looked up from GSD via lookup_table
-    - time_idx: 0 (no temporal info available)
+Batch format (sliding window, after collate):
+    groups[res]["tokens"]: [num_crops, N, 8]   ← crops stacked on dim 0
+    queries:               [num_crops, M, 8]
+    label:                 [H, W]              ← full tile, no batch dim
+    crop_positions:        [(y0, x0), ...]
+    crop_size:             (crop_h, crop_w)
+    full_size:             (full_h, full_w)
 """
 
 import torch
@@ -34,10 +37,11 @@ from transformers import get_cosine_schedule_with_warmup
 
 from training.atomiser import Atomiser_Senflood
 from training.atomiser.error_supervision import compute_error_supervision
+from training.utils.datasets.sliding_window import stitch_predictions
 
 
 class Model_SenFlood(pl.LightningModule):
-    def __init__(self, config, wand, name, transform, lookup_table,):
+    def __init__(self, config, wand, name, transform, lookup_table):
         super().__init__()
         self.strict_loading = False
         self.config = config
@@ -45,10 +49,13 @@ class Model_SenFlood(pl.LightningModule):
         self.wand = wand
         self.name = name
         self.lookup_table = lookup_table
-        
+
         self.num_classes = config["trainer"]["num_classes"]
         self.ignore_index = 255
-        
+
+        # Sliding window inference for val/test
+        self.use_sliding = config["trainer"].get("slide", False)
+
         # =====================================================================
         # METRICS
         # =====================================================================
@@ -76,16 +83,16 @@ class Model_SenFlood(pl.LightningModule):
             task="multiclass", num_classes=self.num_classes,
             average=None, ignore_index=self.ignore_index
         )
-        
+
         # =====================================================================
         # MODEL
         # =====================================================================
         self.encoder = Atomiser_Senflood(config=self.config, lookup_table=self.lookup_table)
         self.loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-        
+
         self.lr = float(config["trainer"]["lr"])
         self.weight_decay = float(config["trainer"]["weight_decay"])
-        
+
         # =====================================================================
         # ERROR SUPERVISION (optional)
         # =====================================================================
@@ -94,7 +101,7 @@ class Model_SenFlood(pl.LightningModule):
         self.use_error_supervision = (
             self.use_error_guided_displacement or self.use_gravity_displacement
         )
-        
+
         if self.use_error_supervision:
             self.lambda_error = config["Atomiser"].get("lambda_error", 0.1)
             self.error_grid_size = config["Atomiser"].get("error_grid_size", 7)
@@ -123,14 +130,13 @@ class Model_SenFlood(pl.LightningModule):
         return self.use_error_supervision and self.current_epoch >= self.error_warmup
 
     # =========================================================================
-    # SHARED STEP LOGIC
+    # SHARED STEP LOGIC (normal path)
     # =========================================================================
 
     def _compute_loss_and_preds(self, batch, training=False):
         """
         Run forward, compute loss, return (loss, preds, labels, result).
-        
-        Used by train/val/test steps to avoid duplication.
+        Used by train step and normal (non-sliding) val/test steps.
         """
         supervise_error = self._should_supervise_error() and training
 
@@ -180,6 +186,72 @@ class Model_SenFlood(pl.LightningModule):
         return total_loss, class_loss, preds, labels
 
     # =========================================================================
+    # SLIDING WINDOW INFERENCE
+    # =========================================================================
+
+    def _forward_crop(self, batch, crop_idx):
+        """
+        Run forward on a single crop slice from a sliding window batch.
+
+        Slices crop_idx from the stacked [num_crops, ...] tensors,
+        keeping a batch dim of 1. Returns logits [1, M, C].
+        """
+        mini_batch = {
+            "groups": {},
+            "queries": batch["queries"][crop_idx:crop_idx + 1],
+            "queries_mask": batch["queries_mask"][crop_idx:crop_idx + 1],
+        }
+        for res, grp in batch["groups"].items():
+            mini_batch["groups"][res] = {
+                "tokens": grp["tokens"][crop_idx:crop_idx + 1],
+                "mask": grp["mask"][crop_idx:crop_idx + 1],
+                "shape": grp["shape"],
+            }
+
+        result = self.forward(mini_batch, training=False)
+
+        if isinstance(result, dict):
+            return result["predictions"]  # [1, M, C]
+        return result
+
+    def _sliding_window_step(self, batch):
+        """
+        Process all crops, stitch predictions, compute metrics on full tile.
+
+        Returns:
+            preds_full: [H, W] full-tile prediction (argmax)
+            label_full: [H, W] full-tile label
+        """
+        num_crops = batch["queries"].shape[0]
+
+        
+
+        positions = batch["crop_positions"]
+        crop_h, crop_w = batch["crop_size"]
+        full_h, full_w = batch["full_size"]
+
+        crop_logits_list = []
+
+        for i in range(num_crops):
+            with torch.no_grad():
+                logits = self._forward_crop(batch, i)  # [1, crop_h*crop_w, C]
+            crop_logits_list.append(logits.squeeze(0))  # [crop_h*crop_w, C]
+
+        # Stitch into full tile
+        preds_full, logits_avg = stitch_predictions(
+            crop_logits_list=crop_logits_list,
+            crop_positions=positions,
+            crop_h=crop_h, crop_w=crop_w,
+            full_h=full_h, full_w=full_w,
+            num_classes=self.num_classes,
+        )
+
+        # label: [H, W] (no batch dim from collate)
+        label_full = batch["label"].to(self.device)
+
+        return preds_full, label_full, logits_avg
+
+    # =========================================================================
     # TRAINING / VALIDATION / TEST STEPS
     # =========================================================================
 
@@ -195,16 +267,38 @@ class Model_SenFlood(pl.LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        total_loss, class_loss, preds, labels = self._compute_loss_and_preds(batch, training=False)
+ 
+        
+        # Now run the model
+        output = self.model(batch)
+        
+        # Check if NaN appears after model forward
 
-        self.metric_IoU_val.update(preds, labels)
-        self.metric_acc_val.update(preds, labels)
-
-        self.log("val_loss", class_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
-        return class_loss
+            
+        loss = self.compute_loss(output, batch)
+        
+        
+        return loss
 
     def test_step(self, batch, batch_idx):
+        # ── Sliding window path ─────────────────────────────
+        if batch.get("sliding", False):
+            preds_full, label_full, logits_avg = self._sliding_window_step(batch)
+
+            loss = self.loss(
+                logits_avg.unsqueeze(0),
+                label_full.unsqueeze(0),
+            )
+
+            valid = (label_full != self.ignore_index)
+            if valid.sum() > 0:
+                self.metric_IoU_test.update(preds_full[valid], label_full[valid])
+                self.metric_acc_test.update(preds_full[valid], label_full[valid])
+
+            self.log("test_loss", loss, on_step=False, on_epoch=True, logger=True)
+            return loss
+
+        # ── Normal path ─────────────────────────────────────
         total_loss, class_loss, preds, labels = self._compute_loss_and_preds(batch, training=False)
 
         self.metric_IoU_test.update(preds, labels)
@@ -238,8 +332,10 @@ class Model_SenFlood(pl.LightningModule):
         self.log("test_accuracy", test_acc.mean(), on_epoch=True, logger=True)
 
         for i, name in enumerate(["no_flood", "flood"]):
-            self.log(f"test_IoU_{name}", test_iou[i], on_epoch=True, logger=True)
-            self.log(f"test_acc_{name}", test_acc[i], on_epoch=True, logger=True)
+            if i < len(test_iou):
+                self.log(f"test_IoU_{name}", test_iou[i], on_epoch=True, logger=True)
+            if i < len(test_acc):
+                self.log(f"test_acc_{name}", test_acc[i], on_epoch=True, logger=True)
 
         self.metric_IoU_test.reset()
         self.metric_acc_test.reset()

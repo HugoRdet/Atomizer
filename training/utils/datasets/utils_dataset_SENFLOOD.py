@@ -8,6 +8,7 @@ import einops
 from tqdm import tqdm
 
 from .token_grouping import *
+from .token_builder import TokenBuilder
 
 
 class Sen1Floods11Dataset(Dataset):
@@ -76,6 +77,9 @@ class Sen1Floods11Dataset(Dataset):
         self.split = mode
         self.look_up = look_up
         self.config_model = config_model
+
+        # Initialize TokenBuilder for centralized token construction
+        self.token_builder = TokenBuilder(look_up)
 
         # Config parameters
         self.nb_tokens = config_model["trainer"]["max_tokens"]
@@ -155,12 +159,14 @@ class Sen1Floods11Dataset(Dataset):
         # ── Attention mask ──────────────────────────────────
         attention_mask = torch.zeros(image_tokens.shape[0])
 
-        # ── Subsample queries ───────────────────────────────
+        # ── Subsample queries using TokenBuilder ───────────
+        queries = self.token_builder.subsample_queries(
+            queries,
+            max_queries=self.max_tokens_reconstruction,
+            ignore_index=self.IGNORE_INDEX,
+            prioritize_valid=True,
+        )
         queries_mask = torch.zeros(queries.shape[0])
-        queries, queries_mask = self._shuffle_arrays([queries, queries_mask])
-        nb_queries = self.max_tokens_reconstruction
-        queries = queries[:nb_queries]
-        queries_mask = queries_mask[:nb_queries]
 
         # ── Return grouped format ───────────────────────────
         return {
@@ -179,12 +185,12 @@ class Sen1Floods11Dataset(Dataset):
         }
 
     # =========================================================================
-    # TOKEN BUILDING
+    # TOKEN BUILDING (using centralized TokenBuilder)
     # =========================================================================
 
     def _build_tokens(self, image, label, resolution):
         """
-        Build [N, 8] tokens from image + label.
+        Build [N, 8] tokens from image + label using TokenBuilder.
         
         Token format:
             [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
@@ -202,80 +208,28 @@ class Sen1Floods11Dataset(Dataset):
             image_tokens: [C*H*W, 8]
             queries:      [H*W, 8]   (single band for segmentation)
         """
-        C, H, W = image.shape
+        # Build image tokens using TokenBuilder
+        image_tokens = self.token_builder.build_tokens(
+            image=image,
+            label=label,
+            resolution=resolution,
+            spectral_indices=self.spectral_indices,
+            resolution_idx=self.resolution_idx,
+            time_idx=self.TIME_IDX_NA,
+        )
 
-        # Spectral indices: [C*H*W]
-        spectral_coords = self.spectral_indices.repeat_interleave(H * W)
-
-        # Position coordinates: [C, H, W, 1]
-        x_indices, y_indices = self._get_position_coordinates(image.shape, resolution)
-
-        # Query position indices: [C, H, W, 1]
-        query_indices = self._get_query_coordinates(image.shape, resolution)
-
-        # Expand label: [H, W] → [C, H, W]
-        label_expanded = label.unsqueeze(0).expand(C, -1, -1)
-
-        # Resolution: same for all bands (all at 10m)
-        resolution_col = torch.full((C, H, W, 1), self.resolution_idx, dtype=torch.float32)
-
-        # Time: -1 for all tokens (no temporal info)
-        time_col = torch.full((C, H, W, 1), self.TIME_IDX_NA, dtype=torch.float32)
-
-        # Stack: [C, H, W, 8]
-        image_tokens = torch.cat([
-            image.unsqueeze(-1),                                           # col 0: value
-            x_indices.float(),                                             # col 1: x
-            y_indices.float(),                                             # col 2: y
-            spectral_coords.view(C, H, W, 1).float(),                     # col 3: spectral_idx
-            label_expanded.unsqueeze(-1).float(),                          # col 4: label
-            query_indices.float(),                                         # col 5: query_idx
-            resolution_col,                                                # col 6: resolution_idx
-            time_col,                                                      # col 7: time_idx
-        ], dim=-1)
-
-        # Queries: first band only (for segmentation)
-        queries = image_tokens[0].unsqueeze(0)
-
-        # Flatten
-        image_tokens = einops.rearrange(image_tokens, "c h w f -> (c h w) f")
-        queries = einops.rearrange(queries, "c h w f -> (c h w) f")
+        # Build queries using TokenBuilder
+        # Use first spectral index for queries (segmentation uses single band)
+        first_spectral_idx = self.spectral_indices[0]
+        queries = self.token_builder.build_queries(
+            label=label,
+            resolution=resolution,
+            first_spectral_idx=first_spectral_idx,
+            resolution_idx=self.resolution_idx,
+            time_idx=self.TIME_IDX_NA,
+        )
 
         return image_tokens, queries
-
-    def _get_position_coordinates(self, image_shape, resolution):
-        """Pixel position indices via lookup table → [C, H, W, 1]."""
-        C, H, W = image_shape[0], image_shape[-2], image_shape[-1]
-
-        res_key = int(resolution * 1000)
-        global_offset = self.look_up.table[(res_key, H)]
-
-        y_coords = torch.arange(H)
-        x_coords = torch.arange(W)
-        x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing="xy")
-
-        x_grid = x_grid + global_offset
-        y_grid = y_grid + global_offset
-
-        x_indices = einops.repeat(x_grid, "h w -> c h w 1", c=C)
-        y_indices = einops.repeat(y_grid, "h w -> c h w 1", c=C)
-
-        return x_indices, y_indices
-
-    def _get_query_coordinates(self, image_shape, resolution):
-        """Query position indices via lookup table → [C, H, W, 1]."""
-        C, H, W = image_shape[0], image_shape[-2], image_shape[-1]
-
-        resolution_latents = 10  # m
-        res_key = int(resolution_latents * 1000)
-
-        if (res_key, H) in self.look_up.table_queries:
-            global_offset = self.look_up.table_queries[(res_key, H)]
-        else:
-            res_key = int(resolution * 1000)
-            global_offset = self.look_up.table_queries.get((res_key, H), 0)
-
-        return torch.full((C, H, W, 1), global_offset, dtype=torch.float32)
 
     # =========================================================================
     # FILE LOADING

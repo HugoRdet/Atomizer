@@ -92,8 +92,6 @@ model = Model_SenFlood(
 )
 
 
-
-
 # =============================================================================
 # DATA MODULE
 # =============================================================================
@@ -111,7 +109,6 @@ data_module = UnifiedDataModule(
 )
 
 
-
 # =============================================================================
 # CALLBACKS
 # =============================================================================
@@ -127,7 +124,7 @@ checkpoint_val = ModelCheckpoint(
     verbose=True,
 )
 
-callbacks = [accumulator, checkpoint_val, lr_monitor]
+callbacks = [accumulator, lr_monitor]
 
 # =============================================================================
 # TRAINER
@@ -142,6 +139,7 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
+    #overfit_batches=1
 )
 
 # =============================================================================
@@ -152,7 +150,7 @@ trainer.test(model, datamodule=data_module)
 
 
 # =============================================================================
-# MEASURE COMPLEXITY
+# MEASURE COMPLEXITY (PyTorch Profiler)
 # =============================================================================
 
 def _batch_to_device(batch: dict, device) -> dict:
@@ -169,7 +167,7 @@ def _batch_to_device(batch: dict, device) -> dict:
 
 
 if os.environ.get("LOCAL_RANK", "0") == "0":
-    from fvcore.nn import FlopCountAnalysis
+    from torch.profiler import profile, ProfilerActivity
 
     print("\n" + "=" * 80)
     print("MEASURING MODEL COMPLEXITY (MADOS)")
@@ -185,33 +183,65 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     num_samples = min(25, len(test_dataset))
     samples = [test_dataset[i] for i in range(num_samples)]
 
-    results = []
-
     print(f"\nTesting MADOS (240×240 @ 10m, 120×120 @ 20m, 40×40 @ 60m)")
 
-    # ============= Atomizer: grouped dict batch =============
-    # Collate single sample into batch-of-1
+    # ============= Prepare batch =============
     batch_0 = collate_grouped([samples[0]])
     batch_0 = _batch_to_device(batch_0, device)
 
     # Warmup
     with torch.no_grad():
-        _ = model(batch_0)
+        for i in range(3):
+            b = collate_grouped([samples[i % num_samples]])
+            b = _batch_to_device(b, device)
+            _ = model(b)
+    torch.cuda.synchronize()
 
-    # FLOPs
+    # ============= FLOPs via PyTorch Profiler =============
     batch_1 = collate_grouped([samples[1]])
     batch_1 = _batch_to_device(batch_1, device)
 
+    gflops = -1
     try:
-        with torch.no_grad():
-            flops = FlopCountAnalysis(model, (batch_1,))
-            gflops = flops.total() / 1e9
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            with_flops=True,
+            record_shapes=True,
+        ) as prof:
+            with torch.no_grad():
+                _ = model(batch_1)
+                torch.cuda.synchronize()
+
+        # Print top-20 ops by FLOPs
+        print("\n" + "-" * 80)
+        print("TOP OPERATIONS BY FLOPs:")
+        print("-" * 80)
+        print(prof.key_averages().table(sort_by="flops", row_limit=20))
+
+        # Total FLOPs
+        total_flops = sum(
+            evt.flops for evt in prof.key_averages() if evt.flops is not None and evt.flops > 0
+        )
+        gflops = total_flops / 1e9
+
+        # Breakdown by op type
+        print("\n" + "-" * 80)
+        print("FLOPs BREAKDOWN BY OPERATION TYPE:")
+        print("-" * 80)
+        op_flops = defaultdict(int)
+        for evt in prof.key_averages():
+            if evt.flops is not None and evt.flops > 0:
+                op_flops[evt.key] += evt.flops
+        for op, flops in sorted(op_flops.items(), key=lambda x: -x[1])[:15]:
+            print(f"  {op:50s} {flops/1e9:>10.3f} GFLOPS")
+
     except Exception as e:
         print(f"  FLOPs measurement failed: {e}")
-        gflops = -1
+        import traceback
+        traceback.print_exc()
 
-    # Inference time
-    num_warmup, num_runs = 3, 20
+    # ============= Inference time =============
+    num_warmup, num_runs = 5, 25
     with torch.no_grad():
         for i in range(num_warmup):
             b = collate_grouped([samples[i % num_samples]])
@@ -230,7 +260,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
     avg_time_ms = (end - start) / num_runs * 1000
 
-    # Count tokens across all resolution groups
+    # ============= Token counts =============
     total_tokens = 0
     tokens_per_res = {}
     for res, group in batch_0["groups"].items():
@@ -238,14 +268,11 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         tokens_per_res[res] = n
         total_tokens += n
 
-    results.append({
-        "total_tokens": total_tokens,
-        "tokens_per_res": tokens_per_res,
-        "gflops": gflops,
-        "inference_time_ms": avg_time_ms,
-    })
+    # ============= Parameter count =============
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Summary
+    # ============= Summary =============
     print("\n" + "=" * 80)
     print(f"COMPLEXITY SUMMARY ({config_model['encoder']} — MADOS)")
     print("=" * 80)
@@ -254,8 +281,10 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         n = tokens_per_res[res]
         print(f"    {res:5.1f} m/px: {n:>8,} tokens")
     print(f"    {'Total':>10}: {total_tokens:>8,} tokens")
-    print(f"\n  GFLOPs:         {gflops:.2f}")
+    print(f"\n  Parameters:     {total_params:,} ({trainable_params:,} trainable)")
+    print(f"  GFLOPs:         {gflops:.2f}")
     print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
+    print(f"  Throughput:     {1000/avg_time_ms:.1f} tiles/sec")
     print("=" * 80)
 
 # =============================================================================

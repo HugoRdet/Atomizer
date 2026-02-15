@@ -57,103 +57,173 @@ ABSTRACT_CHANNELS = {
 
 
 class Lookup_encoding(pl.LightningModule):
+    """
+    Lookup table for position, spectral, query, resolution, and time encoding.
+    
+    Uses a reference grid system: instead of registering every crop size,
+    maintains reference grids (e.g., 512×512) from which crops extract windows.
+    """
+    
     def __init__(self, modalities_config, bands_info, config_model):
         super().__init__()
         self.config = modalities_config
         self.bands_info = bands_info
-        self.modalities = None
-        self.table = None
-        self.pixel_coords_table = None
+        self.modalities = []
+        self.table = {}
         self.table_wave = None
-        self.table_queries = None
+        self.table_queries = {}
         self.table_resolution = None
         self.table_time = None
         self.nb_tokens_queries = config_model["Atomiser"]["spatial_latents"]
+        
+        # Track next available offset for dynamic registration
+        self.next_position_offset = 0
+        self.next_query_offset = 0
 
         # Track abstract channels
         self.abstract_channel_indices = {}
 
         self.init_config()
         self.init_lookup_table()
-        self.init_pixel_coords_table()
         self.init_lookup_table_wave()
         self.init_queries_lookup_table()
         self.init_resolution_lookup_table()
         self.init_time_lookup_table()
 
     # =========================================================================
-    # MODALITY CONFIG
+    # MODALITY CONFIG (Reference Grid System)
     # =========================================================================
 
     def init_config(self):
-        modalities = []
-        modalities.append((0.2, 512))
-        modalities.append((10, 512))
-        modalities.append((0.2, 28))
-        modalities.append((30, 512))
-        modalities.append((10, 240))
-        modalities.append((20, 120))
-        modalities.append((60, 40))
-        modalities.append((10, 120))
-        modalities.append((20, 60))
-        modalities.append((60, 20))
+        """
+        Initialize with reference grid sizes.
         
-        self.modalities = modalities
+        These are large grids (typically 512×512) from which crops
+        of any size can extract coordinate windows.
+        """
+        # Reference grid sizes (matching TokenBuilder.REFERENCE_SIZES)
+        reference_modalities = [
+            (0.2, 512),   # VHR imagery
+            (10.0, 512),  # Sentinel-2/Sentinel-1 at 10m
+            (20.0, 512),  # Sentinel-2 at 20m
+            (30.0, 512),  # Landsat at 30m
+            (60.0, 512),  # Sentinel-2 at 60m
+        ]
+        
+        self.modalities = reference_modalities
+        print(f"[Lookup] Configured {len(reference_modalities)} reference grids")
 
     # =========================================================================
     # POSITION LOOKUP
     # =========================================================================
 
     def init_lookup_table(self):
-        table = dict()
+        """Build initial lookup table from reference grids."""
+        table = {}
         idx_torch_array = 0
-        for couple in self.modalities:
-            resolution, size = couple
+        
+        for resolution, size in self.modalities:
             res_key = int(resolution * 1000)
             table[(res_key, size)] = idx_torch_array
             idx_torch_array += size
+        
         self.table = table
+        self.next_position_offset = idx_torch_array
+        
+        print(f"[Lookup] Position table: {len(table)} reference grids")
+        for (res_key, size), offset in sorted(table.items()):
+            gsd = res_key / 1000
+            print(f"  {gsd:>8.1f} m/px × {size:4d}px → offset {offset:6d}")
 
-    def init_pixel_coords_table(self):
-        coords_table = dict()
-        for resolution, size in self.modalities:
-            res_key = int(resolution * 1000)
-            grid_y, grid_x = torch.meshgrid(
-                torch.arange(size, dtype=torch.float32),
-                torch.arange(size, dtype=torch.float32),
-                indexing='ij',
-            )
-            coords = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)
-            coords_table[(res_key, size)] = coords
-        self.pixel_coords_table = coords_table
-
-    def get_pixel_coords(self, resolution, size):
+    def register_modality(self, resolution: float, size: int):
+        """
+        Register a new (resolution, size) modality.
+        Idempotent: does nothing if already registered.
+        
+        Args:
+            resolution: GSD in m/px
+            size: Reference grid size in pixels
+        
+        Returns:
+            offset: Position encoding offset for this modality
+        """
         res_key = int(resolution * 1000)
         key = (res_key, size)
-        if key not in self.pixel_coords_table:
-            raise ValueError(f"Coords for resolution {resolution} and size {size} not found.")
-        return self.pixel_coords_table[key]
+        
+        if key in self.table:
+            return self.table[key]
+        
+        # Add new position entry
+        offset = self.next_position_offset
+        self.table[key] = offset
+        self.next_position_offset += size
+        
+        # Add to modalities list
+        self.modalities.append((resolution, size))
+        
+        # Create query offset
+        self.table_queries[key] = self.next_query_offset
+        self.next_query_offset += self.nb_tokens_queries
+        
+        gsd = resolution
+        print(f"[Lookup] Registered modality: {gsd:>8.1f} m/px × {size:4d}px → "
+              f"position offset {offset:6d}, query offset {self.table_queries[key]:6d}")
+        
+        return offset
 
-    def get_grid_pos(self, resolution, size):
-        res_key = int(resolution * 1000)
-        key = (res_key, size)
-        if key not in self.table:
-            raise ValueError(f"Resolution {res_key} and size {size} not found.")
-        idx = self.table[key]
-        return torch.arange(idx, idx + size, dtype=torch.float32)
+    def get_or_register_modality(self, resolution: float, size: int) -> int:
+        """
+        Get offset for (resolution, size), registering if needed.
+        
+        This is the main entry point for TokenBuilder.
+        
+        Args:
+            resolution: GSD in m/px
+            size: Reference grid size (e.g., 512)
+        
+        Returns:
+            offset: Position encoding offset
+        """
+        return self.register_modality(resolution, size)
 
     # =========================================================================
     # QUERY LOOKUP
     # =========================================================================
 
     def init_queries_lookup_table(self):
-        table = dict()
+        """Build initial query lookup table."""
+        table = {}
         idx_torch_array = 0
+        
         for resolution, size in self.modalities:
             res_key = int(resolution * 1000)
             table[(res_key, size)] = idx_torch_array
             idx_torch_array += self.nb_tokens_queries
+        
         self.table_queries = table
+        self.next_query_offset = idx_torch_array
+        
+        print(f"[Lookup] Query table: {len(table)} entries ({self.nb_tokens_queries} slots each)")
+
+    def get_query_offset(self, resolution: float, size: int) -> int:
+        """
+        Get query offset for a modality (auto-registers if needed).
+        
+        Args:
+            resolution: GSD in m/px
+            size: Reference grid size
+        
+        Returns:
+            offset: Query encoding offset
+        """
+        res_key = int(resolution * 1000)
+        key = (res_key, size)
+        
+        if key not in self.table_queries:
+            # Auto-register
+            self.register_modality(resolution, size)
+        
+        return self.table_queries[key]
 
     # =========================================================================
     # WAVELENGTH / SPECTRAL LOOKUP
@@ -178,6 +248,7 @@ class Lookup_encoding(pl.LightningModule):
                 if key not in table:
                     table[key] = idx_torch_array
 
+                    # Track abstract channels
                     if bandwidth < 0 or central_wavelength < 0:
                         for name, info in ABSTRACT_CHANNELS.items():
                             if (info["bandwidth"] == int(bandwidth)
@@ -191,7 +262,7 @@ class Lookup_encoding(pl.LightningModule):
 
         n_physical = sum(1 for k in table if k[1] >= 0)
         n_abstract = sum(1 for k in table if k[1] < 0)
-        print(f"[Lookup] table_wave: {len(table)} entries "
+        print(f"[Lookup] Wavelength table: {len(table)} entries "
               f"({n_physical} physical, {n_abstract} abstract)")
         if self.abstract_channel_indices:
             print(f"[Lookup] Abstract channels: {self.abstract_channel_indices}")
@@ -225,7 +296,7 @@ class Lookup_encoding(pl.LightningModule):
         self.table_resolution = table
         self.num_resolution_indices = idx  # total count (including index 0)
 
-        print(f"[Lookup] table_resolution: {len(table)} optical entries + "
+        print(f"[Lookup] Resolution table: {len(table)} optical entries + "
               f"1 learned (idx=0). Total = {self.num_resolution_indices}")
         for res_key, res_idx in sorted(table.items()):
             gsd = res_key / 1000
@@ -283,7 +354,7 @@ class Lookup_encoding(pl.LightningModule):
         self.table_time = dict()
         self.num_time_indices = 1  # index 0 reserved for learned
 
-        print(f"[Lookup] table_time: initialized (idx=0 reserved for learned/no-time)")
+        print(f"[Lookup] Time table: initialized (idx=0 reserved for learned/no-time)")
 
     def get_time_idx(self, time_key) -> int:
         """
@@ -387,18 +458,20 @@ class Lookup_encoding(pl.LightningModule):
     # =========================================================================
 
     def print_summary(self):
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("LOOKUP TABLE SUMMARY")
-        print("=" * 60)
-        print(f"  Position modalities:  {len(self.modalities)}")
+        print("=" * 70)
+        print(f"  Position modalities:  {len(self.modalities)} (reference grids)")
         print(f"  Spectral entries:     {len(self.table_wave)}")
         print(f"  Resolution entries:   {self.num_resolution_indices} "
               f"(1 learned + {self.num_resolution_indices - 1} optical)")
         print(f"  Time entries:         {self.num_time_indices} "
               f"(1 learned + {self.num_time_indices - 1} registered)")
         if self.abstract_channel_indices:
-            print(f"  Abstract channels:    {self.abstract_channel_indices}")
-        print("=" * 60 + "\n")
+            print(f"  Abstract channels:    {list(self.abstract_channel_indices.keys())}")
+        print(f"  Next position offset: {self.next_position_offset}")
+        print(f"  Next query offset:    {self.next_query_offset}")
+        print("=" * 70 + "\n")
 
 
 # =============================================================================

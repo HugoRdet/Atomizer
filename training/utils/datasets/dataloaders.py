@@ -7,6 +7,12 @@ Supports:
 - MNISTSparseCanvas (in-memory MNIST)
 - Sen1Floods11Dataset (grouped token format)
 - HLSBurnScarsDataset (grouped token format)
+- MADOSDataset (grouped token format, with sliding window)
+
+Sliding window:
+    When config_model["trainer"]["slide"] is True, val/test batch_size
+    is forced to 1 (required by the collate for variable-length crop lists).
+    Train batch_size is unaffected.
 """
 
 import h5py
@@ -112,13 +118,19 @@ class UnifiedDataModule(pl.LightningDataModule):
     Dataset types:
     - 'h5':      HDF5-based (Tiny_BigEarthNet, FLAIR_MAE) — h5 worker init
     - 'simple':  In-memory (MNISTSparseCanvas) — no special init
-    - 'grouped': Grouped token format (Sen1Floods11, HLSBurnScars) — 
+    - 'grouped': Grouped token format (Sen1Floods11, HLSBurnScars, MADOS) — 
                  custom collate_fn for nested dict output
+
+    Batch sizes (from config_model["trainer"]):
+    - train_batch_size: training batch size (default: falls back to batch_size param)
+    - val_batch_size:   validation batch size (default: same as train)
+    - test_batch_size:  test batch size (default: same as val)
+    - When slide=True in config, val/test batch_size is forced to 1.
     """
     
     H5_DATASET_CLASSES = {'Tiny_BigEarthNet', 'FLAIR_MAE', 'FLAIR_2'}
     SIMPLE_DATASET_CLASSES = {'MNISTSparseCanvas'}
-    GROUPED_DATASET_CLASSES = {'Sen1Floods11Dataset', 'HLSBurnScarsDataset','MADOSDataset'}
+    GROUPED_DATASET_CLASSES = {'Sen1Floods11Dataset', 'HLSBurnScarsDataset', 'MADOSDataset', 'Sen1Floods11MultiResDataset'}
     
     def __init__(
         self,
@@ -145,7 +157,6 @@ class UnifiedDataModule(pl.LightningDataModule):
         super().__init__()
         
         # Common params
-        self.batch_size = batch_size
         self.num_workers = num_workers
         self.trans_modalities = trans_modalities
         self.model = model
@@ -157,6 +168,19 @@ class UnifiedDataModule(pl.LightningDataModule):
         
         # Determine dataset type early (needed for path setup)
         self._dataset_type = self._get_dataset_type()
+
+        # ── Batch sizes (from config, with fallbacks) ──────
+        trainer_cfg = (config_model or {}).get("trainer", {})
+        self.use_sliding = trainer_cfg.get("slide", False)
+
+        self.batch_size_train = trainer_cfg.get("train_batch_size", batch_size)
+        self.batch_size_val = trainer_cfg.get("val_batch_size", self.batch_size_train)
+        self.batch_size_test = trainer_cfg.get("test_batch_size", self.batch_size_val)
+
+        if self.use_sliding:
+            # Sliding window requires batch_size=1 for val/test
+            self.batch_size_val = 1
+            self.batch_size_test = 1
         
         # Path setup depends on dataset type
         self.path = path
@@ -307,7 +331,7 @@ class UnifiedDataModule(pl.LightningDataModule):
     # DATALOADERS
     # =========================================================================
     
-    def _make_dataloader(self, dataset, shuffle=False, prefetch_factor=2):
+    def _make_dataloader(self, dataset, batch_size, shuffle=False, prefetch_factor=2):
         """Create a DataLoader with the right collate/worker config."""
         worker_init_fn = self._get_worker_init_fn()
         collate_fn = self._get_collate_fn()
@@ -315,14 +339,17 @@ class UnifiedDataModule(pl.LightningDataModule):
         num_workers = self.num_workers
         if self._dataset_type == 'simple' and num_workers > 4:
             num_workers = 4
+
+        # pin_memory doesn't work well with nested dicts in sliding window
+        pin_memory = not (self.use_sliding and batch_size == 1)
         
         return DataLoader(
             dataset,
             num_workers=num_workers,
             worker_init_fn=worker_init_fn,
             collate_fn=collate_fn,
-            pin_memory=True,
-            batch_size=self.batch_size,
+            pin_memory=pin_memory,
+            batch_size=batch_size,
             shuffle=shuffle,
             prefetch_factor=prefetch_factor,
             persistent_workers=True if num_workers > 0 else False,
@@ -333,30 +360,47 @@ class UnifiedDataModule(pl.LightningDataModule):
             self.modality = "train"
         
         rank = dist.get_rank() if dist.is_initialized() else 0
-        print(f"Train DataLoader created on rank: {rank}")
+        print(f"Train DataLoader created on rank: {rank}, batch_size={self.batch_size_train}")
         
         pf = 8 if self._dataset_type == 'h5' else 2
-        return self._make_dataloader(self.train_dataset, shuffle=True, prefetch_factor=pf)
+        return self._make_dataloader(
+            self.train_dataset,
+            batch_size=self.batch_size_train,
+            shuffle=True,
+            prefetch_factor=pf,
+        )
 
     def val_dataloader(self):
         if self.modality is None:
             self.modality = "validation"
         
         rank = dist.get_rank() if dist.is_initialized() else 0
-        print(f"Validation DataLoader created on rank: {rank}")
+        print(f"Validation DataLoader created on rank: {rank}, batch_size={self.batch_size_val}"
+              f"{' (sliding window)' if self.use_sliding else ''}")
         
         pf = 8 if self._dataset_type == 'h5' else 2
-        return self._make_dataloader(self.val_dataset, shuffle=False, prefetch_factor=pf)
+        return self._make_dataloader(
+            self.val_dataset,
+            batch_size=self.batch_size_val,
+            shuffle=False,
+            prefetch_factor=pf,
+        )
 
     def test_dataloader(self):
         if self.modality is None:
             self.modality = "test"
         
         rank = dist.get_rank() if dist.is_initialized() else 0
-        print(f"Test DataLoader created on rank: {rank}")
+        print(f"Test DataLoader created on rank: {rank}, batch_size={self.batch_size_test}"
+              f"{' (sliding window)' if self.use_sliding else ''}")
         
         pf = 4 if self._dataset_type == 'h5' else 2
-        return self._make_dataloader(self.test_dataset, shuffle=False, prefetch_factor=pf)
+        return self._make_dataloader(
+            self.test_dataset,
+            batch_size=self.batch_size_test,
+            shuffle=False,
+            prefetch_factor=pf,
+        )
 
 
 # Backward compatibility alias

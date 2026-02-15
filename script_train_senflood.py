@@ -39,6 +39,7 @@ from training.utils import Lookup_encoding
 # v2 classes (grouped token format)
 from training.trainer_SENFLOOD import Model_SenFlood
 from training.utils.datasets.utils_dataset_SENFLOOD import Sen1Floods11Dataset
+from training.utils.datasets.utils_dataset_SENFLOOD_MULTIRES import Sen1Floods11MultiResDataset
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.token_grouping import collate_grouped
 

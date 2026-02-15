@@ -213,3 +213,113 @@ __pycache__/
 *.pyc
 *.cp
 *.pt
+
+# PASTIS-HD Dataset
+PASTIS-HD/
+pastis-hd/
+pastis_hd/
+
+# Data directories
+data/
+datasets/
+*.h5
+*.hdf5
+*.arrow
+*.parquet
+
+# HuggingFace cache
+.cache/
+cache/
+huggingface/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+checkpoint/
+checkpoints/
+*.safetensors
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Model outputs
+outputs/
+runs/
+logs/
+tensorboard/
+wandb/
+mlruns/
+
+# Large data files
+*.tif
+*.tiff
+*.geotiff
+*.nc
+*.nc4
+*.zarr
+
+# Compressed files (if they contain datasets)
+*.zip
+*.tar.gz
+*.tar
+*.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Environment
+.env
+.env.local
+
+
+
+
