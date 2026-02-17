@@ -1,61 +1,31 @@
 """
-Grouped token utilities for Atomizer datasets.
+Token grouping utilities: collate and grid configuration.
 
-Return contract from __getitem__ (normal):
-{
-    "groups": {
-        <resolution_m>: {
-            "tokens":  [N, 8]   — [value, x, y, spectral_idx, label, query_idx, res_idx, time_idx]
-            "mask":    [N]      — 0.0 = valid, 1.0 = ignore
-            "shape":   (C, H, W)
+Handles the grouped-token batch format:
+    batch = {
+        "groups": {
+            res: {
+                "tokens": [B, N_max, 8],   # padded across batch
+                "mask":   [B, N_max],       # bool, True=padded
+                "shape":  (H, W) or (C, H, W),  # spatial geometry
+            },
         },
-        ...  # one entry per native resolution
-    },
-    "queries":           [M, 8]   — sub-sampled query tokens
-    "queries_mask":      [M]
-    "label":             [H, W]   — at target resolution
-    "target_resolution": float    — resolution of the label grid (meters)
-    "image":             [C, H, W] — raw normalized image for visualization
-}
+        "queries":           [B, M_max, 8],
+        "queries_mask":      [B, M_max],
+        "label":             [B, H, W],
+        "target_resolution": float,
+        "metadata":          {...},
+    }
 
-Return contract from __getitem__ (sliding window, val/test):
-{
-    "sliding":           True
-    "crops": [
-        {"groups": {...}, "queries": [M, 8], "queries_mask": [M]},
-        ...  # one per sliding window crop
-    ],
-    "crop_positions":    [(y0, x0), ...]   — at 10m
-    "crop_size":         (crop_h, crop_w)  — at 10m
-    "full_size":         (full_h, full_w)  — at 10m
-    "label":             [H, W]            — full tile
-    "target_resolution": float
-    "image":             [C, H, W]         — full tile
-}
+Token format:
+    [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
+     col 0  1  2       3          4        5            6            7
 
-After collate_grouped, sliding samples become:
-{
-    "sliding":           True
-    "groups": {
-        <res>: {
-            "tokens":  [num_crops, N, 8]   — sliding dim replaces batch dim
-            "mask":    [num_crops, N]
-            "shape":   (C, H, W)
-        },
-    },
-    "queries":           [num_crops, M, 8]
-    "queries_mask":      [num_crops, M]
-    "crop_positions":    [(y0, x0), ...]
-    "crop_size":         (crop_h, crop_w)
-    "full_size":         (full_h, full_w)
-    "label":             [H, W]             — NOT batched (single tile)
-    "target_resolution": float
-    "image":             [C, H, W]          — NOT batched
-}
-
-The val/test step can then iterate over dim 0 of groups/queries,
-treating each slice as a B=1 mini-batch.
+All tokens are flat — no temporal dimension. Temporal info is in column 7.
 """
+
+import math
+from collections import defaultdict
 
 import torch
 
@@ -64,146 +34,205 @@ import torch
 # COLLATE
 # =============================================================================
 
-def collate_grouped(batch: list[dict]) -> dict:
+def collate_grouped(batch: list) -> dict:
     """
-    Collate a batch of grouped-format samples.
+    Collate a list of samples into a batched dict.
 
-    Two modes:
-    1. Normal (train): all samples have same shape → stack into [B, ...].
-    2. Sliding window (val/test): batch_size=1, sample contains a list of
-       crops. Stack crops along dim 0 → [num_crops, ...]. Metadata (label,
-       image, positions) is kept as-is (single tile).
+    Each sample has:
+        groups[res]["tokens"]: [N_i, 8]   — flat tokens (variable N across samples)
+        groups[res]["mask"]:   [N_i]      — bool
+        groups[res]["shape"]:  tuple      — spatial geometry
 
-    The downstream code sees the same tensor shapes in both cases:
-      groups[res]["tokens"] is [B_or_crops, N, 8]
-      queries is [B_or_crops, M, 8]
-    So the encoder/decoder can process them identically.
+    Output:
+        groups[res]["tokens"]: [B, N_max, 8]  — zero-padded
+        groups[res]["mask"]:   [B, N_max]     — True for padded positions
+        groups[res]["shape"]:  tuple          — from first sample (assumed constant)
+
+    Queries, labels, etc. are similarly padded and stacked.
     """
+    B = len(batch)
 
-    # ── Sliding window path ─────────────────────────────────
-    if batch[0].get("sliding", False):
-        assert len(batch) == 1, (
-            f"Sliding window requires batch_size=1, got {len(batch)}"
-        )
-        return _collate_sliding(batch[0])
+    # ── Collect all resolution keys ─────────────────────────
+    all_resolutions = set()
+    for sample in batch:
+        all_resolutions.update(sample["groups"].keys())
 
-    # ── Normal path (training) ──────────────────────────────
-    return _collate_normal(batch)
-
-
-def _collate_normal(batch: list[dict]) -> dict:
-    """Stack normal samples along batch dimension."""
-    all_resolutions = list(batch[0]["groups"].keys())
-
+    # ── Build groups ────────────────────────────────────────
     groups = {}
-    for res in all_resolutions:
+    for res in sorted(all_resolutions):
+        # Gather per-sample tokens and masks for this resolution
+        sample_tokens = []
+        sample_masks = []
+        shape = None
+
+        for sample in batch:
+            if res in sample["groups"]:
+                g = sample["groups"][res]
+                sample_tokens.append(g["tokens"])   # [N_i, 8]
+                sample_masks.append(g["mask"])       # [N_i] bool
+                if shape is None:
+                    shape = g["shape"]
+            else:
+                # Sample doesn't have this resolution — will be fully masked
+                sample_tokens.append(torch.zeros(0, 8))
+                sample_masks.append(torch.zeros(0, dtype=torch.bool))
+
+        # Find max N across batch
+        N_max = max(t.shape[0] for t in sample_tokens)
+        N_max = max(N_max, 1)  # at least 1 token
+
+        # Pad and stack
+        padded_tokens = []
+        padded_masks = []
+        for tokens, mask in zip(sample_tokens, sample_masks):
+            n = tokens.shape[0]
+            if n < N_max:
+                pad_t = torch.zeros(N_max - n, 8, dtype=tokens.dtype)
+                pad_m = torch.ones(N_max - n, dtype=torch.bool)
+                padded_tokens.append(torch.cat([tokens, pad_t], dim=0))
+                padded_masks.append(torch.cat([mask, pad_m], dim=0))
+            else:
+                padded_tokens.append(tokens)
+                padded_masks.append(mask)
+
         groups[res] = {
-            "tokens": torch.stack([s["groups"][res]["tokens"] for s in batch]),
-            "mask":   torch.stack([s["groups"][res]["mask"] for s in batch]),
-            "shape":  batch[0]["groups"][res]["shape"],
+            "tokens": torch.stack(padded_tokens, dim=0),  # [B, N_max, 8]
+            "mask": torch.stack(padded_masks, dim=0),      # [B, N_max] bool
+            "shape": shape,                                 # tuple, from first sample
         }
 
-    return {
-        "groups":            groups,
-        "queries":           torch.stack([s["queries"] for s in batch]),
-        "queries_mask":      torch.stack([s["queries_mask"] for s in batch]),
-        "label":             torch.stack([s["label"] for s in batch]),
-        "target_resolution": batch[0]["target_resolution"],
-        "image":             torch.stack([s["image"] for s in batch]),
+    # ── Queries ─────────────────────────────────────────────
+    query_list = [s["queries"] for s in batch]
+    qmask_list = [s["queries_mask"] for s in batch]
+    M_max = max(q.shape[0] for q in query_list)
+
+    padded_queries = []
+    padded_qmasks = []
+    for q, qm in zip(query_list, qmask_list):
+        m = q.shape[0]
+        if m < M_max:
+            pad_q = torch.zeros(M_max - m, 8, dtype=q.dtype)
+            pad_m = torch.ones(M_max - m, dtype=torch.bool)
+            padded_queries.append(torch.cat([q, pad_q], dim=0))
+            padded_qmasks.append(torch.cat([qm, pad_m], dim=0))
+        else:
+            padded_queries.append(q)
+            padded_qmasks.append(qm)
+
+    # ── Labels ──────────────────────────────────────────────
+    labels = torch.stack([s["label"] for s in batch], dim=0)  # [B, H, W]
+
+    # ── Metadata ────────────────────────────────────────────
+    target_resolution = batch[0]["target_resolution"]
+
+    result = {
+        "groups": groups,
+        "queries": torch.stack(padded_queries, dim=0),       # [B, M_max, 8]
+        "queries_mask": torch.stack(padded_qmasks, dim=0),   # [B, M_max] bool
+        "label": labels,                                      # [B, H, W]
+        "target_resolution": target_resolution,
     }
 
+    # Pass through optional keys
+    if "image" in batch[0]:
+        result["image"] = torch.stack([s["image"] for s in batch], dim=0)
 
-def _collate_sliding(sample: dict) -> dict:
-    """
-    Collate a single sliding-window sample.
-
-    Stacks the list of crop dicts into tensors where dim 0 = num_crops.
-    This makes the output shape-compatible with the normal collated batch
-    (dim 0 is just num_crops instead of batch_size).
-    """
-    crops = sample["crops"]
-    num_crops = len(crops)
-    all_resolutions = list(crops[0]["groups"].keys())
-
-    # Stack crop tokens along dim 0 → [num_crops, N, 8]
-    groups = {}
-    for res in all_resolutions:
-        groups[res] = {
-            "tokens": torch.stack([c["groups"][res]["tokens"] for c in crops]),
-            "mask":   torch.stack([c["groups"][res]["mask"] for c in crops]),
-            "shape":  crops[0]["groups"][res]["shape"],
-        }
-
-    return {
-        "sliding":           True,
-        "groups":            groups,
-        "queries":           torch.stack([c["queries"] for c in crops]),
-        "queries_mask":      torch.stack([c["queries_mask"] for c in crops]),
-        # ── Per-tile metadata (NOT stacked) ──
-        "crop_positions":    sample["crop_positions"],
-        "crop_size":         sample["crop_size"],
-        "full_size":         sample["full_size"],
-        "label":             sample["label"],
-        "target_resolution": sample["target_resolution"],
-        "image":             sample["image"],
-    }
+    return result
 
 
 # =============================================================================
-# LATENT GRID CONFIG (computed from data, not from yaml)
+# GRID CONFIGURATION
 # =============================================================================
 
 def compute_grid_config(
     resolution: float,
     shape: tuple,
-    pixels_per_latent: int = 50,
+    tokens_per_latent: int = 2000,
+    total_tokens: int = None,
     sigma_factor: float = 1.5,
     max_k: int = 2000,
-    hexagonal: bool = False,
 ) -> dict:
     """
-    Derive latent grid parameters from resolution + image shape.
+    Compute latent grid configuration from total token count.
 
-    The ONLY tunable hyperparameter is pixels_per_latent:
-      - pixels_per_latent=50, image=512×512 → 10×10 latent grid
-      - pixels_per_latent=50, image=120×120 → 2×2  latent grid
-      - pixels_per_latent=50, image=60×60   → 1×1  latent grid
+    The grid is sized by dividing the total number of tokens by
+    tokens_per_latent, then arranging latents on a spatial grid
+    preserving the image's aspect ratio.
 
-    Everything else (sigma, k, span) follows automatically.
+    This replaces the old pixels_per_latent approach, which only
+    counted spatial pixels and required temporal chunking.
+
+    Args:
+        resolution:        Ground sampling distance (m/px)
+        shape:             Spatial geometry — (H, W) or (C, H, W)
+        tokens_per_latent: Target token budget per latent
+        total_tokens:      Actual token count from groups[res]["tokens"].shape[1]
+        sigma_factor:      Multiplier for geographic attention sigma
+        max_k:             Maximum tokens per latent in geographic pruning
+
+    Returns:
+        dict with grid parameters:
+            latents_x, latents_y, L_spatial,
+            span_x, span_y,
+            geo_k, geo_sigma,
+            train_k, val_k,
+            tokens_per_latent, total_tokens
+
+    Example:
+        PASTIS 128x128, 10 S2 bands × 10 timesteps + 3 S1 bands × 10 timesteps
+        = 128 * 128 * (100 + 30) = 2,129,920 tokens
+        tokens_per_latent = 2000 → ~1065 latents → ~33x33 grid
     """
-    C, H, W = shape
+    # Extract spatial dims from shape
+    if len(shape) == 2:
+        H, W = shape
+    elif len(shape) == 3:
+        _, H, W = shape
+    else:
+        raise ValueError(f"Expected shape (H,W) or (C,H,W), got {shape}")
 
-    latents_x = max(1, round(W / pixels_per_latent))
-    latents_y = max(1, round(H / pixels_per_latent))
+    if total_tokens is None:
+        raise ValueError("total_tokens must be provided (from tokens.shape[1])")
 
+    # Number of latents from token budget
+    num_latents = max(1, total_tokens // tokens_per_latent)
+
+    # Arrange on spatial grid preserving aspect ratio
+    aspect = W / H
+    latents_y = max(1, int(math.sqrt(num_latents / aspect)))
+    latents_x = max(1, int(latents_y * aspect))
+
+    # Grow grid to reach target count
+    while latents_x * latents_y < num_latents:
+        if latents_x / latents_y < aspect:
+            latents_x += 1
+        else:
+            latents_y += 1
+
+    L_spatial = latents_x * latents_y
+
+    # Physical span (meters)
     span_x = W * resolution
     span_y = H * resolution
 
+    # Sigma from cell size
     cell_x_m = span_x / latents_x
     cell_y_m = span_y / latents_y
-    cell_m = max(cell_x_m, cell_y_m)
+    geo_sigma = sigma_factor * max(cell_x_m, cell_y_m) / 2.0
 
-    geo_sigma = cell_m * sigma_factor
-
-    total_tokens = C * H * W
-    tokens_per_latent = total_tokens / (latents_x * latents_y)
-    geo_k = min(int(tokens_per_latent * 2), max_k)
-
-    train_k = min(500, geo_k)
-    val_k = min(1000, geo_k)
+    # geo_k bounded by tokens_per_latent and max_k
+    geo_k = min(max_k, tokens_per_latent)
 
     return {
         "latents_x": latents_x,
         "latents_y": latents_y,
-        "L_spatial": latents_x * latents_y,
-        "geo_sigma": geo_sigma,
-        "geo_k": geo_k,
-        "train_k": train_k,
-        "val_k": val_k,
+        "L_spatial": L_spatial,
         "span_x": span_x,
         "span_y": span_y,
-        "cell_size_m": cell_m,
-        "resolution": resolution,
-        "pixels_per_latent": pixels_per_latent,
-        "hexagonal": hexagonal,
+        "geo_k": geo_k,
+        "geo_sigma": geo_sigma,
+        "train_k": min(500, geo_k),
+        "val_k": min(1000, geo_k),
+        "tokens_per_latent": tokens_per_latent,
+        "total_tokens": total_tokens,
     }

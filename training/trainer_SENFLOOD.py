@@ -221,10 +221,9 @@ class Model_SenFlood(pl.LightningModule):
         Returns:
             preds_full: [H, W] full-tile prediction (argmax)
             label_full: [H, W] full-tile label
+            logits_avg: [H*W, C] averaged logits
         """
         num_crops = batch["queries"].shape[0]
-
-        
 
         positions = batch["crop_positions"]
         crop_h, crop_w = batch["crop_size"]
@@ -256,7 +255,9 @@ class Model_SenFlood(pl.LightningModule):
     # =========================================================================
 
     def training_step(self, batch, batch_idx):
-        total_loss, class_loss, preds, labels = self._compute_loss_and_preds(batch, training=True)
+        total_loss, class_loss, preds, labels = self._compute_loss_and_preds(
+            batch, training=True
+        )
 
         self.metric_IoU_train.update(preds, labels)
         self.metric_acc_train.update(preds, labels)
@@ -267,21 +268,177 @@ class Model_SenFlood(pl.LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
- 
-        
-        # Now run the model
-        output = self.model(batch)
-        
-        # Check if NaN appears after model forward
+        # ── Sliding window path ─────────────────────────────
+        if batch.get("sliding", False):
+            preds_full, label_full, logits_avg = self._sliding_window_step(batch)
 
-            
-        loss = self.compute_loss(output, batch)
-        
-        
-        return loss
+            loss = self.loss(
+                logits_avg.unsqueeze(0),
+                label_full.unsqueeze(0),
+            )
+
+            valid = (label_full != self.ignore_index)
+            if valid.sum() > 0:
+                self.metric_IoU_val.update(preds_full[valid], label_full[valid])
+                self.metric_acc_val.update(preds_full[valid], label_full[valid])
+
+            self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            return loss
+
+        # ── Normal path ─────────────────────────────────────
+        total_loss, class_loss, preds, labels = self._compute_loss_and_preds(batch, training=False)
+
+        self.metric_IoU_val.update(preds, labels)
+        self.metric_acc_val.update(preds, labels)
+
+        self.log("val_loss", class_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        return class_loss
 
     def test_step(self, batch, batch_idx):
-        # ── Sliding window path ─────────────────────────────
+        """Modified test_step with debugging for first batch."""
+        
+        # ═════════════════════════════════════════════════════════════════════
+        # DEBUG BLOCK - ONLY FOR FIRST BATCH
+        # ═════════════════════════════════════════════════════════════════════
+        if batch_idx == 0:
+            print("\n" + "="*70)
+            print("🔍 TEST DEBUG - BATCH 0")
+            print("="*70)
+            
+            # ─────────────────────────────────────────────────────────────────
+            # 1. Check sliding window
+            # ─────────────────────────────────────────────────────────────────
+            is_sliding = batch.get("sliding", False)
+            print(f"\n[1] Sliding window: {is_sliding}")
+            
+            if is_sliding:
+                print("  ⚠️  Test is using SLIDING WINDOW")
+                print("  Is validation also using sliding window?")
+            
+            # ─────────────────────────────────────────────────────────────────
+            # 2. Check labels
+            # ─────────────────────────────────────────────────────────────────
+            print(f"\n[2] Labels:")
+            labels = batch["queries"][:, :, 4].long()  # Column 4 = labels
+            print(f"  Shape: {labels.shape}")
+            print(f"  Unique values: {torch.unique(labels).tolist()}")
+            
+            # Distribution
+            for cls in range(self.num_classes):
+                count = (labels == cls).sum().item()
+                pct = 100 * count / labels.numel()
+                print(f"  Class {cls}: {count} ({pct:.1f}%)")
+            
+            ignore_count = (labels == self.ignore_index).sum().item()
+            ignore_pct = 100 * ignore_count / labels.numel()
+            print(f"  Ignore (255): {ignore_count} ({ignore_pct:.1f}%)")
+            
+            if ignore_pct > 80:
+                print(f"  ⚠️  WARNING: {ignore_pct:.1f}% of pixels are IGNORED!")
+                print(f"  This will tank your metrics!")
+            
+            # ─────────────────────────────────────────────────────────────────
+            # 3. Run forward and check predictions
+            # ─────────────────────────────────────────────────────────────────
+            print(f"\n[3] Forward pass:")
+            
+            if not is_sliding:
+                with torch.no_grad():
+                    result = self.forward(batch, training=False)
+                
+                if isinstance(result, dict):
+                    y_hat = result["predictions"]
+                else:
+                    y_hat = result
+                
+                preds = torch.argmax(y_hat, dim=-1)
+                
+                print(f"  Predictions shape: {preds.shape}")
+                print(f"  Unique predictions: {torch.unique(preds).tolist()}")
+                
+                # Distribution
+                for cls in range(self.num_classes):
+                    count = (preds == cls).sum().item()
+                    pct = 100 * count / preds.numel()
+                    print(f"  Predicts class {cls}: {count} ({pct:.1f}%)")
+                
+                # ─────────────────────────────────────────────────────────
+                # 4. Check alignment
+                # ─────────────────────────────────────────────────────────
+                print(f"\n[4] Alignment check:")
+                
+                # Flatten
+                preds_flat = preds.flatten()
+                labels_flat = labels.flatten()
+                
+                # Valid pixels (not ignored)
+                valid_mask = (labels_flat != self.ignore_index)
+                preds_valid = preds_flat[valid_mask]
+                labels_valid = labels_flat[valid_mask]
+                
+                if len(preds_valid) > 0:
+                    matches = (preds_valid == labels_valid).sum().item()
+                    accuracy = 100 * matches / len(preds_valid)
+                    
+                    print(f"  Valid pixels: {len(preds_valid)}")
+                    print(f"  Correct: {matches} ({accuracy:.1f}%)")
+                    
+                    if accuracy < 20:
+                        print(f"\n  ❌ FOUND THE BUG!")
+                        print(f"  Accuracy = {accuracy:.1f}% << 20%")
+                        print(f"  → Predictions and labels are MISALIGNED")
+                        print(f"  → Queries have WRONG coordinates")
+                    elif accuracy < 50:
+                        print(f"\n  ⚠️  Accuracy = {accuracy:.1f}% is suspiciously low")
+                    else:
+                        print(f"\n  ✓ Alignment looks OK ({accuracy:.1f}%)")
+                
+                # ─────────────────────────────────────────────────────────
+                # 5. Confusion matrix
+                # ─────────────────────────────────────────────────────────
+                print(f"\n[5] Confusion matrix:")
+                
+                for true_cls in range(self.num_classes):
+                    true_mask = (labels_valid == true_cls)
+                    n_true = true_mask.sum().item()
+                    
+                    if n_true > 0:
+                        preds_for_true = preds_valid[true_mask]
+                        print(f"\n  When true label = {true_cls} ({n_true} pixels):")
+                        
+                        for pred_cls in range(self.num_classes):
+                            n_pred = (preds_for_true == pred_cls).sum().item()
+                            pct = 100 * n_pred / n_true
+                            print(f"    Predicted {pred_cls}: {n_pred}/{n_true} ({pct:.1f}%)")
+                
+                # ─────────────────────────────────────────────────────────
+                # 6. Check query coordinates
+                # ─────────────────────────────────────────────────────────
+                print(f"\n[6] Query coordinates:")
+                
+                query_x = batch["queries"][0, :10, 1]  # First 10 queries, x coord
+                query_y = batch["queries"][0, :10, 2]  # First 10 queries, y coord
+                
+                print(f"  First 10 x coords: {query_x.tolist()}")
+                print(f"  First 10 y coords: {query_y.tolist()}")
+                print(f"  X range: [{batch['queries'][:, :, 1].min():.4f}, {batch['queries'][:, :, 1].max():.4f}]")
+                print(f"  Y range: [{batch['queries'][:, :, 2].min():.4f}, {batch['queries'][:, :, 2].max():.4f}]")
+                
+                # Check if normalized
+                max_coord = max(batch['queries'][:, :, 1].max(), batch['queries'][:, :, 2].max())
+                if max_coord > 1.0:
+                    print(f"  ⚠️  Coordinates > 1.0 (pixel space, not normalized)")
+                else:
+                    print(f"  ✓ Coordinates are normalized [0, 1]")
+            
+            print("\n" + "="*70 + "\n")
+        
+        # ═════════════════════════════════════════════════════════════════════
+        # NORMAL TEST STEP (after debug)
+        # ═════════════════════════════════════════════════════════════════════
+        
+        # ── Sliding window path ─────────────────────────────────────────────
         if batch.get("sliding", False):
             preds_full, label_full, logits_avg = self._sliding_window_step(batch)
 
@@ -298,7 +455,7 @@ class Model_SenFlood(pl.LightningModule):
             self.log("test_loss", loss, on_step=False, on_epoch=True, logger=True)
             return loss
 
-        # ── Normal path ─────────────────────────────────────
+        # ── Normal path ─────────────────────────────────────────────────────
         total_loss, class_loss, preds, labels = self._compute_loss_and_preds(batch, training=False)
 
         self.metric_IoU_test.update(preds, labels)

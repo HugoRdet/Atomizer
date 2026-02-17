@@ -102,7 +102,7 @@ class TimeEncoder(nn.Module):
             delattr(self, 'time_values')
         self.register_buffer('time_values', time_values)
         
-        print(f"[TimeEncoder] Built time buffer: {num_times} timestamps")
+        
     
     @staticmethod
     def _date_to_doy(date_str: str) -> float:

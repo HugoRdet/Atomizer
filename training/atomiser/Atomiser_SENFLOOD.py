@@ -1,22 +1,26 @@
 """
-Atomiser Model — Grouped Token Format
-======================================
+Atomiser Model — Multi-Resolution Encoder/Decoder
+===================================================
+
+Architecture:
+- Per-resolution latent grids (different sizes based on token count)
+- Cross-attention: separate per resolution
+- Self-attention: concatenate → mix → split (cross-resolution information flow)
+- Decoder: multi-grid top-k (query each resolution grid independently)
+
+All tokens are flat [B, N, 8] — temporal information is encoded in column 7.
+No temporal chunking or averaging. Single encode call processes the full
+spatio-temporal-spectral token set.
 
 Accepts batch dict from dataloader:
 {
-    "groups": {res: {"tokens": [B,N,6], "mask": [B,N], "shape": (C,H,W)}},
-    "queries": [B, M, 6],
+    "groups": {res: {"tokens": [B,N,8], "mask": [B,N], "shape": (H,W) or (C,H,W)}},
+    "queries": [B, M, 8],
     "queries_mask": [B, M],
     "label": [B, H, W],
     "target_resolution": float,
     "image": [B, C, H, W],
 }
-
-Key changes from original:
-- No modality strings — grid configs computed at runtime from resolution + shape
-- Single GeographicPruning instance (params overridden per resolution)
-- encode() loops over resolution groups for cross-attention
-- Latent grid computed from runtime config, not yaml
 """
 
 import torch
@@ -78,12 +82,11 @@ def cache_fn(f):
 
 @dataclass
 class EncoderOutput:
-    """Structured output from encoder."""
-    latents: torch.Tensor
-    coords: torch.Tensor
-    trajectory: Optional[List[torch.Tensor]] = None
-    displacement_stats: Optional[Dict[str, Any]] = None
-    predicted_errors: Optional[List[torch.Tensor]] = None
+    """Structured output from encoder with per-resolution latents."""
+    latents_per_res: Dict[float, torch.Tensor]  # {resolution: [B, L_res, D]}
+    coords_per_res: Dict[float, torch.Tensor]   # {resolution: [B, L_res, 2]}
+    trajectory: Optional[List[Dict[float, torch.Tensor]]] = None
+    global_latents: Optional[torch.Tensor] = None
 
 
 # =============================================================================
@@ -111,10 +114,10 @@ class Atomiser_Senflood(pl.LightningModule):
         self.decoder_pe_dim = self.input_processor.pos_encoder.get_output_dim()
 
         # =====================================================================
-        # 3. LATENT GRID CONFIG (replaces per-modality yaml blocks)
+        # 3. LATENT GRID CONFIG
         # =====================================================================
         latent_cfg = config.get("latent_grid", {})
-        self.pixels_per_latent = latent_cfg.get("pixels_per_latent", 50)
+        self.tokens_per_latent = latent_cfg.get("tokens_per_latent", 2000)
         self.sigma_factor = latent_cfg.get("sigma_factor", 1.5)
         self.max_k = latent_cfg.get("max_k", 2000)
         self.hexagonal = latent_cfg.get("hexagonal", False)
@@ -243,10 +246,9 @@ class Atomiser_Senflood(pl.LightningModule):
 
     def _create_self_attention_factories(self, rope_base: float, compression_scale: float):
         """Create self-attention factories based on configuration."""
-        # Approximate latent spacing for RPE normalization
         rpe_normalize_scale = self.config["Atomiser"].get(
             "rpe_normalize_scale",
-            self.pixels_per_latent * 10.0,  # fallback: pixels_per_latent * ~resolution
+            self.tokens_per_latent * 0.1,
         )
 
         if self.use_hybrid_self_attention:
@@ -344,8 +346,6 @@ class Atomiser_Senflood(pl.LightningModule):
         hidden_dim = self.latent_dim * 2
         mlp_input_dim = self.latent_dim + self.query_dim_recon
 
-
-
         self.output_head = nn.Sequential(
             nn.Linear(mlp_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -379,22 +379,35 @@ class Atomiser_Senflood(pl.LightningModule):
         return repeat(self.spatial_latent_content, 'd -> b n d', b=batch_size, n=L_spatial)
 
     def get_global_latents(self, batch_size: int) -> Optional[torch.Tensor]:
+        """Get global latents (shared across all resolutions)."""
         if self.global_latents is None:
             return None
         return repeat(self.global_latents, 'n d -> b n d', b=batch_size)
 
-    def combine_latents(
+    def init_latents_per_resolution(
         self,
-        spatial_latents: torch.Tensor,
-        global_latents: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if global_latents is not None:
-            return torch.cat([spatial_latents, global_latents], dim=1)
-        return spatial_latents
-
-    # ============================================================================
-    # In Atomiser_Senflood (replace _compute_latent_grid method)
-    # ============================================================================
+        batch_size: int,
+        grid_configs: Dict[float, dict],
+        device: torch.device,
+    ) -> Tuple[Dict[float, torch.Tensor], Dict[float, torch.Tensor]]:
+        """
+        Initialize separate latent grids per resolution.
+        
+        Returns:
+            latents_per_res: {resolution: [B, L_res, D]}
+            coords_per_res: {resolution: [B, L_res, 2]}
+        """
+        latents_per_res = {}
+        coords_per_res = {}
+        
+        for res in sorted(grid_configs.keys()):
+            gc = grid_configs[res]
+            L_spatial = gc["L_spatial"]
+            
+            latents_per_res[res] = self.get_spatial_latents(batch_size, L_spatial)
+            coords_per_res[res] = self._compute_latent_grid(gc, batch_size, device)
+        
+        return latents_per_res, coords_per_res
 
     def _compute_latent_grid(
         self,
@@ -404,10 +417,6 @@ class Atomiser_Senflood(pl.LightningModule):
     ) -> torch.Tensor:
         """
         Compute latent positions from runtime grid config.
-        
-        Supports two layouts:
-        - Square: latents at cell centers (all Voronoi cells same size)
-        - Hexagonal: staggered rows for better 2D coverage
         
         Returns [B, L_spatial, 2] in meters (centered at image origin).
         """
@@ -424,7 +433,6 @@ class Atomiser_Senflood(pl.LightningModule):
         
         return grid.unsqueeze(0).expand(batch_size, -1, -1)
 
-
     def _create_square_grid(
         self,
         lx: int,
@@ -433,25 +441,7 @@ class Atomiser_Senflood(pl.LightningModule):
         span_y: float,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Create a square grid with latents at cell centers.
-        
-        All Voronoi cells have equal size (including edges).
-        
-        Example (lx=4, span_x=100):
-            step = 25
-            positions: -37.5, -12.5, +12.5, +37.5
-            
-            ┌────┬────┬────┬────┐
-            │ ●  │ ●  │ ●  │ ●  │  Each cell is 25×25
-            ├────┼────┼────┼────┤
-            │ ●  │ ●  │ ●  │ ●  │
-            └────┴────┴────┴────┘
-        
-        Returns:
-            grid: [lx*ly, 2] tensor of (x, y) coordinates
-        """
-        # Cell-centered: latents at center of each cell
+        """Create a square grid with latents at cell centers."""
         step_x = span_x / lx
         step_y = span_y / ly
         
@@ -471,7 +461,6 @@ class Atomiser_Senflood(pl.LightningModule):
         
         return grid
 
-
     def _create_hexagonal_grid(
         self,
         lx: int,
@@ -480,44 +469,22 @@ class Atomiser_Senflood(pl.LightningModule):
         span_y: float,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Create a hexagonal grid with staggered rows.
-        
-        Odd rows are offset by half the horizontal step.
-        Some latents may extend slightly past image boundaries - this is intentional
-        to maintain the hexagonal pattern without deformation.
-        
-        Example (lx=5, ly=5):
-            Row 0: ●     ●     ●     ●     ●      (even: starts at -span/2)
-            Row 1:   ●     ●     ●     ●     ●    (odd: offset by step/2)
-            Row 2: ●     ●     ●     ●     ●
-            Row 3:   ●     ●     ●     ●     ●
-            Row 4: ●     ●     ●     ●     ●
-        
-        Returns:
-            grid: [lx*ly, 2] tensor of (x, y) coordinates
-        """
+        """Create a hexagonal grid with staggered rows."""
         half_span_x = span_x / 2.0
         half_span_y = span_y / 2.0
         
-        # Spacing between latents
         step_x = span_x / (lx - 1) if lx > 1 else 0
         step_y = span_y / (ly - 1) if ly > 1 else 0
         
-        # Offset for odd rows (half horizontal step)
         offset = step_x / 2.0
         
         grid_points = []
         
         for row_idx in range(ly):
-            # Y coordinate: from -half_span_y to +half_span_y
             y = -half_span_y + row_idx * step_y if ly > 1 else 0.0
-            
-            # X offset for odd rows
             x_offset = offset if (row_idx % 2 == 1) else 0.0
             
             for col_idx in range(lx):
-                # X coordinate: may extend past boundary on odd rows (intentional)
                 x = -half_span_x + col_idx * step_x + x_offset if lx > 1 else 0.0
                 grid_points.append([x, y])
         
@@ -526,7 +493,71 @@ class Atomiser_Senflood(pl.LightningModule):
         return grid
 
     # =========================================================================
-    # Geographic Pruning
+    # Multi-Resolution Self-Attention Helpers
+    # =========================================================================
+
+    def concatenate_latents_for_self_attn(
+        self,
+        latents_per_res: Dict[float, torch.Tensor],
+        coords_per_res: Dict[float, torch.Tensor],
+        global_latents: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        """
+        Concatenate per-resolution latents for self-attention.
+        
+        Returns:
+            latents_concat: [B, total_L, D]
+            coords_concat: [B, total_L, 2]
+            split_sizes: List of L_res per resolution (for splitting back)
+        """
+        all_spatial = []
+        all_coords = []
+        split_sizes = []
+        
+        for res in sorted(latents_per_res.keys()):
+            all_spatial.append(latents_per_res[res])
+            all_coords.append(coords_per_res[res])
+            split_sizes.append(latents_per_res[res].shape[1])
+        
+        latents_concat = torch.cat(all_spatial, dim=1)
+        coords_concat = torch.cat(all_coords, dim=1)
+        
+        if global_latents is not None:
+            latents_concat = torch.cat([latents_concat, global_latents], dim=1)
+        
+        return latents_concat, coords_concat, split_sizes
+
+    def split_latents_after_self_attn(
+        self,
+        latents_concat: torch.Tensor,
+        split_sizes: List[int],
+        resolutions: List[float],
+    ) -> Tuple[Dict[float, torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Split concatenated latents back to per-resolution.
+        
+        Returns:
+            latents_per_res: {resolution: [B, L_res, D]}
+            global_latents: [B, num_global, D] or None
+        """
+        total_spatial = sum(split_sizes)
+        spatial_concat = latents_concat[:, :total_spatial]
+        
+        latents_list = torch.split(spatial_concat, split_sizes, dim=1)
+        
+        latents_per_res = {}
+        for i, res in enumerate(resolutions):
+            latents_per_res[res] = latents_list[i]
+        
+        if latents_concat.shape[1] > total_spatial:
+            global_latents = latents_concat[:, total_spatial:]
+        else:
+            global_latents = None
+        
+        return latents_per_res, global_latents
+
+    # =========================================================================
+    # Geographic Pruning & Sampling
     # =========================================================================
 
     def _apply_pruning(
@@ -543,13 +574,9 @@ class Atomiser_Senflood(pl.LightningModule):
             geo_k=grid_config["geo_k"],
             sigma=grid_config["geo_sigma"],
             L_spatial=L_spatial,
-            hexagonal=grid_config.get("hexagonal", False),  
+            hexagonal=grid_config.get("hexagonal", False),
         )
         return geo_tokens, geo_masks
-
-    # =========================================================================
-    # Token Sampling
-    # =========================================================================
 
     def _sample_tokens(
         self,
@@ -621,7 +648,7 @@ class Atomiser_Senflood(pl.LightningModule):
         )
 
         delta_x, delta_y, gsd = self._compute_deltas(sampled_tokens, coords)
-
+    
         spatial = latents[:, :L_spatial]
         spatial = cross_attn(
             spatial,
@@ -631,38 +658,58 @@ class Atomiser_Senflood(pl.LightningModule):
             delta_y=delta_y,
             gsd=gsd,
         ) + spatial
+
         spatial = cross_ff(spatial) + spatial
 
         return torch.cat([spatial, latents[:, L_spatial:]], dim=1)
 
-    def _self_attention_step(
+    def _self_attention_step_multiresolution(
         self,
-        latents: torch.Tensor,
-        coords: torch.Tensor,
+        latents_per_res: Dict[float, torch.Tensor],
+        coords_per_res: Dict[float, torch.Tensor],
+        global_latents: Optional[torch.Tensor],
         self_attns: Optional[nn.ModuleList],
-        L_spatial: int,
-    ) -> torch.Tensor:
-        """Self-attention: all latents attend to each other."""
+    ) -> Tuple[Dict[float, torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Self-attention with multi-resolution: concatenate → attend → split.
+        """
+        resolutions = sorted(latents_per_res.keys())
+        
+        latents_concat, coords_concat, split_sizes = self.concatenate_latents_for_self_attn(
+            latents_per_res, coords_per_res, global_latents
+        )
+        
+        total_spatial = sum(split_sizes)
+        
         if self.use_hybrid_self_attention:
-            hybrid_cache = self.hybrid_self_attn.compute_cache(coords)
-            return self.hybrid_self_attn(latents, hybrid_cache, num_spatial=L_spatial)
-
-        if self.use_rpe or self.use_gaussian_bias:
-            px = coords[..., 0]
-            py = coords[..., 1]
-
+            hybrid_cache = self.hybrid_self_attn.compute_cache(coords_concat)
+            latents_concat = self.hybrid_self_attn(
+                latents_concat, hybrid_cache, num_spatial=total_spatial
+            )
+        elif self.use_rpe or self.use_gaussian_bias:
+            px = coords_concat[..., 0]
+            py = coords_concat[..., 1]
+            
             for self_attn, self_ff in self_attns:
                 if self.use_rpe:
-                    latents = self_attn(latents, pos_x=px, pos_y=py, num_spatial=L_spatial) + latents
+                    latents_concat = self_attn(
+                        latents_concat, pos_x=px, pos_y=py, num_spatial=total_spatial
+                    ) + latents_concat
                 else:
-                    latents = self_attn(latents, positions=coords, num_spatial=L_spatial) + latents
-                latents = self_ff(latents) + latents
+                    latents_concat = self_attn(
+                        latents_concat, positions=coords_concat, num_spatial=total_spatial
+                    ) + latents_concat
+                latents_concat = self_ff(latents_concat) + latents_concat
         else:
             for self_attn, self_ff in self_attns:
-                latents = self_attn(latents) + latents
-                latents = self_ff(latents) + latents
-
-        return latents
+                latents_concat = self_attn(latents_concat) + latents_concat
+                latents_concat = self_ff(latents_concat) + latents_concat
+        
+        latents_per_res, global_latents = self.split_latents_after_self_attn(
+            latents_concat, split_sizes, resolutions
+        )
+        
+        return latents_per_res, global_latents
 
     # =========================================================================
     # Encode
@@ -672,161 +719,183 @@ class Atomiser_Senflood(pl.LightningModule):
         self,
         groups: Dict[float, dict],
         grid_configs: Dict[float, dict],
-        primary_config: dict,
         training: bool = True,
         return_trajectory: bool = False,
     ) -> EncoderOutput:
         """
-        Encode resolution-grouped tokens into latent representations.
+        Encode resolution-grouped tokens with per-resolution latent grids.
         
-        For each encoder layer:
-          1. Cross-attention: latents attend to each resolution group sequentially
-          2. Self-attention: all latents attend to each other
+        Architecture:
+          1. Initialize separate latent grid per resolution
+          2. Cross-attention: each resolution attends to its own grid
+          3. Self-attention: concatenate → mix → split (cross-resolution flow)
+          4. Repeat for all layers
         
         Args:
-            groups:         {resolution: {"tokens": [B,N,6], "mask": [B,N], "shape": ...}}
-            grid_configs:   {resolution: compute_grid_config output}
-            primary_config: grid config for the finest resolution (determines latent grid)
-            training:       affects token sub-sampling
+            groups: {resolution: {"tokens": [B,N,8], "mask": [B,N], "shape": ...}}
+            grid_configs: {resolution: compute_grid_config output}
+            training: affects token sub-sampling
             return_trajectory: whether to record latent coords per layer
+        
+        Returns:
+            EncoderOutput with per-resolution latents and coords
         """
         first_group = next(iter(groups.values()))
         B = first_group["tokens"].shape[0]
         device = first_group["tokens"].device
 
-        L_spatial = primary_config["L_spatial"]
+        resolutions = sorted(groups.keys())
 
-        # ── Init latents & coords ───────────────────────────
-        spatial_latents = self.get_spatial_latents(B, L_spatial)
+        # ── Init per-resolution latents & coords ────────────────
+        latents_per_res, coords_per_res = self.init_latents_per_resolution(
+            B, grid_configs, device
+        )
+                
         global_latents = self.get_global_latents(B)
-        latents = self.combine_latents(spatial_latents, global_latents)
 
-        coords = self._compute_latent_grid(primary_config, B, device)
-
-        # ── Geographic pruning (once, before layer loop) ────
+        # ── Geographic pruning (once, before layer loop) ────────
         geo_cache = {}
-        for res in sorted(groups.keys()):
+        for res in resolutions:
             tokens = groups[res]["tokens"]
             mask = groups[res]["mask"]
+
             gc = grid_configs[res]
-            geo_tokens, geo_masks = self._apply_pruning(tokens, mask, coords, gc, L_spatial)
-        
+            coords = coords_per_res[res]
+            L_spatial = gc["L_spatial"]
+            
+            geo_tokens, geo_masks = self._apply_pruning(
+                tokens, mask, coords, gc, L_spatial
+            )
+
             geo_cache[res] = (geo_tokens, geo_masks, gc)
 
-        # ── Trajectory tracking ─────────────────────────────
-        trajectory = [coords.clone()] if return_trajectory else None
+        # ── Trajectory tracking ─────────────────────────────────
+        trajectory = [coords_per_res.copy()] if return_trajectory else None
 
-        # ── Layer loop ──────────────────────────────────────
+        # ── Layer loop ──────────────────────────────────────────
         for layer_idx in range(self.depth):
             cross_attn, cross_ff, self_attns = self.encoder_layers[layer_idx]
 
-            # Cross-attention: one pass per resolution group
-            for res in sorted(groups.keys()):
+            # Cross-attention: each resolution attends to its own tokens
+            for res in resolutions:
                 geo_tokens, geo_masks, gc = geo_cache[res]
-
+                
+                coords = coords_per_res[res]
+                L_spatial = gc["L_spatial"]
+                
                 sampled_tokens, sampled_masks = self._sample_tokens(
                     geo_tokens, geo_masks, gc, training
                 )
 
-                latents = self._cross_attention_step(
-                    latents, sampled_tokens, sampled_masks, coords,
-                    cross_attn, cross_ff, L_spatial,
+                latents_per_res[res] = self._cross_attention_step(
+                    latents_per_res[res],
+                    sampled_tokens,
+                    sampled_masks,
+                    coords,
+                    cross_attn,
+                    cross_ff,
+                    L_spatial,
                 )
 
-            # Self-attention: latents ↔ latents (global)
-            latents = self._self_attention_step(
-                latents, coords, self_attns, L_spatial
+            # Self-attention: concatenate all resolutions → mix → split
+            latents_per_res, global_latents = self._self_attention_step_multiresolution(
+                latents_per_res, coords_per_res, global_latents, self_attns
             )
 
             if return_trajectory:
-                trajectory.append(coords.clone())
+                trajectory.append(coords_per_res.copy())
 
         return EncoderOutput(
-            latents=latents,
-            coords=coords,
+            latents_per_res=latents_per_res,
+            coords_per_res=coords_per_res,
             trajectory=trajectory,
+            global_latents=global_latents,
         )
 
     # =========================================================================
-    # Reconstruct
+    # Reconstruct (Multi-Grid)
     # =========================================================================
 
     def reconstruct(
         self,
-        latents: torch.Tensor,
-        latents_coords: torch.Tensor,
+        latents_per_res: Dict[float, torch.Tensor],
+        coords_per_res: Dict[float, torch.Tensor],
         query_tokens: torch.Tensor,
         query_mask: torch.Tensor,
-        L_spatial: int,
         target_resolution: float = None,
     ) -> torch.Tensor:
-        """Reconstruct query tokens using nearest spatial latents.
+        """
+        Reconstruct with multi-grid top-k: query each resolution grid independently.
         
         Args:
-            latents:           [B, L_total, D] all latent vectors
-            latents_coords:    [B, L_spatial, 2] spatial latent positions in meters
-            query_tokens:      [B, N, 8] raw query data
-            query_mask:        [B, N] valid query mask
-            L_spatial:         number of spatial latents
-            target_resolution: float (m/px), the resolution to reconstruct at.
-                               Passed to decoder so query features are 
-                               resolution-aware. If None, uses per-token 
-                               resolution_idx from query_tokens[:, :, 6].
+            latents_per_res: {resolution: [B, L_res, D]}
+            coords_per_res: {resolution: [B, L_res, 2]}
+            query_tokens: [B, M, 8]
+            query_mask: [B, M]
+            target_resolution: float (m/px)
+        
+        Returns:
+            predictions: [B, M, num_classes]
         """
-        B, N, _ = query_tokens.shape
-        device = latents.device
-        D = latents.shape[-1]
+        B, M, _ = query_tokens.shape
+        device = query_tokens.device
         k = self.decoder_k_spatial
 
-        # ── Query features (spectral + resolution) ──────────
         query_features, _, _ = self.input_processor.process_data_for_decoder(
             query_tokens, query_mask,
             target_resolution=target_resolution,
         )
 
-        # ── Query positions in meters ───────────────────────
         query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
 
-        # ── Find k nearest spatial latents ──────────────────
-        spatial_latents = latents[:, :L_spatial, :]
-        dists_sq = (
-            query_coords.unsqueeze(2) - latents_coords.unsqueeze(1)
-        ).pow(2).sum(dim=-1)
-        _, topk_indices = torch.topk(dists_sq, k=k, dim=-1, largest=False)
-
-        # ── Gather latents & coords ─────────────────────────
-        flat_indices = topk_indices.reshape(B, N * k)
-
-        flat_exp = flat_indices.unsqueeze(-1).expand(-1, -1, D)
-        selected_latents = torch.gather(
-            spatial_latents, 1, flat_exp
-        ).reshape(B, N, k, D)
-
-        flat_coord_exp = flat_indices.unsqueeze(-1).expand(-1, -1, 2)
-        selected_coords = torch.gather(
-            latents_coords, 1, flat_coord_exp
-        ).reshape(B, N, k, 2)
-
-        # ── Relative deltas ─────────────────────────────────
+        # Top-k from EACH resolution grid
+        selected_latents_list = []
+        selected_coords_list = []
+        
+        for res in sorted(latents_per_res.keys()):
+            latents = latents_per_res[res]
+            coords = coords_per_res[res]
+            
+            dists_sq = (
+                query_coords.unsqueeze(2) - coords.unsqueeze(1)
+            ).pow(2).sum(dim=-1)
+            
+            _, topk_indices = torch.topk(dists_sq, k=k, dim=-1, largest=False)
+            
+            flat_indices = topk_indices.reshape(B, M * k)
+            D = latents.shape[-1]
+            flat_exp = flat_indices.unsqueeze(-1).expand(-1, -1, D)
+            selected = torch.gather(latents, 1, flat_exp).reshape(B, M, k, D)
+            
+            flat_coord_exp = flat_indices.unsqueeze(-1).expand(-1, -1, 2)
+            coords_selected = torch.gather(coords, 1, flat_coord_exp).reshape(B, M, k, 2)
+            
+            selected_latents_list.append(selected)
+            selected_coords_list.append(coords_selected)
+        
+        selected_latents = torch.cat(selected_latents_list, dim=2)
+        selected_coords = torch.cat(selected_coords_list, dim=2)
+        
         delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
         delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
 
-        # ── Relative PE + context ───────────────────────────
         relative_pe = self.input_processor.pos_encoder(delta_x, delta_y)
         context = torch.cat([selected_latents, relative_pe], dim=-1)
 
-        # ── Cross-attention ─────────────────────────────────
         output = self.decoder_cross_attn(
             query_features, context,
             delta_x=delta_x, delta_y=delta_y,
             gsd=target_resolution if target_resolution is not None else 10.0,
         )
 
-        # ── Output head ─────────────────────────────────────
         return self.output_head(torch.cat([output, query_features], dim=-1))
 
-    def classify(self, latents: torch.Tensor) -> torch.Tensor:
-        return self.to_logits(latents)
+    def classify(self, latents_per_res: Dict[float, torch.Tensor]) -> torch.Tensor:
+        """Classification from concatenated per-resolution latents."""
+        all_latents = torch.cat(
+            [latents_per_res[res] for res in sorted(latents_per_res.keys())], dim=1
+        )
+        return self.to_logits(all_latents)
 
     # =========================================================================
     # Forward
@@ -841,65 +910,54 @@ class Atomiser_Senflood(pl.LightningModule):
         return_predicted_errors: bool = False,
     ):
         """
-        Main forward pass.
+        Main forward pass: multi-resolution encoding + decoding.
         
-        Args:
-            batch: grouped dict from dataloader:
-                {
-                    "groups": {res: {"tokens": [B,N,8], "mask": [B,N], ...}},
-                    "queries":           [B, M, 8],
-                    "queries_mask":      [B, M],
-                    "label":             [B, H, W],
-                    "target_resolution": float (m/px),
-                    "image":             [B, C, H, W],
-                }
-            training: training mode flag
-            task: "reconstruction", "classification", "encoder", or "visualization"
-            return_trajectory: return latent coords per layer
-            return_predicted_errors: (compat) not implemented, always None
+        All tokens are flat [B, N, 8] — temporal info is in column 7.
+        No temporal chunking or averaging. Single encode call processes the
+        full spatio-temporal-spectral token set per resolution.
+        
+        Flow:
+          1. Compute grid configs from actual token counts
+          2. Single encode call per resolution (geographic pruning handles density)
+          3. Decode with multi-grid top-k
         """
         groups = batch["groups"]
         queries = batch["queries"]
         queries_mask = batch["queries_mask"]
-        target_resolution = batch.get("target_resolution", None)       # ← NEW
+        target_resolution = batch.get("target_resolution", None)
 
-        # ── Compute grid configs per resolution ─────────────
+        # ── Compute grid configs from actual token counts ───────
         resolutions = sorted(groups.keys())
-        grid_configs = {}
-        for res in resolutions:
-            grid_configs[res] = compute_grid_config(
+        grid_configs = {
+            res: compute_grid_config(
                 resolution=res,
                 shape=groups[res]["shape"],
-                pixels_per_latent=self.pixels_per_latent,
+                tokens_per_latent=self.tokens_per_latent,
+                total_tokens=groups[res]["tokens"].shape[1],
                 sigma_factor=self.sigma_factor,
                 max_k=self.max_k,
             )
+            for res in resolutions
+        }
 
-        # Primary = finest resolution (determines latent grid)
-        primary_res = resolutions[0]
-        primary_config = grid_configs[primary_res]
-        L_spatial = primary_config["L_spatial"]
-
+        # ── Single encode call (no temporal chunking) ───────────
         need_trajectory = return_trajectory or task == "visualization"
-
-        # ── Encode ──────────────────────────────────────────
         encoder_output = self.encode(
             groups=groups,
             grid_configs=grid_configs,
-            primary_config=primary_config,
             training=training,
             return_trajectory=need_trajectory,
         )
 
-        latents = encoder_output.latents
-        final_coords = encoder_output.coords
+        latents_per_res = encoder_output.latents_per_res
+        coords_per_res = encoder_output.coords_per_res
         trajectory = encoder_output.trajectory
 
-        # ── Task dispatch ───────────────────────────────────
+        # ── Task dispatch ───────────────────────────────────────
         if task == "encoder":
             result = {
-                'latents': latents,
-                'final_coords': final_coords,
+                'latents_per_res': latents_per_res,
+                'coords_per_res': coords_per_res,
                 'trajectory': trajectory,
             }
             if return_predicted_errors:
@@ -915,24 +973,27 @@ class Atomiser_Senflood(pl.LightningModule):
                 preds = []
                 for i in range(0, N, chunk_size):
                     preds.append(self.reconstruct(
-                        latents, final_coords,
+                        latents_per_res,
+                        coords_per_res,
                         queries[:, i:i + chunk_size],
                         queries_mask[:, i:i + chunk_size],
-                        L_spatial,
-                        target_resolution=target_resolution,            # ← NEW
+                        target_resolution=target_resolution,
                     ))
                 predictions = torch.cat(preds, dim=1)
             else:
                 predictions = self.reconstruct(
-                    latents, final_coords, queries, queries_mask, L_spatial,
-                    target_resolution=target_resolution,                # ← NEW
+                    latents_per_res,
+                    coords_per_res,
+                    queries,
+                    queries_mask,
+                    target_resolution=target_resolution,
                 )
 
             if task == "visualization" or return_predicted_errors:
                 return {
                     'predictions': predictions,
-                    'latents': latents,
-                    'final_coords': final_coords,
+                    'latents_per_res': latents_per_res,
+                    'coords_per_res': coords_per_res,
                     'trajectory': trajectory,
                     'predicted_errors': None,
                 }
@@ -940,7 +1001,7 @@ class Atomiser_Senflood(pl.LightningModule):
             return predictions
 
         else:  # classification
-            return self.classify(latents)
+            return self.classify(latents_per_res)
 
     # =========================================================================
     # Freeze/Unfreeze

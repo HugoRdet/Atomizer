@@ -29,7 +29,7 @@ class GeographicPruning(nn.Module):
     def __init__(
         self,
         geometry,
-        chunk_size: int = 50,
+        chunk_size: int = 10,
     ):
         super().__init__()
         self.geometry = geometry

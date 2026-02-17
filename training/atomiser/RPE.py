@@ -1320,6 +1320,8 @@ class LocalCrossAttentionRoPE(nn.Module):
         K = self.to_k(context).view(B, L, k_samples, H, d)  # [B, L, k, H, d]
         V = self.to_v(context).view(B, L, k_samples, H, d)  # [B, L, k, H, d]
         
+  
+
         # =================================================================
         # Apply RoPE rotation on K only
         # =================================================================
@@ -1330,11 +1332,12 @@ class LocalCrossAttentionRoPE(nn.Module):
         # Attention computation
         # =================================================================
         scores = torch.einsum('b l h d, b l k h d -> b l h k', q, K) * self.scale
-        
+
         if mask is not None:
             scores = scores.masked_fill(~mask.unsqueeze(2), float('-inf'))
-        
+
         attn = F.softmax(scores, dim=-1)
+
         attn = self.dropout(attn)
         
         out = torch.einsum('b l h k, b l k h d -> b l h d', attn, V)

@@ -104,10 +104,12 @@ class Lookup_encoding(pl.LightningModule):
         # Reference grid sizes (matching TokenBuilder.REFERENCE_SIZES)
         reference_modalities = [
             (0.2, 512),   # VHR imagery
+            (1.0, 512),
             (10.0, 512),  # Sentinel-2/Sentinel-1 at 10m
             (20.0, 512),  # Sentinel-2 at 20m
             (30.0, 512),  # Landsat at 30m
             (60.0, 512),  # Sentinel-2 at 60m
+            
         ]
         
         self.modalities = reference_modalities
