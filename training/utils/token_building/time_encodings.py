@@ -60,6 +60,9 @@ class TimeEncoder(nn.Module):
         
         # ── Store reference to lookup for time values ───────
         self._lookup_table = lookup_table
+
+        for doy in range(1, 366):
+            self._lookup_table.get_or_register_time_idx(doy)
         
         print(f"[TimeEncoder] Circular RBF: {self.num_centers} centers, "
               f"period={self.cycle_period} days, "
@@ -82,6 +85,7 @@ class TimeEncoder(nn.Module):
         All valid indices are ≥ 0. Negative indices (-1) are handled
         in forward() and never reach this buffer.
         """
+        
         num_times = self._lookup_table.num_time_indices
         device = self.centers.device  # match existing buffer's device
         time_values = torch.zeros(num_times, dtype=torch.float32, device=device)
@@ -188,4 +192,5 @@ class TimeEncoder(nn.Module):
 
 def build_time_encoder(config: Dict[str, Any], lookup_table: Any) -> TimeEncoder:
     """Factory function for time encoder."""
+    
     return TimeEncoder(config, lookup_table)

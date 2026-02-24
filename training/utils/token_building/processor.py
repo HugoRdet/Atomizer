@@ -98,7 +98,7 @@ class TokenProcessor(nn.Module):
         self.reflectance_encoder = build_reflectance_encoder(config)
         self.resolution_encoder = build_resolution_encoder(config, lookup_table)
         self.time_encoder = build_time_encoder(config, lookup_table)
-        
+        self.compression_alpha = config["Atomiser"].get("compression_alpha", 10.0)
         # 3. Cache constant GSD
         if self.use_constant_gsd:
             self._constant_gsd = float(self.geometry.default_gsd)
@@ -212,8 +212,7 @@ class TokenProcessor(nn.Module):
         delta_x = token_coords[..., 0] - latent_coords[..., 0]
         delta_y = token_coords[..., 1] - latent_coords[..., 1]
         
-        # D. Normalization Scale: [B, 1, 1]
-        physical_scale = self.geometry.get_physical_scale(token_data) / 2.0
+        
         
         # E. GSD: scalar or [B, L, m]
         gsd = self._constant_gsd if self.use_constant_gsd else self.geometry.get_token_gsd(token_data)
@@ -223,7 +222,8 @@ class TokenProcessor(nn.Module):
         # =========================================================
         
         # A. Positional: [B, L, m, pos_dim]
-        pos_features = self.pos_encoder(delta_x, delta_y, compression_scale=physical_scale)
+        compression_scale = self.compression_alpha * gsd
+        pos_features = self.pos_encoder(delta_x, delta_y, compression_scale=compression_scale)
         if len(pos_features.shape) < 4:
             pos_features = pos_features.unsqueeze(-2)
         
@@ -246,6 +246,9 @@ class TokenProcessor(nn.Module):
         # Encoder handles -1 → zeros natively
         time_indices = token_data[..., TOKEN_TIME_IDX].long()
         time_features = self.time_encoder(time_indices)
+
+        
+        
         
         # =========================================================
         # STEP 3: ZERO CONSTANT METADATA (encoder only)
@@ -256,7 +259,7 @@ class TokenProcessor(nn.Module):
         # (The decoder path is unaffected — far fewer tokens.)
         
         resolution_features = self._zero_if_constant(resolution_features)
-        time_features = self._zero_if_constant(time_features)
+        
         
         # =========================================================
         # STEP 4: ASSEMBLY + PROJECTION
@@ -269,6 +272,8 @@ class TokenProcessor(nn.Module):
             resolution_features,
             time_features,
         ], dim=-1)  # [B, L, m, raw_encoder_dim]
+
+
         
         features = self.encoder_mlp(raw_features)  # [B, L, m, tokenizer_out_dim]
         
@@ -383,10 +388,11 @@ class TokenProcessor(nn.Module):
         """
         # Flatten all dims except the last (feature dim)
         flat = features.reshape(-1, features.shape[-1])
-        
+       
         # Check if ALL feature dims are constant across tokens
         if flat.var(dim=0).max().item() < eps:
             return torch.zeros_like(features)
+        
         
         return features
     

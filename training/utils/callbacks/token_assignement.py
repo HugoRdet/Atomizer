@@ -1,6 +1,6 @@
 """
 Token-to-Latent Assignment Visualization for Sen1Floods11
-Updated for dynamic grid configuration (no modality strings)
+Updated for dynamic grid configuration with tokens_per_latent
 """
 
 import torch
@@ -20,7 +20,6 @@ try:
 except ImportError:
     wandb = None
 
-# Import the grid config function
 from training.utils.datasets.token_grouping import compute_grid_config
 
 
@@ -43,9 +42,9 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
     Visualizes token-to-latent assignments.
     
     Creates a 6-panel figure:
-    1. RGB composite (S2)
-    2. SAR composite (VV/VH)
-    3. Ground truth labels
+    1. Image composite (RGB if multi-band, grayscale if single)
+    2. SAR composite or second band view
+    3. Ground truth labels (segmentation) or value histogram (reconstruction)
     4. Voronoi cells (theoretical 100% coverage)
     5. Sampled tokens (actual geo_k tokens selected)
     6. Overlap heatmap
@@ -53,7 +52,7 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
     
     def __init__(
         self,
-        log_every_n_epochs: int = 5,
+        log_every_n_epochs: int = 1,
         sample_indices: List[int] = [0],
         save_dir: str = "./viz_token_assignment",
         use_wandb: bool = True,
@@ -69,9 +68,10 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
         self.latent_colors = None
         self.num_latents = None
         
-        print(f"[TokenAssignmentCallback] Dynamic grid mode")
+        print(f"[TokenAssignmentCallback] Dynamic grid mode (tokens_per_latent)")
     
-    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        print("bouhouhou")
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
             return
         if trainer.global_rank != 0:
@@ -84,6 +84,39 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
             import traceback
             traceback.print_exc()
     
+    def _find_model(self, pl_module):
+        """Find the Atomiser model, which may be nested."""
+        for attr in ['model', 'encoder', 'atomiser', 'net']:
+            if hasattr(pl_module, attr):
+                candidate = getattr(pl_module, attr)
+                if hasattr(candidate, 'geo_pruning') and hasattr(candidate, '_compute_latent_grid'):
+                    return candidate
+        
+        if hasattr(pl_module, 'geo_pruning') and hasattr(pl_module, '_compute_latent_grid'):
+            return pl_module
+        
+        return None
+
+    def _get_grid_params(self, model):
+        """Extract grid parameters from model, handling both old and new naming."""
+        tokens_per_latent = getattr(model, 'tokens_per_latent', None)
+        sigma_factor = getattr(model, 'sigma_factor', 1.5)
+        max_k = getattr(model, 'max_k', 2000)
+        hexagonal = getattr(model, 'hexagonal', False)
+        
+        if hasattr(model, 'config'):
+            latent_cfg = model.config.get('latent_grid', {})
+            tokens_per_latent = latent_cfg.get('tokens_per_latent', tokens_per_latent)
+            sigma_factor = latent_cfg.get('sigma_factor', sigma_factor)
+            max_k = latent_cfg.get('max_k', max_k)
+            hexagonal = latent_cfg.get('hexagonal', hexagonal)
+        
+        if tokens_per_latent is None:
+            tokens_per_latent = 2000
+            print(f"[TokenAssignmentCallback] WARNING: tokens_per_latent not found, using default {tokens_per_latent}")
+        
+        return tokens_per_latent, sigma_factor, max_k, hexagonal
+
     def _run_safe(self, trainer, pl_module):
         """Run visualization with proper cleanup."""
         pl_module.eval()
@@ -96,47 +129,41 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
             
             batch = next(iter(val_loader))
             
-            # Handle both old (tuple) and new (dict) batch formats
-            if isinstance(batch, dict):
-                # New dictionary format
-                groups = batch["groups"]
-                first_res = sorted(groups.keys())[0]
-                group = groups[first_res]
-                
-                tokens = group["tokens"]
-                masks = group["mask"]
-                
-                B = tokens.shape[0]
-                sample_idx = self.sample_indices[0] if self.sample_indices else 0
-                if sample_idx >= B:
-                    sample_idx = 0
-                
-                image_tokens = tokens[sample_idx].clone()
-                attention_mask = masks[sample_idx].clone()
+            groups = batch["groups"]
+            first_res = sorted(groups.keys())[0]
+            group = groups[first_res]
+            
+            tokens = group["tokens"]
+            masks = group["mask"]
+            
+            B = tokens.shape[0]
+            sample_idx = self.sample_indices[0] if self.sample_indices else 0
+            if sample_idx >= B:
+                sample_idx = 0
+            
+            image_tokens = tokens[sample_idx].clone()
+            attention_mask = masks[sample_idx].clone()
+            image = batch["image"][sample_idx].clone().cpu()
+            resolution = batch.get("target_resolution", first_res)
+            
+            if isinstance(resolution, torch.Tensor):
+                resolution = resolution.item()
+            
+            # Label is optional (not present in reconstruction mode)
+            label = None
+            if "label" in batch:
                 label = batch["label"][sample_idx].clone().cpu()
-                image = batch["image"][sample_idx].clone().cpu()
-                resolution = batch.get("target_resolution", first_res)
-                
-                if isinstance(resolution, torch.Tensor):
-                    resolution = resolution.item()
-            else:
-                # Old tuple format (fallback)
-                sample_idx = self.sample_indices[0] if self.sample_indices else 0
-                if sample_idx >= batch[0].shape[0]:
-                    sample_idx = 0
-                
-                image_tokens = batch[0][sample_idx].clone()
-                attention_mask = batch[1][sample_idx].clone()
-                label = batch[4][sample_idx].clone().cpu()
-                image = batch[6][sample_idx].clone().cpu()
-                resolution = batch[7][sample_idx].item() if len(batch) > 7 else 10.0
+            
+            # Detect mode
+            is_reconstruction = label is None
             
             del batch
             gc.collect()
             
             self._visualize(
                 sample_idx, image_tokens, attention_mask,
-                label, image, resolution, pl_module, trainer.current_epoch
+                label, image, resolution, pl_module,
+                trainer.current_epoch, is_reconstruction
             )
             
         finally:
@@ -149,54 +176,22 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
         sample_idx: int,
         image_tokens: torch.Tensor,
         attention_mask: torch.Tensor,
-        label: torch.Tensor,
+        label: Optional[torch.Tensor],
         image: torch.Tensor,
         resolution: float,
         pl_module: pl.LightningModule,
         epoch: int,
+        is_reconstruction: bool = False,
     ):
         """Create visualization using dynamic grid config."""
         device = pl_module.device
         
-        # =========================================================================
-        # Find the actual Atomiser model (may be nested)
-        # =========================================================================
-        model = None
-        
-        # Try common attribute names
-        for attr in ['model', 'encoder', 'atomiser', 'net']:
-            if hasattr(pl_module, attr):
-                candidate = getattr(pl_module, attr)
-                if hasattr(candidate, 'geo_pruning') and hasattr(candidate, '_compute_latent_grid'):
-                    model = candidate
-                    break
-        
-        # If not found, check if pl_module itself is the model
+        model = self._find_model(pl_module)
         if model is None:
-            if hasattr(pl_module, 'geo_pruning') and hasattr(pl_module, '_compute_latent_grid'):
-                model = pl_module
-            else:
-                print("[TokenAssignmentCallback] Could not find Atomiser model")
-                return
+            print("[TokenAssignmentCallback] Could not find Atomiser model")
+            return
         
-        # =========================================================================
-        # Get grid parameters (with fallbacks)
-        # =========================================================================
-        pixels_per_latent = getattr(model, 'pixels_per_latent', 50)
-        sigma_factor = getattr(model, 'sigma_factor', 1.5)
-        max_k = getattr(model, 'max_k', 2000)
-        hexagonal = getattr(model, 'hexagonal', False)
-        
-        # Alternative: try to get from config
-        if hasattr(model, 'config'):
-            latent_cfg = model.config.get('latent_grid', {})
-            pixels_per_latent = latent_cfg.get('pixels_per_latent', pixels_per_latent)
-            sigma_factor = latent_cfg.get('sigma_factor', sigma_factor)
-            max_k = latent_cfg.get('max_k', max_k)
-            hexagonal = latent_cfg.get('hexagonal', hexagonal)
-        
-        print(f"[DEBUG] Grid params: pixels_per_latent={pixels_per_latent}, "
-            f"sigma_factor={sigma_factor}, max_k={max_k}, hexagonal={hexagonal}")
+        tokens_per_latent, sigma_factor, max_k, hexagonal = self._get_grid_params(model)
         
         # =========================================================================
         # Infer image dimensions from tokens
@@ -208,24 +203,24 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
         W = int(x_coords.max().item()) - x_offset + 1
         H = int(y_coords.max().item()) - y_offset + 1
         
-        # Infer number of channels from unique spectral indices
-        C = int(image_tokens[:, 3].max().item()) + 1
+        C = image.shape[0] if image.dim() == 3 else 1
+        N_tokens = image_tokens.shape[0]
         
-        print(f"[DEBUG] Image: {H}×{W}, Channels: {C}, Resolution: {resolution}m")
-        print(f"[DEBUG] Token x range: [{x_coords.min():.0f}, {x_coords.max():.0f}]")
-        print(f"[DEBUG] Token y range: [{y_coords.min():.0f}, {y_coords.max():.0f}]")
-        print(f"[DEBUG] Offsets: x={x_offset}, y={y_offset}")
+        print(f"[TokenAssignment] Image: {C}ch × {H}×{W}, Resolution: {resolution}m, "
+              f"Tokens: {N_tokens}, Mode: {'recon' if is_reconstruction else 'seg'}")
         
         with torch.no_grad():
-            # Compute grid config dynamically
+            # Compute grid config — matches model's forward() call signature
             grid_config = compute_grid_config(
                 resolution=resolution,
                 shape=(C, H, W),
-                pixels_per_latent=pixels_per_latent,
+                tokens_per_latent=tokens_per_latent,
+                total_tokens=N_tokens,
                 sigma_factor=sigma_factor,
                 max_k=max_k,
-                hexagonal=hexagonal,
             )
+            # hexagonal comes from latent_grid config, not compute_grid_config
+            grid_config["hexagonal"] = hexagonal
             
             num_latents = grid_config["L_spatial"]
             lx = grid_config["latents_x"]
@@ -234,21 +229,19 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
             geo_sigma = grid_config["geo_sigma"]
             span_x = grid_config["span_x"]
             span_y = grid_config["span_y"]
-            hexagonal = grid_config.get("hexagonal", False)
             
-            print(f"[DEBUG] Grid: {lx}×{ly} = {num_latents} latents")
-            print(f"[DEBUG] geo_k: {geo_k}, geo_sigma: {geo_sigma:.1f}m")
-            print(f"[DEBUG] Span: {span_x:.1f}×{span_y:.1f}m, Hexagonal: {hexagonal}")
+            print(f"[TokenAssignment] Grid: {lx}×{ly} = {num_latents} latents, "
+                  f"geo_k={geo_k}, sigma={geo_sigma:.1f}m, hex={hexagonal}")
             
             # Generate colors for latents
             if self.latent_colors is None or self.num_latents != num_latents:
                 self.num_latents = num_latents
                 self.latent_colors = generate_distinct_colors(num_latents)
             
-            # Compute latent grid using model's method
+            # Compute latent grid
             latent_coords = model._compute_latent_grid(grid_config, 1, device)  # [1, L, 2]
             
-            # Run geo_pruning with dynamic parameters
+            # Run geo_pruning
             geo_tokens, geo_masks, _ = model.geo_pruning(
                 image_tokens.unsqueeze(0).to(device),
                 attention_mask.unsqueeze(0).to(device),
@@ -256,25 +249,20 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
                 geo_k=geo_k,
                 sigma=geo_sigma,
                 L_spatial=num_latents,
-                hexagonal=hexagonal,  # ← ADD THIS
+                hexagonal=hexagonal,
             )
             
             # Extract results
             tx = geo_tokens[0, :, :, 1].cpu().numpy()  # [L, k]
             ty = geo_tokens[0, :, :, 2].cpu().numpy()  # [L, k]
-            geo_masks_np = geo_masks[0].cpu().numpy()  # [L, k]
+            geo_masks_np = geo_masks[0].cpu().numpy()   # [L, k]
             
             # Convert latent coords from meters to pixels
             latent_meters = latent_coords[0].cpu().numpy()  # [L, 2]
             latent_px = (latent_meters[:, 0] + span_x / 2) / span_x * (W - 1)
             latent_py = (latent_meters[:, 1] + span_y / 2) / span_y * (H - 1)
             
-            print(f"[DEBUG] Latent meters x: [{latent_meters[:, 0].min():.1f}, {latent_meters[:, 0].max():.1f}]")
-            print(f"[DEBUG] Latent meters y: [{latent_meters[:, 1].min():.1f}, {latent_meters[:, 1].max():.1f}]")
-            print(f"[DEBUG] Latent pixels x: [{latent_px.min():.1f}, {latent_px.max():.1f}]")
-            print(f"[DEBUG] Latent pixels y: [{latent_py.min():.1f}, {latent_py.max():.1f}]")
-            
-            # Compute Voronoi cells for ALL pixels
+            # Compute Voronoi cells
             voronoi_assignment = self._compute_voronoi_assignment(
                 H, W, latent_meters, span_x, span_y, resolution
             )
@@ -307,38 +295,26 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
                 else:
                     oob_count += 1
         
-        print(f"[DEBUG] Valid tokens: {valid_count}, Out of bounds: {oob_count}")
+        print(f"[TokenAssignment] Valid tokens: {valid_count}, OOB: {oob_count}")
         
         # Create figure
         self._create_figure(
-            image.numpy(), label.numpy(),
+            image.numpy(), label.numpy() if label is not None else None,
             voronoi_assignment, sampled_latent, sampled_count,
             latent_px, latent_py,
-            grid_config, H, W,
-            sample_idx, epoch
+            grid_config, H, W, C,
+            sample_idx, epoch, is_reconstruction,
+            image_tokens,
         )
     
     def _compute_voronoi_assignment(
-        self,
-        H: int,
-        W: int,
-        latent_meters: np.ndarray,
-        span_x: float,
-        span_y: float,
-        resolution: float,
+        self, H, W, latent_meters, span_x, span_y, resolution,
     ) -> np.ndarray:
-        """
-        Compute Voronoi cell assignment for every pixel.
-        
-        Returns:
-            assignment: [H, W] with latent index for each pixel
-        """
-        # Create pixel coordinate grid in meters
+        """Compute Voronoi cell assignment for every pixel."""
         px_x = np.linspace(-span_x / 2 + resolution / 2, span_x / 2 - resolution / 2, W)
         px_y = np.linspace(-span_y / 2 + resolution / 2, span_y / 2 - resolution / 2, H)
-        grid_x, grid_y = np.meshgrid(px_x, px_y)  # [H, W]
+        grid_x, grid_y = np.meshgrid(px_x, px_y)
         
-        # Compute distance to each latent and find nearest
         assignment = np.zeros((H, W), dtype=np.int32)
         min_dist = np.full((H, W), np.inf)
         
@@ -355,7 +331,7 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
     def _create_figure(
         self,
         image_np: np.ndarray,
-        label_np: np.ndarray,
+        label_np: Optional[np.ndarray],
         voronoi_assignment: np.ndarray,
         sampled_latent: np.ndarray,
         sampled_count: np.ndarray,
@@ -364,10 +340,13 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
         grid_config: dict,
         H: int,
         W: int,
+        C: int,
         sample_idx: int,
         epoch: int,
+        is_reconstruction: bool,
+        image_tokens: torch.Tensor = None,
     ):
-        """Create and save the 6-panel figure."""
+        """Create and save the 6-panel figure. Adapts to single/multi channel and seg/recon mode."""
         
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
         axes = axes.flatten()
@@ -379,106 +358,166 @@ class TokenAssignmentCallbackSenFlood(pl.Callback):
         hexagonal = grid_config.get("hexagonal", False)
         
         # =====================================================================
-        # Row 1: Input data
+        # Panel 1: Main image
         # =====================================================================
-        
-        # 1. RGB (S2 bands B4, B3, B2 = indices 3, 2, 1)
         ax = axes[0]
-        if image_np.shape[0] >= 4:
+        if C >= 4:
+            # Multi-band: RGB from S2 B4, B3, B2 (indices 3, 2, 1)
             rgb = np.stack([image_np[3], image_np[2], image_np[1]], axis=-1)
+            rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
+            ax.imshow(np.clip(rgb, 0, 1))
+            ax.set_title('RGB (S2 B4-B3-B2)', fontsize=11)
+        elif C == 3:
+            rgb = np.stack([image_np[0], image_np[1], image_np[2]], axis=-1)
+            rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
+            ax.imshow(np.clip(rgb, 0, 1))
+            ax.set_title('RGB', fontsize=11)
+        elif C == 1:
+            ax.imshow(image_np[0], cmap='viridis')
+            ax.set_title(f'Single Band (ch 0)', fontsize=11)
         else:
-            rgb = np.stack([image_np[0]] * 3, axis=-1)
-        rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
-        ax.imshow(np.clip(rgb, 0, 1))
-        ax.set_title('RGB (S2 B4-B3-B2)', fontsize=11)
+            # 2 bands: show first as grayscale
+            ax.imshow(image_np[0], cmap='viridis')
+            ax.set_title(f'Band 0 / {C} bands', fontsize=11)
         ax.axis('off')
         
-        # 2. SAR (VV, VH = indices 13, 14)
+        # =====================================================================
+        # Panel 2: Secondary view
+        # =====================================================================
         ax = axes[1]
-        if image_np.shape[0] >= 15:
+        if C >= 15:
+            # SAR composite (VV, VH = indices 13, 14)
             vv = image_np[13]
             vh = image_np[14]
             vv_n = (vv - vv.min()) / (vv.max() - vv.min() + 1e-8)
             vh_n = (vh - vh.min()) / (vh.max() - vh.min() + 1e-8)
             sar = np.stack([vv_n, vh_n, (vv_n + vh_n) / 2], axis=-1)
             ax.imshow(np.clip(sar, 0, 1))
-        ax.set_title('SAR (VV/VH)', fontsize=11)
-        ax.axis('off')
+            ax.set_title('SAR (VV/VH)', fontsize=11)
+        elif C == 1:
+            # Single band: show value histogram
+            vals = image_np[0].flatten()
+            vals = vals[np.isfinite(vals)]
+            ax.hist(vals, bins=100, color='steelblue', edgecolor='none', alpha=0.8)
+            ax.set_title(f'Value Distribution (μ={vals.mean():.2f}, σ={vals.std():.2f})', fontsize=11)
+            ax.set_xlabel('Value')
+            ax.set_ylabel('Count')
+        elif C >= 2:
+            ax.imshow(image_np[1], cmap='viridis')
+            ax.set_title(f'Band 1 / {C} bands', fontsize=11)
+            ax.axis('off')
+        else:
+            ax.axis('off')
+            ax.set_title('N/A', fontsize=11)
         
-        # 3. Labels
+        # =====================================================================
+        # Panel 3: Labels or reconstruction info
+        # =====================================================================
         ax = axes[2]
-        label_rgb = np.zeros((H, W, 3))
-        label_rgb[label_np == 0] = [0.2, 0.4, 0.8]   # Blue = no flood
-        label_rgb[label_np == 1] = [0.9, 0.2, 0.2]   # Red = flood
-        label_rgb[label_np == 255] = [0.5, 0.5, 0.5] # Gray = ignore
-        ax.imshow(label_rgb)
-        n_flood = (label_np == 1).sum()
-        ax.set_title(f'Ground Truth (Flood: {n_flood} px)', fontsize=11)
-        ax.axis('off')
+        if label_np is not None:
+            # Segmentation mode
+            label_rgb = np.zeros((H, W, 3))
+            label_rgb[label_np == 0] = [0.2, 0.4, 0.8]
+            label_rgb[label_np == 1] = [0.9, 0.2, 0.2]
+            label_rgb[label_np == 255] = [0.5, 0.5, 0.5]
+            ax.imshow(label_rgb)
+            n_flood = (label_np == 1).sum()
+            ax.set_title(f'Ground Truth (Flood: {n_flood} px)', fontsize=11)
+            ax.axis('off')
+        elif image_tokens is not None:
+            # Reconstruction mode: show spatial distribution of token values
+            val_map = np.full((H, W), np.nan)
+            x_off = int(image_tokens[:, 1].min().item())
+            y_off = int(image_tokens[:, 2].min().item())
+            
+            # Average token values per pixel (may have multiple bands)
+            count_map = np.zeros((H, W))
+            tokens_np = image_tokens.cpu().numpy()
+            for t in range(min(tokens_np.shape[0], 100000)):  # cap for speed
+                px = int(tokens_np[t, 1]) - x_off
+                py = int(tokens_np[t, 2]) - y_off
+                if 0 <= px < W and 0 <= py < H:
+                    v = tokens_np[t, 0]
+                    if np.isnan(val_map[py, px]):
+                        val_map[py, px] = v
+                    else:
+                        val_map[py, px] += v
+                    count_map[py, px] += 1
+            
+            valid = count_map > 0
+            val_map[valid] /= count_map[valid]
+            
+            im = ax.imshow(val_map, cmap='RdBu_r')
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title(f'Token Values (recon target)', fontsize=11)
+            ax.axis('off')
+        else:
+            ax.axis('off')
+            ax.set_title('No labels available', fontsize=11)
         
         # =====================================================================
-        # Row 2: Token assignment visualization
+        # Panel 4: Voronoi cells
         # =====================================================================
-        
-        # 4. Voronoi cells (100% coverage, theoretical)
         ax = axes[3]
         voronoi_color = self.latent_colors[voronoi_assignment]
         ax.imshow(voronoi_color)
-        ax.scatter(latent_px, latent_py, c='white', s=30, edgecolors='black', linewidths=0.8, zorder=10)
-        ax.set_title(f'Voronoi Cells (100% coverage)', fontsize=11)
+        ax.scatter(latent_px, latent_py, c='white', s=30, edgecolors='black',
+                   linewidths=0.8, zorder=10)
+        ax.set_title(f'Voronoi Cells ({num_latents} latents)', fontsize=11)
         ax.axis('off')
         
-        # 5. Sampled tokens (actual geo_k tokens)
+        # =====================================================================
+        # Panel 5: Sampled tokens
+        # =====================================================================
         ax = axes[4]
-        sampled_color = np.ones((H, W, 3), dtype=np.float32) * 0.9  # Light gray background
+        sampled_color = np.ones((H, W, 3), dtype=np.float32) * 0.9
         mask = sampled_latent >= 0
         sampled_color[mask] = self.latent_colors[sampled_latent[mask]]
         ax.imshow(sampled_color)
-        ax.scatter(latent_px, latent_py, c='white', s=30, edgecolors='black', linewidths=0.8, zorder=10)
+        ax.scatter(latent_px, latent_py, c='white', s=30, edgecolors='black',
+                   linewidths=0.8, zorder=10)
         sampled_coverage = mask.sum() / (H * W) * 100
-        ax.set_title(f'Sampled Tokens ({sampled_coverage:.1f}% coverage, k={geo_k})', fontsize=11)
+        ax.set_title(f'Sampled Tokens ({sampled_coverage:.1f}% cov, k={geo_k})', fontsize=11)
         ax.axis('off')
         
-        # 6. Overlap Heatmap
+        # =====================================================================
+        # Panel 6: Overlap heatmap
+        # =====================================================================
         ax = axes[5]
         im = ax.imshow(sampled_count, cmap='hot', interpolation='nearest')
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.scatter(latent_px, latent_py, c='cyan', s=20, edgecolors='white', linewidths=0.5, zorder=10)
+        ax.scatter(latent_px, latent_py, c='cyan', s=20, edgecolors='white',
+                   linewidths=0.5, zorder=10)
         ax.set_title(f'Overlap Heatmap (max: {sampled_count.max()})', fontsize=11)
         ax.axis('off')
         
         # =====================================================================
         # Title and save
         # =====================================================================
-        
-        grid_type = "Hexagonal" if hexagonal else "Square"
+        grid_type = "Hex" if hexagonal else "Sq"
+        mode_str = "RECON" if is_reconstruction else "SEG"
         fig.suptitle(
-            f'Epoch {epoch}, Sample {sample_idx} | '
-            f'{grid_type} Grid: {lx}×{ly} = {num_latents} latents | '
-            f'Image: {H}×{W} | k={geo_k}',
+            f'Epoch {epoch} | Sample {sample_idx} | {mode_str} | '
+            f'{grid_type} {lx}×{ly}={num_latents} latents | '
+            f'{C}ch × {H}×{W} | k={geo_k}',
             fontsize=13, fontweight='bold'
         )
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         
-        # Save
         save_path = os.path.join(self.save_dir, f'e{epoch:03d}_s{sample_idx}.png')
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"[TokenAssignmentCallback] Saved: {save_path}")
+        print(f"[TokenAssignment] Saved: {save_path}")
         
-        # Stats
-        print(f"  Voronoi coverage: 100%")
-        print(f"  Sampled coverage: {sampled_coverage:.1f}%")
-        print(f"  Max overlap: {sampled_count.max()}")
+        print(f"  Coverage: {sampled_coverage:.1f}%, Max overlap: {sampled_count.max()}")
         
-        # Wandb
         if self.use_wandb and wandb is not None and wandb.run is not None:
             try:
                 wandb.log({
                     f"token_assignment/sample_{sample_idx}": wandb.Image(fig),
                     f"token_assignment/sampled_coverage": sampled_coverage,
-                    f"token_assignment/max_overlap": sampled_count.max(),
+                    f"token_assignment/max_overlap": int(sampled_count.max()),
                 })
-            except:
+            except Exception:
                 pass
         
         plt.close(fig)

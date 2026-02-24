@@ -26,6 +26,26 @@ LEARNED_TIME_IDX       = 0   # Datasets without temporal dimension
 
 
 # =============================================================================
+# SENTINEL CONVENTION
+# =============================================================================
+# Column 7 (time_idx) uses TWO distinct sentinel mechanisms:
+#
+#   -1 = "not applicable" → TimeEncoder outputs ZERO vector
+#        Used by single-date datasets (SenFlood) that have no temporal info.
+#
+#    0 = LEARNED_TIME_IDX → TimeEncoder outputs a LEARNED embedding
+#        Reserved for future use. NOT the same as -1.
+#
+#   ≥1 = registered timestamp → TimeEncoder looks up DOY → circular RBF
+#        Used by multi-temporal datasets (PASTIS).
+#
+# Datasets MUST use the lookup table to get proper indices:
+#   - No temporal info:  set column 7 to -1 directly
+#   - Has temporal info:  call look_up.get_or_register_time_idx(doy)
+#                         which returns indices ≥ 1
+
+
+# =============================================================================
 # ABSTRACT CHANNEL DEFINITIONS
 # =============================================================================
 # Abstract channels use NEGATIVE bandwidth AND central_wavelength values.
@@ -33,8 +53,9 @@ LEARNED_TIME_IDX       = 0   # Datasets without temporal dimension
 
 ABSTRACT_CHANNELS = {
     # Sentinel-1 SAR polarizations
-    "VV": {"bandwidth": -1, "central_wavelength": -1},
-    "VH": {"bandwidth": -2, "central_wavelength": -2},
+    "VV":    {"bandwidth": -1, "central_wavelength": -1},
+    "VH":    {"bandwidth": -2, "central_wavelength": -2},
+    "VV_VH": {"bandwidth": -3, "central_wavelength": -3},  # VV/VH ratio
 
     # Elevation / DEM
     "ELEVATION": {"bandwidth": -10, "central_wavelength": -10},
@@ -62,6 +83,15 @@ class Lookup_encoding(pl.LightningModule):
     
     Uses a reference grid system: instead of registering every crop size,
     maintains reference grids (e.g., 512×512) from which crops extract windows.
+    
+    Time encoding:
+        Datasets with temporal info register their timestamps (as DOY values)
+        via get_or_register_time_idx(doy). This returns indices ≥ 1 that go
+        into token column 7. The TimeEncoder maps these indices back to DOY
+        values for circular RBF encoding.
+        
+        Datasets WITHOUT temporal info set column 7 to -1 directly.
+        The TimeEncoder outputs zeros for -1 indices.
     """
     
     def __init__(self, modalities_config, bands_info, config_model):
@@ -74,7 +104,10 @@ class Lookup_encoding(pl.LightningModule):
         self.table_queries = {}
         self.table_resolution = None
         self.table_time = None
-        self.nb_tokens_queries = config_model["Atomiser"]["spatial_latents"]
+
+
+        self.nb_tokens_queries=1
+   
         
         # Track next available offset for dynamic registration
         self.next_position_offset = 0
@@ -104,8 +137,8 @@ class Lookup_encoding(pl.LightningModule):
         # Reference grid sizes (matching TokenBuilder.REFERENCE_SIZES)
         reference_modalities = [
             (0.2, 512),   # VHR imagery
-            (1.0, 512),
-            (10.0, 512),  # Sentinel-2/Sentinel-1 at 10m
+            (1.0, 2080),
+            (10.0, 1024),  # Sentinel-2/Sentinel-1 at 10m
             (20.0, 512),  # Sentinel-2 at 20m
             (30.0, 512),  # Landsat at 30m
             (60.0, 512),  # Sentinel-2 at 60m
@@ -137,6 +170,18 @@ class Lookup_encoding(pl.LightningModule):
             gsd = res_key / 1000
             print(f"  {gsd:>8.1f} m/px × {size:4d}px → offset {offset:6d}")
 
+    def get_offset_for_resolution(self, resolution: float) -> tuple:
+        """Find the pre-registered reference grid for a given resolution.
+        
+        Returns:
+            (offset, reference_size)
+        """
+        res_key = int(resolution * 1000)
+        for (rk, size), offset in self.table.items():
+            if rk == res_key:
+                return offset, size
+        raise KeyError(f"No reference grid for resolution {resolution} m/px")
+
     def register_modality(self, resolution: float, size: int):
         """
         Register a new (resolution, size) modality.
@@ -151,6 +196,8 @@ class Lookup_encoding(pl.LightningModule):
         """
         res_key = int(resolution * 1000)
         key = (res_key, size)
+
+        
         
         if key in self.table:
             return self.table[key]
@@ -352,6 +399,10 @@ class Lookup_encoding(pl.LightningModule):
           - int sequential timestep (1, 2, 3, …)
 
         Starts empty; datasets register their timesteps at init.
+        
+        IMPORTANT: Datasets WITHOUT temporal info should set column 7 to -1
+        (not 0). The TimeEncoder zeros out -1 indices. Index 0 is a valid
+        learned embedding, not a sentinel.
         """
         self.table_time = dict()
         self.num_time_indices = 1  # index 0 reserved for learned
@@ -369,6 +420,24 @@ class Lookup_encoding(pl.LightningModule):
             Integer index. Returns LEARNED_TIME_IDX (0) if not registered.
         """
         return self.table_time.get(time_key, LEARNED_TIME_IDX)
+
+    def get_or_register_time_idx(self, time_key) -> int:
+        """
+        Get time index for a key, auto-registering if not yet known.
+        
+        This is the main entry point for datasets with temporal info.
+        Returns indices ≥ 1 (index 0 is reserved for learned/no-time).
+        
+        Args:
+            time_key: Hashable time identifier — typically day-of-year (int)
+                      but can be any hashable (str date, tuple, etc.)
+        
+        Returns:
+            Integer index (≥ 1).
+        """
+        if time_key in self.table_time:
+            return self.table_time[time_key]
+        return self.register_time(time_key)
 
     def register_time(self, time_key) -> int:
         """
@@ -505,6 +574,39 @@ def create_sen1floods11_bands_info() -> dict:
             "VH": {
                 "bandwidth": ABSTRACT_CHANNELS["VH"]["bandwidth"],
                 "central_wavelength": ABSTRACT_CHANNELS["VH"]["central_wavelength"],
+            },
+        },
+    }
+    return bands_info
+
+
+def create_pastis_bands_info() -> dict:
+    """Band info for PASTIS-HD: S2 (10 bands) + S1A (3 channels: VV, VH, VV/VH)."""
+    bands_info = {
+        "bands_sen2_info": {
+            "B02": {"bandwidth": 65, "central_wavelength": 490},
+            "B03": {"bandwidth": 35, "central_wavelength": 560},
+            "B04": {"bandwidth": 30, "central_wavelength": 665},
+            "B05": {"bandwidth": 15, "central_wavelength": 705},
+            "B06": {"bandwidth": 15, "central_wavelength": 740},
+            "B07": {"bandwidth": 20, "central_wavelength": 783},
+            "B08": {"bandwidth": 115, "central_wavelength": 842},
+            "B8A": {"bandwidth": 20, "central_wavelength": 865},
+            "B11": {"bandwidth": 90, "central_wavelength": 1610},
+            "B12": {"bandwidth": 180, "central_wavelength": 2190},
+        },
+        "bands_sen1_info": {
+            "VV": {
+                "bandwidth": ABSTRACT_CHANNELS["VV"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VV"]["central_wavelength"],
+            },
+            "VH": {
+                "bandwidth": ABSTRACT_CHANNELS["VH"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VH"]["central_wavelength"],
+            },
+            "VV_VH": {
+                "bandwidth": ABSTRACT_CHANNELS["VV_VH"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VV_VH"]["central_wavelength"],
             },
         },
     }

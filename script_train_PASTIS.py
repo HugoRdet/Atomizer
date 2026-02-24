@@ -40,7 +40,7 @@ from training.trainer_PASTIS import PASTISTrainer
 from training.utils.datasets.utils_dataset_PASTIS import PastisHDDataset
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.token_grouping import collate_grouped
-
+from training.utils import measure_flops, measure_inference_time, batch_to_device
 # =============================================================================
 # ARGS
 # =============================================================================
@@ -120,7 +120,7 @@ checkpoint_val = ModelCheckpoint(
 callbacks = [accumulator, checkpoint_val, lr_monitor]
 
 # =============================================================================
-# TRAINER
+# TRAINER (multi-GPU for training)
 # =============================================================================
 trainer = Trainer(
     strategy="ddp_find_unused_parameters_true",
@@ -135,14 +135,29 @@ trainer = Trainer(
 )
 
 # =============================================================================
-# TRAIN & TEST
+# TRAIN
 # =============================================================================
 trainer.fit(model, datamodule=data_module)
-trainer.test(model, datamodule=data_module)
+
+
+best_ckpt = checkpoint_val.best_model_path
+
+# Kill DDP so single-GPU test doesn't hang
+if torch.distributed.is_initialized():
+    torch.distributed.destroy_process_group()
+
+if os.environ.get("LOCAL_RANK", "0") == "0":
+    test_trainer = Trainer(
+        devices=[0],
+        accelerator="gpu",
+        precision="bf16-mixed",
+        logger=wandb_logger,
+    )
+    test_trainer.test(model, datamodule=data_module, ckpt_path=best_ckpt)
 
 
 # =============================================================================
-# MEASURE COMPLEXITY
+# MEASURE COMPLEXITY — PyTorch profiler (single GPU)
 # =============================================================================
 
 def _batch_to_device(batch: dict, device) -> dict:
@@ -154,13 +169,33 @@ def _batch_to_device(batch: dict, device) -> dict:
         elif isinstance(v, dict):
             out[k] = _batch_to_device(v, device)
         else:
-            out[k] = v  # scalars, tuples, strings — keep as-is
+            out[k] = v
     return out
 
 
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    from fvcore.nn import FlopCountAnalysis
+def measure_flops_pytorch(model, batch, device):
+    """Measure FLOPs using torch.profiler (handles ops fvcore misses)."""
+    batch = _batch_to_device(batch, device)
 
+    with torch.no_grad():
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_flops=True,
+        ) as prof:
+            _ = model(batch)
+
+    total_flops = 0
+    for event in prof.key_averages():
+        if event.flops is not None and event.flops > 0:
+            total_flops += event.flops
+
+    return total_flops / 1e9  # GFLOPs
+
+
+if os.environ.get("LOCAL_RANK", "0") == "0":
     print("\n" + "=" * 80)
     print("MEASURING MODEL COMPLEXITY")
     print("=" * 80 + "\n")
@@ -168,7 +203,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     data_module.setup("test")
     test_dataset = data_module.test_dataset
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda:0")
     model = model.to(device)
     model.eval()
 
@@ -177,32 +212,25 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
     results = []
 
-    for input_size in [128]:  # PASTIS patches are typically 128x128
+    for input_size in [128]:
         print(f"\nTesting input size: {input_size}x{input_size}")
 
-        # ============= Atomizer: grouped dict batch =============
-        # Collate single sample into batch-of-1
+        # ── Warmup ──────────────────────────────────────────
         batch_0 = collate_grouped([samples[0]])
         batch_0 = _batch_to_device(batch_0, device)
-
-        # Warmup
         with torch.no_grad():
             _ = model(batch_0)
 
-        # FLOPs
+        # ── FLOPs via PyTorch profiler ──────────────────────
         batch_1 = collate_grouped([samples[1]])
-        batch_1 = _batch_to_device(batch_1, device)
-
         try:
-            with torch.no_grad():
-                flops = FlopCountAnalysis(model, (batch_1,))
-                gflops = flops.total() / 1e9
+            gflops = measure_flops_pytorch(model, batch_1, device)
         except Exception as e:
             print(f"  FLOPs measurement failed: {e}")
             gflops = -1
 
-        # Inference time
-        num_warmup, num_runs = 3, 20
+        # ── Inference time ──────────────────────────────────
+        num_warmup, num_runs = 5, 30
         with torch.no_grad():
             for i in range(num_warmup):
                 b = collate_grouped([samples[i % num_samples]])
@@ -221,7 +249,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
         avg_time_ms = (end - start) / num_runs * 1000
 
-        # Count tokens from the first group
+        # ── Token count ─────────────────────────────────────
         first_res = next(iter(batch_0["groups"]))
         num_tokens = batch_0["groups"][first_res]["tokens"].shape[1]
 
@@ -237,7 +265,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"  GFLOPs: {gflops:.2f}")
         print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
 
-    # Summary
+    # ── Summary ─────────────────────────────────────────────
     print("\n" + "=" * 80)
     print(f"COMPLEXITY SUMMARY ({config_model['encoder']})")
     print("=" * 80)

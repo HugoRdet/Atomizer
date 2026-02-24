@@ -130,7 +130,7 @@ class UnifiedDataModule(pl.LightningDataModule):
     
     H5_DATASET_CLASSES = {'Tiny_BigEarthNet', 'FLAIR_MAE', 'FLAIR_2'}
     SIMPLE_DATASET_CLASSES = {'MNISTSparseCanvas'}
-    GROUPED_DATASET_CLASSES = {'Sen1Floods11Dataset', 'HLSBurnScarsDataset', 'MADOSDataset', 'Sen1Floods11MultiResDataset','PastisHDDataset'}
+    GROUPED_DATASET_CLASSES = {'Sen1Floods11Dataset', 'HLSBurnScarsDataset', 'MADOSDataset', 'Sen1Floods11MultiResDataset','PastisHDDataset','MMEarthMAEDataset',"PastisSpotReconDataset"}
     
     def __init__(
         self,

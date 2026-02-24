@@ -22,43 +22,23 @@ class Sen1Floods11Dataset(Dataset):
         [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
          col 0  1  2       3          4        5            6            7
     
-    For Sen1Floods11:
-        - resolution_idx: looked up from GSD (10.0 m/px), same for all bands
-        - time_idx: -1 (no temporal info, zeroed out by encoder)
+    Modes:
+        - segmentation (default): queries = 1 per pixel, col 4 = class label
+        - reconstruction:         queries = 1 per pixel-band, col 4 = reflectance
     
-    Convention:
-        -1 = "not applicable" → encoder outputs zero vector
-        ≥0 = valid index      → encoder outputs real features
-    
-    Returns:
-    {
-        "groups": {
-            10.0: {
-                "tokens": [N, 8],
-                "mask":   [N],
-                "shape":  (15, 512, 512),
-            },
-        },
-        "queries":           [M, 8],
-        "queries_mask":      [M],
-        "label":             [512, 512],
-        "target_resolution": 10.0,
-        "image":             [15, 512, 512],
-    }
-    
-    Directory structure:
-    ./data/SENFLOOD/
-    ├── data/flood_events/HandLabeled/{S1Hand,S2Hand,LabelHand}/
-    ├── splits/flood_handlabeled/{flood_train_data,flood_valid_data,flood_test_data}.csv
-    └── normalization_stats.pt  (auto-generated)
+    Single-channel mode:
+        When `single_channel` is set in trainer config, only the specified band
+        index (0-based into the merged S2+S1 stack) is used. Useful for debugging
+        reconstruction and isolating per-band issues.
+        Set to -1 or omit to use all bands (default).
     """
 
-    OPTICAL_RESOLUTION = 10.0   # m/px (all bands at 10m)
+    OPTICAL_RESOLUTION = 10.0
     NUM_S2_BANDS = 13
     NUM_S1_BANDS = 2
     NUM_CLASSES = 2
     IGNORE_INDEX = 255
-    TIME_IDX_NA = -1            # No temporal info → -1 → zeroed by encoder
+    TIME_IDX_NA = -1
 
     def __init__(
         self,
@@ -78,12 +58,39 @@ class Sen1Floods11Dataset(Dataset):
         self.look_up = look_up
         self.config_model = config_model
 
-        # Initialize TokenBuilder for centralized token construction
+        # Initialize TokenBuilder
         self.token_builder = TokenBuilder(look_up)
 
         # Config parameters
         self.nb_tokens = config_model["trainer"]["max_tokens"]
         self.max_tokens_reconstruction = config_model["trainer"]["max_tokens_reconstruction"]
+        self.reconstruction = config_model["trainer"].get("mode", "segmentation") == "reconstruction"
+
+        # ── Single-channel mode ─────────────────────────────
+        # single_channel: index into the merged [S2(13) + S1(2)] band stack
+        #   -1 or absent → all 15 bands (default)
+        #    0..14       → only that band
+        #   list[int]    → only those bands
+        sc = config_model["trainer"].get("single_channel", -1)
+        if isinstance(sc, list):
+            self.selected_channels = sorted(sc)
+        elif isinstance(sc, int) and sc >= 0:
+            self.selected_channels = [sc]
+        else:
+            self.selected_channels = None  # all bands
+
+        if self.selected_channels is not None:
+            total = self.NUM_S2_BANDS + self.NUM_S1_BANDS
+            for ch in self.selected_channels:
+                assert 0 <= ch < total, (
+                    f"single_channel index {ch} out of range [0, {total})"
+                )
+            print(f"[Sen1Floods11] SINGLE-CHANNEL MODE: using band indices {self.selected_channels}")
+
+        if self.reconstruction:
+            print(f"[Sen1Floods11] Mode: RECONSTRUCTION (queries = image tokens, col 4 = reflectance)")
+        else:
+            print(f"[Sen1Floods11] Mode: SEGMENTATION (queries = pixels, col 4 = class label)")
 
         # Split mapping
         self.split_mapping = {
@@ -108,7 +115,16 @@ class Sen1Floods11Dataset(Dataset):
         self.bandwidths, self.wavelengths, self.band_names = self._parse_bands_info()
         self.spectral_indices = self._build_spectral_indices()
 
-        # Resolution index: same for all bands (S2 + S1 both at 10m)
+        # Apply single-channel filtering to band metadata
+        if self.selected_channels is not None:
+            self.bandwidths = self.bandwidths[self.selected_channels]
+            self.wavelengths = self.wavelengths[self.selected_channels]
+            self.band_names = [self.band_names[i] for i in self.selected_channels]
+            self.spectral_indices = self.spectral_indices[self.selected_channels]
+            print(f"[Sen1Floods11] After channel selection: {len(self.bandwidths)} bands → "
+                  f"{[self.band_names[i] if i < len(self.band_names) else '?' for i in range(len(self.band_names))]}")
+
+        # Resolution index
         self.resolution_idx = self.look_up.get_resolution_idx(self.OPTICAL_RESOLUTION)
 
         # Normalization
@@ -120,6 +136,19 @@ class Sen1Floods11Dataset(Dataset):
         print(f"[Sen1Floods11] Time idx: -1 (no temporal info, zeroed by encoder)")
 
     # =========================================================================
+    # CHANNEL SELECTION HELPER
+    # =========================================================================
+
+    def _select_channels(self, image):
+        """
+        Apply single-channel selection to a [C, H, W] image tensor.
+        Returns the selected subset of channels.
+        """
+        if self.selected_channels is None:
+            return image
+        return image[self.selected_channels]  # [len(selected), H, W]
+
+    # =========================================================================
     # DATASET INTERFACE
     # =========================================================================
 
@@ -127,13 +156,14 @@ class Sen1Floods11Dataset(Dataset):
         return len(self.s1_image_list)
 
     def __getitem__(self, index):
+ 
         # ── Load ────────────────────────────────────────────
         with rasterio.open(self.s2_image_list[index]) as src:
-            image_s2 = src.read().astype(np.float32)    # [13, H, W]
+            image_s2 = src.read().astype(np.float32)
         with rasterio.open(self.s1_image_list[index]) as src:
-            image_s1 = src.read().astype(np.float32)    # [2, H, W]
+            image_s1 = src.read().astype(np.float32)
         with rasterio.open(self.label_list[index]) as src:
-            label = src.read(1).astype(np.int64)        # [H, W]
+            label = src.read(1).astype(np.int64)
 
         # ── Clean ───────────────────────────────────────────
         image_s2 = np.nan_to_num(image_s2, nan=0.0, posinf=0.0, neginf=0.0)
@@ -149,66 +179,58 @@ class Sen1Floods11Dataset(Dataset):
         image_s2 = torch.clamp(image_s2, -10, 10)
         image_s1 = torch.clamp(image_s1, -10, 10)
 
-        # ── Merge (same resolution → single image) ─────────
-        image = torch.cat([image_s2, image_s1], dim=0)  # [15, H, W]
+        # ── Merge & select channels ─────────────────────────
+        image_full = torch.cat([image_s2, image_s1], dim=0)  # [15, H, W]
+        image = self._select_channels(image_full)              # [C', H, W]
 
         # ── Build tokens [N, 8] ─────────────────────────────
         resolution = self.OPTICAL_RESOLUTION
-        image_tokens, queries = self._build_tokens(image, label, resolution)
+        image_tokens, seg_queries = self._build_tokens(image, label, resolution)
 
-        # ── Attention mask ──────────────────────────────────
+        # ── Build queries (mode-dependent) ──────────────────
+        if self.reconstruction:
+            queries = image_tokens.clone()
+            queries[:, 4] = queries[:, 0].clone()  # reflectance → label col
+            # Subsample
+            perm = torch.randperm(queries.shape[0])[:self.max_tokens_reconstruction]
+            queries = queries[perm]
+        else:
+            queries = self.token_builder.subsample_queries(
+                seg_queries,
+                max_queries=self.max_tokens_reconstruction,
+                ignore_index=self.IGNORE_INDEX,
+                prioritize_valid=True,
+            )
+
+        # ── Masks ───────────────────────────────────────────
         attention_mask = torch.zeros(image_tokens.shape[0])
-
-        # ── Subsample queries using TokenBuilder ───────────
-        queries = self.token_builder.subsample_queries(
-            queries,
-            max_queries=self.max_tokens_reconstruction,
-            ignore_index=self.IGNORE_INDEX,
-            prioritize_valid=True,
-        )
         queries_mask = torch.zeros(queries.shape[0])
 
-        # ── Return grouped format ───────────────────────────
-        return {
+        # ── Return ──────────────────────────────────────────
+        result = {
             "groups": {
                 resolution: {
-                    "tokens": image_tokens,           # [C*H*W, 8]
-                    "mask": attention_mask,            # [C*H*W]
-                    "shape": tuple(image.shape),       # (15, H, W)
+                    "tokens": image_tokens,
+                    "mask": attention_mask,
+                    "shape": tuple(image.shape),
                 },
             },
-            "queries": queries,                        # [M, 8]
-            "queries_mask": queries_mask,               # [M]
-            "label": label,                            # [H, W]
+            "queries": queries,
+            "queries_mask": queries_mask,
             "target_resolution": resolution,
-            "image": image,                            # [15, H, W]
+            "image": image,
         }
 
+        if not self.reconstruction:
+            result["label"] = label
+
+        return result
+
     # =========================================================================
-    # TOKEN BUILDING (using centralized TokenBuilder)
+    # TOKEN BUILDING
     # =========================================================================
 
     def _build_tokens(self, image, label, resolution):
-        """
-        Build [N, 8] tokens from image + label using TokenBuilder.
-        
-        Token format:
-            [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
-             col 0  1  2       3          4        5            6            7
-        
-        resolution_idx is the same for all bands (S2 + S1 both at 10m).
-        time_idx is -1 for all tokens (zeroed out by TimeEncoder).
-        
-        Args:
-            image:      [C, H, W] normalized values
-            label:      [H, W] class labels
-            resolution: meters per pixel
-        
-        Returns:
-            image_tokens: [C*H*W, 8]
-            queries:      [H*W, 8]   (single band for segmentation)
-        """
-        # Build image tokens using TokenBuilder
         image_tokens = self.token_builder.build_tokens(
             image=image,
             label=label,
@@ -218,8 +240,6 @@ class Sen1Floods11Dataset(Dataset):
             time_idx=self.TIME_IDX_NA,
         )
 
-        # Build queries using TokenBuilder
-        # Use first spectral index for queries (segmentation uses single band)
         first_spectral_idx = self.spectral_indices[0]
         queries = self.token_builder.build_queries(
             label=label,
@@ -232,13 +252,98 @@ class Sen1Floods11Dataset(Dataset):
         return image_tokens, queries
 
     # =========================================================================
+    # VIZ SAMPLES
+    # =========================================================================
+
+    def get_viz_sample(self, index: int) -> dict:
+        """
+        Viz sample — mode-aware.
+        Reconstruction: all tokens as queries, col 4 = reflectance.
+        Segmentation: all pixels as queries, includes label + image.
+        """
+    
+        with rasterio.open(self.s2_image_list[index]) as src:
+            image_s2 = src.read().astype(np.float32)
+        with rasterio.open(self.s1_image_list[index]) as src:
+            image_s1 = src.read().astype(np.float32)
+        with rasterio.open(self.label_list[index]) as src:
+            label = src.read(1).astype(np.int64)
+
+        image_s2 = np.nan_to_num(image_s2, nan=0.0, posinf=0.0, neginf=0.0)
+        image_s1 = np.nan_to_num(image_s1, nan=0.0, posinf=0.0, neginf=0.0)
+        label[label == -1] = self.IGNORE_INDEX
+
+        image_s2 = torch.from_numpy(image_s2)
+        image_s1 = torch.from_numpy(image_s1)
+        label = torch.from_numpy(label)
+
+        image_s2, image_s1 = self.normalize_image(image_s2, image_s1)
+        image_s2 = torch.clamp(image_s2, -10, 10)
+        image_s1 = torch.clamp(image_s1, -10, 10)
+
+        image_full = torch.cat([image_s2, image_s1], dim=0)
+        image = self._select_channels(image_full)
+        C, H, W = image.shape
+
+        if self.reconstruction:
+            # All image tokens as queries
+            dummy_label = torch.full((H, W), self.IGNORE_INDEX, dtype=torch.long)
+            tokens = self.token_builder.build_tokens(
+                image=image,
+                label=dummy_label,
+                resolution=self.OPTICAL_RESOLUTION,
+                spectral_indices=self.spectral_indices,
+                resolution_idx=self.resolution_idx,
+                time_idx=self.TIME_IDX_NA,
+            )
+            tokens[:, 4] = tokens[:, 0].clone()
+
+            queries = tokens.clone()
+            queries_mask = torch.zeros(tokens.shape[0], dtype=torch.bool)
+            attention_mask = torch.zeros(tokens.shape[0])
+
+            return {
+                "groups": {
+                    self.OPTICAL_RESOLUTION: {
+                        "tokens": tokens,
+                        "mask": attention_mask,
+                        "shape": (C, H, W),
+                    },
+                },
+                "queries": queries,
+                "queries_mask": queries_mask,
+                "target_resolution": self.OPTICAL_RESOLUTION,
+                "image": image,
+                "image_shape": (C, H, W),
+                "n_real": tokens.shape[0],
+            }
+        else:
+            # Segmentation: all pixels as queries, no subsampling
+            image_tokens, queries = self._build_tokens(image, label, self.OPTICAL_RESOLUTION)
+            queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
+            attention_mask = torch.zeros(image_tokens.shape[0])
+
+            return {
+                "groups": {
+                    self.OPTICAL_RESOLUTION: {
+                        "tokens": image_tokens,
+                        "mask": attention_mask,
+                        "shape": (C, H, W),
+                    },
+                },
+                "queries": queries,
+                "queries_mask": queries_mask,
+                "label": label,
+                "target_resolution": self.OPTICAL_RESOLUTION,
+                "image": image,
+            }
+
+    # =========================================================================
     # FILE LOADING
     # =========================================================================
 
     def _load_file_lists(self):
-        """Load file lists from split CSV."""
         s1_images, s2_images, labels = [], [], []
-
         print(f"[Sen1Floods11] Loading split file: {self.split_file}")
 
         with open(self.split_file, "r") as f:
@@ -246,7 +351,6 @@ class Sen1Floods11Dataset(Dataset):
             for row in reader:
                 if len(row) < 2:
                     continue
-
                 s1_filename = row[0].replace("S1Hand/", "")
                 label_filename = row[1].replace("LabelHand/", "")
                 s2_filename = s1_filename.replace("_S1Hand", "_S2Hand")
@@ -258,7 +362,6 @@ class Sen1Floods11Dataset(Dataset):
         return s1_images, s2_images, labels
 
     def _filter_invalid_samples(self):
-        """Remove samples with no valid labels (all 255)."""
         valid_s1, valid_s2, valid_labels = [], [], []
         skipped = 0
 
@@ -364,6 +467,7 @@ class Sen1Floods11Dataset(Dataset):
         print(f"[Sen1Floods11] S1 std:  {stats['s1_std'].numpy()}")
 
     def normalize_image(self, s2, s1):
+        """Normalize S2 and S1 separately using precomputed stats."""
         s2_mean = self.norm_stats["s2_mean"].view(13, 1, 1)
         s2_std  = self.norm_stats["s2_std"].view(13, 1, 1)
         s1_mean = self.norm_stats["s1_mean"].view(2, 1, 1)

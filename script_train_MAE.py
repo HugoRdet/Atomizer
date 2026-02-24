@@ -1,45 +1,52 @@
-from training.perceiver import *
-from training.utils import *
-from training.losses import *
-from training.utils.callbacks import *
-from training.utils.datasets import*
-from training.VIT import *
-from training.ResNet import *
-from collections import defaultdict
-from training import *
+"""
+MMEarth MAE Training Script
+============================
+Uses grouped-token batch format:
+    batch = {
+        "groups": {res: {"tokens": [B,N,8], "mask": [B,N], "shape": (C,H,W)}},
+        "queries":      [B, M, 8],
+        "queries_mask":  [B, M],
+    }
+"""
+
+# =============================================================================
+# IMPORTS
+# =============================================================================
 import os
-from sklearn.metrics import average_precision_score
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, GradientAccumulationScheduler
+import time
+import argparse
 import torch
 import numpy as np
-from torch import nn, einsum
-import torch.nn.functional as F
-import einops as einops
-from einops import rearrange, repeat
-from einops.layers.torch import Reduce
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.profilers import PyTorchProfiler
-from torch.profiler import ProfilerActivity
-from pytorch_lightning.callbacks import LearningRateFinder
-import matplotlib.pyplot as plt
+from collections import defaultdict
 
-from configilm import util
-util.MESSAGE_LEVEL = util.MessageLevel.INFO
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    GradientAccumulationScheduler,
+    LearningRateMonitor,
+)
 
 seed_everything(42, workers=True)
-from configilm.extra.DataSets import BENv2_DataSet
-from configilm.extra.DataModules import BENv2_DataModule
-import random
-import argparse
 
-# --- NEW IMPORTS ---
-# Import the new TokenProcessor from your refactored module
-from training.utils.token_building.processor import TokenProcessor
+# --- Project imports ---
+from training.utils import read_yaml
+from training.utils import Lookup_encoding
 
-# Create the parser
-parser = argparse.ArgumentParser(description="Training script")
+from training.trainer_MAE import Model_MMEarth
+from training.utils.datasets.utils_dataset_SENFLOOD import Sen1Floods11Dataset
+from training.utils.datasets.utils_dataset_MM_Earth import MMEarthMAEDataset
+from training.utils.datasets.utils_dataset_PASTIS_SPOT import PastisSpotReconDataset
+
+from training.utils.datasets.dataloaders import UnifiedDataModule
+from training.utils.datasets.token_grouping import collate_grouped
+from training.utils.callbacks.mae_visualization_callback import ReconstructionVizCallback
+from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSenFlood
+
+# =============================================================================
+# ARGS
+# =============================================================================
+parser = argparse.ArgumentParser(description="MMEarth MAE Training")
 parser.add_argument("--xp_name",       type=str, required=True, help="Experiment name")
 parser.add_argument("--config_model",  type=str, required=True, help="Model config yaml file")
 parser.add_argument("--dataset_name",  type=str, required=True, help="Name of the dataset used")
@@ -48,102 +55,83 @@ args = parser.parse_args()
 xp_name = args.xp_name
 config_model = read_yaml("./training/configs/" + args.config_model)
 configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
-bands_yaml       = "./data/bands_info/bands.yaml"
+bands_yaml = "./data/bands_info/bands.yaml"
 
-# 1. Initialize Lookup Table (Kept as is, assuming it handles modality indices)
+# =============================================================================
+# LOOKUP TABLE
+# =============================================================================
 lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
 
-# 2. Modalities Transformations (Data Augmentation stuff)
-modalities_trans = modalities_transformations_config(
-    configs_dataset, 
-    model=config_model["encoder"], 
-    name_config=args.dataset_name
-)
-
-# 3. Initialize the New Processor (Replaces transformations_config)
-# The TokenProcessor handles all encoding logic (Physics + Math)
-# It takes the full config and the lookup table.
-input_processor = TokenProcessor(config_model, lookup_table)
-
-
+# =============================================================================
+# WANDB
+# =============================================================================
 wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
     wandb.init(
         name=config_model["encoder"],
-        project="FLAIR_seg_overfitting",
-        config=config_model
+        project="PASTIS_SPOT",
+        config=config_model,
     )
-    wandb_logger = WandbLogger(project="FLAIR_seg_overfitting")
-
+    wandb_logger = WandbLogger(project="PASTIS_SPOT")
     wandb.define_metric("train_loss", step_metric="trainer/global_step")
     wandb.define_metric("val_loss", step_metric="trainer/global_step")
-    
 
-# 4. Instantiate Model
-# We pass the input_processor where 'transform' used to go
-# Ensure your Model_MAE/__init__ assigns self.input_processor = input_processor
-# AND that Atomiser inside Model_MAE uses it.
-model = Model_FLAIR(
-    config_model,
+# =============================================================================
+# MODEL
+# =============================================================================
+model = Model_MMEarth(
+    config=config_model,
     wand=True,
     name=xp_name,
-    transform=input_processor, # Pass the new processor here,
-    lookup_table=lookup_table
+    transform=None,
+    lookup_table=lookup_table,
 )
 
-checkpoint_path = "./checkpoints/Atos_tofine.ckpt"
-
-# Option 1: Load checkpoint with strict=False (recommended)
-#model = Model_MAE.load_from_checkpoint(
-#    checkpoint_path,
-#    strict=False,  # Allow missing keys (displacement MLP is new)
-#    config=config_model,
-#    wand=True,
-#    name=xp_name,
-#    transform=input_processor,
-#    lookup_table=lookup_table
-#)
-
-
-
+# =============================================================================
+# DATA MODULE
+# =============================================================================
 data_module = UnifiedDataModule(
-    f"./data/custom_flair/{args.dataset_name}",
+    path="./data/PASTIS-HD",
     batch_size=config_model["dataset"]["batchsize"],
     num_workers=4,
-    trans_modalities=modalities_trans,
+    trans_modalities=None,
     trans_tokens=None,
     model=config_model["encoder"],
     dataset_config=read_yaml(bands_yaml),
     config_model=config_model,
     look_up=lookup_table,
-    dataset_class=FLAIR_MAE,
-    limit_train_batches=10,
-    limit_val_batches=5,
+    dataset_class=PastisSpotReconDataset#MMEarthMAEDataset,
 )
 
-reconstruction_callback = FLAIR_CustomSegmentationCallback( #MAE_CustomVisualizationCallback
-    config=config_model
-)
-
-LR_finder=LearningRateFinder(min_lr=1e-05, max_lr=1, num_training_steps=450, mode='exponential', early_stop_threshold=4.0, update_attr=True, attr_name='')
-
-
+# =============================================================================
+# CALLBACKS
+# =============================================================================
 lr_monitor = LearningRateMonitor(logging_interval="step")
+accumulator = GradientAccumulationScheduler(scheduling={0: 1})
 
-checkpoint_val_mod_train = ModelCheckpoint(
+checkpoint_val = ModelCheckpoint(
     dirpath="./checkpoints/",
-    filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_loss:.4f}}",
-    monitor="val_loss",
+    filename=f"{config_model['encoder']}{xp_name}-val_mse-{{epoch:02d}}-{{val_mse:.4f}}",
+    monitor="val_mse",
     mode="min",
     save_top_k=1,
     verbose=True,
 )
 
-accumulator = GradientAccumulationScheduler(scheduling={0:1})
-#gradient_warmup = DisplacementGradientWarmupCallback(start_epoch=10, warmup_epochs=10)
+viz_callback = ReconstructionVizCallback(
+    sample_indices=[0, 1, 2],
+    log_every_n_epochs=1,
+    use_wandb=True,
+)
 
-# Trainer
+
+
+callbacks = [accumulator, checkpoint_val, lr_monitor,viz_callback]
+
+# =============================================================================
+# TRAINER
+# =============================================================================
 trainer = Trainer(
     strategy="ddp_find_unused_parameters_true",
     devices=-1,
@@ -152,14 +140,124 @@ trainer = Trainer(
     precision="bf16-mixed",
     logger=wandb_logger,
     log_every_n_steps=5,
-    callbacks=[accumulator, reconstruction_callback, checkpoint_val_mod_train],
+    callbacks=callbacks,
     default_root_dir="./checkpoints/",
+    #val_check_interval=250,
+    #limit_train_batches=1
 )
 
-# Fit the model
+# =============================================================================
+# TRAIN & TEST
+# =============================================================================
 trainer.fit(model, datamodule=data_module)
+trainer.test(model, datamodule=data_module)
 
-# Save wandb run ID
+# =============================================================================
+# MEASURE COMPLEXITY
+# =============================================================================
+
+def _batch_to_device(batch: dict, device) -> dict:
+    """Recursively move a nested batch dict to device."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device)
+        elif isinstance(v, dict):
+            out[k] = _batch_to_device(v, device)
+        else:
+            out[k] = v
+    return out
+
+
+if os.environ.get("LOCAL_RANK", "0") == "0":
+    from fvcore.nn import FlopCountAnalysis
+
+    print("\n" + "=" * 80)
+    print("MEASURING MODEL COMPLEXITY")
+    print("=" * 80 + "\n")
+
+    data_module.setup("test")
+    test_dataset = data_module.test_dataset
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    model.eval()
+
+    num_samples = min(25, len(test_dataset))
+    samples = [test_dataset[i] for i in range(num_samples)]
+
+    results = []
+
+    for input_size in [128]:
+        print(f"\nTesting input size: {input_size}x{input_size}")
+
+        # Collate single sample into batch-of-1
+        batch_0 = collate_grouped([samples[0]])
+        batch_0 = _batch_to_device(batch_0, device)
+
+        # Warmup
+        with torch.no_grad():
+            _ = model(batch_0)
+
+        # FLOPs
+        batch_1 = collate_grouped([samples[1]])
+        batch_1 = _batch_to_device(batch_1, device)
+
+        try:
+            with torch.no_grad():
+                flops = FlopCountAnalysis(model, (batch_1,))
+                gflops = flops.total() / 1e9
+        except Exception as e:
+            print(f"  FLOPs measurement failed: {e}")
+            gflops = -1
+
+        # Inference time
+        num_warmup, num_runs = 3, 20
+        with torch.no_grad():
+            for i in range(num_warmup):
+                b = collate_grouped([samples[i % num_samples]])
+                b = _batch_to_device(b, device)
+                _ = model(b)
+
+            torch.cuda.synchronize()
+            start = time.time()
+            for i in range(num_runs):
+                idx = (i + num_warmup) % num_samples
+                b = collate_grouped([samples[idx]])
+                b = _batch_to_device(b, device)
+                _ = model(b)
+                torch.cuda.synchronize()
+            end = time.time()
+
+        avg_time_ms = (end - start) / num_runs * 1000
+
+        first_res = next(iter(batch_0["groups"]))
+        num_tokens = batch_0["groups"][first_res]["tokens"].shape[1]
+
+        results.append({
+            "input_size": input_size,
+            "num_tokens": num_tokens,
+            "gflops": gflops,
+            "inference_time_ms": avg_time_ms,
+        })
+
+        print(f"  Tokens: {num_tokens}")
+        print(f"  GFLOPs: {gflops:.2f}")
+        print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
+
+    # Summary
+    print("\n" + "=" * 80)
+    print(f"COMPLEXITY SUMMARY ({config_model['encoder']})")
+    print("=" * 80)
+    print(f"{'Input':<10} {'Tokens':<12} {'GFLOPs':<12} {'Time (ms)':<12}")
+    print("-" * 50)
+    for r in results:
+        print(f"{r['input_size']:<10} {r['num_tokens']:<12} {r['gflops']:<12.2f} {r['inference_time_ms']:<12.2f}")
+    print("=" * 80)
+
+# =============================================================================
+# SAVE WANDB RUN ID
+# =============================================================================
 if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
     run_id = wandb.run.id
     print("WANDB_RUN_ID:", run_id)

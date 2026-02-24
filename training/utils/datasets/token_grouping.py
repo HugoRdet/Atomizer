@@ -120,24 +120,115 @@ def collate_grouped(batch: list) -> dict:
             padded_qmasks.append(qm)
 
     # ── Labels ──────────────────────────────────────────────
-    labels = torch.stack([s["label"] for s in batch], dim=0)  # [B, H, W]
+    #labels = torch.stack([s["label"] for s in batch], dim=0)  # [B, H, W]
 
-    # ── Metadata ────────────────────────────────────────────
-    target_resolution = batch[0]["target_resolution"]
+    
+    
+
 
     result = {
         "groups": groups,
         "queries": torch.stack(padded_queries, dim=0),       # [B, M_max, 8]
         "queries_mask": torch.stack(padded_qmasks, dim=0),   # [B, M_max] bool
-        "label": labels,                                      # [B, H, W]
-        "target_resolution": target_resolution,
     }
 
     # Pass through optional keys
     if "image" in batch[0]:
         result["image"] = torch.stack([s["image"] for s in batch], dim=0)
 
+    if "label" in batch[0]:
+        labels = torch.stack([s["label"] for s in batch], dim=0)
+        result["label"] = labels
+
+    
+    # ── Metadata ────────────────────────────────────────────
+    if "target_resolution" in batch[0]:
+        result["target_resolution"] = batch[0]["target_resolution"]
+
     return result
+
+
+# =============================================================================
+# COLLATE — MAE (handles ground_truth, no label/image)
+# =============================================================================
+
+def collate_mae(batch: list) -> dict:
+    """
+    Collate MAE pre-training samples into a batch.
+
+    Groups are fixed-size (thanks to padding in dataset __getitem__),
+    so collation is just stacking. Queries may vary slightly in count
+    across samples — pad to max M.
+
+    Expected per-sample format:
+        {
+            "groups": {res: {"tokens": [N, 8], "mask": [N], "shape": tuple}},
+            "queries":      [M_i, 8],
+            "queries_mask": [M_i],
+            "ground_truth": [M_i],
+        }
+
+    Output:
+        {
+            "groups": {res: {"tokens": [B, N, 8], "mask": [B, N], "shape": tuple}},
+            "queries":      [B, M_max, 8],
+            "queries_mask": [B, M_max],
+            "ground_truth": [B, M_max],
+        }
+    """
+    B = len(batch)
+
+    # ── Groups: fixed size per dataset, just stack ──────────
+    all_resolutions = set()
+    for sample in batch:
+        all_resolutions.update(sample["groups"].keys())
+
+    groups = {}
+    for res in sorted(all_resolutions):
+        groups[res] = {
+            "tokens": torch.stack(
+                [s["groups"][res]["tokens"] for s in batch], dim=0
+            ),
+            "mask": torch.stack(
+                [s["groups"][res]["mask"] for s in batch], dim=0
+            ),
+            "shape": batch[0]["groups"][res]["shape"],
+        }
+
+    # ── Queries + ground_truth: pad to max M ────────────────
+    query_list = [s["queries"] for s in batch]
+    gt_list = [s["ground_truth"] for s in batch]
+    qmask_list = [s["queries_mask"] for s in batch]
+    M_max = max(q.shape[0] for q in query_list)
+
+    padded_queries = []
+    padded_gt = []
+    padded_qmasks = []
+
+    for q, gt, qm in zip(query_list, gt_list, qmask_list):
+        m = q.shape[0]
+        if m < M_max:
+            pad_n = M_max - m
+            padded_queries.append(
+                torch.cat([q, torch.zeros(pad_n, 8, dtype=q.dtype)], dim=0)
+            )
+            padded_gt.append(
+                torch.cat([gt, torch.zeros(pad_n, dtype=gt.dtype)], dim=0)
+            )
+            padded_qmasks.append(
+                torch.cat([qm, torch.ones(pad_n, dtype=torch.bool)], dim=0)
+            )
+        else:
+            padded_queries.append(q)
+            padded_gt.append(gt)
+            padded_qmasks.append(qm)
+
+    return {
+        "groups": groups,
+        "queries": torch.stack(padded_queries, dim=0),       # [B, M_max, 8]
+        "queries_mask": torch.stack(padded_qmasks, dim=0),   # [B, M_max] bool
+        "ground_truth": torch.stack(padded_gt, dim=0),       # [B, M_max] float
+    }
 
 
 # =============================================================================
@@ -232,7 +323,7 @@ def compute_grid_config(
         "geo_k": geo_k,
         "geo_sigma": geo_sigma,
         "train_k": min(500, geo_k),
-        "val_k": min(1000, geo_k),
+        "val_k": min(500, geo_k),
         "tokens_per_latent": tokens_per_latent,
         "total_tokens": total_tokens,
     }

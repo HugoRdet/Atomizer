@@ -1,0 +1,14 @@
+Transaction
+
+  Prefix: /home/hriffaud/.conda/envs/venv
+
+  All requested packages already installed
+
+
+Looking for: ['torchgeo']
+
+
+Pinned packages:
+  - python 3.10.*
+
+

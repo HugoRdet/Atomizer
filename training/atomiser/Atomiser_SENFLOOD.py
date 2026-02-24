@@ -409,17 +409,7 @@ class Atomiser_Senflood(pl.LightningModule):
         
         return latents_per_res, coords_per_res
 
-    def _compute_latent_grid(
-        self,
-        grid_config: dict,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Compute latent positions from runtime grid config.
-        
-        Returns [B, L_spatial, 2] in meters (centered at image origin).
-        """
+    def _compute_latent_grid(self, grid_config, batch_size, device):
         lx = grid_config["latents_x"]
         ly = grid_config["latents_y"]
         span_x = grid_config["span_x"]
@@ -430,6 +420,9 @@ class Atomiser_Senflood(pl.LightningModule):
             grid = self._create_hexagonal_grid(lx, ly, span_x, span_y, device)
         else:
             grid = self._create_square_grid(lx, ly, span_x, span_y, device)
+        
+        # Update L_spatial to actual count (may differ from lx*ly for hex grids)
+        grid_config["L_spatial"] = grid.shape[0]
         
         return grid.unsqueeze(0).expand(batch_size, -1, -1)
 
@@ -461,35 +454,29 @@ class Atomiser_Senflood(pl.LightningModule):
         
         return grid
 
-    def _create_hexagonal_grid(
-        self,
-        lx: int,
-        ly: int,
-        span_x: float,
-        span_y: float,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Create a hexagonal grid with staggered rows."""
+    def _create_hexagonal_grid(self, lx, ly, span_x, span_y, device):
         half_span_x = span_x / 2.0
         half_span_y = span_y / 2.0
         
         step_x = span_x / (lx - 1) if lx > 1 else 0
         step_y = span_y / (ly - 1) if ly > 1 else 0
-        
         offset = step_x / 2.0
         
         grid_points = []
-        
         for row_idx in range(ly):
             y = -half_span_y + row_idx * step_y if ly > 1 else 0.0
             x_offset = offset if (row_idx % 2 == 1) else 0.0
             
             for col_idx in range(lx):
                 x = -half_span_x + col_idx * step_x + x_offset if lx > 1 else 0.0
+                
+                # Skip latents pushed outside image extent by hex offset
+                if abs(x) > half_span_x or abs(y) > half_span_y:
+                    continue
+                
                 grid_points.append([x, y])
         
         grid = torch.tensor(grid_points, dtype=torch.float32, device=device)
-        
         return grid
 
     # =========================================================================
@@ -590,9 +577,13 @@ class Atomiser_Senflood(pl.LightningModule):
         m = grid_config.get("train_k", 500) if training else grid_config.get("val_k", 500)
         m = min(m, k)
 
+
+
         if m < k:
             perm = torch.randperm(k, device=geo_tokens.device)[:m]
+            
             return geo_tokens[:, :, perm, :], geo_masks[:, :, perm]
+        
 
         return geo_tokens, geo_masks
 
@@ -827,15 +818,10 @@ class Atomiser_Senflood(pl.LightningModule):
         """
         Reconstruct with multi-grid top-k: query each resolution grid independently.
         
-        Args:
-            latents_per_res: {resolution: [B, L_res, D]}
-            coords_per_res: {resolution: [B, L_res, 2]}
-            query_tokens: [B, M, 8]
-            query_mask: [B, M]
-            target_resolution: float (m/px)
-        
-        Returns:
-            predictions: [B, M, num_classes]
+        Relative PE is computed per-resolution grid using:
+            compression_scale = alpha × grid_resolution
+        This ensures each grid's PE uses the natural scale of that grid's
+        latent spacing, regardless of the target query resolution.
         """
         B, M, _ = query_tokens.shape
         device = query_tokens.device
@@ -847,9 +833,10 @@ class Atomiser_Senflood(pl.LightningModule):
         )
 
         query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
-
-        # Top-k from EACH resolution grid
+      
+        # Top-k from EACH resolution grid, with per-grid relative PE
         selected_latents_list = []
+        selected_pe_list = []
         selected_coords_list = []
         
         for res in sorted(latents_per_res.keys()):
@@ -870,17 +857,31 @@ class Atomiser_Senflood(pl.LightningModule):
             flat_coord_exp = flat_indices.unsqueeze(-1).expand(-1, -1, 2)
             coords_selected = torch.gather(coords, 1, flat_coord_exp).reshape(B, M, k, 2)
             
+            # Per-grid relative PE: compression anchored to this grid's resolution
+            delta_x = coords_selected[..., 0] - query_coords[..., 0].unsqueeze(-1)
+            delta_y = coords_selected[..., 1] - query_coords[..., 1].unsqueeze(-1)
+            compression_scale = self.input_processor.compression_alpha * res
+            rel_pe = self.input_processor.pos_encoder(
+                delta_x, delta_y, compression_scale=compression_scale
+            )
+            
             selected_latents_list.append(selected)
+            selected_pe_list.append(rel_pe)
             selected_coords_list.append(coords_selected)
         
+        # Concatenate across grids
         selected_latents = torch.cat(selected_latents_list, dim=2)
-        selected_coords = torch.cat(selected_coords_list, dim=2)
-        
-        delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
-        delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
-
-        relative_pe = self.input_processor.pos_encoder(delta_x, delta_y)
+        relative_pe = torch.cat(selected_pe_list, dim=2)
         context = torch.cat([selected_latents, relative_pe], dim=-1)
+
+        # Deltas for decoder RoPE (if enabled)
+        if self.decoder_use_rpe:
+            selected_coords = torch.cat(selected_coords_list, dim=2)
+            delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
+            delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
+        else:
+            delta_x = None
+            delta_y = None
 
         output = self.decoder_cross_attn(
             query_features, context,
@@ -939,6 +940,8 @@ class Atomiser_Senflood(pl.LightningModule):
             )
             for res in resolutions
         }
+
+        
 
         # ── Single encode call (no temporal chunking) ───────────
         need_trajectory = return_trajectory or task == "visualization"

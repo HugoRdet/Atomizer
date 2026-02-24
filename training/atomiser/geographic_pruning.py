@@ -4,7 +4,7 @@ Geographic Pruning with Voronoi Cells and Padded Tensors
 Memory-efficient, fully tensorized implementation.
 
 All runtime parameters (geo_k, sigma, L_spatial) are passed as forward() args.
-Precomputed cells are cached by token shape (C, H, W).
+Precomputed cells are cached by token shape + latent positions hash.
 """
 
 import torch
@@ -24,7 +24,15 @@ class GeographicPruning(nn.Module):
         cell_indices_padded: [L, max_cell_size] - token indices per cell
         cell_valid_mask: [L, max_cell_size] - True for valid positions
         cell_distances: [L, max_cell_size] - squared distance to latent center
+    
+    Safety guarantees:
+        - Empty Voronoi cells produce index 0 + mask=True (masked out)
+        - All gather indices clamped to [0, N-1]
+        - Bias set to -inf for invalid positions → zero attention weight
+        - Cache key includes latent position hash to prevent collisions
     """
+    
+    MIN_CELL_SIZE = 1
     
     def __init__(
         self,
@@ -35,8 +43,35 @@ class GeographicPruning(nn.Module):
         self.geometry = geometry
         self.chunk_size = chunk_size
         
-        # Cache keyed by shape tuple
+        # Cache keyed by shape + latent position hash
         self._precomputed_keys = set()
+    
+    # =========================================================================
+    # Cache key computation
+    # =========================================================================
+    
+    def _make_cache_key(
+        self,
+        N: int,
+        L_spatial: int,
+        hexagonal: bool,
+        latent_coords: torch.Tensor,
+    ) -> str:
+        """
+        Build a cache key that includes latent positions.
+        
+        Prevents cache collisions when the same N/L/grid_type is used
+        with different latent coordinates (e.g., callbacks vs training,
+        or different grid configs).
+        """
+        grid_type = "hex" if hexagonal else "sq"
+        
+        # Hash latent positions — round to 0.1m to be robust to float noise
+        coords_flat = latent_coords[0].detach().float().cpu()
+        coords_rounded = (coords_flat * 10).long()
+        pos_hash = hash(coords_rounded.numpy().tobytes()) % (10**8)
+        
+        return f"{N}_{L_spatial}_{grid_type}_{pos_hash}"
     
     # =========================================================================
     # Voronoi assignment
@@ -110,11 +145,8 @@ class GeographicPruning(nn.Module):
         """
         Precompute Voronoi cell membership and build padded tensors.
         
-        Steps:
-        1. Assign each token to nearest latent (Voronoi)
-        2. Group tokens by cell
-        3. Shuffle tokens within each cell (uniform coverage)
-        4. Pad to max_cell_size for tensorized operations
+        Empty cells are safe: indices default to 0, valid mask is False,
+        and downstream code masks them out with -inf bias.
         """
         B, N, D = tokens.shape
         L = L_spatial
@@ -126,8 +158,8 @@ class GeographicPruning(nn.Module):
         
         with torch.no_grad():
             # Get coordinates
-            pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)  # [N, 2]
-            lat_coords = latent_coords[0]  # [L, 2]
+            pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)
+            lat_coords = latent_coords[0]
             
             # Voronoi assignment
             cell_membership, dist_to_nearest = self._compute_nearest_latent_chunked(
@@ -136,12 +168,19 @@ class GeographicPruning(nn.Module):
             
             # Count tokens per cell
             cell_counts = torch.bincount(cell_membership, minlength=L)
-            max_cell_size = cell_counts.max().item()
+            
+            empty_cells = (cell_counts == 0).sum().item()
+            if empty_cells > 0:
+                print(f"  WARNING: {empty_cells}/{L} latents have EMPTY Voronoi cells!")
+                print(f"  These will be masked out during attention (bias=-inf).")
+            
+            # max_cell_size must be >= 1 for safe tensor ops
+            max_cell_size = max(cell_counts.max().item(), self.MIN_CELL_SIZE)
             
             print(f"  Cell sizes: min={cell_counts.min().item()}, "
                   f"max={max_cell_size}, mean={cell_counts.float().mean().item():.0f}")
             
-            # Build padded tensors with shuffled tokens per cell
+            # Build padded tensors
             cell_indices_padded = torch.zeros(L, max_cell_size, dtype=torch.long, device=device)
             cell_valid_mask = torch.zeros(L, max_cell_size, dtype=torch.bool, device=device)
             cell_distances = torch.zeros(L, max_cell_size, dtype=dtype, device=device)
@@ -158,6 +197,8 @@ class GeographicPruning(nn.Module):
                     cell_indices_padded[l, :n_in_cell] = in_cell_indices[perm]
                     cell_valid_mask[l, :n_in_cell] = True
                     cell_distances[l, :n_in_cell] = in_cell_distances[perm]
+                # Empty cells: indices=0, valid=False, distances=0
+                # Index 0 is a safe fallback — the token will be masked out
             
             # Register buffers
             self.register_buffer(f"cell_indices_{cache_key}", cell_indices_padded)
@@ -183,7 +224,7 @@ class GeographicPruning(nn.Module):
         geo_k: int,
         sigma: float,
         L_spatial: int,
-        hexagonal: bool = False,  # ← ADD THIS
+        hexagonal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
         B, N, D = tokens.shape
@@ -191,34 +232,41 @@ class GeographicPruning(nn.Module):
         device = tokens.device
         dtype = tokens.dtype
         
-        # =========================================================================
-        # Cache key includes hexagonal flag
-        # =========================================================================
-        grid_type = "hex" if hexagonal else "sq"
-        cache_key = f"{N}_{L_spatial}_{grid_type}"
+        # =====================================================================
+        # Position-aware cache key (prevents callback/training collisions)
+        # =====================================================================
+        cache_key = self._make_cache_key(N, L_spatial, hexagonal, latent_coords)
         
-        # Precompute if needed
         if cache_key not in self._precomputed_keys:
             self._precompute_voronoi_cells(tokens, latent_coords, L_spatial, cache_key)
-    
         
         # Retrieve cached tensors
-        cell_indices = getattr(self, f"cell_indices_{cache_key}")      # [L, max_cell]
-        cell_valid = getattr(self, f"cell_valid_{cache_key}")          # [L, max_cell]
-        cell_distances = getattr(self, f"cell_distances_{cache_key}")  # [L, max_cell]
-        cell_counts = getattr(self, f"cell_counts_{cache_key}")        # [L]
+        cell_indices = getattr(self, f"cell_indices_{cache_key}")
+        cell_valid = getattr(self, f"cell_valid_{cache_key}")
+        cell_distances = getattr(self, f"cell_distances_{cache_key}")
+        cell_counts = getattr(self, f"cell_counts_{cache_key}")
         
         max_cell_size = cell_indices.shape[1]
         
         # =====================================================================
-        # TENSORIZED RANDOM SAMPLING
+        # Clamp k to available tokens
         # =====================================================================
-        
-        # Clamp k to max_cell_size (if fewer tokens exist, take all)
         k = min(k, max_cell_size)
         
+        # =====================================================================
+        # Build selection validity mask (ALWAYS, not just when min < k)
+        # This is the key fix: always track which positions are valid
+        # =====================================================================
+        position_indices = torch.arange(k, device=device).unsqueeze(0)      # [1, k]
+        cell_counts_clamped = cell_counts.unsqueeze(1)                       # [L, 1]
+        selection_valid = (position_indices < cell_counts_clamped)            # [L, k]
+        selection_valid = selection_valid.unsqueeze(0).expand(B, -1, -1)     # [B, L, k]
+        
+        # =====================================================================
+        # TENSORIZED SAMPLING
+        # =====================================================================
+        
         if self.training:
-            # Random scores, invalid positions get -inf
             rand_scores = torch.rand(B, L_spatial, max_cell_size, device=device, dtype=dtype)
             valid_expanded = cell_valid.unsqueeze(0).expand(B, -1, -1)
             rand_scores = torch.where(
@@ -226,72 +274,81 @@ class GeographicPruning(nn.Module):
                 torch.tensor(float('-inf'), device=device, dtype=dtype),
             )
             
-            # Sort descending → random permutation, take first k
             _, perm = torch.sort(rand_scores, dim=-1, descending=True)
             perm_k = perm[:, :, :k]
             
-            # Gather token indices and distances
+            # Clamp to valid buffer range
+            perm_k = perm_k.clamp(0, max(max_cell_size - 1, 0))
+            
             indices_expanded = cell_indices.unsqueeze(0).expand(B, -1, -1)
             distances_expanded = cell_distances.unsqueeze(0).expand(B, -1, -1)
             
             selected_indices = torch.gather(indices_expanded, dim=2, index=perm_k)
             selected_dist_sq = torch.gather(distances_expanded, dim=2, index=perm_k)
         else:
-            # Deterministic: first k tokens per cell
             selected_indices = cell_indices[:, :k].unsqueeze(0).expand(B, -1, -1).clone()
             selected_dist_sq = cell_distances[:, :k].unsqueeze(0).expand(B, -1, -1).clone()
         
         # =====================================================================
-        # Handle cells with fewer than k tokens
+        # Clamp ALL indices to valid token range [0, N-1]
+        # This is the critical safety net for empty cells
         # =====================================================================
-        min_cell_count = cell_counts.min().item()
+        selected_indices = selected_indices.clamp(0, N - 1)
         
-        if min_cell_count < k:
-            position_indices = torch.arange(k, device=device).unsqueeze(0)
-            cell_counts_expanded = cell_counts.unsqueeze(1)
-            selection_valid = (position_indices < cell_counts_expanded).unsqueeze(0).expand(B, -1, -1)
-            
-            selected_indices = torch.where(
-                selection_valid, selected_indices, torch.zeros_like(selected_indices)
-            )
+        # Zero out invalid positions (redundant with clamp but explicit)
+        selected_indices = torch.where(
+            selection_valid, selected_indices, torch.zeros_like(selected_indices)
+        )
         
         # =====================================================================
-        # Gaussian bias
+        # Gaussian bias with -inf for invalid positions
         # =====================================================================
         bias = -selected_dist_sq / (2 * (sigma ** 2))
+        bias = torch.where(
+            selection_valid, bias,
+            torch.tensor(float('-inf'), device=device, dtype=dtype),
+        )
         
         # =====================================================================
         # Gather tokens and masks
         # =====================================================================
-        tokens_per_latent = self._gather_tokens(tokens, selected_indices)
-        masks_per_latent = self._gather_masks(mask, selected_indices)
+        tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
+        masks_per_latent = self._gather_masks(mask, selected_indices, N)
         
-        if min_cell_count < k:
-            masks_per_latent = masks_per_latent | (~selection_valid)
+        # Force-mask invalid positions
+        masks_per_latent = masks_per_latent | (~selection_valid)
         
         return tokens_per_latent, masks_per_latent, bias.to(dtype)
     
     # =========================================================================
-    # Gather helpers
+    # Gather helpers (with bounds checking)
     # =========================================================================
     
     def _gather_tokens(
         self,
-        tokens: torch.Tensor,   # [B, N, D]
-        indices: torch.Tensor,  # [B, L, k]
+        tokens: torch.Tensor,
+        indices: torch.Tensor,
+        N: int,
     ) -> torch.Tensor:
         B, L, k = indices.shape
         D = tokens.shape[-1]
+        
+        indices = indices.clamp(0, N - 1)
+        
         flat_indices = indices.reshape(B, L * k)
         flat_exp = flat_indices.unsqueeze(-1).expand(-1, -1, D)
         return torch.gather(tokens, dim=1, index=flat_exp).reshape(B, L, k, D)
     
     def _gather_masks(
         self,
-        mask: torch.Tensor,     # [B, N]
-        indices: torch.Tensor,  # [B, L, k]
+        mask: torch.Tensor,
+        indices: torch.Tensor,
+        N: int,
     ) -> torch.Tensor:
         B, L, k = indices.shape
+        
+        indices = indices.clamp(0, N - 1)
+        
         flat_indices = indices.reshape(B, L * k)
         return torch.gather(mask, dim=1, index=flat_indices).reshape(B, L, k).bool()
     

@@ -123,8 +123,8 @@ class CartesianRelativeEncoder(nn.Module):
         
         self.num_bands = config["Atomiser"].get("cartesian_num_bands", 32)
         self.max_freq = config["Atomiser"].get("cartesian_max_freq", 32)
-        self.compression_scale = config["Atomiser"].get("position_compression_scale", 3.0)
-        
+        self.compression_scale = config["Atomiser"].get("position_compression_scale", 10.0)
+       
         # Output: X + Y (each with raw + Fourier features)
         self.per_component_dim = 1 + 2 * self.num_bands
         self.out_dim = self.per_component_dim * 2

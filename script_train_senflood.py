@@ -22,6 +22,7 @@ import torch
 import numpy as np
 from collections import defaultdict
 
+
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import (
@@ -46,6 +47,7 @@ from training.utils.datasets.token_grouping import collate_grouped
 # U-Net fallback (unchanged)
 from training.unet.model_unet_senflood import Model_UNet_SenFlood
 from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSenFlood
+from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCallback
 
 # =============================================================================
 # ARGS
@@ -141,8 +143,12 @@ token_assign=TokenAssignmentCallbackSenFlood(
     )
 
 #token_assign
-
-callbacks = [accumulator, checkpoint_val, lr_monitor]
+viz_callback = SegmentationVizCallback(
+    sample_indices=[0, 1, 2],
+    log_every_n_epochs=1,
+    use_wandb=True,
+)
+callbacks = [accumulator, checkpoint_val, lr_monitor,viz_callback]
 
 # =============================================================================
 # TRAINER

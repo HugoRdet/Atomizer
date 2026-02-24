@@ -155,6 +155,8 @@ class Model_SenFlood(pl.LightningModule):
         # Labels from column 4 of query tokens: [B, M, 8] → [B, M]
         labels = batch["queries"][:, :, 4].long()
 
+        
+
         # Flatten: [B, M, C] → [B*M, C],  [B, M] → [B*M]
         y_hat_flat = rearrange(y_hat, "b t c -> (b t) c")
         labels_flat = rearrange(labels, "b n -> (b n)")
@@ -180,6 +182,7 @@ class Model_SenFlood(pl.LightningModule):
             )
             total_loss = class_loss + (self.lambda_error * error_loss)
             self.log("train_error_loss", error_loss, on_step=False, on_epoch=True, logger=True)
+
 
         preds = torch.argmax(y_hat, dim=-1)  # [B, M]
 
@@ -259,6 +262,9 @@ class Model_SenFlood(pl.LightningModule):
             batch, training=True
         )
 
+        
+
+        
         self.metric_IoU_train.update(preds, labels)
         self.metric_acc_train.update(preds, labels)
 

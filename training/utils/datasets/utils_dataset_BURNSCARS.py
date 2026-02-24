@@ -1,440 +1,409 @@
+"""
+MMEarth MAE Dataset — Multi-modal MAE pre-training
+====================================================
+
+Wraps torchgeo's MMEarth dataset for MAE pre-training with Atomizer.
+
+Modalities used (continuous, available at inference):
+    - sentinel2:          12 bands @ 10m (B10 cirrus excluded)
+    - sentinel1_asc:      2 bands (VV, VH) @ 10m
+    - sentinel1_desc:     2 bands (VV, VH) @ 10m
+    - aster:              1 band (elevation) @ 10m (resampled)
+    - canopy_height_eth:  1 band (height) @ 10m (resampled)
+
+Excluded (categorical / not available at inference):
+    - esa_worldcover, dynamic_world, biome, eco_region, era5
+
+Masking:
+    Per-modality spatial block masking. Each modality gets an independent
+    random block mask, forcing cross-modal reconstruction learning.
+
+Token format:
+    [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
+     col 0  1  2       3          4        5            6             7
+
+Directory structure:
+    ./data/MM-Earth/
+    ├── data_1M_v001.h5
+    ├── data_1M_v001_band_stats.json
+    ├── data_1M_v001_splits.json
+    └── data_1M_v001_tile_info.json
+
+Returns:
+{
+    "groups": {
+        10.0: {
+            "tokens": [N_vis, 8],
+            "mask":   [N_vis],
+            "shape":  (128, 128),
+        },
+    },
+    "queries":      [M, 8],
+    "queries_mask": [M],
+    "ground_truth": [M],
+}
+"""
+
 import os
-import glob
-import numpy as np
-import rasterio
+import json
+
 import torch
 from torch.utils.data import Dataset
-import einops
-from tqdm import tqdm
-from sklearn.model_selection import train_test_split
 
-from .token_grouping import *
+from .token_builder import TokenBuilder
+from .block_masking import (
+    generate_spatial_block_mask,
+    expand_mask_to_tokens,
+    apply_mask_to_tokens,
+    build_mae_queries,
+)
+
+try:
+    from torchgeo.datasets import MMEarth
+    HAS_TORCHGEO = True
+except ImportError:
+    HAS_TORCHGEO = False
+    print("[Warning] torchgeo not installed. Install with: pip install torchgeo")
 
 
-class HLSBurnScarsDataset(Dataset):
+class MMEarthMAEDataset(Dataset):
     """
-    HLS Burn Scars Dataset — grouped token format (8 columns).
-    
-    6-band HLS imagery at 30m, 512×512. Single resolution → single group.
-    
-    Token format:
-        [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
-         col 0  1  2       3          4        5            6            7
-    
-    For HLS Burn Scars:
-        - resolution_idx: looked up from GSD (30.0 m/px) via lookup_table (≥0)
-        - time_idx: -1 (no temporal info, zeroed out by encoder)
-    
-    Convention:
-        -1 = "not applicable" → encoder outputs zero vector
-        ≥0 = valid index      → encoder outputs real features
-    
-    Returns:
-    {
-        "groups": {
-            30.0: {
-                "tokens": [N, 8],
-                "mask":   [N],
-                "shape":  (6, 512, 512),
-            },
-        },
-        "queries":           [M, 8],
-        "queries_mask":      [M],
-        "label":             [512, 512],
-        "target_resolution": 30.0,
-        "image":             [6, 512, 512],
-    }
-    
-    Directory structure:
-    ./data/hls_burn_scars/
-    ├── training/
-    │   ├── subsetted_512x512_HLS.S30.T10SEH.2018280.v1.4_merged.tif
-    │   ├── subsetted_512x512_HLS.S30.T10SEH.2018280.v1.4.mask.tif
-    │   └── ...
-    ├── validation/
-    │   └── ...
-    └── normalization_stats.pt  (auto-generated)
-    
-    Bands (6):
-        B02 (Blue, 490nm), B03 (Green, 560nm), B04 (Red, 665nm),
-        B8A (NIR, 865nm), B11 (SWIR1, 1610nm), B12 (SWIR2, 2190nm)
-    
-    Classes: 0 = not burned, 1 = burn scar, 255 = ignore
+    MMEarth dataset for MAE pre-training.
+
+    Uses torchgeo MMEarth as backend. Applies per-modality spatial block
+    masking and returns visible tokens + MAE reconstruction queries.
+
+    Follows the same pattern as Sen1Floods11Dataset and PastisHDDataset:
+        - Band info loaded from YAML config (dataset_config)
+        - Spectral indices looked up via lookup table
+        - Normalization handled by torchgeo (z-score)
+        - TokenBuilder used for token construction
     """
 
-    NUM_BANDS = 6
-    NUM_CLASSES = 2
+    # ── Constants ───────────────────────────────────────────
+    RESOLUTION = 10.0    # m/px — all modalities on same grid
+    IMAGE_SIZE = 128     # px
     IGNORE_INDEX = 255
-    RESOLUTION = 30.0   # meters per pixel (HLS common grid)
-    IMG_SIZE = 512
-    TIME_IDX_NA = -1    # No temporal info → -1 → zeroed by encoder
+    TIME_IDX_NA = -1     # No temporal info → zeroed by encoder
+
+    # ── Modality → YAML key mapping ────────────────────────
+    MODALITY_BAND_CONFIGS = {
+        "sentinel2":          "bands_mmearth_s2",
+        "sentinel1_asc":      "bands_mmearth_s1",
+        "sentinel1_desc":     "bands_mmearth_s1",    # same bands as asc
+        "aster":              "bands_mmearth_aster",
+        "canopy_height_eth":  "bands_mmearth_canopy",
+    }
+
+    # ── torchgeo band selection (skip B10, HV, HH, slope, std) ──
+    MODALITY_BANDS = {
+        "sentinel2":          ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8A", "B8", "B9", "B11", "B12"],
+        "sentinel1_asc":      ["VV", "VH"],
+        "sentinel1_desc":     ["VV", "VH"],
+        "aster":              ["elevation"],
+        "canopy_height_eth":  ["canopy_height"],
+    }
 
     def __init__(
         self,
-        root_path: str = "./data/hls_burn_scars",
+        root_path: str = "./data/MM-Earth",
         transform=None,
         model=None,
         modality_mode="train",
-        mode="train",
-        dataset_config=None,
-        config_model=None,
+        mode: str = "train",
+        dataset_config: dict = None,
+        config_model: dict = None,
         look_up=None,
+        mask_ratio: float = 0.75,
+        block_size: int = 8,
+        max_queries: int = 200_000,
+        subset: str = "MMEarth",
     ):
+        """
+        Same interface as Sen1Floods11Dataset + MAE-specific params.
+
+        Args:
+            root_path:      Path to MM-Earth data directory
+            mode:           "train" / "validation" / "test"
+            dataset_config: YAML config dict (must contain bands_mmearth_* keys)
+            config_model:   Model config dict
+            look_up:        Lookup_encoding instance
+            mask_ratio:     Fraction of pixels to mask per modality
+            block_size:     Low-res noise grid size for block masking
+            max_queries:    Max MAE reconstruction queries per sample
+            subset:         "MMEarth", "MMEarth64", or "MMEarth100k"
+        """
         super().__init__()
+
+        if not HAS_TORCHGEO:
+            raise ImportError("torchgeo is required for MMEarth. pip install torchgeo")
 
         self.root_path = root_path
         self.split = mode
         self.look_up = look_up
         self.config_model = config_model
+        self.dataset_config = dataset_config
+        self.mask_ratio = mask_ratio
+        self.block_size = block_size
+        self.max_queries = max_queries
+        self.subset = subset
 
-        # Config parameters
-        self.nb_tokens = config_model["trainer"]["max_tokens"]
-        self.max_tokens_reconstruction = config_model["trainer"]["max_tokens_reconstruction"]
+        # Token builder (same as Sen1Floods11)
+        self.token_builder = TokenBuilder(look_up)
 
-        # Split mapping (matches PANGAEA convention):
-        #   train + val come from training/ (90/10 split, random_state=23)
-        #   test uses validation/
-        self.split_dir_mapping = {
-            "train": "training",
-            "validation": "training",
-            "test": "validation",
-        }
-
-        # Load file lists
-        self.scene_list, self.mask_list = self._load_file_lists()
-
-        # Band metadata
-        self.bands_info = dataset_config["bands_hls_info"]
-        self.bandwidths, self.wavelengths, self.band_names = self._parse_bands_info()
-        self.spectral_indices = self._build_spectral_indices()
-
-        # Resolution index (same for all tokens — all optical, single resolution)
+        # Resolution index: same for all bands (everything on 10m grid)
         self.resolution_idx = self.look_up.get_resolution_idx(self.RESOLUTION)
 
-        # Normalization
-        self.norm_stats = self._load_or_compute_normalization()
+        # Which modalities to use
+        self.modalities = list(self.MODALITY_BAND_CONFIGS.keys())
 
-        print(f"[HLSBurnScars] Loaded {len(self.scene_list)} samples, "
-              f"{len(self.bandwidths)} bands, split={self.split}")
-        print(f"[HLSBurnScars] Resolution idx: {self.resolution_idx} "
-              f"(GSD={self.RESOLUTION} m/px)")
-        print(f"[HLSBurnScars] Time idx: -1 (no temporal info, zeroed by encoder)")
+        # Parse band info from YAML and build spectral indices
+        self._setup_all_band_indices()
+
+        # Load torchgeo dataset
+        self._load_torchgeo_dataset()
+
+        # Compute target visible token count (fixed output size)
+        self._compute_target_sizes()
+
+        print(f"[MMEarth-MAE] Loaded {len(self.dataset)} samples for '{mode}'")
+        print(f"[MMEarth-MAE] Modalities: {self.modalities}")
+        print(f"[MMEarth-MAE] Total bands: {self.total_bands} → "
+              f"{self.total_tokens} tokens/sample")
+        print(f"[MMEarth-MAE] Mask ratio: {self.mask_ratio} → "
+              f"~{self.target_visible} visible tokens")
+        print(f"[MMEarth-MAE] Max queries: {self.max_queries}")
+
+    # =========================================================================
+    # INITIALIZATION (follows Sen1Floods11 pattern)
+    # =========================================================================
+
+    def _setup_all_band_indices(self):
+        """
+        Parse band info from YAML and build spectral indices.
+        Same pattern as Sen1Floods11._parse_bands_info + _build_spectral_indices.
+        """
+        self.modality_band_info = {}      # {modality: [sorted band dicts]}
+        self.modality_spectral_idx = {}   # {modality: tensor of spectral indices}
+        self.modality_num_bands = {}      # {modality: int}
+
+        for modality in self.modalities:
+            yaml_key = self.MODALITY_BAND_CONFIGS[modality]
+            bands_info = self.dataset_config[yaml_key]
+
+            # Parse (same as Sen1Floods11._parse_bands_info)
+            parsed, spectral_indices = self._parse_and_build_indices(
+                bands_info, modality
+            )
+
+            self.modality_band_info[modality] = parsed
+            self.modality_spectral_idx[modality] = spectral_indices
+            self.modality_num_bands[modality] = len(parsed)
+
+    def _parse_and_build_indices(self, bands_info: dict, modality_name: str):
+        """
+        Parse YAML band info dict and build spectral indices.
+        Same logic as Sen1Floods11._parse_bands_info + _build_spectral_indices.
+
+        Args:
+            bands_info: YAML dict {band_name: {bandwidth, central_wavelength, idx, ...}}
+            modality_name: For error messages
+
+        Returns:
+            parsed: Sorted list of band dicts
+            spectral_indices: torch.Tensor of lookup table indices
+        """
+        # Parse all bands
+        all_bands = []
+        for name, data in bands_info.items():
+            if "bandwidth" in data and "central_wavelength" in data and "idx" in data:
+                all_bands.append({
+                    "idx": data["idx"],
+                    "bandwidth": int(data["bandwidth"]),
+                    "central_wavelength": int(data["central_wavelength"]),
+                    "name": name,
+                })
+        all_bands.sort(key=lambda b: b["idx"])
+
+        # Build spectral indices (same as Sen1Floods11._build_spectral_indices)
+        indices = []
+        for band in all_bands:
+            key = (band["bandwidth"], band["central_wavelength"])
+            if key not in self.look_up.table_wave:
+                # Auto-register abstract channels (negative wavelengths)
+                if band["bandwidth"] < 0:
+                    new_idx = len(self.look_up.table_wave)
+                    self.look_up.table_wave[key] = new_idx
+                    print(f"[MMEarth-MAE] Registered abstract channel "
+                          f"{band['name']} {key} → spectral idx {new_idx}")
+                else:
+                    raise KeyError(
+                        f"[MMEarth-MAE] Band {band['name']} key={key} not in "
+                        f"lookup table for modality '{modality_name}'.\n"
+                        f"Available keys: {list(self.look_up.table_wave.keys())}"
+                    )
+            indices.append(self.look_up.table_wave[key])
+
+        tag = " (abstract)" if all_bands and all_bands[0]["bandwidth"] < 0 else ""
+        print(f"[MMEarth-MAE] {modality_name}: {len(all_bands)} bands{tag}")
+
+        return all_bands, torch.tensor(indices, dtype=torch.long)
+
+    def _load_torchgeo_dataset(self):
+        """Load MMEarth via torchgeo with band selection."""
+        split_map = {"train": "train", "validation": "val", "test": "test"}
+        tg_split = split_map.get(self.split, self.split)
+
+        self.dataset = MMEarth(
+            root=self.root_path,
+            subset=self.subset,
+            modalities=self.modalities,
+            modality_bands=self.MODALITY_BANDS,
+            split=tg_split,
+            normalization_mode="z-score",
+        )
+
+    def _compute_target_sizes(self):
+        """Compute fixed output sizes for padding."""
+        H, W = self.IMAGE_SIZE, self.IMAGE_SIZE
+
+        self.total_bands = sum(self.modality_num_bands.values())
+        self.total_tokens = self.total_bands * H * W
+
+        # Fixed visible count: (1 - mask_ratio) × total
+        self.target_visible = int((1.0 - self.mask_ratio) * self.total_tokens)
 
     # =========================================================================
     # DATASET INTERFACE
     # =========================================================================
 
     def __len__(self):
-        return len(self.scene_list)
+        return len(self.dataset)
 
-    def __getitem__(self, index):
-        # ── Load ────────────────────────────────────────────
-        with rasterio.open(self.scene_list[index]) as src:
-            image = src.read().astype(np.float32)       # [6, 512, 512]
-        with rasterio.open(self.mask_list[index]) as src:
-            label = src.read(1).astype(np.int64)        # [512, 512]
+    def __getitem__(self, index: int) -> dict:
+        # ── Load from torchgeo (already z-score normalized) ─
+        sample = self.dataset[index]
 
-        # ── Clean ───────────────────────────────────────────
-        image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
-        image[image == 9999] = 0.0                      # HLS nodata value
-        label[label == -1] = self.IGNORE_INDEX
+        H, W = self.IMAGE_SIZE, self.IMAGE_SIZE
+        dummy_label = torch.full((H, W), self.IGNORE_INDEX, dtype=torch.long)
 
-        image = torch.from_numpy(image)
-        label = torch.from_numpy(label)
+        all_visible = []
+        all_vis_masks = []
+        all_masked = []
 
-        # ── Normalize ───────────────────────────────────────
-        image = self.normalize_image(image)
-        image = torch.clamp(image, -10, 10)
+        # ── Process each modality independently ─────────────
+        for modality in self.modalities:
+            if modality not in sample:
+                continue
 
-        # ── Build tokens [N, 8] ─────────────────────────────
-        resolution = self.RESOLUTION
-        image_tokens, queries = self._build_tokens(image, label, resolution)
+            data = sample[modality]
+            if data is None or data.numel() == 0:
+                continue
 
-        # ── Attention mask ──────────────────────────────────
-        attention_mask = torch.zeros(image_tokens.shape[0])
+            data = data.float()
+            data = torch.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+            data = torch.clamp(data, -10, 10)
 
-        # ── Subsample queries ───────────────────────────────
-        queries_mask = torch.zeros(queries.shape[0])
-        queries, queries_mask = self._shuffle_arrays([queries, queries_mask])
-        nb_queries = self.max_tokens_reconstruction
-        queries = queries[:nb_queries]
-        queries_mask = queries_mask[:nb_queries]
+            C_m = data.shape[0]
 
-        # ── Return grouped format ───────────────────────────
+            # Resample to 128×128 if needed (ASTER/canopy may differ)
+            if data.shape[1] != H or data.shape[2] != W:
+                data = torch.nn.functional.interpolate(
+                    data.unsqueeze(0), size=(H, W),
+                    mode="bilinear", align_corners=False
+                ).squeeze(0)
+
+            # Get spectral indices for this modality
+            spectral_indices = self.modality_spectral_idx[modality]
+
+            # Build tokens (same as Sen1Floods11._build_tokens)
+            tokens = self.token_builder.build_tokens(
+                image=data,
+                label=dummy_label,
+                resolution=self.RESOLUTION,
+                spectral_indices=spectral_indices,
+                resolution_idx=self.resolution_idx,
+                time_idx=self.TIME_IDX_NA,
+            )  # [C_m * H * W, 8]
+
+            # Independent spatial block mask for this modality
+            spatial_mask = generate_spatial_block_mask(
+                H, W,
+                mask_ratio=self.mask_ratio,
+                block_size=self.block_size,
+            )
+            token_mask = expand_mask_to_tokens(spatial_mask, num_bands=C_m)
+
+            # Split visible / masked (no padding yet — concat first)
+            visible, vis_pad_mask, masked = apply_mask_to_tokens(
+                tokens, token_mask, target_visible=None
+            )
+
+            all_visible.append(visible)
+            all_vis_masks.append(vis_pad_mask)
+            all_masked.append(masked)
+
+        # ── Handle empty sample ─────────────────────────────
+        if len(all_visible) == 0:
+            return self._empty_sample()
+
+        # ── Concatenate all modalities ──────────────────────
+        visible_tokens = torch.cat(all_visible, dim=0)
+        visible_mask = torch.cat(all_vis_masks, dim=0)
+        masked_tokens = torch.cat(all_masked, dim=0)
+
+        # ── Pad/trim to fixed size ──────────────────────────
+        n_vis = visible_tokens.shape[0]
+        if n_vis < self.target_visible:
+            pad_n = self.target_visible - n_vis
+            visible_tokens = torch.cat([
+                visible_tokens,
+                torch.zeros(pad_n, 8, dtype=visible_tokens.dtype),
+            ], dim=0)
+            visible_mask = torch.cat([
+                visible_mask,
+                torch.ones(pad_n, dtype=torch.bool),
+            ], dim=0)
+        elif n_vis > self.target_visible:
+            perm = torch.randperm(n_vis)[:self.target_visible]
+            visible_tokens = visible_tokens[perm]
+            visible_mask = torch.zeros(self.target_visible, dtype=torch.bool)
+
+        # ── Build MAE queries ───────────────────────────────
+        queries, ground_truth, queries_mask = build_mae_queries(
+            masked_tokens, max_queries=self.max_queries
+        )
+
+        # ── Return ──────────────────────────────────────────
         return {
             "groups": {
-                resolution: {
-                    "tokens": image_tokens,           # [C*H*W, 8]
-                    "mask": attention_mask,            # [C*H*W]
-                    "shape": tuple(image.shape),       # (6, 512, 512)
+                self.RESOLUTION: {
+                    "tokens": visible_tokens,   # [target_visible, 8]
+                    "mask": visible_mask,        # [target_visible] bool
+                    "shape": (H, W),
                 },
             },
-            "queries": queries,                        # [M, 8]
-            "queries_mask": queries_mask,               # [M]
-            "label": label,                            # [H, W]
-            "target_resolution": resolution,
-            "image": image,                            # [6, 512, 512]
+            "queries": queries,                 # [M, 8]
+            "queries_mask": queries_mask,        # [M] bool
+            "ground_truth": ground_truth,        # [M] float
         }
 
     # =========================================================================
-    # TOKEN BUILDING
+    # HELPERS
     # =========================================================================
 
-    def _build_tokens(self, image, label, resolution):
-        """
-        Build [N, 8] tokens from image + label.
-        
-        Token format:
-            [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
-             col 0  1  2       3          4        5            6            7
-        
-        All bands are optical → real resolution_idx (≥0).
-        No temporal info → time_idx = -1 (zeroed by encoder).
-        
-        Args:
-            image:      [C, H, W] normalized values
-            label:      [H, W] class labels
-            resolution: meters per pixel
-        
-        Returns:
-            image_tokens: [C*H*W, 8]
-            queries:      [H*W, 8]   (single band for segmentation)
-        """
-        C, H, W = image.shape
-
-        # Spectral indices: [C*H*W]
-        spectral_coords = self.spectral_indices.repeat_interleave(H * W)
-
-        # Position coordinates: [C, H, W, 1]
-        x_indices, y_indices = self._get_position_coordinates(image.shape, resolution)
-
-        # Query position indices: [C, H, W, 1]
-        query_indices = self._get_query_coordinates(image.shape, resolution)
-
-        # Expand label: [H, W] → [C, H, W]
-        label_expanded = label.unsqueeze(0).expand(C, -1, -1)
-
-        # Resolution: real GSD index for all bands (all optical)
-        resolution_col = torch.full((C, H, W, 1), self.resolution_idx, dtype=torch.float32)
-        
-        # Time: -1 for all tokens (no temporal info)
-        time_col = torch.full((C, H, W, 1), self.TIME_IDX_NA, dtype=torch.float32)
-
-        # Stack: [C, H, W, 8]
-        image_tokens = torch.cat([
-            image.unsqueeze(-1),                                           # col 0: value
-            x_indices.float(),                                             # col 1: x
-            y_indices.float(),                                             # col 2: y
-            spectral_coords.view(C, H, W, 1).float(),                     # col 3: spectral_idx
-            label_expanded.unsqueeze(-1).float(),                          # col 4: label
-            query_indices.float(),                                         # col 5: query_idx
-            resolution_col,                                                # col 6: resolution_idx
-            time_col,                                                      # col 7: time_idx
-        ], dim=-1)
-
-        # Queries: first band only (for segmentation)
-        queries = image_tokens[0].unsqueeze(0)
-
-        # Flatten
-        image_tokens = einops.rearrange(image_tokens, "c h w f -> (c h w) f")
-        queries = einops.rearrange(queries, "c h w f -> (c h w) f")
-
-        return image_tokens, queries
-
-    def _get_position_coordinates(self, image_shape, resolution):
-        """Pixel position indices via lookup table → [C, H, W, 1]."""
-        C, H, W = image_shape[0], image_shape[-2], image_shape[-1]
-
-        res_key = int(resolution * 1000)
-        global_offset = self.look_up.table[(res_key, H)]
-
-        y_coords = torch.arange(H)
-        x_coords = torch.arange(W)
-        x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing="xy")
-
-        x_grid = x_grid + global_offset
-        y_grid = y_grid + global_offset
-
-        x_indices = einops.repeat(x_grid, "h w -> c h w 1", c=C)
-        y_indices = einops.repeat(y_grid, "h w -> c h w 1", c=C)
-
-        return x_indices, y_indices
-
-    def _get_query_coordinates(self, image_shape, resolution):
-        """Query position indices via lookup table → [C, H, W, 1]."""
-        C, H, W = image_shape[0], image_shape[-2], image_shape[-1]
-
-        resolution_latents = 10  # m
-        res_key = int(resolution_latents * 1000)
-
-        if (res_key, H) in self.look_up.table_queries:
-            global_offset = self.look_up.table_queries[(res_key, H)]
-        else:
-            res_key = int(resolution * 1000)
-            global_offset = self.look_up.table_queries.get((res_key, H), 0)
-
-        return torch.full((C, H, W, 1), global_offset, dtype=torch.float32)
-
-    # =========================================================================
-    # FILE LOADING
-    # =========================================================================
-
-    def _load_file_lists(self):
-        """Discover scene/mask pairs from directory, with train/val split."""
-        split_dir = os.path.join(
-            self.root_path, self.split_dir_mapping[self.split]
-        )
-
-        if not os.path.isdir(split_dir):
-            raise FileNotFoundError(
-                f"Split directory not found: {split_dir}. "
-                f"Contents of {self.root_path}: {os.listdir(self.root_path)}"
-            )
-
-        all_scenes = sorted(glob.glob(os.path.join(split_dir, "*_merged.tif")))
-        all_masks = sorted(glob.glob(os.path.join(split_dir, "*.mask.tif")))
-
-        scenes, masks = [], []
-        for scene_path in all_scenes:
-            mask_path = scene_path.replace("_merged.tif", ".mask.tif")
-            if mask_path in all_masks:
-                scenes.append(scene_path)
-                masks.append(mask_path)
-
-        if len(scenes) == 0:
-            raise RuntimeError(
-                f"No valid scene/mask pairs found in {split_dir}. "
-                f"Expected files like *_merged.tif and *.mask.tif"
-            )
-
-        # train/val split for training directory
-        # (matches PANGAEA: 90% train, 10% val, random_state=23)
-        if self.split in ("train", "validation"):
-            train_idxs, val_idxs = train_test_split(
-                np.arange(len(scenes)),
-                test_size=0.1,
-                random_state=23,
-            )
-            indices = train_idxs if self.split == "train" else val_idxs
-            scenes = [scenes[i] for i in indices]
-            masks = [masks[i] for i in indices]
-
-        print(f"[HLSBurnScars] Found {len(scenes)} samples in "
-              f"{split_dir} (split={self.split})")
-
-        return scenes, masks
-
-    # =========================================================================
-    # NORMALIZATION
-    # =========================================================================
-
-    def _load_or_compute_normalization(self):
-        norm_file = os.path.join(self.root_path, "normalization_stats.pt")
-
-        if os.path.exists(norm_file):
-            print(f"[HLSBurnScars] Loading normalization stats from {norm_file}")
-            stats = torch.load(norm_file, weights_only=True)
-            self._print_norm_stats(stats)
-            return stats
-
-        if self.split != "train":
-            print(f"[HLSBurnScars] WARNING: No normalization file at {norm_file}")
-            return {
-                "mean": torch.zeros(self.NUM_BANDS),
-                "std": torch.ones(self.NUM_BANDS),
-            }
-
-        print(f"[HLSBurnScars] Computing normalization from "
-              f"{len(self.scene_list)} samples...")
-        stats = self._compute_normalization_stats()
-        torch.save(stats, norm_file)
-        print(f"[HLSBurnScars] Saved normalization stats to {norm_file}")
-        self._print_norm_stats(stats)
-        return stats
-
-    def _compute_normalization_stats(self):
-        ch_sum = torch.zeros(self.NUM_BANDS, dtype=torch.float64)
-        ch_sum_sq = torch.zeros(self.NUM_BANDS, dtype=torch.float64)
-        ch_count = torch.zeros(self.NUM_BANDS, dtype=torch.float64)
-
-        for scene_path in tqdm(self.scene_list, desc="Computing normalization"):
-            try:
-                with rasterio.open(scene_path) as src:
-                    data = src.read().astype(np.float64)
-                data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-                for c in range(self.NUM_BANDS):
-                    channel = data[c].flatten()
-                    valid = channel[(channel > 0) & (channel != 9999)]
-                    if len(valid) > 0:
-                        ch_sum[c] += valid.sum()
-                        ch_sum_sq[c] += (valid ** 2).sum()
-                        ch_count[c] += len(valid)
-            except Exception as e:
-                print(f"[Warning] Could not read {scene_path}: {e}")
-                continue
-
-        mean = ch_sum / ch_count.clamp(min=1)
-        var = (ch_sum_sq / ch_count.clamp(min=1)) - (mean ** 2)
-        std = torch.sqrt(var.clamp(min=1e-8))
-
-        return {"mean": mean.float(), "std": std.float()}
-
-    def _print_norm_stats(self, stats):
-        band_names = ["B02(Blue)", "B03(Green)", "B04(Red)",
-                      "B8A(NIR)", "B11(SWIR1)", "B12(SWIR2)"]
-        print(f"[HLSBurnScars] Normalization stats:")
-        for i, name in enumerate(band_names):
-            print(f"  {name}: mean={stats['mean'][i]:.4f}, std={stats['std'][i]:.4f}")
-
-    def normalize_image(self, image):
-        mean = self.norm_stats["mean"].view(self.NUM_BANDS, 1, 1)
-        std = self.norm_stats["std"].view(self.NUM_BANDS, 1, 1)
-        return (image - mean) / std
-
-    # =========================================================================
-    # BAND METADATA
-    # =========================================================================
-
-    def _parse_bands_info(self):
-        all_bands = []
-        for name, data in self.bands_info.items():
-            if "bandwidth" in data and "central_wavelength" in data and "idx" in data:
-                all_bands.append({
-                    "idx": data["idx"],
-                    "bandwidth": data["bandwidth"],
-                    "central_wavelength": data["central_wavelength"],
-                    "name": name,
-                })
-        all_bands.sort(key=lambda b: b["idx"])
-
-        bw = torch.tensor([b["bandwidth"] for b in all_bands], dtype=torch.float32)
-        wl = torch.tensor([b["central_wavelength"] for b in all_bands], dtype=torch.float32)
-        names = [b["name"] for b in all_bands]
-
-        print(f"[HLSBurnScars] Band order:")
-        for b in all_bands:
-            print(f"  idx={b['idx']:2d}: {b['name']:4s} → "
-                  f"bw={b['bandwidth']:4d}nm, wl={b['central_wavelength']:4d}nm")
-
-        return bw, wl, names
-
-    def _build_spectral_indices(self):
-        indices = []
-        for i, (bw, wl) in enumerate(zip(self.bandwidths, self.wavelengths)):
-            key = (int(bw.item()), int(wl.item()))
-            if key not in self.look_up.table_wave:
-                raise KeyError(
-                    f"Band {self.band_names[i]} key={key} not in lookup. "
-                    f"Available: {list(self.look_up.table_wave.keys())}"
-                )
-            indices.append(self.look_up.table_wave[key])
-        return torch.tensor(indices, dtype=torch.long)
-
-    # =========================================================================
-    # UTILS
-    # =========================================================================
-
-    @staticmethod
-    def _shuffle_arrays(arrays: list):
-        perm = torch.randperm(arrays[0].shape[0])
-        return [arr[perm] for arr in arrays]
+    def _empty_sample(self) -> dict:
+        """Minimal valid sample when all modalities are missing."""
+        H, W = self.IMAGE_SIZE, self.IMAGE_SIZE
+        return {
+            "groups": {
+                self.RESOLUTION: {
+                    "tokens": torch.zeros(self.target_visible, 8),
+                    "mask": torch.ones(self.target_visible, dtype=torch.bool),
+                    "shape": (H, W),
+                },
+            },
+            "queries": torch.zeros(1, 8),
+            "queries_mask": torch.ones(1, dtype=torch.bool),
+            "ground_truth": torch.zeros(1),
+        }

@@ -708,6 +708,7 @@ class Atomiser_error(pl.LightningModule):
         # Relative position encoding
         relative_pe = self.input_processor.pos_encoder(delta_x, delta_y)
         
+        
         # Context = latent features + relative PE
         context = torch.cat([selected_latents, relative_pe], dim=-1)
         
