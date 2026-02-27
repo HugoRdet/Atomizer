@@ -140,6 +140,9 @@ def collate_grouped(batch: list) -> dict:
         labels = torch.stack([s["label"] for s in batch], dim=0)
         result["label"] = labels
 
+    if "task" in batch[0]:
+        result["task"] = batch[0]["task"]
+
     
     # ── Metadata ────────────────────────────────────────────
     if "target_resolution" in batch[0]:

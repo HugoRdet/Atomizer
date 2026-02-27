@@ -20,5 +20,7 @@ conda activate venv
 MODEL_NAME=config_test-Atomiser_Atos_One.yaml
 #python3 flair_test.py
 #sh TrainEval_MAE.sh "$EXPERIMENT_NAME" "$MODEL_NAME" regular
+python script_train_pretraining.py --xp_name esa_test --config_model config_test-Atomiser_Atos_One.yaml --dataset_name mmearth --task all
+
 sh TrainEval_SENFLOOD.sh "$EXPERIMENT_NAME" "$MODEL_NAME" u_regular
 

@@ -23,7 +23,7 @@ import pytorch_lightning as pl
 import torchmetrics
 from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
-
+import torch.nn.functional as F
 from training.atomiser import Atomiser_Senflood
 
 
@@ -79,7 +79,7 @@ class Model_MMEarth(pl.LightningModule):
         y_hat = y_hat.squeeze(-1)
 
         # Target: reflectance stored in col 4
-        targets = batch["queries"][:, :, 0]
+        targets = batch["queries"][:, :, 4]
 
         loss = self.loss(y_hat, targets)
 
@@ -113,7 +113,11 @@ class Model_MMEarth(pl.LightningModule):
         self.val_mse.update(preds, targets)
         self.val_mae.update(preds, targets)
 
+
+
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        
         return loss
 
     # =========================================================================

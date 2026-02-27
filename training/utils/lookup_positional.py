@@ -51,6 +51,24 @@ LEARNED_TIME_IDX       = 0   # Datasets without temporal dimension
 # Abstract channels use NEGATIVE bandwidth AND central_wavelength values.
 # Key format: (int(bandwidth), int(central_wavelength))
 
+# =============================================================================
+# ABSTRACT CHANNEL DEFINITIONS
+# =============================================================================
+# Abstract channels use NEGATIVE bandwidth AND central_wavelength values.
+# Key format: (int(bandwidth), int(central_wavelength))
+#
+# IMPORTANT: Each abstract channel MUST have a unique (bandwidth, central_wavelength) pair.
+# Before adding new entries, check for collisions with existing ones.
+#
+# Current allocation:
+#   -1, -2, -3        : SAR polarizations (VV, VH, VV/VH)
+#   -10               : Elevation / DEM
+#   -11               : Slope
+#   -12               : Aspect
+#   -13               : Canopy Height
+#   -20, -21, -22     : Spectral indices (NDVI, NDWI, MNDWI)
+#   -100, -101, -102  : Generic placeholders
+
 ABSTRACT_CHANNELS = {
     # Sentinel-1 SAR polarizations
     "VV":    {"bandwidth": -1, "central_wavelength": -1},
@@ -64,6 +82,9 @@ ABSTRACT_CHANNELS = {
     # Slope / Aspect
     "SLOPE":  {"bandwidth": -11, "central_wavelength": -11},
     "ASPECT": {"bandwidth": -12, "central_wavelength": -12},
+
+    # Canopy Height
+    "CANOPY_HEIGHT": {"bandwidth": -13, "central_wavelength": -13},
 
     # Indices
     "NDVI":  {"bandwidth": -20, "central_wavelength": -20},
@@ -138,6 +159,7 @@ class Lookup_encoding(pl.LightningModule):
         reference_modalities = [
             (0.2, 512),   # VHR imagery
             (1.0, 2080),
+            (1.6, 1024),
             (10.0, 1024),  # Sentinel-2/Sentinel-1 at 10m
             (20.0, 512),  # Sentinel-2 at 20m
             (30.0, 512),  # Landsat at 30m

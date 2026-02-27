@@ -37,6 +37,7 @@ from training.trainer_MAE import Model_MMEarth
 from training.utils.datasets.utils_dataset_SENFLOOD import Sen1Floods11Dataset
 from training.utils.datasets.utils_dataset_MM_Earth import MMEarthMAEDataset
 from training.utils.datasets.utils_dataset_PASTIS_SPOT import PastisSpotReconDataset
+from training.utils.datasets.utils_dataset_PASTIS_S2 import PastisS2ReconDataset
 
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.token_grouping import collate_grouped
@@ -101,7 +102,7 @@ data_module = UnifiedDataModule(
     dataset_config=read_yaml(bands_yaml),
     config_model=config_model,
     look_up=lookup_table,
-    dataset_class=PastisSpotReconDataset#MMEarthMAEDataset,
+    dataset_class=PastisS2ReconDataset#MMEarthMAEDataset#PastisSpotReconDataset#,###PastisS2ReconDataset##
 )
 
 # =============================================================================
@@ -143,7 +144,7 @@ trainer = Trainer(
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
     #val_check_interval=250,
-    #limit_train_batches=1
+    limit_train_batches=750
 )
 
 # =============================================================================
