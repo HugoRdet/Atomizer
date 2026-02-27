@@ -350,8 +350,6 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
-    limit_train_batches=10,
-    limit_val_batches=10,
     gradient_clip_val=1.0,
     ckpt_path=args.ckpt_path
 )
