@@ -95,12 +95,24 @@ if is_unet:
         name=xp_name,
     )
 else:
-    model = Model_SenFlood(
+    #model = Model_SenFlood(
+    #    config=config_model,
+    #    wand=True,
+    #    name=xp_name,
+    #    transform=None,           # encoder creates its own TokenProcessor
+    #    lookup_table=lookup_table,
+    #)
+
+    checkpoint_path = "./checkpoints/ATOMIZER_recon-val_mIoU-epoch=16-val_avg_mIoU=0.4233.ckpt"
+    # Option 1: Load checkpoint with strict=False (recommended)
+    model = Model_SenFlood.load_from_checkpoint(
+        checkpoint_path,
+        strict=False,  # Allow missing keys (displacement MLP is new)
         config=config_model,
         wand=True,
         name=xp_name,
-        transform=None,           # encoder creates its own TokenProcessor
-        lookup_table=lookup_table,
+        transform=None,
+        lookup_table=lookup_table
     )
 
 # =============================================================================

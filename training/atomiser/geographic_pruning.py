@@ -5,6 +5,10 @@ Memory-efficient, fully tensorized implementation.
 
 All runtime parameters (geo_k, sigma, L_spatial) are passed as forward() args.
 Precomputed cells are cached by token shape + latent positions hash.
+
+For large token counts (>50k), an on-the-fly chunked top-k path is used
+instead of precomputation to avoid combinatorial cache explosion from
+variable-length inputs (e.g., FLAIR-HUB with temporal dropout).
 """
 
 import torch
@@ -20,10 +24,14 @@ class GeographicPruning(nn.Module):
     Each token is assigned to its nearest latent (Voronoi cell).
     Tokens are stored in padded tensors for fully tensorized sampling.
     
-    Precomputed buffers (cached per shape):
-        cell_indices_padded: [L, max_cell_size] - token indices per cell
-        cell_valid_mask: [L, max_cell_size] - True for valid positions
-        cell_distances: [L, max_cell_size] - squared distance to latent center
+    Two paths:
+        1. Cached Voronoi (N <= ON_THE_FLY_THRESHOLD):
+           Precomputes cell membership, caches padded tensors per (N, L, grid) key.
+           Fast for repeated identical shapes (e.g., MMEarth).
+        
+        2. On-the-fly top-k (N > ON_THE_FLY_THRESHOLD):
+           Chunked distance computation + top-k per latent.
+           No caching, handles variable token counts efficiently.
     
     Safety guarantees:
         - Empty Voronoi cells produce index 0 + mask=True (masked out)
@@ -33,6 +41,7 @@ class GeographicPruning(nn.Module):
     """
     
     MIN_CELL_SIZE = 1
+    ON_THE_FLY_THRESHOLD = 2000000  # tokens above this skip precomputation
     
     def __init__(
         self,
@@ -68,13 +77,13 @@ class GeographicPruning(nn.Module):
         
         # Hash latent positions — round to 0.1m to be robust to float noise
         coords_flat = latent_coords[0].detach().float().cpu()
-        coords_rounded = (coords_flat * 10).long()
+        coords_rounded = coords_flat.long()
         pos_hash = hash(coords_rounded.numpy().tobytes()) % (10**8)
         
         return f"{N}_{L_spatial}_{grid_type}_{pos_hash}"
     
     # =========================================================================
-    # Voronoi assignment
+    # Voronoi assignment (for cached path)
     # =========================================================================
     
     def _compute_nearest_latent_chunked(
@@ -132,7 +141,7 @@ class GeographicPruning(nn.Module):
         return nearest_latent, min_dist_sq.to(original_dtype)
     
     # =========================================================================
-    # Precomputation
+    # Precomputation (cached path, small N only)
     # =========================================================================
     
     def _precompute_voronoi_cells(
@@ -213,7 +222,111 @@ class GeographicPruning(nn.Module):
             torch.cuda.empty_cache()
     
     # =========================================================================
-    # Forward
+    # On-the-fly path (large N, no caching)
+    # =========================================================================
+    
+    def _forward_on_the_fly(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+        latent_coords: torch.Tensor,
+        geo_k: int,
+        sigma: float,
+        L_spatial: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        On-the-fly geographic pruning for large token counts.
+        
+        Uses chunked top-k per latent instead of full Voronoi precomputation.
+        No caching — handles variable token counts without memory explosion.
+        
+        Chunks over latents to keep peak memory bounded:
+            peak ≈ chunk_size × N × sizeof(float)
+        """
+        B, N, D = tokens.shape
+        k = min(geo_k, N)
+        L = L_spatial
+        device = tokens.device
+        dtype = tokens.dtype
+
+        print(f"[GeoPruning] On-the-fly: N={N}, L={L}, k={k} ...")  # ADD THIS
+    
+        
+        with torch.no_grad():
+            pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)  # [N, 2]
+            lat_coords = latent_coords[0]  # [L, 2]
+            
+            selected_indices = torch.zeros(L, k, dtype=torch.long, device=device)
+            selected_dist_sq = torch.zeros(L, k, dtype=dtype, device=device)
+            selection_valid = torch.zeros(L, k, dtype=torch.bool, device=device)
+            
+            # Chunk over latents to bound memory at chunk_size × N
+            chunk = max(self.chunk_size, 1)
+            for l_start in range(0, L, chunk):
+                l_end = min(l_start + chunk, L)
+                lat_chunk = lat_coords[l_start:l_end]  # [c, 2]
+                
+                # [c, N] distance matrix
+                diff = pixel_coords.unsqueeze(0) - lat_chunk.unsqueeze(1)  # [c, N, 2]
+                dist_sq = (diff ** 2).sum(dim=-1)  # [c, N]
+                del diff
+                
+                actual_k = min(k, N)
+                
+                # Top-k nearest tokens per latent in this chunk
+                topk_dist, topk_idx = torch.topk(
+                    dist_sq, actual_k, dim=-1, largest=False
+                )
+                del dist_sq
+                
+                selected_indices[l_start:l_end, :actual_k] = topk_idx
+                selected_dist_sq[l_start:l_end, :actual_k] = topk_dist
+                selection_valid[l_start:l_end, :actual_k] = True
+        
+        # Expand to batch dimension
+        selected_indices = selected_indices.unsqueeze(0).expand(B, -1, -1).contiguous()
+        selected_dist_sq = selected_dist_sq.unsqueeze(0).expand(B, -1, -1).contiguous()
+        selection_valid = selection_valid.unsqueeze(0).expand(B, -1, -1).contiguous()
+        
+        # Training: shuffle the k selected tokens per latent for stochastic sampling
+        if self.training:
+            rand_perm = torch.rand(B, L, k, device=device, dtype=dtype)
+            rand_perm = torch.where(
+                selection_valid, rand_perm,
+                torch.tensor(float('-inf'), device=device, dtype=dtype),
+            )
+            _, perm = torch.sort(rand_perm, dim=-1, descending=True)
+            
+            selected_indices = torch.gather(selected_indices, dim=2, index=perm)
+            selected_dist_sq = torch.gather(selected_dist_sq, dim=2, index=perm)
+            selection_valid = torch.gather(selection_valid, dim=2, index=perm)
+        
+        # Safety: clamp indices
+        selected_indices = selected_indices.clamp(0, N - 1)
+        selected_indices = torch.where(
+            selection_valid, selected_indices, torch.zeros_like(selected_indices)
+        )
+        
+        # Gaussian bias with -inf for invalid positions
+        bias = -selected_dist_sq / (2 * (sigma ** 2))
+        bias = torch.where(
+            selection_valid, bias,
+            torch.tensor(float('-inf'), device=device, dtype=dtype),
+        )
+        
+        # Gather tokens and masks
+        tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
+        masks_per_latent = self._gather_masks(mask, selected_indices, N)
+        
+        # Force-mask invalid positions
+        masks_per_latent = masks_per_latent | (~selection_valid)
+
+        print(f"[GeoPruning] On-the-fly done.")  # ADD THIS
+        
+        return tokens_per_latent, masks_per_latent, bias.to(dtype)
+    
+    # =========================================================================
+    # Forward (routes to cached or on-the-fly path)
     # =========================================================================
     
     def forward(
@@ -232,9 +345,17 @@ class GeographicPruning(nn.Module):
         device = tokens.device
         dtype = tokens.dtype
         
-        # =====================================================================
-        # Position-aware cache key (prevents callback/training collisions)
-        # =====================================================================
+        # =================================================================
+        # Route: on-the-fly for large inputs, cached for small
+        # =================================================================
+        if N > self.ON_THE_FLY_THRESHOLD:
+            return self._forward_on_the_fly(
+                tokens, mask, latent_coords, geo_k, sigma, L_spatial
+            )
+        
+        # =================================================================
+        # Cached Voronoi path (original logic, for small N)
+        # =================================================================
         cache_key = self._make_cache_key(N, L_spatial, hexagonal, latent_coords)
         
         if cache_key not in self._precomputed_keys:
@@ -372,4 +493,8 @@ class GeographicPruning(nn.Module):
     
     def extra_repr(self) -> str:
         cached = ", ".join(self._precomputed_keys) if self._precomputed_keys else "none"
-        return f"chunk_size={self.chunk_size}, cached=[{cached}]"
+        return (
+            f"chunk_size={self.chunk_size}, "
+            f"on_the_fly_threshold={self.ON_THE_FLY_THRESHOLD}, "
+            f"cached=[{cached}]"
+        )

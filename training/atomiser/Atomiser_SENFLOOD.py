@@ -663,10 +663,13 @@ class Atomiser_Senflood(pl.LightningModule):
     # =========================================================================
 
     def encode(self, groups, grid_configs, training=True, return_trajectory=False):
+        
         first_group = next(iter(groups.values()))
         B = first_group["tokens"].shape[0]
         device = first_group["tokens"].device
         resolutions = sorted(groups.keys())
+
+      
 
         latents_per_res, coords_per_res = self.init_latents_per_resolution(
             B, grid_configs, device
@@ -751,12 +754,15 @@ class Atomiser_Senflood(pl.LightningModule):
             task_embed: [task_embed_dim] learned task vector
             training: enables latent dropping
         """
+
         B, M, _ = query_coords.shape
         D = latents.shape[-1]
 
         k_fetch = k + 1 if training else k
         k_fetch = min(k_fetch, coords.shape[1])
         k_keep = min(k, k_fetch)
+
+        
 
         dists_sq = (
             query_coords.unsqueeze(2) - coords.unsqueeze(1)
@@ -785,22 +791,32 @@ class Atomiser_Senflood(pl.LightningModule):
             coords, 1, flat_idx.unsqueeze(-1).expand(-1, -1, 2),
         ).reshape(B, M, k_keep, 2)
 
-        # RPE
+        # RPE — flatten (M, k_keep) → (M*k_keep) before pos_encoder, reshape after.
+        # pos_encoder expects [B, N] inputs. When k_keep=1 (grids with very few
+        # latents, e.g. FLAIR-HUB 10m: 10×10 spatial → 1-2 latents), pos_encoder
+        # squeezes the trailing singleton and returns [B, M, PE] (3D) instead of
+        # [B, M, k_keep, PE] (4D), crashing the downstream cat.
         delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
         delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
 
+        B_dec, M_dec, K_dec = delta_x.shape
+        delta_x_flat = delta_x.reshape(B_dec, M_dec * K_dec)
+        delta_y_flat = delta_y.reshape(B_dec, M_dec * K_dec)
+
         if isinstance(query_gsd, torch.Tensor) and query_gsd.dim() >= 2:
             compression_scale = self.input_processor.compression_alpha * query_gsd.unsqueeze(-1)
+            compression_scale = compression_scale.reshape(B_dec, M_dec * K_dec)
         else:
             compression_scale = self.input_processor.compression_alpha * query_gsd
 
         rel_pe = self.input_processor.pos_encoder(
-            delta_x, delta_y, compression_scale=compression_scale,
+            delta_x_flat, delta_y_flat, compression_scale=compression_scale,
         )
+        rel_pe = rel_pe.reshape(B_dec, M_dec, K_dec, -1)
 
         # Expand query features and task embedding to match [B, M, k, ...]
         query_expanded = query_features.unsqueeze(2).expand(-1, -1, k_keep, -1)
-        task_expanded = task_embed.expand(B, M, k_keep, -1)
+        task_expanded = task_embed.view(1, 1, 1, -1).expand(B, M, k_keep, -1)
 
         # Local prediction: MLP(latent, RPE, query, task)
         local_input = torch.cat(
@@ -856,14 +872,17 @@ class Atomiser_Senflood(pl.LightningModule):
             )
             grid_features.append(grid_feat)
 
-        # Fuse across grids
-        if len(grid_features) == 1:
-            fused = grid_features[0]
-        else:
-            stacked = torch.stack(grid_features, dim=2)           # [B, M, G, D]
-            scores = self.grid_gate(stacked).squeeze(-1)          # [B, M, G]
-            weights = F.softmax(scores, dim=-1)                   # [B, M, G]
-            fused = (weights.unsqueeze(-1) * stacked).sum(dim=2)  # [B, M, D]
+        # =====================================================================
+        # Fuse across grids (DDP-Safe: No conditional branching)
+        # =====================================================================
+        stacked = torch.stack(grid_features, dim=2)           # [B, M, G, D]
+        
+        # Always pass through grid_gate so gradients sync perfectly across ranks
+        scores = self.grid_gate(stacked).squeeze(-1)          # [B, M, G]
+        
+        # If G=1 (e.g. MMEarth only), softmax gracefully returns exactly 1.0.
+        weights = F.softmax(scores, dim=-1)                   # [B, M, G]
+        fused = (weights.unsqueeze(-1) * stacked).sum(dim=2)  # [B, M, D]
 
         # ── Output head ──────────────────────────────────────────
         if return_features:

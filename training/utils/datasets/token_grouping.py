@@ -25,13 +25,217 @@ All tokens are flat — no temporal dimension. Temporal info is in column 7.
 """
 
 import math
-from collections import defaultdict
-
 import torch
+import torch.distributed as dist
+from torch.utils.data import Sampler
+
+# =============================================================================
+# ROUND-ROBIN BATCH SAMPLER
+# =============================================================================
+
+class RoundRobinDistributedBatchSampler(Sampler):
+    """
+    Yields batches alternating between datasets in a ConcatDataset.
+
+    All ranks see the same dataset at every step, preventing DDP
+    deadlocks from mismatched head execution.
+
+    Shorter datasets are cycled (with re-shuffling) to match the
+    longest, so no data is wasted from larger datasets.
+
+    Uses deterministic shuffling (seed + epoch) so all ranks generate
+    identical orderings, then each rank takes its own slice.
+    """
+
+    def __init__(
+        self,
+        dataset_lengths: list,
+        batch_size: int,
+        num_replicas: int = None,
+        rank: int = None,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        if num_replicas is None:
+            if dist.is_available() and dist.is_initialized():
+                num_replicas = dist.get_world_size()
+            else:
+                num_replicas = 1
+        if rank is None:
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+            else:
+                rank = 0
+
+        self.dataset_lengths = dataset_lengths
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.num_datasets = len(dataset_lengths)
+
+        # Distributed batch: each step consumes batch_size * num_replicas samples
+        self.global_batch_size = self.batch_size * self.num_replicas
+
+        # Per-dataset: how many full distributed batches each dataset provides
+        self.batches_per_dataset = [
+            d_len // self.global_batch_size for d_len in dataset_lengths
+        ]
+
+        # Round-robin runs for as many rounds as the longest dataset has batches.
+        # Shorter datasets cycle.
+        self.max_batches = max(self.batches_per_dataset)
+
+        # Total batches yielded per epoch (per rank):
+        # max_batches rounds × num_datasets batches per round
+        self.total_batches = self.max_batches * self.num_datasets
+
+    def _build_indices(self, d_len, num_needed, offset, generator):
+        """
+        Build a list of `num_needed` global indices for one dataset,
+        cycling through the dataset with fresh shuffles as needed.
+        Indices are offset for ConcatDataset addressing.
+        """
+        indices = []
+        while len(indices) < num_needed:
+            if self.shuffle:
+                perm = torch.randperm(d_len, generator=generator).tolist()
+            else:
+                perm = list(range(d_len))
+            indices.extend(perm)
+
+        # Truncate to exactly what we need and apply ConcatDataset offset
+        indices = indices[:num_needed]
+        return [i + offset for i in indices]
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        # Each dataset needs max_batches * global_batch_size samples.
+        # Shorter datasets will cycle through their data.
+        needed_per_dataset = self.max_batches * self.global_batch_size
+
+        dataset_indices = []
+        current_offset = 0
+        for d_len in self.dataset_lengths:
+            # Each dataset gets its own sub-generator for reproducibility
+            # (order of randperm calls must be deterministic across ranks)
+            sub_seed = g.initial_seed() + current_offset
+            sub_g = torch.Generator()
+            sub_g.manual_seed(sub_seed)
+
+            indices = self._build_indices(
+                d_len, needed_per_dataset, current_offset, sub_g
+            )
+            dataset_indices.append(indices)
+            current_offset += d_len
+
+        # Yield batches in round-robin order
+        for b in range(self.max_batches):
+            for d_idx in range(self.num_datasets):
+                start = b * self.global_batch_size
+                end = start + self.global_batch_size
+                global_batch = dataset_indices[d_idx][start:end]
+
+                # Each rank takes its slice
+                local_start = self.rank * self.batch_size
+                local_end = local_start + self.batch_size
+                local_batch = global_batch[local_start:local_end]
+                yield local_batch
+
+    def __len__(self):
+        """Number of batches this rank will yield per epoch."""
+        return self.total_batches
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
 
 # =============================================================================
-# COLLATE
+# PAD HELPERS
+# =============================================================================
+
+def _pad_tokens(tensors, pad_value=0.0):
+    """Pad a list of [N_i, D] tensors to [B, N_max, D]."""
+    max_len = max(t.shape[0] for t in tensors)
+    D = tensors[0].shape[1]
+    B = len(tensors)
+
+    padded = torch.full((B, max_len, D), pad_value, dtype=tensors[0].dtype)
+    for i, t in enumerate(tensors):
+        padded[i, :t.shape[0]] = t
+
+    return padded
+
+def _pad_masks(masks, pad_value=True):
+    """Pad a list of [N_i] bool tensors to [B, N_max]. Padded = True."""
+    max_len = max(m.shape[0] for m in masks)
+    B = len(masks)
+
+    padded = torch.full((B, max_len), pad_value, dtype=torch.bool)
+    for i, m in enumerate(masks):
+        padded[i, :m.shape[0]] = m
+
+    return padded
+
+# =============================================================================
+# MULTI-TASK COLLATE (DYNAMIC VERSION)
+# =============================================================================
+
+def collate_multitask(samples: list) -> dict:
+    """
+    Collate multi-task samples into a batch.
+    Dynamic version: Safe to use because Round-Robin sampling + static modalities 
+    guarantees identical batch structures across all DDP ranks.
+    """
+    B = len(samples)
+
+    # 1. Collate groups dynamically
+    all_resolutions = set()
+    for s in samples:
+        all_resolutions.update(s["groups"].keys())
+
+    groups = {}
+    for res in sorted(all_resolutions):
+        tokens_list = [s["groups"][res]["tokens"] for s in samples]
+        masks_list = [s["groups"][res]["mask"] for s in samples]
+        shape = samples[0]["groups"][res]["shape"]
+
+        groups[res] = {
+            "tokens": _pad_tokens(tokens_list),
+            "mask": _pad_masks(masks_list),
+            "shape": shape,
+        }
+
+    # 2. Collate tasks dynamically
+    all_task_names = set()
+    for s in samples:
+        all_task_names.update(s.get("tasks", {}).keys())
+
+    tasks = {}
+    for task_name in sorted(all_task_names):
+        queries_list = [s["tasks"][task_name]["queries"] for s in samples]
+        masks_list = [s["tasks"][task_name]["queries_mask"] for s in samples]
+
+        tasks[task_name] = {
+            "queries": _pad_tokens(queries_list),
+            "queries_mask": _pad_masks(masks_list),
+        }
+
+    target_resolution = samples[0].get("target_resolution", 10.0)
+
+    return {
+        "groups": groups,
+        "tasks": tasks,
+        "target_resolution": target_resolution,
+    }
+
+
+# =============================================================================
+# SINGLE-TASK COLLATE (GROUPED)
 # =============================================================================
 
 def collate_grouped(batch: list) -> dict:
@@ -119,13 +323,6 @@ def collate_grouped(batch: list) -> dict:
             padded_queries.append(q)
             padded_qmasks.append(qm)
 
-    # ── Labels ──────────────────────────────────────────────
-    #labels = torch.stack([s["label"] for s in batch], dim=0)  # [B, H, W]
-
-    
-    
-
-
     result = {
         "groups": groups,
         "queries": torch.stack(padded_queries, dim=0),       # [B, M_max, 8]
@@ -143,7 +340,6 @@ def collate_grouped(batch: list) -> dict:
     if "task" in batch[0]:
         result["task"] = batch[0]["task"]
 
-    
     # ── Metadata ────────────────────────────────────────────
     if "target_resolution" in batch[0]:
         result["target_resolution"] = batch[0]["target_resolution"]
@@ -245,6 +441,7 @@ def compute_grid_config(
     total_tokens: int = None,
     sigma_factor: float = 1.5,
     max_k: int = 2000,
+    min_pixels_per_latent: int = 4,
 ) -> dict:
     """
     Compute latent grid configuration from total token count.
@@ -253,16 +450,22 @@ def compute_grid_config(
     tokens_per_latent, then arranging latents on a spatial grid
     preserving the image's aspect ratio.
 
-    This replaces the old pixels_per_latent approach, which only
-    counted spatial pixels and required temporal chunking.
+    For temporal modalities (e.g. S1/S2 time series), total_tokens can
+    vastly exceed the spatial extent (H×W) because each timestamp ×
+    band generates separate tokens at the same spatial positions.
+    The latent grid is capped so it never exceeds the spatial pixel
+    count, preventing empty Voronoi cells and downstream NaN.
 
     Args:
-        resolution:        Ground sampling distance (m/px)
-        shape:             Spatial geometry — (H, W) or (C, H, W)
-        tokens_per_latent: Target token budget per latent
-        total_tokens:      Actual token count from groups[res]["tokens"].shape[1]
-        sigma_factor:      Multiplier for geographic attention sigma
-        max_k:             Maximum tokens per latent in geographic pruning
+        resolution:           Ground sampling distance (m/px)
+        shape:                Spatial geometry — (H, W) or (C, H, W)
+        tokens_per_latent:    Target token budget per latent
+        total_tokens:         Actual token count from groups[res]["tokens"].shape[1]
+        sigma_factor:         Multiplier for geographic attention sigma
+        max_k:                Maximum tokens per latent in geographic pruning
+        min_pixels_per_latent: Minimum spatial pixels per latent (caps grid density).
+                              Prevents more latents than spatial positions for
+                              temporal data. Default 4.
 
     Returns:
         dict with grid parameters:
@@ -271,11 +474,6 @@ def compute_grid_config(
             geo_k, geo_sigma,
             train_k, val_k,
             tokens_per_latent, total_tokens
-
-    Example:
-        PASTIS 128x128, 10 S2 bands × 10 timesteps + 3 S1 bands × 10 timesteps
-        = 128 * 128 * (100 + 30) = 2,129,920 tokens
-        tokens_per_latent = 2000 → ~1065 latents → ~33x33 grid
     """
     # Extract spatial dims from shape
     if len(shape) == 2:
@@ -290,6 +488,12 @@ def compute_grid_config(
 
     # Number of latents from token budget
     num_latents = max(1, total_tokens // tokens_per_latent)
+
+    # Cap: never more latents than spatial positions allow.
+    # Temporal tokens share spatial locations, so the latent grid
+    # must fit within the H×W spatial extent.
+    max_spatial_latents = max(1, (H * W) // min_pixels_per_latent)
+    num_latents = min(num_latents, max_spatial_latents)
 
     # Arrange on spatial grid preserving aspect ratio
     aspect = W / H

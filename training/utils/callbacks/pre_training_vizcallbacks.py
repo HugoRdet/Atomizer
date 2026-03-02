@@ -1,33 +1,41 @@
 """
-Multi-Task Pre-training Visualization Callbacks
-=================================================
+Multi-Task Pre-training Visualization Callbacks (Encode-Once)
+==============================================================
 
-Two callbacks for the multi-task pre-training setup:
+Two callbacks for the encode-once multi-task pre-training setup:
 
-1. PretrainSegVizCallback — Segmentation visualization for ESA + DW
+1. PretrainSegVizCallback  — Segmentation visualization (any seg task)
 2. PretrainReconVizCallback — Reconstruction visualization
 
-Both work with Model_Pretrain which requires task_name in forward().
-Both expect datasets to be stored in trainer.datamodule under known attribute names.
+Both work with the encode-once batch format:
+    batch["tasks"][task_name]["queries"]   (not batch["queries"])
+    pl_module.forward_multitask(batch)     returns {task_name: preds}
 
-Usage:
+Both find the multi-task dataset via trainer.datamodule.train_dataset
+(MMEarthMultiTask or FlairHubMultiTask) and call .get_viz_sample().
+
+get_viz_sample() returns:
+    {
+        "groups": {res: {"tokens": ..., "mask": ..., "shape": ...}},
+        "tasks":  {task_name: {"queries": [M,8], "queries_mask": [M]}},
+        "target_resolution": float,
+        "image":       [C, H, W] raw unnormalized image,
+        "labels":      {task_name: [H, W] label tensor},
+        "image_shape": (C, H, W),
+        "n_real":      int (non-padded token count),
+    }
+
+Usage in train_pretrain_v2.py:
+    from training.viz_callbacks_pretrain import (
+        PretrainSegVizCallback, PretrainReconVizCallback,
+        ESA_CLASS_NAMES, DW_CLASS_NAMES,
+        COSIA_CLASS_NAMES, LPIS_CLASS_NAMES,
+    )
+
     callbacks = [
-        PretrainSegVizCallback(
-            task_name="esa_worldcover",
-            dataset_attr="train_dataset_esa",  # or however you store it
-            class_names=ESA_CLASS_NAMES,
-            sample_indices=(0, 1, 2),
-        ),
-        PretrainSegVizCallback(
-            task_name="dynamic_world",
-            dataset_attr="train_dataset_dw",
-            class_names=DW_CLASS_NAMES,
-            sample_indices=(0, 1, 2),
-        ),
-        PretrainReconVizCallback(
-            dataset_attr="train_dataset_recon",
-            sample_indices=(0,),
-        ),
+        PretrainSegVizCallback(task_name="esa_worldcover",  sample_indices=(0, 1)),
+        PretrainSegVizCallback(task_name="flairhub_cosia",  sample_indices=(0, 1)),
+        PretrainReconVizCallback(sample_indices=(0,)),
     ]
 """
 
@@ -37,7 +45,7 @@ import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 from einops import rearrange
 
-from training.utils.datasets.token_grouping import collate_grouped
+from training.utils.datasets.token_grouping import collate_multitask
 
 
 # =============================================================================
@@ -54,6 +62,85 @@ DW_CLASS_NAMES = [
     "Shrub/scrub", "Built", "Bare", "Snow/ice",
 ]
 
+COSIA_CLASS_NAMES = [
+    "Building", "Pervious surface", "Impervious surface", "Bare soil",
+    "Water", "Coniferous", "Deciduous", "Brushwood", "Vineyard",
+    "Herbaceous veg", "Agricultural land", "Plowed land",
+    "Swimming pool", "Snow", "Clear cut", "Mixed",
+    "Ligneous", "Greenhouse",
+]
+
+LPIS_CLASS_NAMES = [f"LPIS_{i}" for i in range(23)]
+
+# Task → defaults
+_TASK_DEFAULTS = {
+    "esa_worldcover": {"class_names": ESA_CLASS_NAMES,  "rgb_idx": [3, 2, 1]},
+    "dynamic_world":  {"class_names": DW_CLASS_NAMES,   "rgb_idx": [3, 2, 1]},
+    "flairhub_cosia": {"class_names": COSIA_CLASS_NAMES, "rgb_idx": [0, 1, 2]},
+    "flairhub_lpis":  {"class_names": LPIS_CLASS_NAMES,  "rgb_idx": [0, 1, 2]},
+}
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _unwrap_model(pl_module):
+    """
+    Get the raw model from a PL module, bypassing DDP/FSDP wrappers.
+
+    DDP wraps the model as pl_module.module. Calling forward() on the
+    DDP-wrapped model triggers NCCL collectives — which deadlocks if
+    only rank 0 is running the callback. Using the unwrapped model
+    runs a plain forward pass with no distributed sync.
+    """
+    model = pl_module
+    # DDP wraps as .module
+    if hasattr(model, "module"):
+        model = model.module
+    return model
+
+
+def _batch_to_device(batch, device):
+    """Recursively move batch tensors to device."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device)
+        elif isinstance(v, dict):
+            out[k] = _batch_to_device(v, device)
+        else:
+            out[k] = v
+    return out
+
+
+def _get_multitask_dataset(trainer):
+    """
+    Find the multi-task dataset from the DataModule.
+
+    Works with both MMEarthMultiTaskDataModule and FlairHubMultiTaskDataModule,
+    which store the dataset as trainer.datamodule.train_dataset.
+    """
+    dm = trainer.datamodule
+    if dm is None:
+        return None
+    if hasattr(dm, "train_dataset") and hasattr(dm.train_dataset, "get_viz_sample"):
+        return dm.train_dataset
+    return None
+
+
+def _normalize_rgb(rgb):
+    """Percentile-based contrast stretch for display."""
+    rgb = rgb.numpy() if isinstance(rgb, torch.Tensor) else rgb.copy()
+    for c in range(min(3, rgb.shape[0])):
+        lo = np.percentile(rgb[c], 2)
+        hi = np.percentile(rgb[c], 98)
+        if hi - lo > 1e-6:
+            rgb[c] = (rgb[c] - lo) / (hi - lo)
+        else:
+            rgb[c] = 0.0
+    return np.clip(rgb, 0, 1)
+
 
 # =============================================================================
 # SEGMENTATION CALLBACK
@@ -61,19 +148,20 @@ DW_CLASS_NAMES = [
 
 class PretrainSegVizCallback(pl.Callback):
     """
-    Segmentation visualization for one task (ESA or DW).
+    Segmentation visualization for one task.
 
     Renders RGB | GT mask | Predicted mask for a few samples.
-    Calls pl_module.forward(batch, task_name, training=False).
-    """
+    Uses the encode-once path: forward_multitask(batch) → {task: preds}.
 
-    RGB_INDICES = [3, 2, 1]  # B04(Red), B03(Green), B02(Blue) in merged MMEarth order
+    Works with any seg task: esa_worldcover, dynamic_world,
+    flairhub_cosia, flairhub_lpis.
+    """
 
     def __init__(
         self,
         task_name: str,
-        dataset_attr: str = None,
         class_names: list = None,
+        rgb_indices: list = None,
         sample_indices=(0, 1, 2),
         log_every_n_epochs=1,
         use_wandb=True,
@@ -81,32 +169,14 @@ class PretrainSegVizCallback(pl.Callback):
     ):
         super().__init__()
         self.task_name = task_name
-        self.dataset_attr = dataset_attr
-        self.class_names = class_names or []
         self.sample_indices = sample_indices
         self.log_every_n_epochs = log_every_n_epochs
         self.use_wandb = use_wandb
         self.ignore_index = ignore_index
 
-    def _get_dataset(self, trainer):
-        """Find the dataset, trying multiple locations."""
-        dm = trainer.datamodule
-
-        # Try explicit attribute name
-        if self.dataset_attr and hasattr(dm, self.dataset_attr):
-            return getattr(dm, self.dataset_attr)
-
-        # Try datasets dict
-        if hasattr(dm, "datasets") and isinstance(dm.datasets, dict):
-            if self.task_name in dm.datasets:
-                return dm.datasets[self.task_name]
-
-        # Try train_datasets dict
-        if hasattr(dm, "train_datasets") and isinstance(dm.train_datasets, dict):
-            if self.task_name in dm.train_datasets:
-                return dm.train_datasets[self.task_name]
-
-        return None
+        defaults = _TASK_DEFAULTS.get(task_name, {})
+        self.class_names = class_names or defaults.get("class_names", [])
+        self.rgb_indices = rgb_indices or defaults.get("rgb_idx", [0, 1, 2])
 
     def on_train_epoch_end(self, trainer, pl_module):
         if trainer.global_rank != 0:
@@ -114,12 +184,19 @@ class PretrainSegVizCallback(pl.Callback):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
             return
 
-        dataset = self._get_dataset(trainer)
-        if dataset is None or not hasattr(dataset, "get_viz_sample"):
+        dataset = _get_multitask_dataset(trainer)
+        if dataset is None:
+            return
+
+        # Skip if this task isn't enabled in the dataset
+        if hasattr(dataset, "enabled_tasks") and self.task_name not in dataset.enabled_tasks:
             return
 
         device = pl_module.device
-        pl_module.eval()
+
+        # ── CRITICAL: unwrap DDP to avoid NCCL deadlock ──
+        model = _unwrap_model(pl_module)
+        model.eval()
 
         figures = []
 
@@ -130,38 +207,55 @@ class PretrainSegVizCallback(pl.Callback):
             try:
                 sample = dataset.get_viz_sample(idx)
 
-                # Get spatial dims from tokens
-                shape = list(sample["groups"].values())[0]["shape"]
-                if len(shape) == 3:
-                    C, H, W = shape
-                else:
-                    H, W = shape
-                    C = sum(1 for _ in range(18))  # fallback
+                # Check task produced queries for this sample
+                if self.task_name not in sample.get("tasks", {}):
+                    continue
 
-                batch = collate_grouped([sample])
+                # Spatial dims
+                image_shape = sample.get("image_shape")
+                if image_shape and len(image_shape) == 3:
+                    C, H, W = image_shape
+                else:
+                    shape = list(sample["groups"].values())[0]["shape"]
+                    C, H, W = shape
+
+                # Collate → batch of 1
+                batch = collate_multitask([sample])
                 batch = _batch_to_device(batch, device)
 
                 with torch.no_grad():
-                    predictions = pl_module.forward(batch, self.task_name, training=False)
+                    all_predictions = model.forward_multitask(
+                        batch, training=False,
+                    )
+
+                if self.task_name not in all_predictions:
+                    continue
+
+                predictions = all_predictions[self.task_name]
 
                 # [1, M, num_classes] → [M]
                 preds = torch.argmax(predictions, dim=-1).squeeze(0).cpu()
 
                 # Labels from queries col 4
-                labels = batch["queries"].squeeze(0)[:, 4].long().cpu()
+                labels = (
+                    batch["tasks"][self.task_name]["queries"]
+                    .squeeze(0)[:, 4]
+                    .long()
+                    .cpu()
+                )
 
-                # Reshape to spatial
+                # Reshape to spatial grid
                 n_pixels = H * W
                 pred_2d = preds[:n_pixels].reshape(H, W)
                 label_2d = labels[:n_pixels].reshape(H, W)
 
-                # RGB from image if available, else from tokens
+                # RGB image
                 if "image" in sample:
                     image = sample["image"]
-                    rgb_idx = [i for i in self.RGB_INDICES if i < image.shape[0]]
+                    rgb_idx = [i for i in self.rgb_indices if i < image.shape[0]]
                     if len(rgb_idx) < 3:
-                        rgb_idx = [0, 0, 0]
-                    rgb = self._normalize_rgb(image[rgb_idx])
+                        rgb_idx = list(range(min(3, image.shape[0])))
+                    rgb = _normalize_rgb(image[rgb_idx])
                 else:
                     rgb = np.zeros((3, H, W))
 
@@ -182,23 +276,14 @@ class PretrainSegVizCallback(pl.Callback):
                 wandb.log({name: wandb.Image(fig)})
             plt.close("all")
 
-        pl_module.train()
-
-    @staticmethod
-    def _normalize_rgb(rgb):
-        rgb = rgb.numpy() if isinstance(rgb, torch.Tensor) else rgb
-        for c in range(3):
-            lo = np.percentile(rgb[c], 2)
-            hi = np.percentile(rgb[c], 98)
-            if hi - lo > 1e-6:
-                rgb[c] = (rgb[c] - lo) / (hi - lo)
-            else:
-                rgb[c] = 0.0
-        return np.clip(rgb, 0, 1)
+        model.train()
 
     def _make_figure(self, rgb, label, pred, sample_idx, epoch):
-        n_classes = len(self.class_names) if self.class_names else max(label.max(), pred.max()) + 1
-        cmap = plt.cm.get_cmap("tab20", n_classes)
+        n_classes = (
+            len(self.class_names) if self.class_names
+            else int(max(label.max(), pred.max())) + 1
+        )
+        cmap = plt.cm.get_cmap("tab20", max(n_classes, 2))
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
@@ -207,18 +292,27 @@ class PretrainSegVizCallback(pl.Callback):
         axes[0].axis("off")
 
         masked_label = np.ma.masked_where(label == self.ignore_index, label)
-        axes[1].imshow(masked_label, cmap=cmap, vmin=0, vmax=n_classes - 1, interpolation="nearest")
+        axes[1].imshow(
+            masked_label, cmap=cmap, vmin=0, vmax=n_classes - 1,
+            interpolation="nearest",
+        )
         axes[1].set_title("GT Label")
         axes[1].axis("off")
 
-        im = axes[2].imshow(pred, cmap=cmap, vmin=0, vmax=n_classes - 1, interpolation="nearest")
+        axes[2].imshow(
+            pred, cmap=cmap, vmin=0, vmax=n_classes - 1,
+            interpolation="nearest",
+        )
         axes[2].set_title("Prediction")
         axes[2].axis("off")
 
         valid = label != self.ignore_index
         if valid.sum() > 0:
             acc = (pred[valid] == label[valid]).mean() * 100
-            title = f"{self.task_name} — Sample {sample_idx} — Epoch {epoch} — Acc: {acc:.1f}%"
+            title = (
+                f"{self.task_name} — Sample {sample_idx} — "
+                f"Epoch {epoch} — Acc: {acc:.1f}%"
+            )
         else:
             title = f"{self.task_name} — Sample {sample_idx} — Epoch {epoch}"
 
@@ -236,41 +330,24 @@ class PretrainReconVizCallback(pl.Callback):
     Reconstruction visualization.
 
     Renders RGB ground truth | predicted RGB | error map.
-    Calls pl_module.encoder(batch, ..., return_features=False) directly
-    to use the encoder's reconstruction_head (not task-specific heads).
-    """
+    Uses the encode-once path: forward_multitask(batch) → {task: preds}.
 
-    RGB_INDICES = [2, 1, 0]  # B04(Red=idx2), B03(Green=idx1), B02(Blue=idx0) in S2 order
+    Works with both MMEarth (single-res, reshapeable) and FLAIR-HUB
+    (multi-res, may not reshape cleanly → scatter-only fallback).
+    """
 
     def __init__(
         self,
-        dataset_attr: str = None,
         sample_indices=(0,),
+        rgb_indices: list = None,
         log_every_n_epochs=1,
         use_wandb=True,
     ):
         super().__init__()
-        self.dataset_attr = dataset_attr
         self.sample_indices = sample_indices
+        self.rgb_indices = rgb_indices  # None = auto-detect
         self.log_every_n_epochs = log_every_n_epochs
         self.use_wandb = use_wandb
-
-    def _get_dataset(self, trainer):
-        """Find the reconstruction dataset."""
-        dm = trainer.datamodule
-
-        if self.dataset_attr and hasattr(dm, self.dataset_attr):
-            return getattr(dm, self.dataset_attr)
-
-        if hasattr(dm, "datasets") and isinstance(dm.datasets, dict):
-            if "reconstruction" in dm.datasets:
-                return dm.datasets["reconstruction"]
-
-        if hasattr(dm, "train_datasets") and isinstance(dm.train_datasets, dict):
-            if "reconstruction" in dm.train_datasets:
-                return dm.train_datasets["reconstruction"]
-
-        return None
 
     def on_train_epoch_end(self, trainer, pl_module):
         if trainer.global_rank != 0:
@@ -278,12 +355,18 @@ class PretrainReconVizCallback(pl.Callback):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
             return
 
-        dataset = self._get_dataset(trainer)
-        if dataset is None or not hasattr(dataset, "get_viz_sample"):
+        dataset = _get_multitask_dataset(trainer)
+        if dataset is None:
+            return
+
+        if hasattr(dataset, "enabled_tasks") and "reconstruction" not in dataset.enabled_tasks:
             return
 
         device = pl_module.device
-        pl_module.eval()
+
+        # ── CRITICAL: unwrap DDP to avoid NCCL deadlock ──
+        model = _unwrap_model(pl_module)
+        model.eval()
 
         figures = []
 
@@ -293,56 +376,91 @@ class PretrainReconVizCallback(pl.Callback):
 
             try:
                 sample = dataset.get_viz_sample(idx)
-                C, H, W = sample["image_shape"]
-                n_real = sample["n_real"]
 
-                batch = collate_grouped([sample])
+                if "reconstruction" not in sample.get("tasks", {}):
+                    continue
+
+                # Determine image shape
+                image_shape = sample.get("image_shape")
+                if image_shape is None:
+                    image_shape = list(sample["groups"].values())[0]["shape"]
+                C, H, W = image_shape
+
+                n_real = sample.get("n_real", C * H * W)
+
+                # Auto-detect RGB indices
+                rgb_idx = self.rgb_indices
+                if rgb_idx is None:
+                    # MMEarth merged: ≥12 bands → B04(R)=3, B03(G)=2, B02(B)=1
+                    # FLAIR-HUB aerial: 4 bands → R=0, G=1, B=2
+                    rgb_idx = [3, 2, 1] if C >= 12 else [0, 1, 2]
+
+                # Collate → batch of 1
+                batch = collate_multitask([sample])
                 batch = _batch_to_device(batch, device)
 
                 with torch.no_grad():
-                    # Use the reconstruction task head
-                    predictions = pl_module.forward(
-                        batch, "reconstruction", training=False
+                    all_predictions = model.forward_multitask(
+                        batch, training=False,
                     )
+
+                if "reconstruction" not in all_predictions:
+                    continue
+
+                predictions = all_predictions["reconstruction"]
 
                 # [1, M, 1] → [M]
                 preds = predictions.squeeze(0).squeeze(-1).cpu()
-                gt = batch["queries"].squeeze(0)[:, 4].cpu()
+                gt = (
+                    batch["tasks"]["reconstruction"]["queries"]
+                    .squeeze(0)[:, 4]
+                    .cpu()
+                )
 
                 preds = preds[:n_real]
                 gt = gt[:n_real]
 
                 mse = ((gt - preds) ** 2).mean().item()
-                corr = torch.corrcoef(torch.stack([preds, gt]))[0, 1].item()
+                corr_val = torch.corrcoef(torch.stack([preds, gt]))[0, 1].item()
 
-                print(f"[RECON VIZ] Sample {idx}, Epoch {trainer.current_epoch}: "
-                      f"MSE={mse:.6f}, corr={corr:.4f}")
-
-                # Reshape to [C, H, W]
-                gt_img = rearrange(gt, "(C H W) -> C H W", C=C, H=H, W=W)
-                pred_img = rearrange(preds, "(C H W) -> C H W", C=C, H=H, W=W)
-
-                # RGB figure
-                rgb_idx = [i for i in self.RGB_INDICES if i < C]
-                if len(rgb_idx) < 3:
-                    rgb_idx = [0, 0, 0]
-
-                gt_rgb = self._normalize_rgb(gt_img[rgb_idx].clone())
-                pred_rgb = self._normalize_rgb(pred_img[rgb_idx].clone())
-                error_rgb = np.abs(pred_rgb - gt_rgb)
-
-                fig = self._make_figure(
-                    gt_rgb, pred_rgb, error_rgb,
-                    idx, trainer.current_epoch, mse,
+                print(
+                    f"[RECON VIZ] Sample {idx}, Epoch {trainer.current_epoch}: "
+                    f"MSE={mse:.6f}, corr={corr_val:.4f}, "
+                    f"shape=({C},{H},{W}), n_real={n_real}"
                 )
-                figures.append((f"recon_rgb_{idx}", fig))
 
-                # Band diagnostics
-                fig2 = self._make_band_figure(
-                    gt_img, pred_img, gt, preds, C,
-                    idx, trainer.current_epoch, corr, mse,
-                )
-                figures.append((f"recon_bands_{idx}", fig2))
+                # Try spatial reshape: works for single-res (MMEarth) where
+                # n_real == C*H*W, fails for multi-res (FLAIR-HUB)
+                expected = C * H * W
+                if preds.shape[0] == expected:
+                    gt_img = rearrange(gt, "(C H W) -> C H W", C=C, H=H, W=W)
+                    pred_img = rearrange(preds, "(C H W) -> C H W", C=C, H=H, W=W)
+
+                    safe_rgb = [i for i in rgb_idx if i < C]
+                    if len(safe_rgb) < 3:
+                        safe_rgb = list(range(min(3, C)))
+
+                    gt_rgb = _normalize_rgb(gt_img[safe_rgb].clone())
+                    pred_rgb = _normalize_rgb(pred_img[safe_rgb].clone())
+                    error_rgb = np.abs(pred_rgb - gt_rgb)
+
+                    fig = self._make_spatial_figure(
+                        gt_rgb, pred_rgb, error_rgb,
+                        idx, trainer.current_epoch, mse,
+                    )
+                    figures.append((f"recon_rgb_{idx}", fig))
+
+                    fig2 = self._make_band_figure(
+                        gt_img, pred_img, gt, preds, C,
+                        idx, trainer.current_epoch, corr_val, mse,
+                    )
+                    figures.append((f"recon_bands_{idx}", fig2))
+                else:
+                    # Multi-res: can't reshape cleanly → scatter only
+                    fig = self._make_scatter_figure(
+                        gt, preds, idx, trainer.current_epoch, corr_val, mse,
+                    )
+                    figures.append((f"recon_scatter_{idx}", fig))
 
             except Exception as e:
                 import traceback
@@ -355,22 +473,14 @@ class PretrainReconVizCallback(pl.Callback):
                 wandb.log({name: wandb.Image(fig)})
             plt.close("all")
 
-        pl_module.train()
+        model.train()
+
+    # ----- figure builders ---------------------------------------------------
 
     @staticmethod
-    def _normalize_rgb(rgb):
-        rgb = rgb.numpy()
-        for c in range(3):
-            lo = np.percentile(rgb[c], 2)
-            hi = np.percentile(rgb[c], 98)
-            if hi - lo > 1e-6:
-                rgb[c] = (rgb[c] - lo) / (hi - lo)
-            else:
-                rgb[c] = 0.0
-        return np.clip(rgb, 0, 1)
-
-    @staticmethod
-    def _make_figure(gt_rgb, pred_rgb, error_rgb, sample_idx, epoch, mse=None):
+    def _make_spatial_figure(gt_rgb, pred_rgb, error_rgb,
+                             sample_idx, epoch, mse=None):
+        """RGB ground-truth | prediction | error map."""
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
         axes[0].imshow(np.transpose(gt_rgb, (1, 2, 0)))
@@ -388,13 +498,42 @@ class PretrainReconVizCallback(pl.Callback):
         axes[2].axis("off")
         fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
 
-        fig.suptitle(f"Reconstruction — Sample {sample_idx} — Epoch {epoch}", fontsize=14)
+        fig.suptitle(
+            f"Reconstruction — Sample {sample_idx} — Epoch {epoch}",
+            fontsize=14,
+        )
+        fig.tight_layout()
+        return fig
+
+    @staticmethod
+    def _make_scatter_figure(gt, preds, sample_idx, epoch, corr, mse):
+        """Scatter plot for multi-res cases that can't reshape spatially."""
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+
+        n_scatter = min(10_000, gt.shape[0])
+        scatter_idx = torch.randperm(gt.shape[0])[:n_scatter]
+        ax.scatter(
+            gt[scatter_idx].numpy(), preds[scatter_idx].numpy(),
+            s=1, alpha=0.2,
+        )
+        lims = [gt.min().item(), gt.max().item()]
+        ax.plot(lims, lims, "r--", lw=1)
+        ax.set_xlabel("GT")
+        ax.set_ylabel("Predicted")
+        ax.set_title(f"corr={corr:.3f}, MSE={mse:.4f}")
+        ax.set_aspect("equal")
+
+        fig.suptitle(
+            f"Reconstruction (multi-res) — Sample {sample_idx} — Epoch {epoch}",
+            fontsize=14,
+        )
         fig.tight_layout()
         return fig
 
     @staticmethod
     def _make_band_figure(gt_img, pred_img, gt_flat, pred_flat, C,
                           sample_idx, epoch, corr, mse):
+        """Per-band GT vs pred images + scatter plot."""
         if C <= 4:
             band_indices = list(range(C))
         else:
@@ -407,19 +546,24 @@ class PretrainReconVizCallback(pl.Callback):
             vmin = min(gt_img[b].min().item(), pred_img[b].min().item())
             vmax = max(gt_img[b].max().item(), pred_img[b].max().item())
 
-            axes[0, col].imshow(gt_img[b].numpy(), cmap="gray", vmin=vmin, vmax=vmax)
+            axes[0, col].imshow(
+                gt_img[b].numpy(), cmap="gray", vmin=vmin, vmax=vmax,
+            )
             axes[0, col].set_title(f"GT band {b}")
             axes[0, col].axis("off")
 
-            axes[1, col].imshow(pred_img[b].numpy(), cmap="gray", vmin=vmin, vmax=vmax)
+            axes[1, col].imshow(
+                pred_img[b].numpy(), cmap="gray", vmin=vmin, vmax=vmax,
+            )
             axes[1, col].set_title(f"Pred band {b}")
             axes[1, col].axis("off")
 
+        # Scatter in the last column
         ax_scatter = fig.add_subplot(1, n_bands + 1, n_bands + 1)
         axes[0, -1].axis("off")
         axes[1, -1].axis("off")
 
-        n_scatter = min(10000, gt_flat.shape[0])
+        n_scatter = min(10_000, gt_flat.shape[0])
         scatter_idx = torch.randperm(gt_flat.shape[0])[:n_scatter]
         ax_scatter.scatter(
             gt_flat[scatter_idx].numpy(), pred_flat[scatter_idx].numpy(),
@@ -432,22 +576,9 @@ class PretrainReconVizCallback(pl.Callback):
         ax_scatter.set_title(f"corr={corr:.3f}, MSE={mse:.4f}")
         ax_scatter.set_aspect("equal")
 
-        fig.suptitle(f"Band diagnostics — Sample {sample_idx}, Epoch {epoch}", fontsize=14)
+        fig.suptitle(
+            f"Band diagnostics — Sample {sample_idx}, Epoch {epoch}",
+            fontsize=14,
+        )
         fig.tight_layout()
         return fig
-
-
-# =============================================================================
-# UTILITY
-# =============================================================================
-
-def _batch_to_device(batch, device):
-    out = {}
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = v.to(device)
-        elif isinstance(v, dict):
-            out[k] = _batch_to_device(v, device)
-        else:
-            out[k] = v
-    return out

@@ -1,32 +1,31 @@
 """
-Pre-training Script — MMEarth + FLAIR-HUB
-==========================================
-Supports single-task validation runs (one dataset class at a time)
-and multi-task training (ChunkedInterleaved with all tasks).
-
-Uses grouped-token batch format:
-    batch = {
-        "groups": {res: {"tokens": [B,N,8], "mask": [B,N], "shape": (C,H,W)}},
-        "queries":      [B, M, 8],
-        "queries_mask":  [B, M],
-        "task":          str,
-    }
+Pre-training Script — Encode-Once Multi-Task (MMEarth + FLAIR-HUB + Combined)
+===============================================================================
+Single encode, multiple decodes per sample (~2× speedup over interleaved).
 
 Examples:
-    # MMEarth multi-task (original)
-    python train_pretrain.py --xp_name test --config_model atomiser.yaml --dataset_name MMEarth --task all
+    # MMEarth — all 3 tasks (default)
+    python train_pretrain_v2.py --xp_name test --config_model atomiser.yaml --dataset_name MMEarth
 
-    # FLAIR-HUB reconstruction only (toy dataset test)
-    python train_pretrain.py --xp_name flair_test --config_model atomiser.yaml --dataset_name FLAIR-HUB \
-        --task flairhub_recon --flairhub_path ./data/FLAIR-HUB/toy/FLAIR-HUB_TOY
+    # MMEarth — seg only
+    python train_pretrain_v2.py --xp_name seg --config_model atomiser.yaml --dataset_name MMEarth \
+        --tasks esa_worldcover dynamic_world
 
-    # FLAIR-HUB all tasks
-    python train_pretrain.py --xp_name flair_all --config_model atomiser.yaml --dataset_name FLAIR-HUB \
-        --task all_flairhub --flairhub_path ./data/FLAIR-HUB/toy/FLAIR-HUB_TOY
+    # FLAIR-HUB — all 3 tasks (default)
+    python train_pretrain_v2.py --xp_name flair --config_model atomiser.yaml --dataset_name FlairHub \
+        --flairhub_path /path/to/FLAIR-HUB
 
-    # Combined MMEarth + FLAIR-HUB
-    python train_pretrain.py --xp_name combined --config_model atomiser.yaml --dataset_name combined \
-        --task all_combined --flairhub_path ./data/FLAIR-HUB/toy/FLAIR-HUB_TOY
+    # FLAIR-HUB — COSIA + reconstruction only, cap at 50k samples
+    python train_pretrain_v2.py --xp_name flair_cosia --config_model atomiser.yaml --dataset_name FlairHub \
+        --tasks flairhub_cosia reconstruction --max_samples 50000
+
+    # Combined — all 5 tasks from both datasets
+    python train_pretrain_v2.py --xp_name combined --config_model atomiser.yaml --dataset_name Combined \
+        --tasks esa_worldcover dynamic_world flairhub_cosia flairhub_lpis reconstruction
+
+    # Resume from checkpoint
+    python train_pretrain_v2.py --xp_name test --config_model atomiser.yaml --dataset_name MMEarth \
+        --ckpt_path ./checkpoints/last.ckpt
 """
 
 # =============================================================================
@@ -37,8 +36,8 @@ import time
 import argparse
 import torch
 import numpy as np
-from collections import defaultdict
-
+from pytorch_lightning.strategies import DDPStrategy
+import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import (
@@ -46,91 +45,350 @@ from pytorch_lightning.callbacks import (
     GradientAccumulationScheduler,
     LearningRateMonitor,
 )
+from torch.utils.data import DataLoader, ConcatDataset, DistributedSampler
+import torch.distributed as dist
 
 seed_everything(42, workers=True)
 
-# --- Project imports ---
 from training.utils import read_yaml
 from training.utils import Lookup_encoding
-
 from training.trainer_pretraining import Model_Pretrain
+from training.utils.datasets.utils_dataset_MM_Earth_pretrain import MMEarthMultiTask
+from training.utils.datasets.utils_dataset_FLAIRHUB import FlairHubMultiTask
 
-from training.utils.datasets.utils_dataset_MM_Earth_pretrain import (
-    MMEarthReconstruction, MMEarthSegDW, MMEarthSegESA,
-    ESA_NUM_CLASSES, DW_NUM_CLASSES,
-)
-
-from training.utils.datasets.utils_dataset_FLAIRHUB import (
-    FlairHubSegCOSIA, FlairHubSegLPIS, FlairHubReconstruction,
-)
-
-from training.utils.datasets.dataloaders import UnifiedDataModule
-from training.utils.datasets.token_grouping import collate_grouped
-from training.utils.datasets.dataloaders_MTP import PretrainDataModule
-
+# CRITICAL UPDATE: Using the newly built Round-Robin Sampler instead of dummy padding
+from training.utils.datasets.token_grouping import collate_multitask, RoundRobinDistributedBatchSampler
 from training.utils.callbacks.pre_training_vizcallbacks import (
-    PretrainSegVizCallback, PretrainReconVizCallback,
-    ESA_CLASS_NAMES, DW_CLASS_NAMES,
+    PretrainSegVizCallback,
+    PretrainReconVizCallback,
+    COSIA_CLASS_NAMES,
+    LPIS_CLASS_NAMES,
+    ESA_CLASS_NAMES,
+    DW_CLASS_NAMES,
 )
 
-# =============================================================================
-# DATASET CLASS REGISTRY
-# =============================================================================
-DATASET_CLASSES = {
-    # MMEarth
-    "esa_worldcover":  MMEarthSegESA,
-    "dynamic_world":   MMEarthSegDW,
-    "reconstruction":  MMEarthReconstruction,
-    # FLAIR-HUB
-    "flairhub_cosia":  FlairHubSegCOSIA,
-    "flairhub_lpis":   FlairHubSegLPIS,
-    "flairhub_recon":  FlairHubReconstruction,
-}
 
-# Task groupings for --task argument
-TASK_GROUPS = {
-    "all":              {"mmearth": True,  "flairhub": False},
-    "all_flairhub":     {"mmearth": False, "flairhub": True},
-    "all_combined":     {"mmearth": True,  "flairhub": True},
-}
+# =============================================================================
+# DATAMODULE — MMEarth
+# =============================================================================
 
-VALID_TASKS = list(DATASET_CLASSES.keys()) + list(TASK_GROUPS.keys())
+class MMEarthMultiTaskDataModule(pl.LightningDataModule):
+    """
+    Encode-once multi-task DataModule for MMEarth.
+
+    Every sample contains encoder tokens + query sets for all enabled tasks.
+    Standard DistributedSampler — no chunking, no interleaving needed.
+    """
+
+    def __init__(
+        self,
+        mmearth_path: str,
+        bands_yaml_path: str,
+        config_model: dict,
+        look_up,
+        batch_size: int = 1,
+        num_workers: int = 4,
+        subset: str = "MMEarth",
+        tasks: list = None,
+        max_queries_seg: int = 100_000,
+        max_queries_recon: int = 200_000,
+        max_samples: int = None,
+        val_fraction: float = 0.01,
+    ):
+        super().__init__()
+        self.mmearth_path = mmearth_path
+        self.bands_yaml_path = bands_yaml_path
+        self.config_model = config_model
+        self.look_up = look_up
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.subset = subset
+        self.tasks = tasks or ["esa_worldcover", "dynamic_world", "reconstruction"]
+        self.max_queries_seg = max_queries_seg
+        self.max_queries_recon = max_queries_recon
+        self.max_samples = max_samples
+        self.val_fraction = val_fraction
+        self.dataset_config = read_yaml(bands_yaml_path)
+
+    def setup(self, stage=None):
+        common_kwargs = dict(
+            root_path=self.mmearth_path,
+            dataset_config=self.dataset_config,
+            config_model=self.config_model,
+            look_up=self.look_up,
+            subset=self.subset,
+            tasks=self.tasks,
+            max_queries_seg=self.max_queries_seg,
+            max_queries_recon=self.max_queries_recon,
+            max_samples=self.max_samples,
+        )
+
+        self.train_dataset = MMEarthMultiTask(mode="train", **common_kwargs)
+        self.val_dataset = MMEarthMultiTask(mode="train", **common_kwargs)
+
+        # Deterministic train/val split
+        full_len = len(self.train_dataset)
+        val_len = max(8, int(full_len * self.val_fraction))
+        train_len = full_len - val_len
+
+        generator = torch.Generator().manual_seed(42)
+        all_indices = torch.randperm(full_len, generator=generator).tolist()
+
+        self.train_dataset.tile_indices = [
+            self.train_dataset.tile_indices[i] for i in all_indices[:train_len]
+        ]
+        self.val_dataset.tile_indices = [
+            self.val_dataset.tile_indices[i] for i in all_indices[train_len:]
+        ]
+
+        print(f"[MultiTaskDM] tasks={self.tasks}")
+        print(f"[MultiTaskDM] train={train_len}, val={val_len}")
+
+    def _make_loader(self, dataset, shuffle=False):
+        sampler = None
+        if dist.is_available() and dist.is_initialized():
+            sampler = DistributedSampler(dataset, shuffle=shuffle)
+
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=(shuffle and sampler is None),
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=collate_multitask,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+        )
+
+    def train_dataloader(self):
+        return self._make_loader(self.train_dataset, shuffle=True)
+
+    def val_dataloader(self):
+        return self._make_loader(self.val_dataset, shuffle=False)
+
+    def test_dataloader(self):
+        return self.val_dataloader()
+
+
+# =============================================================================
+# DATAMODULE — FLAIR-HUB
+# =============================================================================
+
+class FlairHubMultiTaskDataModule(pl.LightningDataModule):
+    """
+    Encode-once multi-task DataModule for FLAIR-HUB.
+
+    Uses CSV-based splits (FLAIR-HUB_TRAIN.csv, FLAIR-HUB_VALID.csv).
+    Multi-resolution, multi-temporal tokens + per-task queries.
+    """
+
+    def __init__(
+        self,
+        flairhub_path: str,
+        bands_yaml_path: str,
+        config_model: dict,
+        look_up,
+        batch_size: int = 1,
+        num_workers: int = 4,
+        tasks: list = None,
+        max_queries_seg: int = 100_000,
+        max_queries_recon: int = 200_000,
+        max_samples: int = None,
+        csv_dir: str = None,
+    ):
+        super().__init__()
+        self.flairhub_path = flairhub_path
+        self.bands_yaml_path = bands_yaml_path
+        self.config_model = config_model
+        self.look_up = look_up
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.tasks = tasks or ["flairhub_cosia", "flairhub_lpis", "reconstruction"]
+        self.max_queries_seg = max_queries_seg
+        self.max_queries_recon = max_queries_recon
+        self.max_samples = max_samples
+        self.csv_dir = csv_dir
+        self.dataset_config = read_yaml(bands_yaml_path)
+
+    def setup(self, stage=None):
+        common_kwargs = dict(
+            root_path=self.flairhub_path,
+            dataset_config=self.dataset_config,
+            config_model=self.config_model,
+            look_up=self.look_up,
+            tasks=self.tasks,
+            max_queries_seg=self.max_queries_seg,
+            max_queries_recon=self.max_queries_recon,
+            max_samples=self.max_samples,
+            csv_dir=self.csv_dir,
+        )
+
+        self.train_dataset = FlairHubMultiTask(mode="train", **common_kwargs)
+        self.val_dataset = FlairHubMultiTask(mode="validation", **common_kwargs)
+
+        print(f"[FlairHubDM] tasks={self.tasks}")
+        print(f"[FlairHubDM] train={len(self.train_dataset)}, "
+              f"val={len(self.val_dataset)}")
+
+    def _make_loader(self, dataset, shuffle=False):
+        sampler = None
+        if dist.is_available() and dist.is_initialized():
+            sampler = DistributedSampler(dataset, shuffle=shuffle)
+
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=(shuffle and sampler is None),
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=collate_multitask,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+        )
+
+    def train_dataloader(self):
+        return self._make_loader(self.train_dataset, shuffle=True)
+
+    def val_dataloader(self):
+        return self._make_loader(self.val_dataset, shuffle=False)
+
+    def test_dataloader(self):
+        return self.val_dataloader()
+
+
+# =============================================================================
+# DATAMODULE — COMBINED (MMEarth + FLAIR-HUB)
+# =============================================================================
+
+class CombinedMultiTaskDataModule(pl.LightningDataModule):
+    """
+    Merges MMEarth and FLAIR-HUB into a single training loop.
+
+    Uses RoundRobinDistributedBatchSampler to alternate batches 
+    between datasets. Guarantees all ranks process the same dataset 
+    at the same step, preventing DDP deadlocks entirely.
+    """
+
+    def __init__(
+        self,
+        mmearth_dm: MMEarthMultiTaskDataModule,
+        flairhub_dm: FlairHubMultiTaskDataModule,
+        all_tasks: list,
+        batch_size: int = 1,
+        num_workers: int = 4,
+    ):
+        super().__init__()
+        self.mmearth_dm = mmearth_dm
+        self.flairhub_dm = flairhub_dm
+        self.all_tasks = all_tasks
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def setup(self, stage=None):
+        self.mmearth_dm.setup(stage)
+        self.flairhub_dm.setup(stage)
+
+        # Raw datasets (no TaskPaddingWrapper needed anymore!)
+        self.mm_train = self.mmearth_dm.train_dataset
+        self.mm_val = self.mmearth_dm.val_dataset
+        self.fh_train = self.flairhub_dm.train_dataset
+        self.fh_val = self.flairhub_dm.val_dataset
+
+        self.train_dataset = ConcatDataset([self.mm_train, self.fh_train])
+        self.val_dataset = ConcatDataset([self.mm_val, self.fh_val])
+        
+        self.train_lengths = [len(self.mm_train), len(self.fh_train)]
+        self.val_lengths = [len(self.mm_val), len(self.fh_val)]
+
+        print(f"[CombinedDM] tasks={self.all_tasks}")
+        print(f"[CombinedDM] train: MMEarth={len(self.mm_train)}, FlairHub={len(self.fh_train)}")
+        print(f"[CombinedDM] val: MMEarth={len(self.mm_val)}, FlairHub={len(self.fh_val)}")
+
+    def _make_round_robin_loader(self, dataset, lengths, shuffle):
+        sampler = RoundRobinDistributedBatchSampler(
+            dataset_lengths=lengths,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+        )
+
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler, # Important: pass via batch_sampler
+            num_workers=self.num_workers,
+            collate_fn=collate_multitask,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+        )
+
+    def train_dataloader(self):
+        return self._make_round_robin_loader(self.train_dataset, self.train_lengths, shuffle=True)
+
+    def val_dataloader(self):
+        return self._make_round_robin_loader(self.val_dataset, self.val_lengths, shuffle=False)
+
+    def test_dataloader(self):
+        return self.val_dataloader()
+
+
+# =============================================================================
+# VALID TASKS
+# =============================================================================
+MMEARTH_TASKS = ["esa_worldcover", "dynamic_world", "reconstruction"]
+FLAIRHUB_TASKS = ["flairhub_cosia", "flairhub_lpis", "reconstruction"]
+COMBINED_TASKS = ["esa_worldcover", "dynamic_world", "flairhub_cosia", "flairhub_lpis", "reconstruction"]
 
 # =============================================================================
 # ARGS
 # =============================================================================
-parser = argparse.ArgumentParser(description="Atomizer Pre-training (MMEarth + FLAIR-HUB)")
+parser = argparse.ArgumentParser(description="Atomizer Pre-training (Encode-Once)")
 parser.add_argument("--xp_name",        type=str, required=True, help="Experiment name")
 parser.add_argument("--config_model",   type=str, required=True, help="Model config yaml file")
-parser.add_argument("--dataset_name",   type=str, required=True, help="Name of the dataset used")
-parser.add_argument("--task",           type=str, default="all",
-                    choices=VALID_TASKS,
-                    help="Which task to run (default: all)")
+parser.add_argument("--dataset_name",   type=str, required=True,
+                    choices=["MMEarth", "MMEarth100k", "MMEarth64", "FlairHub", "Combined"],
+                    help="Dataset to use")
+parser.add_argument("--tasks",          type=str, nargs="+", default=None,
+                    help="Tasks to train on (default: all for chosen dataset)")
 # Paths
 parser.add_argument("--mmearth_path",   type=str, default="./data/MM-Earth",
                     help="Path to MMEarth data")
-parser.add_argument("--flairhub_path",  type=str, default="./data/FLAIR-HUB/FLAIR-HUB_TOY",
+parser.add_argument("--flairhub_path",  type=str, default="./data/FLAIR-HUB/extracted",
                     help="Path to FLAIR-HUB data")
-# FLAIR-HUB options
-parser.add_argument("--flairhub_tasks", type=str, nargs="+",
-                    default=["cosia", "lpis", "recon"],
-                    help="FLAIR-HUB tasks to include (cosia, lpis, recon)")
-parser.add_argument("--flairhub_max_timestamps", type=int, default=10,
-                    help="Max timestamps per temporal modality")
-parser.add_argument("--flairhub_temporal_dropout", type=float, default=0.3,
-                    help="Fraction of timestamps to drop during training")
-parser.add_argument("--flairhub_csv_dir", type=str, default=None,
-                    help="Directory containing FLAIR-HUB split CSVs (defaults to flairhub_path)")
-
-parser.add_argument("--ckpt_path", type=str, default=None, help="Resume from checkpoint")
-
+parser.add_argument("--flairhub_csv_dir", type=str, default="./data/FLAIR-HUB",
+                    help="Path to FLAIR-HUB CSV split files (default: flairhub_path)")
+# Training
+parser.add_argument("--ckpt_path",      type=str, default=None, help="Resume from checkpoint")
+parser.add_argument("--num_workers",    type=int, default=4)
+parser.add_argument("--max_queries_seg",   type=int, default=100_000)
+parser.add_argument("--max_queries_recon", type=int, default=200_000)
+parser.add_argument("--max_samples",       type=int, default=None,
+                    help="Cap training set size per dataset (e.g. 100000). Default: use all.")
+# Viz
+parser.add_argument("--viz_every_n_epochs", type=int, default=1,
+                    help="Log visualization every N epochs (default: 1)")
 
 args = parser.parse_args()
 
+# Resolve default tasks based on dataset
+is_flairhub = args.dataset_name == "FlairHub"
+is_combined = args.dataset_name == "Combined"
+
+if args.tasks is None:
+    if is_combined:
+        args.tasks = COMBINED_TASKS
+    elif is_flairhub:
+        args.tasks = FLAIRHUB_TASKS
+    else:
+        args.tasks = MMEARTH_TASKS
+
 xp_name = args.xp_name
 config_model = read_yaml("./training/configs/" + args.config_model)
-configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
+configs_dataset = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 bands_yaml = "./data/bands_info/bands.yaml"
+
+task_label = "_".join(sorted(args.tasks))
 
 # =============================================================================
 # LOOKUP TABLE
@@ -144,11 +402,9 @@ wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
     wandb.init(
-        name=f"{config_model['encoder']}_{args.task}",
+        name=f"{config_model['encoder']}_{args.dataset_name}_{task_label}",
         project="Atomizer_Pretrain",
-        config={**config_model, "task": args.task,
-                "flairhub_path": args.flairhub_path,
-                "flairhub_tasks": args.flairhub_tasks},
+        config={**config_model, "tasks": args.tasks, "dataset": args.dataset_name},
     )
     wandb_logger = WandbLogger(project="Atomizer_Pretrain")
     wandb.define_metric("train_loss", step_metric="trainer/global_step")
@@ -168,75 +424,95 @@ model = Model_Pretrain(
 # =============================================================================
 # DATA MODULE
 # =============================================================================
-task = args.task
+if is_combined:
+    # Split tasks by dataset
+    mm_tasks = [t for t in args.tasks if t in MMEARTH_TASKS]
+    fh_tasks = [t for t in args.tasks if t in FLAIRHUB_TASKS]
 
-# Determine enable flags
-if task in TASK_GROUPS:
-    # Multi-task mode
-    enable_mmearth = TASK_GROUPS[task]["mmearth"]
-    enable_flairhub = TASK_GROUPS[task]["flairhub"]
-    use_multi_task = True
-elif task.startswith("flairhub_"):
-    # Single FLAIR-HUB task
-    enable_mmearth = False
-    enable_flairhub = True
-    use_multi_task = True  # Use PretrainDataModule even for single FLAIR-HUB task
-    # Map task name to flairhub_tasks list
-    flair_task_map = {
-        "flairhub_cosia": ["cosia"],
-        "flairhub_lpis":  ["lpis"],
-        "flairhub_recon": ["recon"],
-    }
-    args.flairhub_tasks = flair_task_map[task]
-else:
-    # Single MMEarth task — use original UnifiedDataModule
-    enable_mmearth = True
-    enable_flairhub = False
-    use_multi_task = False
+    # Ensure reconstruction is in both if requested
+    if "reconstruction" in args.tasks:
+        if "reconstruction" not in mm_tasks:
+            mm_tasks.append("reconstruction")
+        if "reconstruction" not in fh_tasks:
+            fh_tasks.append("reconstruction")
 
-if use_multi_task:
-    data_module = PretrainDataModule(
+    mmearth_dm = MMEarthMultiTaskDataModule(
         mmearth_path=args.mmearth_path,
+        bands_yaml_path=bands_yaml,
+        config_model=config_model,
+        look_up=lookup_table,
+        batch_size=config_model["dataset"]["batchsize"],
+        num_workers=args.num_workers,
+        subset="MMEarth",
+        tasks=mm_tasks,
+        max_queries_seg=args.max_queries_seg,
+        max_queries_recon=args.max_queries_recon,
+        max_samples=args.max_samples,
+    )
+
+    flairhub_dm = FlairHubMultiTaskDataModule(
         flairhub_path=args.flairhub_path,
         bands_yaml_path=bands_yaml,
         config_model=config_model,
         look_up=lookup_table,
         batch_size=config_model["dataset"]["batchsize"],
-        num_workers=4,
-        enable_mmearth=enable_mmearth,
-        enable_flairhub=enable_flairhub,
-        flairhub_tasks=args.flairhub_tasks,
-        flairhub_max_timestamps=args.flairhub_max_timestamps,
-        flairhub_temporal_dropout=args.flairhub_temporal_dropout,
-        flairhub_csv_dir=args.flairhub_csv_dir,
+        num_workers=args.num_workers,
+        tasks=fh_tasks,
+        max_queries_seg=args.max_queries_seg,
+        max_queries_recon=args.max_queries_recon,
+        max_samples=args.max_samples,
+        csv_dir=args.flairhub_csv_dir,
     )
-else:
-    dataset_class = DATASET_CLASSES[task]
-    data_module = UnifiedDataModule(
-        path=args.mmearth_path,
+
+    data_module = CombinedMultiTaskDataModule(
+        mmearth_dm=mmearth_dm,
+        flairhub_dm=flairhub_dm,
+        all_tasks=args.tasks,
         batch_size=config_model["dataset"]["batchsize"],
-        num_workers=4,
-        trans_modalities=None,
-        trans_tokens=None,
-        model=config_model["encoder"],
-        dataset_config=read_yaml(bands_yaml),
+        num_workers=args.num_workers,
+    )
+
+elif is_flairhub:
+    data_module = FlairHubMultiTaskDataModule(
+        flairhub_path=args.flairhub_path,
+        bands_yaml_path=bands_yaml,
         config_model=config_model,
         look_up=lookup_table,
-        dataset_class=dataset_class,
+        batch_size=config_model["dataset"]["batchsize"],
+        num_workers=args.num_workers,
+        tasks=args.tasks,
+        max_queries_seg=args.max_queries_seg,
+        max_queries_recon=args.max_queries_recon,
+        max_samples=args.max_samples,
+        csv_dir=args.flairhub_csv_dir,
+    )
+
+else:
+    data_module = MMEarthMultiTaskDataModule(
+        mmearth_path=args.mmearth_path,
+        bands_yaml_path=bands_yaml,
+        config_model=config_model,
+        look_up=lookup_table,
+        batch_size=config_model["dataset"]["batchsize"],
+        num_workers=args.num_workers,
+        subset=args.dataset_name,
+        tasks=args.tasks,
+        max_queries_seg=args.max_queries_seg,
+        max_queries_recon=args.max_queries_recon,
+        max_samples=args.max_samples,
     )
 
 # =============================================================================
 # CALLBACKS
 # =============================================================================
 lr_monitor = LearningRateMonitor(logging_interval="step")
-accumulator = GradientAccumulationScheduler(scheduling={0: 1})
+accumulator = GradientAccumulationScheduler(scheduling={0: 64})
 
-# ── Checkpoint: pick the right metric per task ──
-seg_tasks = ["esa_worldcover", "dynamic_world", "flairhub_cosia", "flairhub_lpis",
-             "all", "all_flairhub", "all_combined"]
-recon_tasks = ["reconstruction", "flairhub_recon"]
+# ── Checkpointing ────────────────────────────────────────────────────────────
+ALL_SEG_TASKS = ["esa_worldcover", "dynamic_world", "flairhub_cosia", "flairhub_lpis"]
+has_seg = any(t in args.tasks for t in ALL_SEG_TASKS)
 
-if task in seg_tasks:
+if has_seg:
     ckpt_monitor = "val_avg_mIoU"
     ckpt_mode = "max"
     ckpt_fmt = f"{config_model['encoder']}_{xp_name}-val_mIoU-{{epoch:02d}}-{{val_avg_mIoU:.4f}}"
@@ -254,94 +530,59 @@ checkpoint_val = ModelCheckpoint(
     verbose=True,
 )
 
-# ── Viz callbacks ──
-viz_callbacks = []
-
-# COSIA class names (for viz)
-COSIA_CLASS_NAMES = [
-    "Building", "Greenhouse", "Swimming pool", "Impervious", "Pervious",
-    "Bare soil", "Water", "Snow", "Herbaceous veg", "Agricultural",
-    "Plowed", "Vineyard", "Deciduous", "Coniferous", "Brushwood",
-    "Clear cut", "Ligneous", "Mixed",
-]
-
-# MMEarth viz
-if enable_mmearth and task in ("esa_worldcover", "all", "all_combined"):
-    ds_attr = "train_dataset_esa" if use_multi_task else "train_dataset"
-    viz_callbacks.append(PretrainSegVizCallback(
-        task_name="esa_worldcover",
-        dataset_attr=ds_attr,
-        class_names=ESA_CLASS_NAMES,
-        sample_indices=[0, 1, 2],
-        log_every_n_epochs=1,
-        use_wandb=True,
-        ignore_index=255,
-    ))
-
-if enable_mmearth and task in ("dynamic_world", "all", "all_combined"):
-    ds_attr = "train_dataset_dw" if use_multi_task else "train_dataset"
-    viz_callbacks.append(PretrainSegVizCallback(
-        task_name="dynamic_world",
-        dataset_attr=ds_attr,
-        class_names=DW_CLASS_NAMES,
-        sample_indices=[0, 1, 2],
-        log_every_n_epochs=1,
-        use_wandb=True,
-        ignore_index=255,
-    ))
-
-if task in ("reconstruction", "all", "all_combined", "flairhub_recon"):
-    ds_attr = "train_dataset_recon" if (use_multi_task and enable_mmearth) else \
-              "train_dataset_flair_recon" if (use_multi_task and enable_flairhub and not enable_mmearth) else \
-              "train_dataset"
-    viz_callbacks.append(PretrainReconVizCallback(
-        dataset_attr=ds_attr,
-        sample_indices=[0, 1, 2],
-        log_every_n_epochs=1,
-        use_wandb=True,
-    ))
-
-# FLAIR-HUB viz
-if enable_flairhub and "cosia" in args.flairhub_tasks and task in ("flairhub_cosia", "all_flairhub", "all_combined"):
-    viz_callbacks.append(PretrainSegVizCallback(
-        task_name="flairhub_cosia",
-        dataset_attr="train_dataset_cosia",
-        class_names=COSIA_CLASS_NAMES,
-        sample_indices=[0, 1, 2],
-        log_every_n_epochs=1,
-        use_wandb=True,
-        ignore_index=255,
-    ))
-
-if enable_flairhub and "lpis" in args.flairhub_tasks and task in ("flairhub_lpis", "all_flairhub", "all_combined"):
-    viz_callbacks.append(PretrainSegVizCallback(
-        task_name="flairhub_lpis",
-        dataset_attr="train_dataset_lpis",
-        class_names=None,  # 23 classes, skip names for now
-        sample_indices=[0, 1, 2],
-        log_every_n_epochs=1,
-        use_wandb=True,
-        ignore_index=255,
-    ))
-
-
 checkpoint_resume = ModelCheckpoint(
     dirpath="./checkpoints/",
     filename=f"{config_model['encoder']}_{xp_name}-last-{{epoch:02d}}",
     every_n_epochs=1,
-    save_top_k=1,       # keep only the latest
-    save_last=True,      # also saves "last.ckpt" symlink
+    save_top_k=1,
+    save_last=True,
     verbose=True,
 )
 
-callbacks = [accumulator, checkpoint_val,checkpoint_resume, lr_monitor] + viz_callbacks
+# ── Visualization callbacks ──────────────────────────────────────────────────
+# Task → (class_names, rgb_indices)
+VIZ_TASK_CONFIG = {
+    "flairhub_cosia":  (COSIA_CLASS_NAMES, [0, 1, 2]),  # FLAIR aerial: R=0, G=1, B=2
+    "flairhub_lpis":   (LPIS_CLASS_NAMES,  [0, 1, 2]),
+    "esa_worldcover":  (ESA_CLASS_NAMES,   [2, 1, 0]),  # MMEarth S2: B04=2, B03=1, B02=0
+    "dynamic_world":   (DW_CLASS_NAMES,    [2, 1, 0]),
+}
+
+viz_callbacks = []
+
+for task_name in args.tasks:
+    if task_name in VIZ_TASK_CONFIG:
+        class_names, rgb_idx = VIZ_TASK_CONFIG[task_name]
+        viz_callbacks.append(
+            PretrainSegVizCallback(
+                task_name=task_name,
+                class_names=class_names,
+                rgb_indices=rgb_idx,
+                sample_indices=(0, 1, 2),
+                log_every_n_epochs=args.viz_every_n_epochs,
+            )
+        )
+
+if "reconstruction" in args.tasks:
+    recon_rgb = [0, 1, 2] if (is_flairhub and not is_combined) else [2, 1, 0]
+    viz_callbacks.append(
+        PretrainReconVizCallback(
+            rgb_indices=recon_rgb,
+            sample_indices=(0, 1),
+            log_every_n_epochs=args.viz_every_n_epochs,
+        )
+    )
+
+callbacks = [accumulator, checkpoint_val, checkpoint_resume, lr_monitor]  # + viz_callbacks
+print(f"[Callbacks] {len(viz_callbacks)} viz callbacks (disabled): "
+      f"{[type(c).__name__ for c in viz_callbacks]}")
 
 # =============================================================================
 # TRAINER
 # =============================================================================
 trainer = Trainer(
-    use_distributed_sampler=False,
-    strategy="ddp_find_unused_parameters_true",
+    strategy=DDPStrategy(find_unused_parameters=True),
+    use_distributed_sampler=False,  # <--- CRITICAL FIX: Custom Sampler Enforcer
     devices=-1,
     max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu",
@@ -351,21 +592,20 @@ trainer = Trainer(
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
     gradient_clip_val=1.0,
-    ckpt_path=args.ckpt_path
+    val_check_interval=0.05
 )
 
 # =============================================================================
 # TRAIN & TEST
 # =============================================================================
-trainer.fit(model, datamodule=data_module)
+trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
 trainer.test(model, datamodule=data_module)
 
 # =============================================================================
-# MEASURE COMPLEXITY
+# MEASURE COMPLEXITY (rank 0 only)
 # =============================================================================
 
 def _batch_to_device(batch: dict, device) -> dict:
-    """Recursively move a nested batch dict to device."""
     out = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
@@ -385,21 +625,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     print("=" * 80 + "\n")
 
     data_module.setup("test")
-
-    # Pick a dataset for complexity measurement
-    if use_multi_task:
-        if enable_mmearth:
-            test_dataset = data_module.val_dataset_esa
-            task_name = "esa_worldcover"
-        elif hasattr(data_module, "val_dataset_cosia"):
-            test_dataset = data_module.val_dataset_cosia
-            task_name = "flairhub_cosia"
-        else:
-            test_dataset = data_module.val_dataset_flair_recon
-            task_name = "reconstruction"
-    else:
-        test_dataset = data_module.test_dataset
-        task_name = test_dataset.TASK_NAME
+    test_dataset = data_module.val_dataset
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
@@ -413,21 +639,20 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     for input_size in [128]:
         print(f"\nTesting input size: {input_size}x{input_size}")
 
-        # Collate single sample into batch-of-1
-        batch_0 = collate_grouped([samples[0]])
+        batch_0 = collate_multitask([samples[0]])
         batch_0 = _batch_to_device(batch_0, device)
 
-        # Warmup — Model_Pretrain.forward needs (batch, task_name)
+        # Warmup
         with torch.no_grad():
-            _ = model(batch_0, task_name, training=False)
+            _ = model.forward_multitask(batch_0, training=False)
 
         # FLOPs
-        batch_1 = collate_grouped([samples[1]])
+        batch_1 = collate_multitask([samples[1]])
         batch_1 = _batch_to_device(batch_1, device)
 
         try:
             with torch.no_grad():
-                flops = FlopCountAnalysis(model, (batch_1, task_name))
+                flops = FlopCountAnalysis(model, (batch_1,))
                 gflops = flops.total() / 1e9
         except Exception as e:
             print(f"  FLOPs measurement failed: {e}")
@@ -437,17 +662,17 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         num_warmup, num_runs = 3, 20
         with torch.no_grad():
             for i in range(num_warmup):
-                b = collate_grouped([samples[i % num_samples]])
+                b = collate_multitask([samples[i % num_samples]])
                 b = _batch_to_device(b, device)
-                _ = model(b, task_name, training=False)
+                _ = model.forward_multitask(b, training=False)
 
             torch.cuda.synchronize()
             start = time.time()
             for i in range(num_runs):
                 idx = (i + num_warmup) % num_samples
-                b = collate_grouped([samples[idx]])
+                b = collate_multitask([samples[idx]])
                 b = _batch_to_device(b, device)
-                _ = model(b, task_name, training=False)
+                _ = model.forward_multitask(b, training=False)
                 torch.cuda.synchronize()
             end = time.time()
 
@@ -467,7 +692,6 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"  GFLOPs: {gflops:.2f}")
         print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
 
-    # Summary
     print("\n" + "=" * 80)
     print(f"COMPLEXITY SUMMARY ({config_model['encoder']})")
     print("=" * 80)
