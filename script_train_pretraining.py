@@ -67,6 +67,9 @@ from training.utils.callbacks.pre_training_vizcallbacks import (
     DW_CLASS_NAMES,
 )
 
+# FlairHub reconstruction viz is now a standalone script:
+# python visualize_flairhub_recon.py --ckpt_path ... --config_model ...
+
 
 # =============================================================================
 # DATAMODULE — MMEarth
@@ -506,7 +509,7 @@ else:
 # CALLBACKS
 # =============================================================================
 lr_monitor = LearningRateMonitor(logging_interval="step")
-accumulator = GradientAccumulationScheduler(scheduling={0: 64})
+accumulator = GradientAccumulationScheduler(scheduling={0: 16})
 
 # ── Checkpointing ────────────────────────────────────────────────────────────
 ALL_SEG_TASKS = ["esa_worldcover", "dynamic_world", "flairhub_cosia", "flairhub_lpis"]
@@ -550,6 +553,7 @@ VIZ_TASK_CONFIG = {
 
 viz_callbacks = []
 
+# ── Segmentation viz (per-task) ──────────────────────────────────────────────
 for task_name in args.tasks:
     if task_name in VIZ_TASK_CONFIG:
         class_names, rgb_idx = VIZ_TASK_CONFIG[task_name]
@@ -563,26 +567,37 @@ for task_name in args.tasks:
             )
         )
 
+# ── Reconstruction viz ───────────────────────────────────────────────────────
 if "reconstruction" in args.tasks:
-    recon_rgb = [0, 1, 2] if (is_flairhub and not is_combined) else [2, 1, 0]
-    viz_callbacks.append(
-        PretrainReconVizCallback(
-            rgb_indices=recon_rgb,
-            sample_indices=(0, 1),
-            log_every_n_epochs=args.viz_every_n_epochs,
+    # MMEarth single-resolution recon (when MMEarth is involved)
+    if not is_flairhub:  # i.e. MMEarth-only or Combined
+        recon_rgb = [2, 1, 0]  # S2: B04, B03, B02
+        viz_callbacks.append(
+            PretrainReconVizCallback(
+                rgb_indices=recon_rgb,
+                sample_indices=(0, 1),
+                log_every_n_epochs=args.viz_every_n_epochs,
+            )
         )
-    )
 
-callbacks = [accumulator, checkpoint_val, checkpoint_resume, lr_monitor]  # + viz_callbacks
-print(f"[Callbacks] {len(viz_callbacks)} viz callbacks (disabled): "
+    # FlairHub multi-modal recon: use standalone visualize_flairhub_recon.py
+    # after training (no callback needed — avoids blocking DDP)
+
+callbacks = [accumulator, checkpoint_val, checkpoint_resume, lr_monitor] #+ viz_callbacks
+print(f"[Callbacks] {len(viz_callbacks)} viz callbacks: "
       f"{[type(c).__name__ for c in viz_callbacks]}")
+
+# =============================================================================
+# SETUP DATA MODULE
+# =============================================================================
+data_module.setup()
 
 # =============================================================================
 # TRAINER
 # =============================================================================
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
-    use_distributed_sampler=False,  # <--- CRITICAL FIX: Custom Sampler Enforcer
+    use_distributed_sampler=False, 
     devices=-1,
     max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu",
@@ -592,6 +607,7 @@ trainer = Trainer(
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
     gradient_clip_val=1.0,
+    limit_val_batches=10000,
     val_check_interval=0.05
 )
 

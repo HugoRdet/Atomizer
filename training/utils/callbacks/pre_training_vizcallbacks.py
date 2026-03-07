@@ -582,3 +582,63 @@ class PretrainReconVizCallback(pl.Callback):
         )
         fig.tight_layout()
         return fig
+    
+
+class FlairMultiModalReconCallback(pl.Callback):
+    def __init__(self, dataset, log_every_n_epochs=1):
+        super().__init__()
+        self.dataset = dataset
+        self.log_every_n_epochs = log_every_n_epochs
+
+    @torch.no_grad()
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+
+        pl_module.eval()
+        device = pl_module.device
+        sample = self.dataset.get_viz_sample(random.randint(0, len(self.dataset)-1))
+        
+        # Prepare Batch
+        from training.utils.datasets.token_grouping import collate_multitask
+        batch = collate_multitask([sample])
+        batch = self._dict_to_device(batch, device)
+
+        # Encode Once
+        latents, coords, _ = pl_module._encode(batch, training=False)
+
+        viz_logs = {}
+        res_map = {0.2: "VHR_0.2m", 1.6: "SPOT_1.6m", 10.0: "Sentinel_10m"}
+
+        for res, q_data in sample["recon_viz_queries"].items():
+            # Decode this specific resolution
+            queries = q_data["queries"].unsqueeze(0).to(device)
+            mask = q_data["queries_mask"].unsqueeze(0).to(device)
+            
+            features = pl_module._decode(
+                latents, coords, queries, mask,
+                task_name="reconstruction", target_resolution=res, training=False
+            )
+            
+            preds = pl_module.heads["reconstruction"](features).squeeze() # [M]
+            targets = queries[0, :, 0] # [M]
+            
+            # Reshape based on resolution
+            size = 512 if res == 0.2 else (64 if res == 1.6 else 10)
+            # Take the first band (usually Red or VV) for the 2D plot
+            # Note: total tokens M = size * size * n_bands. 
+            # We reshape to [size, size, n_bands] then take index 0
+            n_bands = preds.shape[0] // (size * size)
+            img_recon = preds.view(size, size, n_bands)[:, :, 0].cpu().numpy()
+            img_gt = targets.view(size, size, n_bands)[:, :, 0].cpu().numpy()
+
+            viz_logs[f"viz/{res_map[res]}_GT"] = wandb.Image(img_gt)
+            viz_logs[f"viz/{res_map[res]}_RECON"] = wandb.Image(img_recon)
+
+        trainer.logger.experiment.log({**viz_logs, "epoch": trainer.current_epoch})
+
+    def _dict_to_device(self, d, device):
+        # helper to move nested dicts
+        return {k: (v.to(device) if isinstance(v, torch.Tensor) else 
+                (self._dict_to_device(v, device) if isinstance(v, dict) else v)) 
+                for k, v in d.items()}

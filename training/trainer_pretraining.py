@@ -209,10 +209,7 @@ class Model_Pretrain(pl.LightningModule):
                                   f"std={finite.std():.6f} nan_frac={torch.isnan(col_data).float().mean():.3f}")
                         else:
                             print(f"    col[{col}]: ALL NaN/Inf")
-                else:
-                    # Still print basic stats for first few steps
-                    print(f"[DIAG encode] res={res}: OK shape={list(tok.shape)} "
-                          f"valid={n_valid} range=[{tok.min():.4f}, {tok.max():.4f}]")
+            
 
         resolutions = sorted(groups.keys())
         grid_configs = {
@@ -488,8 +485,7 @@ class Model_Pretrain(pl.LightningModule):
                 has_nan = torch.isnan(pred).any().item()
                 if has_nan:
                     print(f"  PRED {task_name}: ALL NaN", flush=True)
-                else:
-                    print(f"  PRED {task_name}: OK range=[{pred.min():.4f}, {pred.max():.4f}]", flush=True)
+           
 
         total_loss = 0.0
         num_tasks = 0

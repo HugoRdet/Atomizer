@@ -14,6 +14,7 @@ Handles the grouped-token batch format:
         "queries_mask":      [B, M_max],
         "label":             [B, H, W],
         "target_resolution": float,
+        "dataset_name":      str,
         "metadata":          {...},
     }
 
@@ -188,8 +189,11 @@ def _pad_masks(masks, pad_value=True):
 def collate_multitask(samples: list) -> dict:
     """
     Collate multi-task samples into a batch.
-    Dynamic version: Safe to use because Round-Robin sampling + static modalities 
+    Dynamic version: Safe to use because Round-Robin sampling + static modalities
     guarantees identical batch structures across all DDP ranks.
+
+    Passes through dataset_name from the first sample (homogeneous batches
+    guaranteed by round-robin sampling).
     """
     B = len(samples)
 
@@ -227,11 +231,17 @@ def collate_multitask(samples: list) -> dict:
 
     target_resolution = samples[0].get("target_resolution", 10.0)
 
-    return {
+    result = {
         "groups": groups,
         "tasks": tasks,
         "target_resolution": target_resolution,
     }
+
+    # Pass through dataset_name (homogeneous batch from round-robin)
+    if "dataset_name" in samples[0]:
+        result["dataset_name"] = samples[0]["dataset_name"]
+
+    return result
 
 
 # =============================================================================
@@ -253,6 +263,9 @@ def collate_grouped(batch: list) -> dict:
         groups[res]["shape"]:  tuple          — from first sample (assumed constant)
 
     Queries, labels, etc. are similarly padded and stacked.
+
+    Passes through dataset_name from the first sample (homogeneous batches
+    guaranteed by round-robin sampling).
     """
     B = len(batch)
 
@@ -344,6 +357,10 @@ def collate_grouped(batch: list) -> dict:
     if "target_resolution" in batch[0]:
         result["target_resolution"] = batch[0]["target_resolution"]
 
+    # Pass through dataset_name (homogeneous batch from round-robin)
+    if "dataset_name" in batch[0]:
+        result["dataset_name"] = batch[0]["dataset_name"]
+
     return result
 
 
@@ -358,6 +375,9 @@ def collate_mae(batch: list) -> dict:
     Groups are fixed-size (thanks to padding in dataset __getitem__),
     so collation is just stacking. Queries may vary slightly in count
     across samples — pad to max M.
+
+    Passes through dataset_name from the first sample (homogeneous batches
+    guaranteed by round-robin sampling).
 
     Expected per-sample format:
         {
@@ -422,12 +442,18 @@ def collate_mae(batch: list) -> dict:
             padded_gt.append(gt)
             padded_qmasks.append(qm)
 
-    return {
+    result = {
         "groups": groups,
         "queries": torch.stack(padded_queries, dim=0),       # [B, M_max, 8]
         "queries_mask": torch.stack(padded_qmasks, dim=0),   # [B, M_max] bool
         "ground_truth": torch.stack(padded_gt, dim=0),       # [B, M_max] float
     }
+
+    # Pass through dataset_name (homogeneous batch from round-robin)
+    if "dataset_name" in batch[0]:
+        result["dataset_name"] = batch[0]["dataset_name"]
+
+    return result
 
 
 # =============================================================================

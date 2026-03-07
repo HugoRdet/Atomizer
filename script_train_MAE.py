@@ -120,15 +120,11 @@ checkpoint_val = ModelCheckpoint(
     verbose=True,
 )
 
-viz_callback = ReconstructionVizCallback(
-    sample_indices=[0, 1, 2],
-    log_every_n_epochs=1,
-    use_wandb=True,
-)
 
 
 
-callbacks = [accumulator, checkpoint_val, lr_monitor,viz_callback]
+
+callbacks = [accumulator, checkpoint_val, lr_monitor]
 
 # =============================================================================
 # TRAINER
@@ -144,6 +140,7 @@ trainer = Trainer(
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
     #val_check_interval=250,
+    limit_val_batches=40
     limit_train_batches=750
 )
 
