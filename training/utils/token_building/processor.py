@@ -240,6 +240,7 @@ class TokenProcessor(nn.Module):
         # D. Resolution: [B, L, m, res_dim]
         # Encoder handles -1 → zeros natively
         resolution_indices = token_data[..., TOKEN_RESOLUTION_IDX].long()
+      
         resolution_features = self.resolution_encoder(resolution_indices)
         
         # E. Time: [B, L, m, time_dim]
@@ -258,12 +259,13 @@ class TokenProcessor(nn.Module):
         # convergence. We detect and zero them before the MLP.
         # (The decoder path is unaffected — far fewer tokens.)
         
-        resolution_features = self._zero_if_constant(resolution_features)
+        #resolution_features = self._zero_if_constant(resolution_features)
         
         
         # =========================================================
         # STEP 4: ASSEMBLY + PROJECTION
         # =========================================================
+
         
         raw_features = torch.cat([
             pos_features,

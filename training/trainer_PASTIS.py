@@ -1,18 +1,26 @@
 """
-PASTIS Crop Classification Trainer
-===================================
+PASTIS Crop Segmentation Trainer
+==================================
 
 PyTorch Lightning module for training the Atomizer model on PASTIS dataset
-for multi-temporal crop type classification.
+for multi-temporal crop type segmentation.
 
-Adapted from Model_SenFlood to share the same interface and conventions.
+Uses the proven self.encoder(batch) forward path (single call).
+
+Compatible with both batch formats:
+  - Old: batch["queries"], batch["queries_mask"]
+  - New: batch["tasks"]["pastis_segmentation"]["queries"], ...
+
+The trainer unwraps the tasks dict back to flat format before passing
+to the encoder, preserving the original forward path.
 
 Token format (8 columns):
     [value, x, y, spectral_idx, label, query_flag, resolution_idx, time_idx]
 
-Batch format (normal):
+Batch format (after unwrapping):
     groups[res]["tokens"]: [B, N, 8]
     queries:               [B, M, 8]
+    queries_mask:          [B, M]
     label:                 [B, H, W]
 """
 
@@ -24,38 +32,40 @@ from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
 
 from training.atomiser import Atomiser_Senflood
-from training.atomiser.error_supervision import compute_error_supervision
+
+
+TASK_NAME = "pastis_segmentation"
 
 
 class PASTISTrainer(pl.LightningModule):
     """
-    PyTorch Lightning trainer for PASTIS crop classification.
+    PyTorch Lightning trainer for PASTIS crop segmentation.
 
-    Same interface as Model_SenFlood:
-        PASTISTrainer(config, wand, name, transform, lookup_table)
+    Uses self.encoder(batch) forward path — the encoder handles
+    encode + decode + prediction internally.
     """
 
-    # PASTIS crop type names (19 classes)
+    # PASTIS crop type names (19 classes, 0-18)
     CROP_NAMES = [
         "background",
-        "wheat",
+        "meadow",
+        "soft_winter_wheat",
         "corn",
-        "barley",
-        "rapeseed",
+        "winter_barley",
+        "winter_rapeseed",
+        "spring_barley",
         "sunflower",
-        "orchards",
-        "nuts",
-        "permanent_meadows",
-        "temporary_meadows",
-        "soybean",
-        "hard_wheat",
+        "grapevine",
+        "beet",
+        "soy",
+        "sorghum",
+        "flax",
         "protein_crops",
-        "rice",
-        "potatoes_sugarbeet",
-        "hops_hemp",
-        "vineyards",
-        "fruits_vegetables",
-        "other",
+        "other_cereals",
+        "fruits_veg",
+        "other_crops",
+        "grassland",
+        "shrub_forest",
     ]
 
     def __init__(self, config, wand, name, transform, lookup_table):
@@ -70,11 +80,8 @@ class PASTISTrainer(pl.LightningModule):
         self.num_classes = config["trainer"]["num_classes"]
         self.ignore_index = 255
 
-        # Sliding window inference for val/test
-        self.use_sliding = config["trainer"].get("slide", False)
-
         # =================================================================
-        # METRICS  (per-class for 19 crop types)
+        # METRICS
         # =================================================================
         self.metric_IoU_train = torchmetrics.JaccardIndex(
             task="multiclass", num_classes=self.num_classes,
@@ -104,7 +111,9 @@ class PASTISTrainer(pl.LightningModule):
         # =================================================================
         # MODEL
         # =================================================================
-        self.encoder = Atomiser_Senflood(config=self.config, lookup_table=self.lookup_table)
+        self.encoder = Atomiser_Senflood(
+            config=self.config, lookup_table=self.lookup_table
+        )
         self.loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
         self.lr = float(config["trainer"]["lr"])
@@ -113,21 +122,47 @@ class PASTISTrainer(pl.LightningModule):
         # =================================================================
         # ERROR SUPERVISION (optional)
         # =================================================================
-        self.use_error_guided_displacement = config["Atomiser"].get("use_error_guided_displacement", False)
-        self.use_gravity_displacement = config["Atomiser"].get("use_gravity_displacement", False)
+        self.use_error_guided_displacement = config["Atomiser"].get(
+            "use_error_guided_displacement", False)
+        self.use_gravity_displacement = config["Atomiser"].get(
+            "use_gravity_displacement", False)
         self.use_error_supervision = (
             self.use_error_guided_displacement or self.use_gravity_displacement
         )
 
         if self.use_error_supervision:
+            from training.atomiser.error_supervision import compute_error_supervision
+            self._compute_error_supervision = compute_error_supervision
             self.lambda_error = config["Atomiser"].get("lambda_error", 0.1)
             self.error_grid_size = config["Atomiser"].get("error_grid_size", 7)
             self.error_grid_spacing = config["Atomiser"].get("error_grid_spacing", 2)
-            self.error_channels_to_sample = config["Atomiser"].get("error_channels_to_sample", 1)
+            self.error_channels_to_sample = config["Atomiser"].get(
+                "error_channels_to_sample", 1)
             self.error_loss_type = config["Atomiser"].get("error_loss_type", "mse")
             self.error_normalize = config["Atomiser"].get("error_normalize", True)
-            self.error_warmup = config["Atomiser"].get("error_supervision_warmup_epochs", 0)
+            self.error_warmup = config["Atomiser"].get(
+                "error_supervision_warmup_epochs", 0)
             self.stable_depth = config["Atomiser"].get("stable_depth", 0)
+
+    # =====================================================================
+    # BATCH UNWRAPPING
+    # =====================================================================
+
+    def _unwrap_batch(self, batch):
+        """
+        Unwrap tasks dict back to flat format for the encoder.
+
+        New format: batch["tasks"]["pastis_segmentation"]["queries"]
+        Old format: batch["queries"]
+
+        The encoder expects flat format. This method converts new → old
+        if needed, and returns the batch in-place (no copy).
+        """
+        if "queries" not in batch and "tasks" in batch:
+            task_data = batch["tasks"].get(TASK_NAME, {})
+            batch["queries"] = task_data.get("queries", None)
+            batch["queries_mask"] = task_data.get("queries_mask", None)
+        return batch
 
     # =====================================================================
     # FORWARD
@@ -136,6 +171,7 @@ class PASTISTrainer(pl.LightningModule):
     def forward(self, batch, training=False, return_trajectory=False,
                 return_predicted_errors=False):
         """Forward pass — delegates entirely to encoder."""
+        batch = self._unwrap_batch(batch)
         return self.encoder(
             batch,
             training=training,
@@ -154,6 +190,7 @@ class PASTISTrainer(pl.LightningModule):
         """
         Run forward, compute loss, return (loss, class_loss, preds, labels).
         """
+        batch = self._unwrap_batch(batch)
         supervise_error = self._should_supervise_error() and training
 
         result = self.forward(
@@ -179,8 +216,9 @@ class PASTISTrainer(pl.LightningModule):
 
         # Error supervision (training only)
         total_loss = class_loss
-        if supervise_error and isinstance(result, dict) and result.get("predicted_errors") is not None:
-            error_loss, _ = compute_error_supervision(
+        if (supervise_error and isinstance(result, dict)
+                and result.get("predicted_errors") is not None):
+            error_loss, _ = self._compute_error_supervision(
                 model=self.encoder,
                 trajectory=result["trajectory"],
                 predicted_errors=result["predicted_errors"],
@@ -195,7 +233,8 @@ class PASTISTrainer(pl.LightningModule):
                 normalize=self.error_normalize,
             )
             total_loss = class_loss + (self.lambda_error * error_loss)
-            self.log("train_error_loss", error_loss, on_step=False, on_epoch=True, logger=True)
+            self.log("train_error_loss", error_loss,
+                     on_step=False, on_epoch=True, logger=True)
 
         preds = torch.argmax(y_hat, dim=-1)  # [B, M]
 
@@ -213,8 +252,10 @@ class PASTISTrainer(pl.LightningModule):
         self.metric_IoU_train.update(preds, labels)
         self.metric_acc_train.update(preds, labels)
 
-        self.log("train_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_class_loss", class_loss, on_step=False, on_epoch=True, logger=True)
+        self.log("train_loss", total_loss,
+                 on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_class_loss", class_loss,
+                 on_step=False, on_epoch=True, logger=True)
 
         return total_loss
 
@@ -226,7 +267,8 @@ class PASTISTrainer(pl.LightningModule):
         self.metric_IoU_val.update(preds, labels)
         self.metric_acc_val.update(preds, labels)
 
-        self.log("val_loss", class_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_loss", class_loss,
+                 on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         return class_loss
 
@@ -238,7 +280,8 @@ class PASTISTrainer(pl.LightningModule):
         self.metric_IoU_test.update(preds, labels)
         self.metric_acc_test.update(preds, labels)
 
-        self.log("test_loss", class_loss, on_step=False, on_epoch=True, logger=True)
+        self.log("test_loss", class_loss,
+                 on_step=False, on_epoch=True, logger=True)
 
         return class_loss
 
@@ -247,14 +290,18 @@ class PASTISTrainer(pl.LightningModule):
     # =====================================================================
 
     def on_train_epoch_end(self):
-        self.log("train_mIoU", self.metric_IoU_train.compute(), on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_accuracy", self.metric_acc_train.compute(), on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_mIoU", self.metric_IoU_train.compute(),
+                 on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_accuracy", self.metric_acc_train.compute(),
+                 on_epoch=True, prog_bar=True, logger=True)
         self.metric_IoU_train.reset()
         self.metric_acc_train.reset()
 
     def on_validation_epoch_end(self):
-        self.log("val_mIoU", self.metric_IoU_val.compute(), on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_accuracy", self.metric_acc_val.compute(), on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_mIoU", self.metric_IoU_val.compute(),
+                 on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_accuracy", self.metric_acc_val.compute(),
+                 on_epoch=True, prog_bar=True, logger=True)
         self.metric_IoU_val.reset()
         self.metric_acc_val.reset()
 
@@ -265,12 +312,14 @@ class PASTISTrainer(pl.LightningModule):
         self.log("test_mIoU", test_iou.mean(), on_epoch=True, logger=True)
         self.log("test_accuracy", test_acc.mean(), on_epoch=True, logger=True)
 
-        # Log per-class metrics for all 19 crop types
+        # Log per-class metrics
         for i, name in enumerate(self.CROP_NAMES):
             if i < len(test_iou):
-                self.log(f"test_IoU_{name}", test_iou[i], on_epoch=True, logger=True)
+                self.log(f"test_IoU_{name}", test_iou[i],
+                         on_epoch=True, logger=True)
             if i < len(test_acc):
-                self.log(f"test_acc_{name}", test_acc[i], on_epoch=True, logger=True)
+                self.log(f"test_acc_{name}", test_acc[i],
+                         on_epoch=True, logger=True)
 
         self.metric_IoU_test.reset()
         self.metric_acc_test.reset()

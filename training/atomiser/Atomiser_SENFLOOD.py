@@ -327,16 +327,19 @@ class Atomiser_Senflood(pl.LightningModule):
 
     def _init_decoder(self):
         """
-        Local MLP input: [latent, RPE, query_features]
-        Task embedding removed — decoder is task-agnostic.
+        Upgraded decoder for supervised segmentation:
+          1. Wider & deeper local predictor (3 layers, 2× hidden dim)
+          2. Content-aware neighbor gating (replaces pure IDW)
+          3. Post-fusion residual MLP before the reconstruction head
         """
-        decoder_hidden  = self.latent_dim
+        decoder_hidden  = self.latent_dim * 2
         local_input_dim = (
             self.latent_dim
             + self.decoder_pe_dim
             + self.query_dim_recon
         )
 
+        # --- Option 1: wider & deeper per-neighbor MLP ---
         self.local_predictor = nn.Sequential(
             nn.Linear(local_input_dim, decoder_hidden),
             nn.LayerNorm(decoder_hidden),
@@ -344,17 +347,40 @@ class Atomiser_Senflood(pl.LightningModule):
             nn.Linear(decoder_hidden, decoder_hidden),
             nn.LayerNorm(decoder_hidden),
             nn.GELU(),
+            nn.Linear(decoder_hidden, self.latent_dim),
+            nn.LayerNorm(self.latent_dim),
+            nn.GELU(),
         )
 
+        # --- Option 3: content-aware neighbor gating ---
+        # Input: per-neighbor prediction + RPE → scalar score per neighbor.
+        # Combined with distance prior via additive logits before softmax.
         self.register_buffer('decoder_temperature', torch.tensor(2.0))
-        self.grid_gate = nn.Linear(decoder_hidden, 1)
-
-        hidden_dim = self.latent_dim * 2
-        self.reconstruction_head = nn.Sequential(
-            nn.Linear(decoder_hidden, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.neighbor_gate = nn.Sequential(
+            nn.Linear(self.latent_dim + self.decoder_pe_dim, self.latent_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.num_classes),
+            nn.Linear(self.latent_dim, 1),
+        )
+
+        # Multi-resolution grid gate (unchanged)
+        self.grid_gate = nn.Linear(self.latent_dim, 1)
+
+        # --- Option 2: post-fusion residual MLP ---
+        self.post_fusion = nn.Sequential(
+            nn.Linear(self.latent_dim, decoder_hidden),
+            nn.LayerNorm(decoder_hidden),
+            nn.GELU(),
+            nn.Linear(decoder_hidden, self.latent_dim),
+            nn.LayerNorm(self.latent_dim),
+            nn.GELU(),
+        )
+
+        # Final prediction head
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(self.latent_dim, decoder_hidden),
+            nn.LayerNorm(decoder_hidden),
+            nn.GELU(),
+            nn.Linear(decoder_hidden, self.num_classes),
         )
 
     def _init_classifier(self):
@@ -534,13 +560,18 @@ class Atomiser_Senflood(pl.LightningModule):
     # =========================================================================
 
     def _cross_attention_step(self, latents, sampled_tokens, sampled_masks,
-                               coords, cross_attn, cross_ff, L_spatial):
+                            coords, cross_attn, cross_ff, L_spatial):
         """
         Local cross-attention for a single resolution.
 
         latents  [B, L, D]  — L_vis during MAE, L_all during standard encoding.
         coords   [B, L, 2]  — must match the latents passed in.
         L_spatial            — number of spatial latents (for global latent split).
+
+        For latents in pure-padding regions where all tokens are masked,
+        we force-unmask one token to prevent softmax over all -inf → NaN.
+        That token is zero-valued (padding), so cross-attention produces
+        a near-zero output and the residual preserves the latent's value.
         """
         processed_tokens = self.input_processor.process_data_for_encoder(
             sampled_tokens, sampled_masks, latent_positions=coords
@@ -548,10 +579,24 @@ class Atomiser_Senflood(pl.LightningModule):
         delta_x, delta_y, gsd = self._compute_deltas(sampled_tokens, coords)
 
         spatial = latents[:, :L_spatial]
-        spatial = cross_attn(
+
+        # Prevent all-masked latents: force-unmask first token for latents
+        # where every token is masked (padding region). This prevents
+        # softmax(all -inf) → NaN. The unmasked token is zero-padded,
+        # so its contribution is minimal.
+        all_masked = sampled_masks.all(dim=-1, keepdim=True)  # [B, L, 1]
+        if all_masked.any():
+            sampled_masks = sampled_masks.clone()
+            sampled_masks[:, :, 0] = sampled_masks[:, :, 0] & ~all_masked.squeeze(-1)
+
+        attn_out = cross_attn(
             spatial, context=processed_tokens, mask=~sampled_masks,
             delta_x=delta_x, delta_y=delta_y, gsd=gsd,
-        ) + spatial
+        )
+        # Safety net: catch any remaining NaN from numerical edge cases
+        attn_out = torch.nan_to_num(attn_out, nan=0.0)
+
+        spatial = attn_out + spatial
         spatial = cross_ff(spatial) + spatial
 
         return torch.cat([spatial, latents[:, L_spatial:]], dim=1)
@@ -863,12 +908,21 @@ class Atomiser_Senflood(pl.LightningModule):
         query_expanded = query_features.unsqueeze(2).expand(-1, -1, k_keep, -1)
 
         local_input  = torch.cat([selected_latents, rel_pe, query_expanded], dim=-1)
-        local_preds  = self.local_predictor(local_input)
+        local_preds  = self.local_predictor(local_input)   # [B, M, k, latent_dim]
 
-        # IDW blend
-        gs_sq        = grid_spacing.pow(2).clamp(min=1e-8)
-        dists_norm   = topk_dists_sq / gs_sq
-        weights      = F.softmax(-dists_norm * self.decoder_temperature, dim=-1)
+        # Content-aware neighbor gating (Option 3)
+        # Learned gate scores from prediction content + relative position,
+        # combined additively with distance prior so the model can override
+        # pure distance weighting at class boundaries.
+        gate_input    = torch.cat([local_preds, rel_pe], dim=-1)  # [B, M, k, latent_dim + pe_dim]
+        content_score = self.neighbor_gate(gate_input).squeeze(-1)  # [B, M, k]
+
+        gs_sq      = grid_spacing.pow(2).clamp(min=1e-8)
+        dists_norm = topk_dists_sq / gs_sq
+        weights    = F.softmax(
+            content_score - dists_norm * self.decoder_temperature, dim=-1,
+        )  # [B, M, k]
+
         grid_feature = (weights.unsqueeze(-1) * local_preds).sum(dim=2)
         return grid_feature
 
@@ -918,6 +972,9 @@ class Atomiser_Senflood(pl.LightningModule):
         scores  = self.grid_gate(stacked).squeeze(-1)       # [B, M, G]
         weights = F.softmax(scores, dim=-1)                 # [B, M, G]
         fused   = (weights.unsqueeze(-1) * stacked).sum(dim=2)  # [B, M, D]
+
+        # Post-fusion residual refinement (Option 2)
+        fused = self.post_fusion(fused) + fused
 
         if return_features:
             return fused
@@ -1057,12 +1114,16 @@ class Atomiser_Senflood(pl.LightningModule):
 
     def freeze_decoder(self):
         self._set_requires_grad(self.local_predictor, False)
+        self._set_requires_grad(self.neighbor_gate, False)
         self._set_requires_grad(self.grid_gate, False)
+        self._set_requires_grad(self.post_fusion, False)
         self._set_requires_grad(self.reconstruction_head, False)
 
     def unfreeze_decoder(self):
         self._set_requires_grad(self.local_predictor, True)
+        self._set_requires_grad(self.neighbor_gate, True)
         self._set_requires_grad(self.grid_gate, True)
+        self._set_requires_grad(self.post_fusion, True)
         self._set_requires_grad(self.reconstruction_head, True)
 
     def freeze_classifier(self):

@@ -41,7 +41,7 @@ class GeographicPruning(nn.Module):
     """
     
     MIN_CELL_SIZE = 1
-    ON_THE_FLY_THRESHOLD = 2000000  # tokens above this skip precomputation
+    ON_THE_FLY_THRESHOLD = 200_000_000  # tokens above this skip precomputation
     
     def __init__(
         self,

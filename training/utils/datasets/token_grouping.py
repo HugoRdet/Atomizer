@@ -204,9 +204,23 @@ def collate_multitask(samples: list) -> dict:
 
     groups = {}
     for res in sorted(all_resolutions):
-        tokens_list = [s["groups"][res]["tokens"] for s in samples]
-        masks_list = [s["groups"][res]["mask"] for s in samples]
-        shape = samples[0]["groups"][res]["shape"]
+        tokens_list = []
+        masks_list = []
+        shape = None
+
+        for s in samples:
+            if res in s["groups"]:
+                tokens_list.append(s["groups"][res]["tokens"])
+                masks_list.append(s["groups"][res]["mask"])
+                if shape is None:
+                    shape = s["groups"][res]["shape"]
+            else:
+                # Sample doesn't have this resolution — empty placeholder, will be fully masked
+                tokens_list.append(torch.zeros(0, 8))
+                masks_list.append(torch.zeros(0, dtype=torch.bool))
+
+        if shape is None:
+            shape = (1, 1)
 
         groups[res] = {
             "tokens": _pad_tokens(tokens_list),

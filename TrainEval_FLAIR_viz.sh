@@ -1,27 +1,12 @@
-#!/bin/bash
 
-# Check if all three required arguments are provided
-if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 <xp_name> <config_model> <config_dataset>"
-    exit 1
-fi
+python3 script_train_C2SEG.py     --xp_name aug_hsi_final     --subset germany --train_sensors hsi --fusion     --train_city augsburg     --train_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --test_city augsburg     --test_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --max_queries 16384 --query_upsample_factor 4     --query_upsample_fraction 0.0 --query_upsample_prob 0.0     --spectral_aug_prob 0.0     --grad_accum 1 --num_workers 4
 
-XP_NAME="$1"
-CONFIG_MODEL="$2"
-CONFIG_DATASET="$3"
+python3 script_train_C2SEG.py     --xp_name aug_hsi_final     --subset germany --train_sensors hsi --fusion     --train_city augsburg     --train_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --test_city augsburg     --test_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --max_queries 16384 --query_upsample_factor 4     --query_upsample_fraction 0.3 --query_upsample_prob 0.3     --spectral_aug_prob 0.3     --grad_accum 1 --num_workers 4
 
-#echo "Starting training..."
-python -u viz_callback.py --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET"
+python3 script_train_C2SEG.py     --xp_name aug_hsi_final     --subset germany --train_sensors hsi --fusion     --train_city augsburg     --train_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --test_city augsburg     --test_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --max_queries 16384 --query_upsample_factor 4     --query_upsample_fraction 0.3 --query_upsample_prob 0.3     --spectral_aug_prob 0.5     --grad_accum 1 --num_workers 4
 
-# Read the WandB run ID from the wandb_runs directory using the xp_name variable for the filename
-RUN_FILE="training/wandb_runs/${XP_NAME}.txt"
-if [ ! -f "$RUN_FILE" ]; then
-    echo "Error: $RUN_FILE not found."
-    exit 1
-fi
+python3 script_train_C2SEG.py     --xp_name aug_hsi_final     --subset germany --train_sensors hsi --fusion     --train_city augsburg     --train_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --test_city augsburg     --test_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --max_queries 16384 --query_upsample_factor 4     --query_upsample_fraction 0.5 --query_upsample_prob 0.5     --spectral_aug_prob 0.5     --grad_accum 1 --num_workers 4
 
+CUDA_VISIBLE_DEVICES=0 python3 script_train_C2SEG.py     --xp_name aug_hsi_final     --subset germany --train_sensors hsi --fusion     --train_city augsburg     --train_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --test_city augsburg     --test_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --max_queries 16384 --query_upsample_factor 4     --query_upsample_fraction 0.5 --query_upsample_prob 0.5     --spectral_aug_prob 0.5     --grad_accum 1 --num_workers 4
 
-
-#python script_evaluation_spec.py --run_id "$RUN_ID" --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET" 
-
-#python script_evaluation.py --run_id AYAYdsdsqA --xp_name "$XP_NAME" --config_model "$CONFIG_MODEL" --dataset_name "$CONFIG_DATASET" 
+CUDA_VISIBLE_DEVICES=0 python3 script_train_C2SEG.py     --xp_name aug_hsi_final     --subset germany --train_sensors hsi --fusion     --train_city augsburg     --train_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --test_city augsburg     --test_mat ./data/CrossCity/Germany/augsburg_multimodal.mat     --max_queries 16384 --query_upsample_factor 4     --query_upsample_fraction 0.5 --query_upsample_prob 0.5     --spectral_aug_prob 0.5     --grad_accum 3 --num_workers 4

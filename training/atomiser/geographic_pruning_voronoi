@@ -1,8 +1,14 @@
 """
-Geographic Attention Module (Randomized Voronoi Sampling)
+Geographic Pruning with Voronoi Cells and Padded Tensors
 
-Memory-efficient version that partitions tokens among latents (Voronoi cells)
-and samples k tokens per latent from its geographic territory.
+Memory-efficient, fully tensorized implementation.
+
+All runtime parameters (geo_k, sigma, L_spatial) are passed as forward() args.
+Precomputed cells are cached by token shape + latent positions hash.
+
+For large token counts (>50k), an on-the-fly chunked top-k path is used
+instead of precomputation to avoid combinatorial cache explosion from
+variable-length inputs (e.g., FLAIR-HUB with temporal dropout).
 """
 
 import torch
@@ -13,266 +19,482 @@ from typing import Tuple, Optional
 
 class GeographicPruning(nn.Module):
     """
-    Voronoi-based geographic pruning with stochastic sampling.
+    Voronoi-based geographic pruning with padded tensor storage.
     
     Each token is assigned to its nearest latent (Voronoi cell).
-    Each latent then samples k tokens from its cell, with fallback
-    to nearby cells if the cell has fewer than k tokens.
+    Tokens are stored in padded tensors for fully tensorized sampling.
+    
+    Two paths:
+        1. Cached Voronoi (N <= ON_THE_FLY_THRESHOLD):
+           Precomputes cell membership, caches padded tensors per (N, L, grid) key.
+           Fast for repeated identical shapes (e.g., MMEarth).
+        
+        2. On-the-fly top-k (N > ON_THE_FLY_THRESHOLD):
+           Chunked distance computation + top-k per latent.
+           No caching, handles variable token counts efficiently.
+    
+    Safety guarantees:
+        - Empty Voronoi cells produce index 0 + mask=True (masked out)
+        - All gather indices clamped to [0, N-1]
+        - Bias set to -inf for invalid positions → zero attention weight
+        - Cache key includes latent position hash to prevent collisions
     """
+    
+    MIN_CELL_SIZE = 1
+    ON_THE_FLY_THRESHOLD = 2000000  # tokens above this skip precomputation
     
     def __init__(
         self,
         geometry,
-        num_spatial_latents: int,
-        geo_k: int = 1500,
-        default_sigma: float = 0.5,
-        chunk_size: int = 25,
+        chunk_size: int = 10,
     ):
         super().__init__()
         self.geometry = geometry
-        self.num_spatial_latents = num_spatial_latents
-        self.geo_k = geo_k
-        self.default_sigma = default_sigma
         self.chunk_size = chunk_size
+        
+        # Cache keyed by shape + latent position hash
+        self._precomputed_keys = set()
+    
+    # =========================================================================
+    # Cache key computation
+    # =========================================================================
+    
+    def _make_cache_key(
+        self,
+        N: int,
+        L_spatial: int,
+        hexagonal: bool,
+        latent_coords: torch.Tensor,
+    ) -> str:
+        """
+        Build a cache key that includes latent positions.
+        
+        Prevents cache collisions when the same N/L/grid_type is used
+        with different latent coordinates (e.g., callbacks vs training,
+        or different grid configs).
+        """
+        grid_type = "hex" if hexagonal else "sq"
+        
+        # Hash latent positions — round to 0.1m to be robust to float noise
+        coords_flat = latent_coords[0].detach().float().cpu()
+        coords_rounded = coords_flat.long()
+        pos_hash = hash(coords_rounded.numpy().tobytes()) % (10**8)
+        
+        return f"{N}_{L_spatial}_{grid_type}_{pos_hash}"
+    
+    # =========================================================================
+    # Voronoi assignment (for cached path)
+    # =========================================================================
+    
+    def _compute_nearest_latent_chunked(
+        self,
+        pixel_coords: torch.Tensor,
+        latent_coords: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Assign each token to its nearest latent via chunked distance computation.
+        
+        Returns:
+            nearest_latent: [N] index of nearest latent per token
+            min_dist_sq:    [N] squared distance to nearest latent
+        """
+        N = pixel_coords.shape[0]
+        L = latent_coords.shape[0]
+        device = pixel_coords.device
+        original_dtype = pixel_coords.dtype
+        
+        pixel_f64 = pixel_coords.double()
+        latent_f64 = latent_coords.double()
+        
+        nearest_latent = torch.empty(N, dtype=torch.long, device=device)
+        min_dist_sq = torch.full((N,), float('inf'), dtype=torch.float64, device=device)
+        
+        tok_chunk_size = 50000
+        lat_chunk_size = self.chunk_size
+        
+        for tok_start in range(0, N, tok_chunk_size):
+            tok_end = min(tok_start + tok_chunk_size, N)
+            tok_chunk = pixel_f64[tok_start:tok_end]
+            n_tok = tok_end - tok_start
+            
+            tok_nearest = torch.empty(n_tok, dtype=torch.long, device=device)
+            tok_min_dist = torch.full((n_tok,), float('inf'), dtype=torch.float64, device=device)
+            
+            for lat_start in range(0, L, lat_chunk_size):
+                lat_end = min(lat_start + lat_chunk_size, L)
+                lat_chunk = latent_f64[lat_start:lat_end]
+                
+                diff = tok_chunk.unsqueeze(1) - lat_chunk.unsqueeze(0)
+                dist_sq = (diff ** 2).sum(dim=-1)
+                
+                lat_min_dist, lat_min_idx = dist_sq.min(dim=-1)
+                
+                update_mask = lat_min_dist < tok_min_dist
+                tok_nearest[update_mask] = lat_min_idx[update_mask] + lat_start
+                tok_min_dist[update_mask] = lat_min_dist[update_mask]
+                
+                del diff, dist_sq
+            
+            nearest_latent[tok_start:tok_end] = tok_nearest
+            min_dist_sq[tok_start:tok_end] = tok_min_dist
+        
+        return nearest_latent, min_dist_sq.to(original_dtype)
+    
+    # =========================================================================
+    # Precomputation (cached path, small N only)
+    # =========================================================================
+    
+    def _precompute_voronoi_cells(
+        self,
+        tokens: torch.Tensor,
+        latent_coords: torch.Tensor,
+        L_spatial: int,
+        cache_key: str,
+    ):
+        """
+        Precompute Voronoi cell membership and build padded tensors.
+        
+        Empty cells are safe: indices default to 0, valid mask is False,
+        and downstream code masks them out with -inf bias.
+        """
+        B, N, D = tokens.shape
+        L = L_spatial
+        device = tokens.device
+        dtype = tokens.dtype
+        
+        print(f"[VoronoiPruning] Precomputing cells for {cache_key}...")
+        print(f"  Tokens: {N}, Latents: {L}")
+        
+        with torch.no_grad():
+            # Get coordinates
+            pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)
+            lat_coords = latent_coords[0]
+            
+            # Voronoi assignment
+            cell_membership, dist_to_nearest = self._compute_nearest_latent_chunked(
+                pixel_coords, lat_coords
+            )
+            
+            # Count tokens per cell
+            cell_counts = torch.bincount(cell_membership, minlength=L)
+            
+            empty_cells = (cell_counts == 0).sum().item()
+            if empty_cells > 0:
+                print(f"  WARNING: {empty_cells}/{L} latents have EMPTY Voronoi cells!")
+                print(f"  These will be masked out during attention (bias=-inf).")
+            
+            # max_cell_size must be >= 1 for safe tensor ops
+            max_cell_size = max(cell_counts.max().item(), self.MIN_CELL_SIZE)
+            
+            print(f"  Cell sizes: min={cell_counts.min().item()}, "
+                  f"max={max_cell_size}, mean={cell_counts.float().mean().item():.0f}")
+            
+            # Build padded tensors
+            cell_indices_padded = torch.zeros(L, max_cell_size, dtype=torch.long, device=device)
+            cell_valid_mask = torch.zeros(L, max_cell_size, dtype=torch.bool, device=device)
+            cell_distances = torch.zeros(L, max_cell_size, dtype=dtype, device=device)
+            
+            for l in range(L):
+                in_cell_mask = (cell_membership == l)
+                in_cell_indices = torch.where(in_cell_mask)[0]
+                in_cell_distances = dist_to_nearest[in_cell_mask]
+                
+                n_in_cell = in_cell_indices.shape[0]
+                
+                if n_in_cell > 0:
+                    perm = torch.randperm(n_in_cell, device=device)
+                    cell_indices_padded[l, :n_in_cell] = in_cell_indices[perm]
+                    cell_valid_mask[l, :n_in_cell] = True
+                    cell_distances[l, :n_in_cell] = in_cell_distances[perm]
+                # Empty cells: indices=0, valid=False, distances=0
+                # Index 0 is a safe fallback — the token will be masked out
+            
+            # Register buffers
+            self.register_buffer(f"cell_indices_{cache_key}", cell_indices_padded)
+            self.register_buffer(f"cell_valid_{cache_key}", cell_valid_mask)
+            self.register_buffer(f"cell_distances_{cache_key}", cell_distances)
+            self.register_buffer(f"cell_counts_{cache_key}", cell_counts)
+            
+            self._precomputed_keys.add(cache_key)
+            
+            del pixel_coords, lat_coords, cell_membership, dist_to_nearest
+            gc.collect()
+            torch.cuda.empty_cache()
+    
+    # =========================================================================
+    # On-the-fly path (large N, no caching)
+    # =========================================================================
+    
+    def _forward_on_the_fly(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+        latent_coords: torch.Tensor,
+        geo_k: int,
+        sigma: float,
+        L_spatial: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        On-the-fly geographic pruning for large token counts.
+        
+        Uses chunked top-k per latent instead of full Voronoi precomputation.
+        No caching — handles variable token counts without memory explosion.
+        
+        Chunks over latents to keep peak memory bounded:
+            peak ≈ chunk_size × N × sizeof(float)
+        """
+        B, N, D = tokens.shape
+        k = min(geo_k, N)
+        L = L_spatial
+        device = tokens.device
+        dtype = tokens.dtype
 
+        print(f"[GeoPruning] On-the-fly: N={N}, L={L}, k={k} ...")  # ADD THIS
+    
+        
+        with torch.no_grad():
+            pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)  # [N, 2]
+            lat_coords = latent_coords[0]  # [L, 2]
+            
+            selected_indices = torch.zeros(L, k, dtype=torch.long, device=device)
+            selected_dist_sq = torch.zeros(L, k, dtype=dtype, device=device)
+            selection_valid = torch.zeros(L, k, dtype=torch.bool, device=device)
+            
+            # Chunk over latents to bound memory at chunk_size × N
+            chunk = max(self.chunk_size, 1)
+            for l_start in range(0, L, chunk):
+                l_end = min(l_start + chunk, L)
+                lat_chunk = lat_coords[l_start:l_end]  # [c, 2]
+                
+                # [c, N] distance matrix
+                diff = pixel_coords.unsqueeze(0) - lat_chunk.unsqueeze(1)  # [c, N, 2]
+                dist_sq = (diff ** 2).sum(dim=-1)  # [c, N]
+                del diff
+                
+                actual_k = min(k, N)
+                
+                # Top-k nearest tokens per latent in this chunk
+                topk_dist, topk_idx = torch.topk(
+                    dist_sq, actual_k, dim=-1, largest=False
+                )
+                del dist_sq
+                
+                selected_indices[l_start:l_end, :actual_k] = topk_idx
+                selected_dist_sq[l_start:l_end, :actual_k] = topk_dist
+                selection_valid[l_start:l_end, :actual_k] = True
+        
+        # Expand to batch dimension
+        selected_indices = selected_indices.unsqueeze(0).expand(B, -1, -1).contiguous()
+        selected_dist_sq = selected_dist_sq.unsqueeze(0).expand(B, -1, -1).contiguous()
+        selection_valid = selection_valid.unsqueeze(0).expand(B, -1, -1).contiguous()
+        
+        # Training: shuffle the k selected tokens per latent for stochastic sampling
+        if self.training:
+            rand_perm = torch.rand(B, L, k, device=device, dtype=dtype)
+            rand_perm = torch.where(
+                selection_valid, rand_perm,
+                torch.tensor(float('-inf'), device=device, dtype=dtype),
+            )
+            _, perm = torch.sort(rand_perm, dim=-1, descending=True)
+            
+            selected_indices = torch.gather(selected_indices, dim=2, index=perm)
+            selected_dist_sq = torch.gather(selected_dist_sq, dim=2, index=perm)
+            selection_valid = torch.gather(selection_valid, dim=2, index=perm)
+        
+        # Safety: clamp indices
+        selected_indices = selected_indices.clamp(0, N - 1)
+        selected_indices = torch.where(
+            selection_valid, selected_indices, torch.zeros_like(selected_indices)
+        )
+        
+        # Gaussian bias with -inf for invalid positions
+        bias = -selected_dist_sq / (2 * (sigma ** 2))
+        bias = torch.where(
+            selection_valid, bias,
+            torch.tensor(float('-inf'), device=device, dtype=dtype),
+        )
+        
+        # Gather tokens and masks
+        tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
+        masks_per_latent = self._gather_masks(mask, selected_indices, N)
+        
+        # Force-mask invalid positions
+        masks_per_latent = masks_per_latent | (~selection_valid)
+
+        print(f"[GeoPruning] On-the-fly done.")  # ADD THIS
+        
+        return tokens_per_latent, masks_per_latent, bias.to(dtype)
+    
+    # =========================================================================
+    # Forward (routes to cached or on-the-fly path)
+    # =========================================================================
+    
     def forward(
         self,
         tokens: torch.Tensor,
         mask: torch.Tensor,
         latent_coords: torch.Tensor,
-        sigma: Optional[float] = None,
-        id_modality: str = "default",
+        geo_k: int,
+        sigma: float,
+        L_spatial: int,
+        hexagonal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            tokens: [B, N, D] input tokens
-            mask: [B, N] boolean mask (True = invalid/masked)
-            latent_coords: [B, L, 2] latent positions in meters
-            sigma: Optional sigma for Gaussian bias
-            id_modality: Modality identifier (unused in dynamic version)
-            
-        Returns:
-            tokens_per_latent: [B, L, k, D] gathered tokens
-            masks_per_latent: [B, L, k] gathered masks
-            bias: [B, L, k] Gaussian spatial bias
-        """
+        
         B, N, D = tokens.shape
-        L = self.num_spatial_latents
-        k = self.geo_k
+        k = geo_k
         device = tokens.device
         dtype = tokens.dtype
-
-        # Handle NaN coordinates
-        if torch.isnan(latent_coords).any():
-            latent_coords = torch.nan_to_num(latent_coords, nan=0.0)
-
-        with torch.no_grad():
-            # =================================================================
-            # 1. GET TOKEN COORDINATES
-            # =================================================================
-            pixel_coords = self.geometry.get_token_centers(tokens)  # [B, N, 2]
-            
-            # =================================================================
-            # 2. COMPUTE VORONOI ASSIGNMENT (Memory-Efficient)
-            # =================================================================
-            # For each token, find its nearest latent
-            # Instead of [B, L, N] distance matrix, compute [B, N] assignments
-            nearest_latent_idx, token_dist_sq = self._compute_voronoi_assignment_chunked(
-                pixel_coords, latent_coords
-            )  # [B, N], [B, N]
-            
-            # =================================================================
-            # 3. BUILD SAMPLING WEIGHTS PER LATENT
-            # =================================================================
-            # Create [B, L, N] sparse-ish weights where tokens in cell have weight 1
-            # Tokens outside cell have small weight (for fallback)
-            selected_indices, selected_dist_sq = self._sample_from_voronoi_cells(
-                nearest_latent_idx, token_dist_sq, pixel_coords, latent_coords, mask, k
-            )  # [B, L, k], [B, L, k]
-            
-            # =================================================================
-            # 4. COMPUTE GAUSSIAN BIAS
-            # =================================================================
-            effective_sigma = sigma if sigma is not None else self.default_sigma
-            selected_bias = -selected_dist_sq / (2 * (effective_sigma ** 2))
-
+        
         # =================================================================
-        # 5. GATHER TOKENS AND MASKS
+        # Route: on-the-fly for large inputs, cached for small
         # =================================================================
-        tokens_per_latent = self._gather_tokens(tokens, selected_indices)
-        masks_per_latent = self._gather_masks(mask, selected_indices)
-
-        return tokens_per_latent, masks_per_latent, selected_bias.to(dtype)
-
-    def _compute_voronoi_assignment_chunked(
+        if N > self.ON_THE_FLY_THRESHOLD:
+            return self._forward_on_the_fly(
+                tokens, mask, latent_coords, geo_k, sigma, L_spatial
+            )
+        
+        # =================================================================
+        # Cached Voronoi path (original logic, for small N)
+        # =================================================================
+        cache_key = self._make_cache_key(N, L_spatial, hexagonal, latent_coords)
+        
+        if cache_key not in self._precomputed_keys:
+            self._precompute_voronoi_cells(tokens, latent_coords, L_spatial, cache_key)
+        
+        # Retrieve cached tensors
+        cell_indices = getattr(self, f"cell_indices_{cache_key}")
+        cell_valid = getattr(self, f"cell_valid_{cache_key}")
+        cell_distances = getattr(self, f"cell_distances_{cache_key}")
+        cell_counts = getattr(self, f"cell_counts_{cache_key}")
+        
+        max_cell_size = cell_indices.shape[1]
+        
+        # =====================================================================
+        # Clamp k to available tokens
+        # =====================================================================
+        k = min(k, max_cell_size)
+        
+        # =====================================================================
+        # Build selection validity mask (ALWAYS, not just when min < k)
+        # This is the key fix: always track which positions are valid
+        # =====================================================================
+        position_indices = torch.arange(k, device=device).unsqueeze(0)      # [1, k]
+        cell_counts_clamped = cell_counts.unsqueeze(1)                       # [L, 1]
+        selection_valid = (position_indices < cell_counts_clamped)            # [L, k]
+        selection_valid = selection_valid.unsqueeze(0).expand(B, -1, -1)     # [B, L, k]
+        
+        # =====================================================================
+        # TENSORIZED SAMPLING
+        # =====================================================================
+        
+        if self.training:
+            rand_scores = torch.rand(B, L_spatial, max_cell_size, device=device, dtype=dtype)
+            valid_expanded = cell_valid.unsqueeze(0).expand(B, -1, -1)
+            rand_scores = torch.where(
+                valid_expanded, rand_scores,
+                torch.tensor(float('-inf'), device=device, dtype=dtype),
+            )
+            
+            _, perm = torch.sort(rand_scores, dim=-1, descending=True)
+            perm_k = perm[:, :, :k]
+            
+            # Clamp to valid buffer range
+            perm_k = perm_k.clamp(0, max(max_cell_size - 1, 0))
+            
+            indices_expanded = cell_indices.unsqueeze(0).expand(B, -1, -1)
+            distances_expanded = cell_distances.unsqueeze(0).expand(B, -1, -1)
+            
+            selected_indices = torch.gather(indices_expanded, dim=2, index=perm_k)
+            selected_dist_sq = torch.gather(distances_expanded, dim=2, index=perm_k)
+        else:
+            selected_indices = cell_indices[:, :k].unsqueeze(0).expand(B, -1, -1).clone()
+            selected_dist_sq = cell_distances[:, :k].unsqueeze(0).expand(B, -1, -1).clone()
+        
+        # =====================================================================
+        # Clamp ALL indices to valid token range [0, N-1]
+        # This is the critical safety net for empty cells
+        # =====================================================================
+        selected_indices = selected_indices.clamp(0, N - 1)
+        
+        # Zero out invalid positions (redundant with clamp but explicit)
+        selected_indices = torch.where(
+            selection_valid, selected_indices, torch.zeros_like(selected_indices)
+        )
+        
+        # =====================================================================
+        # Gaussian bias with -inf for invalid positions
+        # =====================================================================
+        bias = -selected_dist_sq / (2 * (sigma ** 2))
+        bias = torch.where(
+            selection_valid, bias,
+            torch.tensor(float('-inf'), device=device, dtype=dtype),
+        )
+        
+        # =====================================================================
+        # Gather tokens and masks
+        # =====================================================================
+        tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
+        masks_per_latent = self._gather_masks(mask, selected_indices, N)
+        
+        # Force-mask invalid positions
+        masks_per_latent = masks_per_latent | (~selection_valid)
+        
+        return tokens_per_latent, masks_per_latent, bias.to(dtype)
+    
+    # =========================================================================
+    # Gather helpers (with bounds checking)
+    # =========================================================================
+    
+    def _gather_tokens(
         self,
-        pixel_coords: torch.Tensor,  # [B, N, 2]
-        latent_coords: torch.Tensor,  # [B, L, 2]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute nearest latent for each token using chunked computation.
-        
-        Returns:
-            nearest_latent_idx: [B, N] index of nearest latent for each token
-            min_dist_sq: [B, N] squared distance to nearest latent
-        """
-        B, N, _ = pixel_coords.shape
-        L = latent_coords.shape[1]
-        device = pixel_coords.device
-        dtype = pixel_coords.dtype
-        
-        # Pre-allocate outputs
-        nearest_latent_idx = torch.empty(B, N, dtype=torch.long, device=device)
-        min_dist_sq = torch.full((B, N), float('inf'), dtype=dtype, device=device)
-        
-        # Process latents in chunks to avoid [B, N, L] tensor
-        for lat_start in range(0, L, self.chunk_size):
-            lat_end = min(lat_start + self.chunk_size, L)
-            
-            # Latent coords for this chunk: [B, chunk_L, 2]
-            lat_chunk = latent_coords[:, lat_start:lat_end, :]
-            
-            # Compute distances: [B, N, chunk_L]
-            # Using ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a·b
-            pixel_sq = (pixel_coords ** 2).sum(dim=-1, keepdim=True)  # [B, N, 1]
-            lat_sq = (lat_chunk ** 2).sum(dim=-1).unsqueeze(1)  # [B, 1, chunk_L]
-            cross = torch.bmm(pixel_coords, lat_chunk.transpose(1, 2))  # [B, N, chunk_L]
-            
-            chunk_dist_sq = pixel_sq + lat_sq - 2 * cross  # [B, N, chunk_L]
-            
-            # Find minimum in this chunk
-            chunk_min_dist, chunk_min_idx = chunk_dist_sq.min(dim=-1)  # [B, N]
-            
-            # Update global minimum
-            update_mask = chunk_min_dist < min_dist_sq
-            nearest_latent_idx[update_mask] = chunk_min_idx[update_mask] + lat_start
-            min_dist_sq[update_mask] = chunk_min_dist[update_mask]
-            
-            # Free memory
-            del chunk_dist_sq, chunk_min_dist, chunk_min_idx
-        
-        return nearest_latent_idx, min_dist_sq
-
-    def _sample_from_voronoi_cells(
-        self,
-        nearest_latent_idx: torch.Tensor,  # [B, N]
-        token_dist_sq: torch.Tensor,  # [B, N]
-        pixel_coords: torch.Tensor,  # [B, N, 2]
-        latent_coords: torch.Tensor,  # [B, L, 2]
-        mask: torch.Tensor,  # [B, N]
-        k: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample k tokens per latent from Voronoi cells.
-        
-        For latents with fewer than k tokens in their cell,
-        falls back to nearest tokens overall.
-        """
-        B, N = nearest_latent_idx.shape
-        L = self.num_spatial_latents
-        device = nearest_latent_idx.device
-        dtype = pixel_coords.dtype
-        
-        # Pre-allocate outputs
-        selected_indices = torch.empty(B, L, k, dtype=torch.long, device=device)
-        selected_dist_sq = torch.empty(B, L, k, dtype=dtype, device=device)
-        
-        for b in range(B):
-            for l in range(L):
-                # Find tokens assigned to this latent
-                cell_mask = (nearest_latent_idx[b] == l) & (~mask[b])
-                cell_indices = torch.where(cell_mask)[0]
-                n_in_cell = cell_indices.shape[0]
-                
-                if n_in_cell >= k:
-                    # Enough tokens in cell: random sample
-                    perm = torch.randperm(n_in_cell, device=device)[:k]
-                    sampled_indices = cell_indices[perm]
-                    sampled_dist_sq = token_dist_sq[b, sampled_indices]
-                else:
-                    # Not enough tokens: take all from cell + nearest from outside
-                    if n_in_cell > 0:
-                        # Take all tokens from cell
-                        in_cell_indices = cell_indices
-                        in_cell_dist_sq = token_dist_sq[b, in_cell_indices]
-                    else:
-                        in_cell_indices = torch.empty(0, dtype=torch.long, device=device)
-                        in_cell_dist_sq = torch.empty(0, dtype=dtype, device=device)
-                    
-                    # Find nearest tokens from outside cell
-                    n_needed = k - n_in_cell
-                    outside_mask = (~cell_mask) & (~mask[b])
-                    outside_indices = torch.where(outside_mask)[0]
-                    
-                    if outside_indices.shape[0] > 0:
-                        # Compute distance to this latent for outside tokens
-                        lat_pos = latent_coords[b, l]  # [2]
-                        outside_coords = pixel_coords[b, outside_indices]  # [n_outside, 2]
-                        outside_dist_sq = ((outside_coords - lat_pos) ** 2).sum(dim=-1)
-                        
-                        # Take nearest
-                        n_take = min(n_needed, outside_indices.shape[0])
-                        _, topk_idx = torch.topk(outside_dist_sq, k=n_take, largest=False)
-                        outside_sampled = outside_indices[topk_idx]
-                        outside_sampled_dist = outside_dist_sq[topk_idx]
-                    else:
-                        outside_sampled = torch.empty(0, dtype=torch.long, device=device)
-                        outside_sampled_dist = torch.empty(0, dtype=dtype, device=device)
-                    
-                    # Combine
-                    sampled_indices = torch.cat([in_cell_indices, outside_sampled])
-                    sampled_dist_sq = torch.cat([in_cell_dist_sq, outside_sampled_dist])
-                    
-                    # Pad if still not enough (shouldn't happen normally)
-                    if sampled_indices.shape[0] < k:
-                        n_pad = k - sampled_indices.shape[0]
-                        pad_indices = sampled_indices[:1].repeat(n_pad) if sampled_indices.shape[0] > 0 else torch.zeros(n_pad, dtype=torch.long, device=device)
-                        pad_dist = sampled_dist_sq[:1].repeat(n_pad) if sampled_dist_sq.shape[0] > 0 else torch.zeros(n_pad, dtype=dtype, device=device)
-                        sampled_indices = torch.cat([sampled_indices, pad_indices])
-                        sampled_dist_sq = torch.cat([sampled_dist_sq, pad_dist])
-                
-                selected_indices[b, l] = sampled_indices
-                selected_dist_sq[b, l] = sampled_dist_sq
-        
-        return selected_indices, selected_dist_sq
-
-    def _gather_tokens(self, tokens: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        tokens: torch.Tensor,
+        indices: torch.Tensor,
+        N: int,
+    ) -> torch.Tensor:
         B, L, k = indices.shape
         D = tokens.shape[-1]
-        flat_indices = indices.reshape(B, L * k).unsqueeze(-1).expand(-1, -1, D)
-        gathered = torch.gather(tokens, dim=1, index=flat_indices)
-        return gathered.reshape(B, L, k, D)
-
-    def _gather_masks(self, mask: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        B, L, k = indices.shape
+        
+        indices = indices.clamp(0, N - 1)
+        
         flat_indices = indices.reshape(B, L * k)
-        gathered = torch.gather(mask, dim=1, index=flat_indices)
-        return gathered.reshape(B, L, k).bool()
-
-
-def create_geographic_pruning(config: dict, geometry) -> GeographicPruning:
-    atom_cfg = config["Atomiser"]
-    latents_per_row = atom_cfg["spatial_latents"]
+        flat_exp = flat_indices.unsqueeze(-1).expand(-1, -1, D)
+        return torch.gather(tokens, dim=1, index=flat_exp).reshape(B, L, k, D)
     
-    span = atom_cfg.get("latent_surface", 102.4)
-    spacing = span / (latents_per_row - 1)
+    def _gather_masks(
+        self,
+        mask: torch.Tensor,
+        indices: torch.Tensor,
+        N: int,
+    ) -> torch.Tensor:
+        B, L, k = indices.shape
+        
+        indices = indices.clamp(0, N - 1)
+        
+        flat_indices = indices.reshape(B, L * k)
+        return torch.gather(mask, dim=1, index=flat_indices).reshape(B, L, k).bool()
     
-    return GeographicPruning(
-        geometry=geometry,
-        num_spatial_latents=latents_per_row ** 2,
-        geo_k=atom_cfg.get("geo_k", 1500),
-        default_sigma=spacing,
-        chunk_size=atom_cfg.get("geo_pruning_chunk_size", 25),
-    )
-
-def create_geographic_pruning(config: dict, geometry) -> GeographicPruning:
-    atomiser_cfg = config["Atomiser"]
-    spatial_latents_per_row = atomiser_cfg["spatial_latents"]
+    # =========================================================================
+    # Cache management
+    # =========================================================================
     
-    return GeographicPruning(
-        geometry=geometry,
-        num_spatial_latents=spatial_latents_per_row ** 2,
-        geo_k=atomiser_cfg.get("geo_k", 1500),
-        assign_k=atomiser_cfg.get("assign_k", 4), # Added this line
-        default_sigma=atomiser_cfg.get("geo_sigma", 0.5),
-    )
+    def clear_cache(self, cache_key: Optional[str] = None):
+        """Clear precomputed buffers."""
+        keys_to_clear = [cache_key] if cache_key else list(self._precomputed_keys)
+        
+        for key in keys_to_clear:
+            for prefix in ["cell_indices", "cell_valid", "cell_distances", "cell_counts"]:
+                buffer_name = f"{prefix}_{key}"
+                if hasattr(self, buffer_name):
+                    delattr(self, buffer_name)
+            self._precomputed_keys.discard(key)
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    def extra_repr(self) -> str:
+        cached = ", ".join(self._precomputed_keys) if self._precomputed_keys else "none"
+        return (
+            f"chunk_size={self.chunk_size}, "
+            f"on_the_fly_threshold={self.ON_THE_FLY_THRESHOLD}, "
+            f"cached=[{cached}]"
+        )

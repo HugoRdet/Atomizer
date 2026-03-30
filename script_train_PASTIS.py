@@ -1,64 +1,260 @@
 """
-PASTIS-HD Training Script
-=========================
-Uses grouped-token batch format with multi-temporal support:
-    batch = {
-        "groups": {res: {"tokens": [B,N,8], "mask": [B,N], "shape": (C,H,W)}},
-        "queries":      [B, M, 8],
-        "queries_mask":  [B, M],
-        "label":         [B, H, W],
-        "target_resolution": float,
-    }
+PASTIS-HD Training Script — Multi-temporal Crop Segmentation
+==============================================================
+
+Train Atomizer-IO on PASTIS-HD for crop type segmentation.
+  - S2 (10 bands, multi-temporal) — always enabled
+  - S1A (2 bands, multi-temporal) — optional via --use_s1
+  - SPOT6 (3 bands, single frame) — optional via --use_spot
+
+Splits (fold-based):
+  - Train: folds 1, 2, 3
+  - Val:   fold 4
+  - Test:  fold 5
+
+Examples:
+    # S2-only, from scratch
+    python train_pastis.py --xp_name pastis_s2only
+
+    # S2 + S1, last 5 timesteps, from pretrained encoder
+    python train_pastis.py --xp_name pastis_s2s1_last5 \
+        --use_s1 --temporal_last --multi_temporal 5 \
+        --pretrained_encoder ./checkpoints/encoder.pth
+
+    # S2 + S1 + SPOT, full temporal
+    python train_pastis.py --xp_name pastis_full \
+        --use_s1 --use_spot --multi_temporal 10
 """
 
 # =============================================================================
 # IMPORTS
 # =============================================================================
 import os
-import time
 import argparse
 import torch
-import numpy as np
-from collections import defaultdict
-
+import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
-    GradientAccumulationScheduler,
     LearningRateMonitor,
 )
+from torch.utils.data import DataLoader, DistributedSampler
+import torch.distributed as dist
 
 seed_everything(42, workers=True)
 
-# --- Project imports ---
-from training.utils import read_yaml
-from training.utils import Lookup_encoding
-
-# PASTIS classes (grouped token format with temporal dimension)
+from training.utils import read_yaml, Lookup_encoding
 from training.trainer_PASTIS import PASTISTrainer
 from training.utils.datasets.utils_dataset_PASTIS import PastisHDDataset
-from training.utils.datasets.dataloaders import UnifiedDataModule
-from training.utils.datasets.token_grouping import collate_grouped
-from training.utils import measure_flops, measure_inference_time, batch_to_device
+from training.utils.datasets.token_grouping import collate_multitask
+from training.utils.datasets.token_builder import TokenBuilder
+
+
+# =============================================================================
+# KNOWN RESOLUTIONS
+# =============================================================================
+
+ALL_KNOWN_RESOLUTIONS = {
+    1.0: 2048, 2.5: 2048, 10.0: 2048, 20.0: 2048, 30.0: 2048,
+}
+
+
+def register_all_resolutions(lookup_table):
+    for res, ref_size in ALL_KNOWN_RESOLUTIONS.items():
+        TokenBuilder.REFERENCE_SIZES[res] = ref_size
+        lookup_table.get_or_register_modality(res, ref_size)
+        lookup_table.get_resolution_idx(res)
+
+
+# =============================================================================
+# PRETRAINED ENCODER LOADING
+# =============================================================================
+
+def load_pretrained_encoder(model, ckpt_path):
+    print(f"\n{'='*60}")
+    print(f"  Loading pretrained encoder from: {ckpt_path}")
+    print(f"{'='*60}")
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    if "state_dict" in ckpt:
+        full_state = ckpt["state_dict"]
+        encoder_state = {k[len("encoder."):]: v
+                         for k, v in full_state.items() if k.startswith("encoder.")}
+        print(f"  Extracted {len(encoder_state)} encoder keys from Lightning checkpoint")
+    elif "encoder" in ckpt:
+        encoder_state = ckpt["encoder"]
+        print(f"  Loaded {len(encoder_state)} encoder keys from raw checkpoint")
+    else:
+        raise ValueError(f"Checkpoint keys: {list(ckpt.keys())}")
+
+    model_state = model.encoder.state_dict()
+    compatible = {}
+    skipped = []
+    for k, v in encoder_state.items():
+        if k in model_state and v.shape == model_state[k].shape:
+            compatible[k] = v
+        elif k in model_state:
+            skipped.append((k, v.shape, model_state[k].shape))
+
+    result = model.encoder.load_state_dict(compatible, strict=False)
+    print(f"  Loaded: {len(compatible)}, Skipped: {len(skipped)}, "
+          f"Fresh: {len(result.missing_keys) - len(skipped)}")
+    for k, s, d in skipped:
+        print(f"    - {k}: {s} ≠ {d}")
+    print(f"{'='*60}\n")
+    return model
+
+
+# =============================================================================
+# DATAMODULE
+# =============================================================================
+
+class PastisDataModule(pl.LightningDataModule):
+
+    def __init__(
+        self,
+        root_path: str,
+        config_model: dict,
+        look_up,
+        batch_size: int = 4,
+        num_workers: int = 4,
+        use_s1: bool = True,
+        use_spot: bool = True,
+        temporal_last: bool = False,
+    ):
+        super().__init__()
+        self.root_path = root_path
+        self.config_model = config_model
+        self.look_up = look_up
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.use_s1 = use_s1
+        self.use_spot = use_spot
+        self.temporal_last = temporal_last
+
+    def _make_dataset(self, mode: str):
+        return PastisHDDataset(
+            root_path=self.root_path,
+            mode=mode,
+            config_model=self.config_model,
+            look_up=self.look_up,
+            use_s1=self.use_s1,
+            use_spot=self.use_spot,
+            temporal_last=self.temporal_last,
+        )
+
+    def setup(self, stage=None):
+        if hasattr(self, "_setup_done") and self._setup_done:
+            return
+        self._setup_done = True
+
+        self.train_dataset = self._make_dataset("train")
+        self.val_dataset = self._make_dataset("validation")
+        self.test_dataset = self._make_dataset("test")
+
+        modalities = ["S2"]
+        if self.use_s1:
+            modalities.append("S1")
+        if self.use_spot:
+            modalities.append("SPOT")
+
+        print(f"\n[PASTIS-DM] Summary:")
+        print(f"  Modalities: {' + '.join(modalities)}")
+        print(f"  Train: {len(self.train_dataset)} patches (folds 1,2,3)")
+        print(f"  Val:   {len(self.val_dataset)} patches (fold 4)")
+        print(f"  Test:  {len(self.test_dataset)} patches (fold 5)")
+
+    def _make_loader(self, dataset, shuffle=False):
+        sampler = None
+        if dist.is_available() and dist.is_initialized():
+            sampler = DistributedSampler(dataset, shuffle=shuffle)
+        return DataLoader(
+            dataset, batch_size=self.batch_size,
+            shuffle=(shuffle and sampler is None), sampler=sampler,
+            num_workers=self.num_workers, collate_fn=collate_multitask,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+        )
+
+    def train_dataloader(self):
+        return self._make_loader(self.train_dataset, shuffle=True)
+
+    def val_dataloader(self):
+        return self._make_loader(self.val_dataset, shuffle=False)
+
+    def test_dataloader(self):
+        return self._make_loader(self.test_dataset, shuffle=False)
+
+
 # =============================================================================
 # ARGS
 # =============================================================================
-parser = argparse.ArgumentParser(description="PASTIS-HD training script")
-parser.add_argument("--xp_name",       type=str, required=True, help="Experiment name")
-parser.add_argument("--config_model",  type=str, required=True, help="Model config yaml file")
-parser.add_argument("--dataset_name",  type=str, required=True, help="Name of the dataset used")
+parser = argparse.ArgumentParser(description="PASTIS-HD Training")
+parser.add_argument("--xp_name",        type=str, required=True)
+parser.add_argument("--config_model",   type=str,
+                    default="config_test-Atomiser_Atos_One.yaml")
+parser.add_argument("--data_dir",       type=str, default="./data/PASTIS-HD")
+parser.add_argument("--ckpt_path",      type=str, default=None,
+                    help="Resume training from Lightning checkpoint")
+parser.add_argument("--pretrained_encoder", type=str, default=None,
+                    help="Load pretrained encoder weights (no head)")
+parser.add_argument("--num_workers",    type=int, default=4)
+parser.add_argument("--grad_accum",     type=int, default=1)
+
+# Modality toggles
+parser.add_argument("--use_s1",         action="store_true",
+                    help="Enable S1A SAR data (default: S2-only)")
+parser.add_argument("--use_spot",       action="store_true",
+                    help="Enable SPOT6 RGB data (default: S2-only)")
+
+# Temporal config
+parser.add_argument("--multi_temporal", type=int, default=None,
+                    help="Number of temporal frames (overrides config)")
+parser.add_argument("--temporal_last",  action="store_true",
+                    help="Take last N timesteps instead of uniform sampling")
+
 args = parser.parse_args()
 
-xp_name = args.xp_name
+# =============================================================================
+# CONFIG & LOOKUP
+# =============================================================================
 config_model = read_yaml("./training/configs/" + args.config_model)
-configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
-bands_yaml = "./data/bands_info/bands.yaml"
+bands_yaml_path = "./data/bands_info/bands.yaml"
+configs_dataset_path = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 
-# =============================================================================
-# LOOKUP TABLE
-# =============================================================================
-lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
+# Override multi_temporal in config if specified via CLI
+if args.multi_temporal is not None:
+    if "dataset" not in config_model:
+        config_model["dataset"] = {}
+    config_model["dataset"]["multi_temporal"] = args.multi_temporal
+
+lookup_table = Lookup_encoding(
+    read_yaml(configs_dataset_path), read_yaml(bands_yaml_path), config_model)
+register_all_resolutions(lookup_table)
+
+# Register VV-VH SAR channel (not in bands.yaml, needed for S1 3rd band)
+if args.use_s1:
+    lookup_table.register_abstract_channel("VV_VH")
+
+# Build modality description for logging
+modalities = ["S2"]
+if args.use_s1:
+    modalities.append("S1")
+if args.use_spot:
+    modalities.append("SPOT")
+modality_str = "+".join(modalities)
+
+multi_temporal = config_model.get("dataset", {}).get("multi_temporal", 10)
+temporal_str = f"{multi_temporal} frames ({'last' if args.temporal_last else 'uniform'})"
+
+print(f"\n[PASTIS] Experiment:   {args.xp_name}")
+print(f"[PASTIS] Data dir:     {args.data_dir}")
+print(f"[PASTIS] Modalities:   {modality_str}")
+print(f"[PASTIS] Temporal:     {temporal_str}")
 
 # =============================================================================
 # WANDB
@@ -66,221 +262,92 @@ lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml)
 wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
+    pretrain_tag = "pretrained" if args.pretrained_encoder else "scratch"
+    run_name = f"PASTIS_{args.xp_name}_{modality_str}_{pretrain_tag}"
     wandb.init(
-        name=config_model["encoder"],
-        project="PASTIS",
-        config=config_model,
+        name=run_name, project="Atomizer_PASTIS",
+        config={
+            **config_model,
+            "modalities": modalities,
+            "use_s1": args.use_s1,
+            "use_spot": args.use_spot,
+            "temporal_last": args.temporal_last,
+            "multi_temporal": multi_temporal,
+        },
     )
-    wandb_logger = WandbLogger(project="PASTIS")
-    wandb.define_metric("train_loss", step_metric="trainer/global_step")
-    wandb.define_metric("val_loss", step_metric="trainer/global_step")
+    wandb_logger = WandbLogger(project="Atomizer_PASTIS")
+
+# =============================================================================
+# DATA MODULE
+# =============================================================================
+data_module = PastisDataModule(
+    root_path=args.data_dir,
+    config_model=config_model,
+    look_up=lookup_table,
+    batch_size=config_model["dataset"]["batchsize"],
+    num_workers=args.num_workers,
+    use_s1=args.use_s1,
+    use_spot=args.use_spot,
+    temporal_last=args.temporal_last,
+)
+data_module.setup()
+print(f"[PASTIS] Lookup table: {len(lookup_table.table_wave)} entries")
 
 # =============================================================================
 # MODEL
 # =============================================================================
 model = PASTISTrainer(
-    config=config_model,
-    wand=True,
-    name=xp_name,
-    transform=None,
-    lookup_table=lookup_table,
+    config=config_model, wand=True, name=args.xp_name,
+    transform=None, lookup_table=lookup_table,
 )
 
-# =============================================================================
-# DATA MODULE
-# =============================================================================
-data_module = UnifiedDataModule(
-    path="./data/PASTIS-HD",
-    batch_size=config_model["dataset"]["batchsize"],
-    num_workers=4,
-    trans_modalities=None,
-    trans_tokens=None,
-    model=config_model["encoder"],
-    dataset_config=read_yaml(bands_yaml),
-    config_model=config_model,
-    look_up=lookup_table,
-    dataset_class=PastisHDDataset,
-)
+if args.pretrained_encoder:
+    model = load_pretrained_encoder(model, args.pretrained_encoder)
 
 # =============================================================================
-# CALLBACKS
+# CALLBACKS & TRAINER
 # =============================================================================
-lr_monitor = LearningRateMonitor(logging_interval="step")
-accumulator = GradientAccumulationScheduler(scheduling={0: 1})
+ckpt_dir = f"./checkpoints/pastis/"
+os.makedirs(ckpt_dir, exist_ok=True)
 
-checkpoint_val = ModelCheckpoint(
-    dirpath="./checkpoints/",
-    filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_loss:.4f}}",
-    monitor="val_mIoU",
-    mode="max",
-    save_top_k=1,
-    verbose=True,
-)
+callbacks = [
+    ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename=f"pastis_{args.xp_name}-{{epoch:02d}}-{{val_mIoU:.4f}}",
+        monitor="val_mIoU", mode="max",
+        save_top_k=1, verbose=True,
+    ),
+    ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename=f"pastis_{args.xp_name}-last-{{epoch:02d}}",
+        every_n_epochs=1, save_top_k=1, save_last=True, verbose=True,
+    ),
+    LearningRateMonitor(logging_interval="step"),
+]
 
-callbacks = [accumulator, checkpoint_val, lr_monitor]
-
-# =============================================================================
-# TRAINER (multi-GPU for training)
-# =============================================================================
 trainer = Trainer(
-    strategy="ddp_find_unused_parameters_true",
-    devices=-1,
-    max_epochs=config_model["trainer"]["epochs"],
-    accelerator="gpu",
-    precision="bf16-mixed",
-    logger=wandb_logger,
-    log_every_n_steps=5,
-    callbacks=callbacks,
-    default_root_dir="./checkpoints/",
+    strategy=DDPStrategy(find_unused_parameters=True),
+    use_distributed_sampler=False,
+    devices=-1, max_epochs=config_model["trainer"]["epochs"],
+    accelerator="gpu", precision="bf16-mixed",
+    logger=wandb_logger, log_every_n_steps=5,
+    callbacks=callbacks, default_root_dir=ckpt_dir,
+    gradient_clip_val=1.0, accumulate_grad_batches=args.grad_accum,
 )
 
 # =============================================================================
 # TRAIN
 # =============================================================================
-trainer.fit(model, datamodule=data_module)
+print(f"\n{'='*60}")
+print(f"  PASTIS-HD — {modality_str}")
+print(f"  Temporal: {temporal_str}")
+print(f"  Train: folds 1,2,3 → Val: fold 4 → Test: fold 5")
+print(f"{'='*60}\n")
 
+trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
 
-best_ckpt = checkpoint_val.best_model_path
-
-# Kill DDP so single-GPU test doesn't hang
-if torch.distributed.is_initialized():
-    torch.distributed.destroy_process_group()
-
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    test_trainer = Trainer(
-        devices=[0],
-        accelerator="gpu",
-        precision="bf16-mixed",
-        logger=wandb_logger,
-    )
-    test_trainer.test(model, datamodule=data_module, ckpt_path=best_ckpt)
-
-
-# =============================================================================
-# MEASURE COMPLEXITY — PyTorch profiler (single GPU)
-# =============================================================================
-
-def _batch_to_device(batch: dict, device) -> dict:
-    """Recursively move a nested batch dict to device."""
-    out = {}
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = v.to(device)
-        elif isinstance(v, dict):
-            out[k] = _batch_to_device(v, device)
-        else:
-            out[k] = v
-    return out
-
-
-def measure_flops_pytorch(model, batch, device):
-    """Measure FLOPs using torch.profiler (handles ops fvcore misses)."""
-    batch = _batch_to_device(batch, device)
-
-    with torch.no_grad():
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            with_flops=True,
-        ) as prof:
-            _ = model(batch)
-
-    total_flops = 0
-    for event in prof.key_averages():
-        if event.flops is not None and event.flops > 0:
-            total_flops += event.flops
-
-    return total_flops / 1e9  # GFLOPs
-
-
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    print("\n" + "=" * 80)
-    print("MEASURING MODEL COMPLEXITY")
-    print("=" * 80 + "\n")
-
-    data_module.setup("test")
-    test_dataset = data_module.test_dataset
-
-    device = torch.device("cuda:0")
-    model = model.to(device)
-    model.eval()
-
-    num_samples = min(25, len(test_dataset))
-    samples = [test_dataset[i] for i in range(num_samples)]
-
-    results = []
-
-    for input_size in [128]:
-        print(f"\nTesting input size: {input_size}x{input_size}")
-
-        # ── Warmup ──────────────────────────────────────────
-        batch_0 = collate_grouped([samples[0]])
-        batch_0 = _batch_to_device(batch_0, device)
-        with torch.no_grad():
-            _ = model(batch_0)
-
-        # ── FLOPs via PyTorch profiler ──────────────────────
-        batch_1 = collate_grouped([samples[1]])
-        try:
-            gflops = measure_flops_pytorch(model, batch_1, device)
-        except Exception as e:
-            print(f"  FLOPs measurement failed: {e}")
-            gflops = -1
-
-        # ── Inference time ──────────────────────────────────
-        num_warmup, num_runs = 5, 30
-        with torch.no_grad():
-            for i in range(num_warmup):
-                b = collate_grouped([samples[i % num_samples]])
-                b = _batch_to_device(b, device)
-                _ = model(b)
-
-            torch.cuda.synchronize()
-            start = time.time()
-            for i in range(num_runs):
-                idx = (i + num_warmup) % num_samples
-                b = collate_grouped([samples[idx]])
-                b = _batch_to_device(b, device)
-                _ = model(b)
-                torch.cuda.synchronize()
-            end = time.time()
-
-        avg_time_ms = (end - start) / num_runs * 1000
-
-        # ── Token count ─────────────────────────────────────
-        first_res = next(iter(batch_0["groups"]))
-        num_tokens = batch_0["groups"][first_res]["tokens"].shape[1]
-
-        results.append({
-            "input_size": input_size,
-            "gsd_target": 10,
-            "num_tokens": num_tokens,
-            "gflops": gflops,
-            "inference_time_ms": avg_time_ms,
-        })
-
-        print(f"  Tokens: {num_tokens}")
-        print(f"  GFLOPs: {gflops:.2f}")
-        print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
-
-    # ── Summary ─────────────────────────────────────────────
-    print("\n" + "=" * 80)
-    print(f"COMPLEXITY SUMMARY ({config_model['encoder']})")
-    print("=" * 80)
-    print(f"{'Input':<10} {'Tokens':<12} {'GFLOPs':<12} {'Time (ms)':<12}")
-    print("-" * 50)
-    for r in results:
-        print(f"{r['input_size']:<10} {r['num_tokens']:<12} {r['gflops']:<12.2f} {r['inference_time_ms']:<12.2f}")
-    print("=" * 80)
-
-# =============================================================================
-# SAVE WANDB RUN ID
-# =============================================================================
 if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
-    run_id = wandb.run.id
-    print("WANDB_RUN_ID:", run_id)
+    import wandb
     os.makedirs("training/wandb_runs", exist_ok=True)
-    with open(f"training/wandb_runs/{xp_name}.txt", "w") as f:
-        f.write(run_id)
+    with open(f"training/wandb_runs/pastis_{args.xp_name}.txt", "w") as f:
+        f.write(wandb.run.id)

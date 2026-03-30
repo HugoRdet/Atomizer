@@ -15,6 +15,7 @@ fi
 ## === Then load the module and activate your env ===
 conda activate venv
 
+python script_train_Ben.py 
 # Call training script with experiment name used in the arguments
 #sh TrainEval.sh "$EXPERIMENT_NAME" config_test-Atomiser_Atos.yaml regular
 MODEL_NAME=config_test-Atomiser_Atos_One.yaml

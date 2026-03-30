@@ -1,261 +1,126 @@
 """
-Compute per-band, per-modality normalization statistics for FLAIR-HUB.
+Compute per-band normalization stats for BigEarthNet S2.
 
-Iterates over the first N patches (default 10,000) and computes:
-    - mean per band per modality
-    - std per band per modality
-
-Uses Welford's online algorithm to avoid loading everything into memory.
-
-Saves results as a JSON file that can be loaded by the dataset class.
+Computes p2/p98 percentiles per band from a random subset of the training set,
+then saves as JSON for use by the dataset class.
 
 Usage:
-    python compute_flairhub_stats.py \
-        --root ./data/FLAIR-HUB/extracted \
-        --n_samples 10000 \
-        --output ./data/FLAIR-HUB/normalization_stats.json
+    python compute_ben_stats.py
+
+Output:
+    data/Encoded-BigEarthNet/ben_norm_stats.json
 """
 
-import os
 import json
-import argparse
-import re
 import numpy as np
+import torch
+from configilm.extra.DataSets import BENv2_DataSet
 
-try:
-    import rasterio
-except ImportError:
-    raise ImportError("rasterio required: pip install rasterio")
-
-
-# ─── FLAIR-HUB constants ────────────────────────────────────────────────────
-
-MOD_SUFFIXES = {
-    "aerial":  "AERIAL_RGBI",
-    "spot":    "SPOT_RGBI",
-    "s2":      "SENTINEL2_TS",
-    "s1_asc":  "SENTINEL1-ASC_TS",
-    "s1_des":  "SENTINEL1-DESC_TS",
+DATA_DIRS = {
+    "images_lmdb": "data/Encoded-BigEarthNet",
+    "metadata_parquet": "data/Encoded-BigEarthNet/metadata.parquet",
+    "metadata_snow_cloud_parquet": "data/Encoded-BigEarthNet/metadata_for_patches_with_snow_cloud_or_shadow.parquet",
 }
 
-# Number of spectral bands per modality (not counting time)
-N_BANDS = {
-    "aerial":  4,
-    "spot":    4,
-    "s2":      10,
-    "s1_asc":  2,
-    "s1_des":  2,
-}
+OUTPUT_PATH = "data/Encoded-BigEarthNet/ben_norm_stats.json"
 
-CSV_SPLIT_FILES = {
-    "train": "FLAIR-HUB_TRAIN.csv",
-}
+# 10 S2 bands (no 60m bands B01/B09), matching reBEN paper
+# configilm 14-ch layout: [S1_VV, S1_VH, B02, B03, B04, B08, B05, B06, B07, B8A, B11, B12, B01, B09]
+S2_CHANNEL_INDICES = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+S2_BAND_NAMES = ["B02", "B03", "B04", "B08", "B05", "B06", "B07", "B8A", "B11", "B12"]
 
-BAND_NAMES = {
-    "aerial":  ["RED", "GREEN", "BLUE", "NIR"],
-    "spot":    ["RED", "GREEN", "BLUE", "NIR"],
-    "s2":      ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"],
-    "s1_asc":  ["VV", "VH"],
-    "s1_des":  ["VV", "VH"],
-}
-
-
-# ─── Patch discovery ────────────────────────────────────────────────────────
-
-def parse_patch_id(patch_id):
-    match = re.match(r"^(D\d+-\w+?)_(.+)_(\d+-\d+)$", patch_id)
-    if not match:
-        return None
-    return {
-        "patch_id": patch_id,
-        "domain": match.group(1),
-        "roi": match.group(2),
-        "coords": match.group(3),
-    }
-
-
-def load_patches_from_csv(root, max_n=10000):
-    """Load patch list from CSV, searching root and parent dir."""
-    csv_name = CSV_SPLIT_FILES["train"]
-    csv_path = None
-    for d in [root, os.path.dirname(root)]:
-        candidate = os.path.join(d, csv_name)
-        if os.path.exists(candidate):
-            csv_path = candidate
-            break
-
-    if csv_path is None:
-        raise FileNotFoundError(f"Cannot find {csv_name} in {root} or parent")
-
-    import csv
-    patches = []
-    with open(csv_path, "r") as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            pid = row.get("patch_id", "").strip()
-            if not pid:
-                continue
-            info = parse_patch_id(pid)
-            if info is not None:
-                patches.append(info)
-            if len(patches) >= max_n:
-                break
-
-    print(f"Loaded {len(patches)} patches from {csv_path}")
-    return patches
-
-
-def get_modality_path(root, domain, roi, coords, mod):
-    suffix = MOD_SUFFIXES[mod]
-    folder = f"{domain}_{suffix}"
-    filename = f"{domain}_{suffix}_{roi}_{coords}.tif"
-    return os.path.join(root, folder, roi, filename)
-
-
-# ─── Welford online stats ───────────────────────────────────────────────────
-
-class WelfordStats:
-    """Online computation of mean and variance per band."""
-
-    def __init__(self, n_bands):
-        self.n_bands = n_bands
-        self.count = np.zeros(n_bands, dtype=np.float64)
-        self.mean = np.zeros(n_bands, dtype=np.float64)
-        self.M2 = np.zeros(n_bands, dtype=np.float64)
-
-    def update(self, data_per_band):
-        """
-        Update stats with data.
-
-        Args:
-            data_per_band: dict {band_idx: flat_array} or array [C, ...]
-        """
-        if isinstance(data_per_band, np.ndarray):
-            # [C, H, W] or [C, ...] — iterate over first dim
-            for c in range(min(data_per_band.shape[0], self.n_bands)):
-                vals = data_per_band[c].ravel().astype(np.float64)
-                for v in [vals]:  # batch update
-                    n = len(v)
-                    if n == 0:
-                        continue
-                    batch_mean = v.mean()
-                    batch_var = v.var()
-                    batch_count = n
-
-                    delta = batch_mean - self.mean[c]
-                    total_count = self.count[c] + batch_count
-
-                    new_mean = self.mean[c] + delta * batch_count / max(total_count, 1)
-                    m_a = self.M2[c]
-                    m_b = batch_var * batch_count
-                    self.M2[c] = m_a + m_b + delta ** 2 * self.count[c] * batch_count / max(total_count, 1)
-                    self.mean[c] = new_mean
-                    self.count[c] = total_count
-
-    def get_mean(self):
-        return self.mean.tolist()
-
-    def get_std(self):
-        var = np.where(self.count > 1, self.M2 / self.count, 0.0)
-        return np.sqrt(var).tolist()
-
-    def get_count(self):
-        return self.count.tolist()
-
-
-# ─── Main ────────────────────────────────────────────────────────────────────
-
-def compute_stats(root, n_samples=10000):
-    patches = load_patches_from_csv(root, max_n=n_samples)
-
-    # Init per-modality stats
-    stats = {}
-    for mod, nb in N_BANDS.items():
-        stats[mod] = WelfordStats(nb)
-
-    n_processed = 0
-    n_missing = {mod: 0 for mod in N_BANDS}
-
-    for i, patch in enumerate(patches):
-        if i % 500 == 0:
-            print(f"  Processing patch {i}/{len(patches)}...")
-
-        for mod, nb in N_BANDS.items():
-            path = get_modality_path(root, patch["domain"], patch["roi"], patch["coords"], mod)
-
-            if not os.path.exists(path):
-                n_missing[mod] += 1
-                continue
-
-            try:
-                with rasterio.open(path) as f:
-                    data = f.read().astype(np.float64)
-            except Exception as e:
-                print(f"  Warning: failed to read {path}: {e}")
-                n_missing[mod] += 1
-                continue
-
-            # For temporal: [T*C, H, W] → [T, C, H, W] → per-band across all T
-            total_bands = data.shape[0]
-            if total_bands > nb:
-                # Temporal modality
-                T = total_bands // nb
-                data = data[:T * nb].reshape(T, nb, data.shape[1], data.shape[2])
-                # Flatten time into spatial: [C, T*H*W]
-                data = data.transpose(1, 0, 2, 3).reshape(nb, -1)
-
-            stats[mod].update(data)
-
-        n_processed += 1
-
-    print(f"\nProcessed {n_processed} patches")
-    for mod in N_BANDS:
-        print(f"  {mod}: {n_missing[mod]} missing files")
-
-    # Build output
-    result = {}
-    for mod, nb in N_BANDS.items():
-        result[mod] = {
-            "mean": stats[mod].get_mean(),
-            "std": stats[mod].get_std(),
-            "count": stats[mod].get_count(),
-            "band_names": BAND_NAMES[mod],
-            "n_patches": n_processed - n_missing[mod],
-        }
-
-    return result
+N_SAMPLES = 10000  # random subset for stats computation
+SEED = 42
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute FLAIR-HUB normalization stats")
-    parser.add_argument("--root", type=str, default="./data/FLAIR-HUB/extracted",
-                        help="Path to extracted FLAIR-HUB data")
-    parser.add_argument("--n_samples", type=int, default=10000,
-                        help="Number of patches to use")
-    parser.add_argument("--output", type=str, default="./data/FLAIR-HUB/normalization_stats.json",
-                        help="Output JSON file")
-    args = parser.parse_args()
+    print(f"Loading BEN training set...")
+    ds = BENv2_DataSet.BENv2DataSet(
+        data_dirs=DATA_DIRS,
+        split="train",
+        img_size=(14, 120, 120),
+        include_snowy=False,
+        include_cloudy=False,
+    )
+    print(f"Training set: {len(ds)} samples")
 
-    print(f"Computing normalization stats from {args.root}")
-    print(f"Using first {args.n_samples} patches")
-    print()
+    n_bands = len(S2_CHANNEL_INDICES)
+    n_samples = min(N_SAMPLES, len(ds))
 
-    result = compute_stats(args.root, args.n_samples)
+    # Collect per-band values from random subset
+    rng = np.random.RandomState(SEED)
+    indices = rng.choice(len(ds), size=n_samples, replace=False)
 
-    # Pretty print
-    print("\n" + "=" * 60)
-    print("NORMALIZATION STATISTICS")
-    print("=" * 60)
-    for mod, s in result.items():
-        print(f"\n{mod} ({s['n_patches']} patches):")
-        for i, name in enumerate(s["band_names"]):
-            print(f"  {name:8s}: mean={s['mean'][i]:10.3f}  std={s['std'][i]:10.3f}")
+    # Accumulate per-band: we'll store all pixel values and compute percentiles
+    # Each band has 120*120 = 14400 pixels per sample
+    # 10k samples × 14400 = 144M values per band — too much to hold in memory
+    # Instead: use reservoir sampling / streaming percentile via sorted subset
+    # Practical approach: subsample pixels too
+    PIXELS_PER_SAMPLE = 500  # random pixels per sample per band
+    n_total = n_samples * PIXELS_PER_SAMPLE
+
+    print(f"Sampling {n_samples} images × {PIXELS_PER_SAMPLE} pixels = "
+          f"{n_total:,} values per band")
+
+    band_values = {i: np.zeros(n_total, dtype=np.float32) for i in range(n_bands)}
+
+    for count, idx in enumerate(indices):
+        if (count + 1) % 1000 == 0:
+            print(f"  {count+1}/{n_samples}")
+
+        img, _ = ds[int(idx)]  # [14, 120, 120]
+
+        for b_idx, ch_idx in enumerate(S2_CHANNEL_INDICES):
+            band_data = img[ch_idx].numpy().flatten()  # [14400]
+            # Random pixel subsample
+            pix_idx = rng.choice(len(band_data), size=PIXELS_PER_SAMPLE, replace=False)
+            start = count * PIXELS_PER_SAMPLE
+            end = start + PIXELS_PER_SAMPLE
+            band_values[b_idx][start:end] = band_data[pix_idx]
+
+    # Compute percentiles
+    stats = {}
+    print(f"\nPer-band percentile stats:")
+    print(f"  {'Band':<8s} {'p2':>10s} {'p98':>10s} {'median':>10s} {'mean':>10s} {'std':>10s}")
+    print(f"  {'-'*52}")
+
+    for b_idx, (ch_idx, name) in enumerate(zip(S2_CHANNEL_INDICES, S2_BAND_NAMES)):
+        vals = band_values[b_idx]
+        p2 = float(np.percentile(vals, 2))
+        p98 = float(np.percentile(vals, 98))
+        median = float(np.median(vals))
+        mean = float(np.mean(vals))
+        std = float(np.std(vals))
+
+        stats[name] = {
+            "ch_idx": ch_idx,
+            "p2": p2,
+            "p98": p98,
+            "median": median,
+            "mean": mean,
+            "std": std,
+        }
+
+        print(f"  {name:<8s} {p2:>10.2f} {p98:>10.2f} {median:>10.2f} {mean:>10.2f} {std:>10.2f}")
 
     # Save
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump(result, f, indent=2)
-    print(f"\nSaved to {args.output}")
+    output = {
+        "description": "Per-band normalization stats for BigEarthNet S2 (10 bands, no 60m)",
+        "method": "percentile",
+        "percentiles": [2, 98],
+        "n_samples": n_samples,
+        "n_pixels_per_sample": PIXELS_PER_SAMPLE,
+        "bands": stats,
+        # Also save as flat arrays for easy loading
+        "band_names": S2_BAND_NAMES,
+        "band_p2": [stats[n]["p2"] for n in S2_BAND_NAMES],
+        "band_p98": [stats[n]["p98"] for n in S2_BAND_NAMES],
+    }
+
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(output, f, indent=2)
+
+    print(f"\n→ Saved to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

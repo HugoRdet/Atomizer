@@ -164,7 +164,7 @@ class TimeEncoder(nn.Module):
         # ── L2 normalize ────────────────────────────────────
         norm = encoded.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         encoded = encoded / norm
-        
+       
         # ── Zero out N/A tokens (idx < 0) ──────────────────
         if is_na.any():
             encoded[is_na] = 0.0
