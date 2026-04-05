@@ -1,130 +1,206 @@
 """
-UNet Baseline for MDAS Segmentation
-====================================
+UNet — PANGAEA Architecture, Standalone Interface
+===================================================
 
-Standard encoder-decoder UNet with skip connections.
-First conv layer adapts to arbitrary input channel count,
-so the same architecture works for HySpex (368ch) and S2 (12ch).
+Same architecture as PANGAEA benchmark UNet (encoder + decoder),
+but with a simple tensor interface:
 
-Architecture:
-    Encoder: input → 64 → 128 → 256 → 512
-    Decoder: 512 → 256 → 128 → 64 → num_classes
+    model = UNet(in_channels=36, num_classes=2)
+    logits = model(x)  # [B, 36, 256, 256] → [B, 2, 256, 256]
 
-Designed for small crop sizes (14×14 to 64×64).
-Uses padding to preserve spatial dimensions through convolutions.
+No PANGAEA base class dependency. No dict input.
+Topology default: [64, 128, 256, 512, 1024]
 """
+
+from collections import OrderedDict
+from typing import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ConvBlock(nn.Module):
-    """Two 3×3 convolutions with BatchNorm and ReLU."""
+# ═══════════════════════════════════════════════════════════════════════
+# BUILDING BLOCKS (from PANGAEA)
+# ═══════════════════════════════════════════════════════════════════════
+
+class DoubleConv(nn.Module):
+    """(Conv → BN → ReLU) × 2"""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        return self.block(x)
+        return self.conv(x)
+
+
+class InConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = DoubleConv(in_ch, out_ch)
+
+    def forward(self, x):
+        return self.conv(x)
 
 
 class DownBlock(nn.Module):
-    """MaxPool → ConvBlock."""
+    """MaxPool → DoubleConv"""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        self.pool = nn.MaxPool2d(2)
-        self.conv = ConvBlock(in_ch, out_ch)
+        self.mpconv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_ch, out_ch),
+        )
 
     def forward(self, x):
-        x = self.pool(x)
-        return self.conv(x)
+        return self.mpconv(x)
 
 
 class UpBlock(nn.Module):
-    """Upsample → concat skip → ConvBlock."""
+    """ConvTranspose → cat skip → DoubleConv"""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        # in_ch = channels from below + skip channels
-        self.conv = ConvBlock(in_ch, out_ch)
+        self.up = nn.ConvTranspose2d(in_ch // 2, in_ch // 2, 2, stride=2)
+        self.conv = DoubleConv(in_ch, out_ch)
 
-    def forward(self, x, skip):
-        # Upsample x to match skip's spatial size
-        x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, skip], dim=1)
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+
+        # Pad if sizes don't match
+        dy = x2.size(2) - x1.size(2)
+        dx = x2.size(3) - x1.size(3)
+        x1 = F.pad(x1, (dx // 2, dx - dx // 2, dy // 2, dy - dy // 2))
+
+        x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
 
+class OutConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ENCODER
+# ═══════════════════════════════════════════════════════════════════════
+
+class UNetEncoder(nn.Module):
+    """
+    UNet encoder: InConv → Down × (n_levels - 1)
+    Returns list of features [deepest, ..., shallowest]
+    """
+
+    def __init__(self, in_channels: int, topology: Sequence[int]):
+        super().__init__()
+
+        self.in_conv = InConv(in_channels, topology[0])
+
+        down_dict = OrderedDict()
+        n_layers = len(topology)
+        for idx in range(n_layers):
+            is_not_last = idx != n_layers - 1
+            in_dim = topology[idx]
+            out_dim = topology[idx + 1] if is_not_last else topology[idx]
+            down_dict[f"down{idx + 1}"] = DownBlock(in_dim, out_dim)
+
+        self.down_seq = nn.ModuleDict(down_dict)
+
+    def forward(self, x: torch.Tensor) -> list:
+        x = self.in_conv(x)
+        features = [x]
+        for layer in self.down_seq.values():
+            features.append(layer(features[-1]))
+        features.reverse()  # deepest first
+        return features
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DECODER
+# ═══════════════════════════════════════════════════════════════════════
+
+class UNetDecoder(nn.Module):
+    """
+    UNet decoder: Up × (n_levels - 1)
+    Takes feature list [deepest, ..., shallowest]
+    """
+
+    def __init__(self, topology: Sequence[int]):
+        super().__init__()
+
+        n_layers = len(topology)
+
+        # Build upward topology
+        up_topo = [topology[0]]
+        for idx in range(n_layers):
+            is_not_last = idx != n_layers - 1
+            out_dim = topology[idx + 1] if is_not_last else topology[idx]
+            up_topo.append(out_dim)
+
+        up_dict = OrderedDict()
+        for idx in reversed(range(n_layers)):
+            is_not_last = idx != 0
+            x1_idx = idx
+            x2_idx = idx - 1 if is_not_last else idx
+            in_dim = up_topo[x1_idx] * 2
+            out_dim = up_topo[x2_idx]
+            up_dict[f"up{idx + 1}"] = UpBlock(in_dim, out_dim)
+
+        self.up_seq = nn.ModuleDict(up_dict)
+
+    def forward(self, features: list) -> torch.Tensor:
+        x1 = features.pop(0)
+        for idx, layer in enumerate(self.up_seq.values()):
+            x2 = features[idx]
+            x1 = layer(x1, x2)
+        return x1
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FULL UNET
+# ═══════════════════════════════════════════════════════════════════════
+
 class UNet(nn.Module):
     """
-    Standard UNet for semantic segmentation.
+    Full UNet: encoder + decoder + classification head.
 
-    Parameters
-    ----------
-    in_channels : int
-        Number of input channels (e.g. 368 for HySpex, 12 for S2).
-    num_classes : int
-        Number of output classes (default: 6 for MDAS).
-    base_dim : int
-        Base feature dimension (default: 64). Encoder doubles at each stage.
+    Same architecture as PANGAEA benchmark, standalone interface.
+
+    Args:
+        in_channels: input channels (e.g. 36 = 12 bands × 3 timesteps)
+        num_classes: output classes
+        topology: feature dims at each level [64, 128, 256, 512, 1024]
+
+    Input:  [B, in_channels, H, W]
+    Output: [B, num_classes, H, W]
     """
 
     def __init__(
         self,
         in_channels: int,
-        num_classes: int = 6,
-        base_dim: int = 64,
+        num_classes: int,
+        topology: Sequence[int] = (64, 128, 256, 512, 1024),
     ):
         super().__init__()
 
-        d = base_dim  # 64
-
-        # Encoder
-        self.enc1 = ConvBlock(in_channels, d)       # → d
-        self.enc2 = DownBlock(d, d * 2)              # → 2d
-        self.enc3 = DownBlock(d * 2, d * 4)          # → 4d
-        self.enc4 = DownBlock(d * 4, d * 8)          # → 8d (bottleneck)
-
-        # Decoder
-        self.dec3 = UpBlock(d * 8 + d * 4, d * 4)   # 8d up + 4d skip → 4d
-        self.dec2 = UpBlock(d * 4 + d * 2, d * 2)   # 4d up + 2d skip → 2d
-        self.dec1 = UpBlock(d * 2 + d, d)            # 2d up + d skip  → d
-
-        # Head
-        self.head = nn.Conv2d(d, num_classes, 1)
+        self.encoder = UNetEncoder(in_channels, topology)
+        self.decoder = UNetDecoder(topology)
+        self.out_conv = OutConv(topology[0], num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            x: [B, C, H, W] input tensor.
-
-        Returns:
-            logits: [B, num_classes, H, W] — same spatial size as input.
-        """
-        # Encoder
-        e1 = self.enc1(x)   # [B, d, H, W]
-        e2 = self.enc2(e1)  # [B, 2d, H/2, W/2]
-        e3 = self.enc3(e2)  # [B, 4d, H/4, W/4]
-        e4 = self.enc4(e3)  # [B, 8d, H/8, W/8]
-
-        # Decoder
-        d3 = self.dec3(e4, e3)  # [B, 4d, H/4, W/4]
-        d2 = self.dec2(d3, e2)  # [B, 2d, H/2, W/2]
-        d1 = self.dec1(d2, e1)  # [B, d, H, W]
-
-        return self.head(d1)    # [B, num_classes, H, W]
-
-    def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        features = self.encoder(x)
+        x = self.decoder(features)
+        return self.out_conv(x)

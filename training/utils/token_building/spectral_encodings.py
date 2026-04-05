@@ -1,41 +1,8 @@
-"""
-Spectral Encoder — Uniform Gaussians + Linear Projection
-==========================================================
-
-Encodes spectral band identity (wavelength + bandwidth) into a compact
-learned representation.
-
-Architecture:
-    1. Fixed codebook: 256 uniformly spaced Gaussians over 350–2600 nm.
-       Each band's spectral support [λ - Δλ/2, λ + Δλ/2] is integrated
-       against each Gaussian → 256-dim physics vector. L2-normalized.
-
-    2. Abstract channels (SAR, DEM, indices): learned 256-dim embeddings
-       stored as named parameters, treated identically to physics vectors.
-
-    3. Linear projection: 256 → 64. Single linear layer (no nonlinearity)
-       preserves cosine similarity between RBF vectors, enabling
-       generalization to unseen sensor bands.
-
-    4. Forward-time deduplication: spectral indices are highly redundant
-       (e.g., 368 unique bands × 4096 pixels = 1.5M tokens, but only
-       368 unique spectral vectors). We compute the projection on unique
-       indices only, then scatter back.
-
-Key change from previous version:
-    MLP (256→128→GELU→64) replaced with Linear(256→64).
-    Reason: the MLP memorizes training sensor patterns and fails on
-    unseen bands. A linear projection preserves the RBF geometry —
-    if two bands are similar in 256-dim RBF space, they remain similar
-    in 64-dim projected space. This is critical for cross-sensor transfer.
-"""
-
 import math
-from typing import Any, Dict, List, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Any, List, Optional
 
 
 # =============================================================================
@@ -46,20 +13,20 @@ ABSTRACT_CHANNELS = {
     # Sentinel-1 SAR polarizations
     "VV": {"bandwidth": -1, "central_wavelength": -1},
     "VH": {"bandwidth": -2, "central_wavelength": -2},
-
+    
     # Elevation / DEM
     "ELEVATION": {"bandwidth": -10, "central_wavelength": -10},
     "DEM": {"bandwidth": -10, "central_wavelength": -10},
-
+    
     # Slope / Aspect
     "SLOPE": {"bandwidth": -11, "central_wavelength": -11},
     "ASPECT": {"bandwidth": -12, "central_wavelength": -12},
-
+    
     # Indices
     "NDVI": {"bandwidth": -20, "central_wavelength": -20},
     "NDWI": {"bandwidth": -21, "central_wavelength": -21},
     "MNDWI": {"bandwidth": -22, "central_wavelength": -22},
-
+    
     # Generic placeholders
     "ABSTRACT_1": {"bandwidth": -100, "central_wavelength": -100},
     "ABSTRACT_2": {"bandwidth": -101, "central_wavelength": -101},
@@ -67,390 +34,296 @@ ABSTRACT_CHANNELS = {
 }
 
 
-# =============================================================================
-# GAUSSIAN CODEBOOK COMPUTATION
-# =============================================================================
-
-def build_uniform_gaussian_codebook(
-    n_gaussians: int = 512,
-    wl_min: float = 350.0,
-    wl_max: float = 2600.0,
-    n_sample_points: int = 200,
-) -> tuple:
-    """
-    Build uniformly spaced Gaussian anchors for spectral encoding.
-
-    Args:
-        n_gaussians: Number of Gaussian basis functions.
-        wl_min: Lower wavelength bound (nm).
-        wl_max: Upper wavelength bound (nm).
-        n_sample_points: Integration sample count per band.
-
-    Returns:
-        means: [n_gaussians] Gaussian center positions (nm).
-        sigma: float, standard deviation = spacing between centers.
-    """
-    means = torch.linspace(wl_min, wl_max, n_gaussians)
-    sigma = (wl_max - wl_min) / (n_gaussians - 1)  # = spacing
-    return means, sigma
-
-
-def compute_band_encoding(
-    center_wl: float,
-    bandwidth: float,
-    gaussian_means: torch.Tensor,
-    gaussian_sigma: float,
-    n_points: int = 200,
-) -> torch.Tensor:
-    """
-    Compute the spectral encoding for one physical band.
-
-    Integrates the band's spectral response (uniform over [λ-Δλ/2, λ+Δλ/2])
-    against each Gaussian basis function using dense sampling.
-
-    Args:
-        center_wl: Central wavelength (nm).
-        bandwidth: Full bandwidth (nm).
-        gaussian_means: [K] centers of the Gaussians.
-        gaussian_sigma: Shared standard deviation.
-        n_points: Number of integration sample points.
-
-    Returns:
-        encoding: [K] response vector, L2-normalized.
-    """
-    half_bw = bandwidth / 2.0
-    wl_lo = center_wl - half_bw
-    wl_hi = center_wl + half_bw
-
-    # Sample wavelengths across the band's support
-    device = gaussian_means.device
-    t = torch.linspace(0, 1, n_points, device=device)
-    lambdas = wl_lo + (wl_hi - wl_lo) * t  # [n_points]
-    lambdas = lambdas.unsqueeze(1)  # [n_points, 1]
-
-    means = gaussian_means.unsqueeze(0)  # [1, K]
-
-    # Gaussian response: exp(-0.5 * ((λ - μ) / σ)^2)
-    responses = torch.exp(
-        -0.5 * ((lambdas - means) / gaussian_sigma) ** 2
-    )  # [n_points, K]
-
-    # Integrate (mean over sample points ≈ integral / bandwidth)
-    encoding = responses.mean(dim=0)  # [K]
-
-    # L2-normalize
-    norm = encoding.norm(p=2)
-    if norm > 1e-8:
-        encoding = encoding / norm
-
-    return encoding
-
-
-# =============================================================================
-# SPECTRAL ENCODER
-# =============================================================================
-
 class SpectralEncoder(nn.Module):
     """
-    Spectral encoder with uniform Gaussians + linear projection.
-
-    The codebook is fixed (no gradients); the projection is learned.
-    Abstract channels (SAR, DEM, etc.) use learned embeddings of the
-    same raw dimension as the physics codebook, then pass through the
-    same projection.
-
-    Key design choice: single linear layer (no nonlinearity) preserves
-    the cosine similarity structure of the RBF codebook. This enables
-    generalization to unseen sensors whose RBF patterns were never
-    seen during training.
-
-    Forward-time deduplication: only unique spectral indices are
-    processed through the projection; results are scattered back.
+    Spectral encoder using uniform Gaussian basis functions.
+    
+    Physics-based encoding for optical bands:
+        1. Place K Gaussians uniformly from wl_min to wl_max
+        2. For each band (λ, μ), integrate each Gaussian over [λ-μ/2, λ+μ/2]
+        3. L2-normalize the integral vector
+        4. Project to output dimension via learned linear layer
+    
+    This naturally generalizes from narrow hyperspectral bands to unseen
+    broadband configurations: a broad band's encoding is the weighted
+    average of narrow bands' encodings, lying in the convex hull
+    of training encodings.
+    
+    Non-optical modalities (SAR, DEM) use learned embeddings.
+    
+    The physics codebook is precomputed at init and frozen — only the
+    linear projection and abstract embeddings are learned.
     """
-
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        lookup_table: Any,
-    ):
+    
+    def __init__(self, config: Dict[str, Any], lookup_table: Any):
         super().__init__()
         self.config = config
         self.lookup_table = lookup_table
-
-        # ── Gaussian config ─────────────────────────────────────────
-        atom_cfg = config.get("Atomiser", config.get("Atomizer", {}))
-        self.n_gaussians = atom_cfg.get("spectral_n_gaussians", 256)
-        self.wl_min = atom_cfg.get("spectral_wl_min", 350.0)
-        self.wl_max = atom_cfg.get("spectral_wl_max", 2600.0)
-        self.n_sample_points = atom_cfg.get("spectral_n_sample_points", 200)
-
-        # ── Projection config ───────────────────────────────────────
-        self.mlp_hidden = atom_cfg.get("spectral_mlp_hidden", 128)  # unused but kept for compat
-        self.mlp_out = atom_cfg.get("spectral_mlp_out", 64)
-        self.out_dim = self.mlp_out  # External interface
-
-        # ── Raw Gaussian dimension ──────────────────────────────────
+        
+        # ── Gaussian basis config ──────────────────────────────────
+        atomiser_cfg = config.get("Atomiser", {})
+        self.n_gaussians = atomiser_cfg.get("spectral_n_gaussians", 256)
+        self.wl_min = atomiser_cfg.get("spectral_wl_min", 350.0)
+        self.wl_max = atomiser_cfg.get("spectral_wl_max", 2600.0)
+        self.proj_dim = atomiser_cfg.get("spectral_proj_dim", 32)
+        
+        # Raw dimension = n_gaussians (before projection)
         self.raw_dim = self.n_gaussians
-
-        # ── Build Gaussian anchors ──────────────────────────────────
-        gaussian_means, gaussian_sigma = build_uniform_gaussian_codebook(
-            n_gaussians=self.n_gaussians,
-            wl_min=self.wl_min,
-            wl_max=self.wl_max,
-            n_sample_points=self.n_sample_points,
-        )
-        self.register_buffer("gaussian_means", gaussian_means)
-        self.gaussian_sigma = gaussian_sigma
-
-        # ── Build fixed physics codebook ────────────────────────────
+        self.out_dim = self.proj_dim
+        
+        # ── Fixed Gaussian centers and sigma ───────────────────────
+        centers = torch.linspace(self.wl_min, self.wl_max, self.n_gaussians)
+        self.register_buffer("centers", centers)
+        
+        # Sigma = spacing between centers (smooth coverage, no gaps)
+        sigma = (self.wl_max - self.wl_min) / self.n_gaussians
+        self.register_buffer("sigma", torch.tensor(sigma))
+        
+        # ── Learned linear projection ──────────────────────────────
+        # No bias: the L2-normalized input is already centered
+        self.proj = nn.Linear(self.raw_dim, self.out_dim, bias=False)
+        
+        # ── Build physics codebook ─────────────────────────────────
         num_channels = len(lookup_table.table_wave)
-        physics_codebook = torch.zeros(num_channels, self.raw_dim)
-
-        self.abstract_channel_map = {}  # idx → channel_name
+        
+        # Track abstract channels
+        self.abstract_channel_map = {}  # idx -> channel_name
         abstract_indices = []
-
+        
+        # Precompute raw integral vectors for all optical channels
+        raw_vectors = torch.zeros(num_channels, self.raw_dim)
+        
         for (bandwidth, central_wavelength), idx in lookup_table.table_wave.items():
             if bandwidth < 0 or central_wavelength < 0:
                 channel_name = self._identify_abstract_channel(
-                    bandwidth, central_wavelength
-                )
+                    bandwidth, central_wavelength)
                 self.abstract_channel_map[idx] = channel_name
                 abstract_indices.append(idx)
             else:
-                physics_codebook[idx] = compute_band_encoding(
-                    center_wl=float(central_wavelength),
-                    bandwidth=float(bandwidth),
-                    gaussian_means=gaussian_means,
-                    gaussian_sigma=gaussian_sigma,
-                    n_points=self.n_sample_points,
-                )
-
-        self.register_buffer("physics_codebook", physics_codebook)
-
-        # ── Learnable embeddings for abstract channels ──────────────
+                raw_vectors[idx] = self._compute_integral_vector(
+                    float(central_wavelength), float(bandwidth))
+        
+        # Store raw vectors for projection in forward()
+        self.register_buffer("raw_codebook", raw_vectors)
+        
+        # ── Abstract channel embeddings ────────────────────────────
         self._create_named_embeddings(abstract_indices)
-
-        # ── MLP: raw_dim → mlp_hidden → mlp_out ────────────────────
-        self.spectral_mlp = nn.Sequential(
-            nn.Linear(self.raw_dim, self.mlp_out),
-            #nn.GELU(),
-            #nn.Linear(self.mlp_hidden, self.mlp_out),
-        )
-
-        # ── Logging ─────────────────────────────────────────────────
-        n_phys = num_channels - len(abstract_indices)
-        print(f"[SpectralEncoder] {self.n_gaussians} uniform Gaussians "
-              f"over [{self.wl_min}, {self.wl_max}] nm, "
-              f"σ = {gaussian_sigma:.1f} nm")
-        print(f"[SpectralEncoder] MLP: {self.raw_dim} → {self.mlp_hidden} "
-              f"→ {self.mlp_out}")
-        print(f"[SpectralEncoder] Physics channels: {n_phys}, "
-              f"Abstract channels: {len(abstract_indices)}")
+        
+        # ── Info ───────────────────────────────────────────────────
+        n_optical = num_channels - len(abstract_indices)
+        print(f"[SpectralEncoder] Uniform Gaussians: K={self.n_gaussians}, "
+              f"range=[{self.wl_min}, {self.wl_max}]nm, "
+              f"σ={sigma:.1f}nm")
+        print(f"[SpectralEncoder] Projection: {self.raw_dim} → {self.out_dim}")
+        print(f"[SpectralEncoder] Optical channels: {n_optical}, "
+              f"Abstract: {len(abstract_indices)}")
         for idx, name in self.abstract_channel_map.items():
             print(f"[SpectralEncoder]   idx={idx} → {name}")
-
-    # ─────────────────────────────────────────────────────────────────
-    # Abstract channel helpers
-    # ─────────────────────────────────────────────────────────────────
-
-    @staticmethod
+    
+    # =========================================================================
+    # GAUSSIAN INTEGRAL
+    # =========================================================================
+    
+    def _compute_integral_vector(
+        self, central_wavelength: float, bandwidth: float
+    ) -> torch.Tensor:
+        """
+        Compute the integral of each Gaussian basis over the band's
+        spectral support [λ - μ/2, λ + μ/2].
+        
+        Uses the error function for analytical integration:
+            ∫ N(c_i, σ) dλ = 0.5 * [erf((hi - c_i)/(σ√2)) - erf((lo - c_i)/(σ√2))]
+        
+        Returns L2-normalized vector of shape [n_gaussians].
+        """
+        lo = central_wavelength - bandwidth / 2.0
+        hi = central_wavelength + bandwidth / 2.0
+        
+        sigma_val = self.sigma.item()
+        sqrt2_sigma = sigma_val * math.sqrt(2.0)
+        
+        z_lo = (lo - self.centers) / sqrt2_sigma
+        z_hi = (hi - self.centers) / sqrt2_sigma
+        
+        integrals = 0.5 * (torch.erf(z_hi) - torch.erf(z_lo))
+        
+        # L2 normalize
+        norm = integrals.norm(p=2)
+        if norm > 1e-8:
+            integrals = integrals / norm
+        
+        return integrals
+    
+    # =========================================================================
+    # ABSTRACT CHANNELS
+    # =========================================================================
+    
     def _identify_abstract_channel(
-        bandwidth: int, central_wavelength: int,
+        self, bandwidth: int, central_wavelength: int
     ) -> str:
+        """Identify abstract channel type from its lookup key."""
         for name, info in ABSTRACT_CHANNELS.items():
-            if (info["bandwidth"] == bandwidth
-                    and info["central_wavelength"] == central_wavelength):
+            if (info["bandwidth"] == bandwidth and
+                    info["central_wavelength"] == central_wavelength):
                 return name
         return f"ABSTRACT_bw{bandwidth}_wl{central_wavelength}"
-
+    
     def _create_named_embeddings(self, abstract_indices: List[int]):
+        """Create one learned embedding per unique abstract channel type."""
         unique_channels = set(self.abstract_channel_map.values())
-
+        
         if not unique_channels:
             self.named_embeddings = nn.ModuleDict()
             self.name_to_safe_name = {}
             return
-
+        
         self.named_embeddings = nn.ModuleDict()
-
-        for channel_name in sorted(unique_channels):
-            embedding = nn.Parameter(torch.zeros(self.raw_dim))
-            nn.init.trunc_normal_(embedding, std=0.02, a=-2.0, b=2.0)
-
+        
+        for channel_name in unique_channels:
+            # Learned embedding in output space (proj_dim)
+            embedding = nn.Parameter(torch.zeros(self.out_dim))
+            nn.init.trunc_normal_(embedding, std=0.02, a=-2., b=2.)
+            
             safe_name = channel_name.replace(".", "_").replace("-", "_")
-            mod = nn.Module()
-            mod.register_parameter("embedding", embedding)
-            self.named_embeddings[safe_name] = mod
-
+            self.named_embeddings[safe_name] = nn.Module()
+            self.named_embeddings[safe_name].register_parameter(
+                "embedding", embedding)
+        
         self.name_to_safe_name = {
             name: name.replace(".", "_").replace("-", "_")
             for name in unique_channels
         }
-
-    # ─────────────────────────────────────────────────────────────────
-    # Codebook expansion (for newly registered bands at inference time)
-    # ─────────────────────────────────────────────────────────────────
-
-    def _maybe_expand_codebook(self):
-        """
-        If new bands were registered in lookup_table since __init__,
-        expand the physics codebook to cover them.
-        """
-        current_size = self.physics_codebook.shape[0]
-        needed_size = len(self.lookup_table.table_wave)
-
-        if needed_size <= current_size:
-            return
-
-        # Expand
-        extra = torch.zeros(
-            needed_size - current_size,
-            self.raw_dim,
-            device=self.physics_codebook.device,
-        )
-
-        for (bandwidth, central_wavelength), idx in self.lookup_table.table_wave.items():
-            if idx < current_size:
-                continue  # already in codebook
-
-            if bandwidth < 0 or central_wavelength < 0:
-                channel_name = self._identify_abstract_channel(
-                    bandwidth, central_wavelength
-                )
-                self.abstract_channel_map[idx] = channel_name
-                # Will be handled by named_embeddings lookup
-            else:
-                row = compute_band_encoding(
-                    center_wl=float(central_wavelength),
-                    bandwidth=float(bandwidth),
-                    gaussian_means=self.gaussian_means,
-                    gaussian_sigma=self.gaussian_sigma,
-                    n_points=self.n_sample_points,
-                )
-                extra[idx - current_size] = row
-
-        self.physics_codebook = torch.cat(
-            [self.physics_codebook, extra.to(self.physics_codebook.device)],
-            dim=0,
-        )
-
-    # ─────────────────────────────────────────────────────────────────
-    # Forward
-    # ─────────────────────────────────────────────────────────────────
-
+        
+        print(f"[SpectralEncoder] Learned embeddings: "
+              f"{', '.join(sorted(unique_channels))}")
+    
+    # =========================================================================
+    # FORWARD
+    # =========================================================================
+    
     def forward(self, channel_indices: torch.Tensor) -> torch.Tensor:
         """
-        Encode spectral band indices into compact representations.
-
-        Uses deduplication: only unique indices go through the projection.
-
         Args:
-            channel_indices: [*] integer spectral indices (col 3 of tokens)
-
+            channel_indices: [...] integer indices into table_wave
+            
         Returns:
-            embeddings: [*, out_dim] compressed spectral features
+            embeddings: [..., out_dim]
         """
-        self._maybe_expand_codebook()
-
-        original_shape = channel_indices.shape
-        flat_indices = channel_indices.reshape(-1)  # [N]
-
-        # ── Deduplicate ─────────────────────────────────────────────
-        unique_indices, inverse_map = torch.unique(
-            flat_indices, return_inverse=True
-        )
-        # unique_indices: [U], inverse_map: [N] → index into unique
-
-        # ── Build raw embeddings for unique indices only ────────────
-        raw = self.physics_codebook[unique_indices]  # [U, raw_dim]
-
-        # ── Replace abstract channels with learned embeddings ───────
+        # Bounds check
+        max_idx = channel_indices.max().item()
+        min_idx = channel_indices.min().item()
+        codebook_size = self.raw_codebook.shape[0]
+        
+        if max_idx >= codebook_size or min_idx < 0:
+            raise IndexError(
+                f"channel_indices [{min_idx}, {max_idx}] out of bounds "
+                f"for codebook size {codebook_size}")
+        
+        # Look up raw integral vectors [..., n_gaussians]
+        raw = self.raw_codebook[channel_indices]
+        
+        # Project: [..., n_gaussians] → [..., out_dim]
+        orig_shape = raw.shape[:-1]
+        flat = raw.reshape(-1, self.raw_dim)
+        projected = self.proj(flat)
+        embeddings = projected.reshape(*orig_shape, self.out_dim)
+        
+        # Replace abstract channel positions with learned embeddings
         if self.named_embeddings:
-            for idx_val, channel_name in self.abstract_channel_map.items():
-                mask = (unique_indices == idx_val)
+            for idx, channel_name in self.abstract_channel_map.items():
+                mask = (channel_indices == idx)
                 if mask.any():
                     safe_name = self.name_to_safe_name[channel_name]
-                    learned = self.named_embeddings[safe_name].embedding
-                    raw = torch.where(
+                    learned_vec = self.named_embeddings[safe_name].embedding
+                    embeddings = torch.where(
                         mask.unsqueeze(-1),
-                        learned.unsqueeze(0).expand_as(raw),
-                        raw,
+                        learned_vec.expand_as(embeddings),
+                        embeddings,
                     )
-
-        # ── Linear projection (only on U unique vectors) ────────────
-        compressed = self.spectral_mlp(raw)  # [U, out_dim]
-
-        # ── Scatter back to all tokens ──────────────────────────────
-        result = compressed[inverse_map]  # [N, out_dim]
-
-        # ── Reshape to original batch dims ──────────────────────────
-        return result.reshape(*original_shape, self.out_dim)
-
-    # ─────────────────────────────────────────────────────────────────
-    # Accessors (backward compat)
-    # ─────────────────────────────────────────────────────────────────
-
+        
+        return embeddings
+    
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
+    
     def get_embedding(self, channel_name: str) -> Optional[torch.Tensor]:
-        """Get raw learned embedding for an abstract channel (pre-projection)."""
-        if hasattr(self, "name_to_safe_name") and channel_name in self.name_to_safe_name:
+        """Get learned embedding for an abstract channel."""
+        if (hasattr(self, 'name_to_safe_name') and
+                channel_name in self.name_to_safe_name):
             safe_name = self.name_to_safe_name[channel_name]
             return self.named_embeddings[safe_name].embedding
         return None
-
+    
     def set_embedding(self, channel_name: str, values: torch.Tensor):
-        """Set raw learned embedding for an abstract channel."""
-        if hasattr(self, "name_to_safe_name") and channel_name in self.name_to_safe_name:
+        """Set learned embedding for an abstract channel."""
+        if (hasattr(self, 'name_to_safe_name') and
+                channel_name in self.name_to_safe_name):
             safe_name = self.name_to_safe_name[channel_name]
             with torch.no_grad():
                 self.named_embeddings[safe_name].embedding.copy_(values)
+    
+    def encode_band(self, wavelength: float, bandwidth: float) -> torch.Tensor:
+        """
+        Encode a single band on-the-fly (not in codebook).
+        Useful for debugging or novel bands at inference.
+        
+        Returns: [out_dim] tensor on same device as projection weights.
+        """
+        raw = self._compute_integral_vector(wavelength, bandwidth)
+        raw = raw.to(self.proj.weight.device).unsqueeze(0)
+        return self.proj(raw).squeeze(0)
+    
+    def visualize_codebook(self, n_samples: int = 10):
+        """Print a few entries for debugging."""
+        print(f"\n[SpectralEncoder] Codebook samples:")
+        for (bw, wl), idx in list(self.lookup_table.table_wave.items())[:n_samples]:
+            if bw < 0:
+                name = self.abstract_channel_map.get(idx, "?")
+                print(f"  idx={idx:>4d}  ABSTRACT ({name})")
+            else:
+                raw = self.raw_codebook[idx]
+                peak_gauss = raw.argmax().item()
+                peak_wl = self.centers[peak_gauss].item()
+                n_active = (raw > 0.01).sum().item()
+                print(f"  idx={idx:>4d}  λ={wl:>6.0f}nm  Δλ={bw:>4.0f}nm  "
+                      f"peak_basis={peak_gauss} (~{peak_wl:.0f}nm)  "
+                      f"active={n_active}")
 
-    def get_compressed_embedding(self, channel_name: str) -> Optional[torch.Tensor]:
-        """Get the post-projection embedding for an abstract channel."""
-        raw = self.get_embedding(channel_name)
-        if raw is None:
-            return None
-        with torch.no_grad():
-            return self.spectral_mlp(raw.unsqueeze(0)).squeeze(0)
-
-
-# =============================================================================
-# FACTORY
-# =============================================================================
 
 def build_spectral_encoder(
-    config: Dict[str, Any], lookup_table: Any,
+    config: Dict[str, Any], lookup_table: Any
 ) -> SpectralEncoder:
-    """Factory function — drop-in replacement."""
+    """Factory function for spectral encoder."""
     return SpectralEncoder(config, lookup_table)
 
 
 # =============================================================================
-# LOOKUP TABLE HELPERS
+# LOOKUP TABLE HELPER
 # =============================================================================
 
 def register_abstract_channel(lookup_table, channel_name: str) -> int:
     """
     Register an abstract channel in the lookup table.
-
+    
     Args:
-        lookup_table: Lookup object with table_wave dict.
-        channel_name: Must be in ABSTRACT_CHANNELS.
-
+        lookup_table: The lookup table object with table_wave dict
+        channel_name: Name (must be in ABSTRACT_CHANNELS)
+        
     Returns:
-        Assigned index.
+        The assigned index for this channel
     """
     if channel_name not in ABSTRACT_CHANNELS:
         raise ValueError(
             f"Unknown abstract channel: {channel_name}. "
-            f"Known: {list(ABSTRACT_CHANNELS.keys())}"
-        )
-
+            f"Known: {list(ABSTRACT_CHANNELS.keys())}")
+    
     info = ABSTRACT_CHANNELS[channel_name]
     key = (info["bandwidth"], info["central_wavelength"])
-
+    
     if key in lookup_table.table_wave:
         return lookup_table.table_wave[key]
-
+    
     new_idx = len(lookup_table.table_wave)
     lookup_table.table_wave[key] = new_idx
     return new_idx

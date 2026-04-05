@@ -51,6 +51,7 @@ from training.utils.datasets.utils_dataset_PASTIS import PastisHDDataset
 from training.utils.datasets.token_grouping import collate_multitask
 from training.utils.datasets.token_builder import TokenBuilder
 
+from training.trainer_SENFLOOD import Model_SenFlood
 
 # =============================================================================
 # KNOWN RESOLUTIONS
@@ -174,7 +175,7 @@ class PastisDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset, batch_size=self.batch_size,
             shuffle=(shuffle and sampler is None), sampler=sampler,
-            num_workers=self.num_workers, collate_fn=collate_multitask,
+            num_workers=self.num_workers, collate_fn=pastis_collate,  # ← THIS
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
             prefetch_factor=2 if self.num_workers > 0 else None,
@@ -265,7 +266,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     pretrain_tag = "pretrained" if args.pretrained_encoder else "scratch"
     run_name = f"PASTIS_{args.xp_name}_{modality_str}_{pretrain_tag}"
     wandb.init(
-        name=run_name, project="Atomizer_PASTIS",
+        name=run_name, project="PASTIS",
         config={
             **config_model,
             "modalities": modalities,
@@ -275,7 +276,18 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
             "multi_temporal": multi_temporal,
         },
     )
-    wandb_logger = WandbLogger(project="Atomizer_PASTIS")
+    wandb_logger = WandbLogger(project="PASTIS")
+
+def pastis_collate(samples):
+    batch = collate_multitask(samples)
+    if "queries" not in batch and "tasks" in batch:
+        task_data = next(iter(batch["tasks"].values()))
+        batch["queries"] = task_data["queries"]
+        batch["queries_mask"] = task_data["queries_mask"]
+    return batch
+
+# Change 3: in PastisDataModule._make_loader, use pastis_collate
+collate_fn=pastis_collate  # was collate_multitask
 
 # =============================================================================
 # DATA MODULE
@@ -328,11 +340,11 @@ callbacks = [
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
     use_distributed_sampler=False,
-    devices=-1, max_epochs=config_model["trainer"]["epochs"],
+    devices=2, max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu", precision="bf16-mixed",
     logger=wandb_logger, log_every_n_steps=5,
     callbacks=callbacks, default_root_dir=ckpt_dir,
-    gradient_clip_val=1.0, accumulate_grad_batches=args.grad_accum,
+    accumulate_grad_batches=args.grad_accum,
 )
 
 # =============================================================================

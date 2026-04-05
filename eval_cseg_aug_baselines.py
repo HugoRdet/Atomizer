@@ -64,11 +64,11 @@ from training.perceiverIO.perceiver_seg import PerceiverSeg
 from training.senpa_seg.senpa import SenPaSeg
 from training.utils.datasets_baselines.utils_dataset_Cseg import (
     NUM_CLASSES, IGNORE_INDEX, CLASS_NAMES, CHINA_LABEL_REMAP,
+    C2SEG_CLASS_REMAP,
     SENSOR_META_KEY, SENSOR_GSD, AXIS_ORDER, MAT_KEYS,
     MatFileReader,
 )
 from training.utils.datasets_baselines.collate import spectral_interpolate
-
 
 
 # =============================================================================
@@ -96,13 +96,19 @@ def hex_to_rgb(h):
     return [int(h[i:i+2], 16) for i in (0, 2, 4)]
 
 CLASS_COLORS_HEX = {
-    0:  "#1A1A1A", 1:  "#1E90FF", 2:  "#4D4D4D", 3:  "#E60000",
-    4:  "#A020F0", 5:  "#CC6600", 6:  "#FF99CC", 7:  "#FFD700",
-    8:  "#D2B48C", 9:  "#BFFF00", 10: "#006400", 11: "#8DB360",
-    12: "#F5DEB3", 13: "#00CED1",
+    0: "#FFFFFF",  # Background
+    1: "#FF0000",  # Urban Fabric
+    2: "#CC00E6",  # Industrial/Commercial
+    3: "#000000",  # Street Network
+    4: "#A64D00",  # Mine/Dump/Construction
+    5: "#FFAAFF",  # Artif. Vegetated
+    6: "#FFFF00",  # Arable Land
+    7: "#BEFF00",  # Low Vegetation
+    8: "#007800",  # Forests
+    9: "#0000FF",  # Water
 }
 
-CLASS_COLORS = [hex_to_rgb(CLASS_COLORS_HEX[i]) for i in range(14)]
+CLASS_COLORS = [hex_to_rgb(CLASS_COLORS_HEX[i]) for i in range(10)]
 
 
 # =============================================================================
@@ -402,6 +408,12 @@ class BaselineSlidingWindow:
             for raw_val, new_val in CHINA_LABEL_REMAP.items():
                 remapped[full_label == raw_val] = new_val
             full_label = remapped
+
+        # Merge classes (14 → 10)
+        merged = np.full_like(full_label, IGNORE_INDEX)
+        for old_val, new_val in C2SEG_CLASS_REMAP.items():
+            merged[full_label == old_val] = new_val
+        full_label = merged
 
         crop_h = crop_w = self.crop_size
         stride_h = max(1, crop_h // self.stride_divisor)

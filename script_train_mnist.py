@@ -1,160 +1,156 @@
-#%%
 """
-Training script for MNIST Sparse Canvas latent movement experiment.
+MNIST Classification — Training Script
+========================================
+Tests the new multi-res Atomiser on MNIST digit classification.
+Uses new-format dataset (8-column tokens, batch dict output).
 
-Tests whether Perceiver latents can learn to "move" toward sparse signal
-(a single digit on a large black canvas).
+Usage:
+    python train_mnist.py
 """
-from pytorch_lightning.strategies import DDPStrategy
-from training.perceiver import *
-from training.utils import *
-from training.losses import *
-from training.utils.callbacks import *
-from training.VIT import *
-from training.ResNet import *
-from collections import defaultdict
-from training import *
+
 import os
-from sklearn.metrics import average_precision_score
+import torch
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, GradientAccumulationScheduler
-import torch
-import numpy as np
-from torch import nn, einsum
-import torch.nn.functional as F
-import einops as einops
-from einops import rearrange, repeat
-from einops.layers.torch import Reduce
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.callbacks import LearningRateFinder
-import matplotlib.pyplot as plt
-import argparse
-
-# Import MNIST-specific components
-from training.utils.datasets import MNISTSparseCanvas,EMNISTSparseCanvas, UnifiedDataModule
-from training.utils.callbacks import *
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    GradientAccumulationScheduler,
+    LearningRateMonitor,
+)
+from torch.utils.data import DataLoader
 
 seed_everything(42, workers=True)
 
+from training.utils import read_yaml, Lookup_encoding
+from training.trainer_MNIST import Model_MNIST
+from training.utils.datasets.utils_dataset_MNIST import MNISTSparseCanvas
+from training.utils.datasets.token_builder import TokenBuilder
+
+
 # =============================================================================
-# Configuration
+# COLLATE
 # =============================================================================
 
-xp_name = "mnist_latent_movement"
+def mnist_collate(samples):
+    """
+    Collate MNIST dict samples into a batched dict.
 
-# Load base config and modify for MNIST experiment
+    Each sample:
+        {"groups": {0.2: {"tokens": [N,8], "mask": [N], "shape": (H,W)}},
+         "queries": [M,8], "queries_mask": [M], "label": scalar}
+
+    Batched output:
+        {"groups": {0.2: {"tokens": [B,N,8], "mask": [B,N], "shape": (H,W)}},
+         "queries": [B,M,8], "queries_mask": [B,M], "label": [B]}
+    """
+    # Get all resolution keys
+    all_res = sorted(samples[0]["groups"].keys())
+
+    # Stack groups
+    groups = {}
+    for res in all_res:
+        groups[res] = {
+            "tokens": torch.stack([s["groups"][res]["tokens"] for s in samples]),
+            "mask": torch.stack([s["groups"][res]["mask"] for s in samples]),
+            "shape": samples[0]["groups"][res]["shape"],
+        }
+
+    return {
+        "groups": groups,
+        "queries": torch.stack([s["queries"] for s in samples]),
+        "queries_mask": torch.stack([s["queries_mask"] for s in samples]),
+        "label": torch.stack([s["label"] for s in samples]),
+    }
+
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+xp_name = "mnist_classification"
+
 config_model = read_yaml("./training/configs/config_test-Atomiser_Atos_One.yaml")
 
-# Override config for MNIST experiment
-config_model["trainer"]["max_tokens"] = 262144  # 512*512
-config_model["trainer"]["max_tokens_reconstruction"] = 65536  # 256*256 queries
+# MNIST overrides
+config_model["trainer"]["max_tokens"] = 784
+config_model["trainer"]["max_tokens_reconstruction"] = 784
 
-# Debug/visualization config
-config_model["debug"] = {
-    "viz_every_n_epochs": 5,
-    "idxs_to_viz": [0, 1, 2, 3],  # Visualize first 4 samples
-}
-
-# MNIST-specific dataset config
-mnist_config = {
-    "canvas_size": 64,
-    "min_digit_size": 64,
-    "max_digit_size": 64,
-    "num_samples_train": 10000,  # Use subset for faster iteration
-    "num_samples_val": 1000,
-    "fixed_position": False,  # Random position (set True for ablation)
-}
+# Latent grid: 1 latent per token → 784 latents (28×28)
+if "latent_grid" not in config_model:
+    config_model["latent_grid"] = {}
+config_model["latent_grid"]["tokens_per_latent"] = 784
+config_model["latent_grid"]["sigma_factor"] = 1.5
+config_model["latent_grid"]["max_k"] = 784
 
 # =============================================================================
-# Lookup table (simplified for MNIST - single band)
+# LOOKUP TABLE
 # =============================================================================
 
-# For MNIST, we use a simplified lookup or None
-# The dataset handles coordinate encoding internally
-lookup_table = None
-
-# If you need wavelength lookup for compatibility:
 bands_yaml = "./data/bands_info/bands.yaml"
 configs_dataset = "./data/Tiny_BigEarthNet/configs_dataset_regular.yaml"
-lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
+lookup_table = Lookup_encoding(
+    read_yaml(configs_dataset), read_yaml(bands_yaml), config_model
+)
+
+# Register MNIST resolution (0.2 m/px, 28×28 canvas)
+TokenBuilder.REFERENCE_SIZES[0.2] = 28
+lookup_table.get_or_register_modality(0.2, 28)
+lookup_table.get_resolution_idx(0.2)
 
 # =============================================================================
-# Wandb Logger
+# WANDB
 # =============================================================================
 
 wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
-    wandb.init(
-        name=xp_name,
-        project="MNIST_latent_movement",
-        config={
-            **config_model,
-            "mnist_config": mnist_config,
-        }
-    )
-    wandb_logger = WandbLogger(project="MNIST_latent_movement")
+    wandb.init(name=xp_name, project="MNIST_classification", config=config_model)
+    wandb_logger = WandbLogger(project="MNIST_classification")
 
 # =============================================================================
-# Model
+# DATASETS
 # =============================================================================
 
-# Transformation config (simplified for MNIST)
-test_conf = None  # MNIST dataset handles its own tokenization
+train_dataset = MNISTSparseCanvas(
+    mode="train", config_model=config_model, look_up=lookup_table,
+)
+val_dataset = MNISTSparseCanvas(
+    mode="val", config_model=config_model, look_up=lookup_table,
+)
+
+batch_size = config_model["dataset"]["batchsize"]
+
+train_loader = DataLoader(
+    train_dataset, batch_size=batch_size, shuffle=True,
+    num_workers=4, collate_fn=mnist_collate, pin_memory=True,
+)
+val_loader = DataLoader(
+    val_dataset, batch_size=batch_size, shuffle=False,
+    num_workers=4, collate_fn=mnist_collate, pin_memory=True,
+)
+
+# =============================================================================
+# MODEL
+# =============================================================================
 
 model = Model_MNIST(
-    config_model,
-    wand=True,
-    name=xp_name,
-    transform=test_conf,
-    lookup_table=lookup_table
+    config=config_model, wand=True, name=xp_name,
+    transform=None, lookup_table=lookup_table,
 )
 
-
-#model= Diagnostic_MLP(config=config_model)
-
 # =============================================================================
-# Data Module
+# CALLBACKS & TRAINER
 # =============================================================================
 
-data_module = UnifiedDataModule(
-    dataset_class=MNISTSparseCanvas,
-    config_model=config_model,
-    look_up=lookup_table,
-    batch_size=config_model["dataset"]["batchsize"],
-    num_workers=4,  # MNIST doesn't need many workers
-    # MNIST-specific params
-)
-
-
-
-# =============================================================================
-# Callbacks
-# =============================================================================
-
-# MNIST visualization callback (reconstruction + trajectory)
-
-# Learning rate monitor
-lr_monitor = LearningRateMonitor(logging_interval="step")
-
-# Checkpoint callback
-checkpoint_callback = ModelCheckpoint(
-    dirpath="./checkpoints/mnist/",
-    filename=f"{xp_name}-{{epoch:02d}}-{{val_loss:.4f}}",
-    monitor="val_loss",
-    mode="min",
-    save_top_k=1,
-    verbose=True,
-)
-
-# Gradient accumulation (optional)
-accumulator = GradientAccumulationScheduler(scheduling={0: 1})
-
-token_sel=TokenAssignmentVisualizationCallbackMNIST(config=config_model)
-# =============================================================================
-# Trainer
-# =============================================================================
+callbacks = [
+    LearningRateMonitor(logging_interval="step"),
+    GradientAccumulationScheduler(scheduling={0: 1}),
+    ModelCheckpoint(
+        dirpath="./checkpoints/mnist/",
+        filename=f"{xp_name}-{{epoch:02d}}-{{val_loss:.4f}}",
+        monitor="val_loss", mode="min", save_top_k=1, verbose=True,
+    ),
+]
 
 trainer = Trainer(
     accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -163,56 +159,37 @@ trainer = Trainer(
     logger=wandb_logger,
     strategy="ddp_find_unused_parameters_true",
     max_epochs=config_model["trainer"]["epochs"],
-    callbacks=[
-        token_sel,
-        lr_monitor,
-        checkpoint_callback,
-        accumulator,
-    ],
+    callbacks=callbacks,
     enable_checkpointing=True,
-    enable_model_summary=True,
     log_every_n_steps=10,
-    val_check_interval=1.0,  # Validate every epoch
-    # Debugging options (uncomment for quick testing)
-    # fast_dev_run=True,
-    #limit_train_batches=1,
-    #limit_val_batches=1,
 )
 
 # =============================================================================
-# Training
+# TRAIN
 # =============================================================================
 
 print("=" * 60)
-print("MNIST Sparse Canvas - Latent Movement Experiment")
+print("MNIST Classification — New Atomiser (RoPE test)")
 print("=" * 60)
-print(f"Canvas size: {mnist_config['canvas_size']}x{mnist_config['canvas_size']}")
-print(f"Digit size range: {mnist_config['min_digit_size']}-{mnist_config['max_digit_size']}")
-print(f"Number of latents: {config_model['Atomiser']['spatial_latents']**2}")
-print(f"Train samples: {mnist_config['num_samples_train']}")
-print(f"Val samples: {mnist_config['num_samples_val']}")
-print(f"Batch size: {config_model['dataset']['batchsize']}")
+print(f"  Canvas:  28×28, 1 band")
+print(f"  Tokens:  784")
+print(f"  tokens_per_latent: {config_model['latent_grid']['tokens_per_latent']}")
+print(f"  Latents: ~784 (1:1 mapping)")
+print(f"  max_k:   {config_model['latent_grid']['max_k']}")
+print(f"  Batch:   {batch_size}")
+print(f"  Epochs:  {config_model['trainer']['epochs']}")
 print("=" * 60)
 
-# Fit the model
-trainer.fit(model, datamodule=data_module)
+trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 # =============================================================================
-# Save run info
+# SAVE RUN ID
 # =============================================================================
 
 if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
     run_id = wandb.run.id
-    print(f"WANDB_RUN_ID: {run_id}")
     os.makedirs("training/wandb_runs", exist_ok=True)
     with open(f"training/wandb_runs/{xp_name}.txt", "w") as f:
         f.write(run_id)
-    
-    # Log final summary
-    wandb.log({
-        "experiment/canvas_size": mnist_config["canvas_size"],
-        "experiment/num_latents": config_model["Atomiser"]["spatial_latents"] ** 2,
-        "experiment/digit_size_range": f"{mnist_config['min_digit_size']}-{mnist_config['max_digit_size']}",
-    })
 
 print("Training complete!")

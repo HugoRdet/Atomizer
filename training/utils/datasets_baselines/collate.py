@@ -67,11 +67,12 @@ def get_collate_fn(modalities: List[str]) -> Callable:
     Standard PANGAEA collate. All samples must have the same shape.
 
     Handles optional temporal padding for time-series data.
+    Passes through dates if present (for temporal models like LTAE).
     """
     def collate_fn(batch):
         _pad_temporal(batch, modalities)
 
-        return {
+        result = {
             "image": {
                 modality: torch.stack([x["image"][modality] for x in batch])
                 for modality in modalities
@@ -79,6 +80,16 @@ def get_collate_fn(modalities: List[str]) -> Callable:
             "target": torch.stack([x["target"] for x in batch]),
             "metadata": [sample["metadata"] for sample in batch],
         }
+
+        # Pass through dates if present (for LTAE temporal models)
+        if "dates" in batch[0]:
+            result["dates"] = {
+                modality: torch.stack([x["dates"][modality] for x in batch])
+                for modality in modalities
+                if modality in batch[0]["dates"]
+            }
+
+        return result
 
     return collate_fn
 

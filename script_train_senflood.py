@@ -44,8 +44,6 @@ from training.utils.datasets.utils_dataset_SENFLOOD_MULTIRES import Sen1Floods11
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.token_grouping import collate_grouped
 
-# U-Net fallback (unchanged)
-from training.unet.model_unet_senflood import Model_UNet_SenFlood
 from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSenFlood
 from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCallback
 
@@ -63,7 +61,6 @@ config_model = read_yaml("./training/configs/" + args.config_model)
 configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
 bands_yaml = "./data/bands_info/bands.yaml"
 
-is_unet = config_model["encoder"] == "UNET"
 
 # =============================================================================
 # LOOKUP TABLE
@@ -88,32 +85,30 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # =============================================================================
 # MODEL
 # =============================================================================
+is_unet=False
 if is_unet:
-    model = Model_UNet_SenFlood(
+    pass
+    
+else:
+    model = Model_SenFlood(
         config=config_model,
         wand=True,
         name=xp_name,
+        transform=None,           # encoder creates its own TokenProcessor
+        lookup_table=lookup_table,
     )
-else:
-    #model = Model_SenFlood(
+
+    #checkpoint_path = "./checkpoints/ATOMIZER_recon-val_mIoU-epoch=16-val_avg_mIoU=0.4233.ckpt"
+    # Option 1: Load checkpoint with strict=False (recommended)
+    #model = Model_SenFlood.load_from_checkpoint(
+    #    checkpoint_path,
+    #    strict=False,  # Allow missing keys (displacement MLP is new)
     #    config=config_model,
     #    wand=True,
     #    name=xp_name,
-    #    transform=None,           # encoder creates its own TokenProcessor
-    #    lookup_table=lookup_table,
+    #    transform=None,
+    #    lookup_table=lookup_table
     #)
-
-    checkpoint_path = "./checkpoints/ATOMIZER_recon-val_mIoU-epoch=16-val_avg_mIoU=0.4233.ckpt"
-    # Option 1: Load checkpoint with strict=False (recommended)
-    model = Model_SenFlood.load_from_checkpoint(
-        checkpoint_path,
-        strict=False,  # Allow missing keys (displacement MLP is new)
-        config=config_model,
-        wand=True,
-        name=xp_name,
-        transform=None,
-        lookup_table=lookup_table
-    )
 
 # =============================================================================
 # DATA MODULE
@@ -175,6 +170,7 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
+    gradient_clip_val=1.0
 )
 
 # =============================================================================

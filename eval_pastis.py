@@ -51,17 +51,28 @@ except ImportError:
 
 from training.utils import read_yaml, Lookup_encoding
 from training.trainer_PASTIS import PASTISTrainer
+from training.trainer_SENFLOOD import Model_SenFlood
 from training.utils.datasets.utils_dataset_PASTIS import PastisHDDataset
 from training.utils.datasets.token_grouping import collate_multitask
 from training.utils.datasets.token_builder import TokenBuilder
+
+
+def pastis_collate(samples):
+    """Collate that unwraps tasks dict to flat queries for model compatibility."""
+    batch = collate_multitask(samples)
+    if "queries" not in batch and "tasks" in batch:
+        task_data = next(iter(batch["tasks"].values()))
+        batch["queries"] = task_data["queries"]
+        batch["queries_mask"] = task_data["queries_mask"]
+    return batch
 
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
 
-NUM_CLASSES = 20
-IGNORE_INDEX = 19   # Class 19 = "Void Label" (PANGAEA convention)
+NUM_CLASSES = 19
+IGNORE_INDEX = 255
 TASK_NAME = "pastis_segmentation"
 
 CLASS_NAMES = {
@@ -84,7 +95,6 @@ CLASS_NAMES = {
     16: "Orchard",
     17: "Mixed Cereal",
     18: "Sorghum",
-    19: "Void Label",
 }
 
 # Colors for 19 classes (0..18)
@@ -233,7 +243,7 @@ def run_inference(model, dataset, device, max_viz=8):
         label = sample["label"]  # [H, W]
         H, W = sample["image_shape"]
 
-        batch = collate_multitask([sample])
+        batch = pastis_collate([sample])
         batch = _batch_to_device(batch, device)
 
         with torch.no_grad():
@@ -277,11 +287,9 @@ def compute_metrics(all_preds, all_labels):
     """
     Compute mIoU, mF1, OA, per-class IoU/F1 across all patches.
 
-    PANGAEA-compatible:
-      - All classes (0-18) included in mIoU average
-      - Absent classes get IoU = 0 (drags mean down, matching torchmetrics macro)
-      - Only ignore_index (255) pixels are skipped
-      - Also reports "present-only" mIoU for reference
+    mIoU is computed over CROP CLASSES ONLY (1-18), excluding background (0).
+    This matches the standard PASTIS benchmark convention.
+    Also reports mIoU_all (including background) for reference.
     """
     pred_all = np.concatenate(all_preds)
     label_all = np.concatenate(all_labels)
@@ -294,10 +302,9 @@ def compute_metrics(all_preds, all_labels):
     overall_acc = float((pred_valid == label_valid).sum() / max(len(label_valid), 1))
 
     per_class = {}
-    all_ious = []        # all classes (PANGAEA convention)
-    present_ious = []    # only present classes (for reference)
-    all_f1s = []
-    present_f1s = []
+    crop_ious = []       # classes 1-18 only (for mIoU)
+    crop_f1s = []
+    all_ious = []        # all classes including background (for reference)
 
     for cls_id in range(NUM_CLASSES):
         pred_cls = pred_valid == cls_id
@@ -327,23 +334,19 @@ def compute_metrics(all_preds, all_labels):
             "in_test": support > 0,
         }
 
-        # PANGAEA: all classes contribute (absent → IoU=0)
         all_ious.append(iou)
-        all_f1s.append(f1)
 
-        # Present-only: for reference
-        if support > 0:
-            present_ious.append(iou)
-            present_f1s.append(f1)
+        # Crop classes only (exclude background 0)
+        if cls_id >= 1:
+            crop_ious.append(iou)
+            crop_f1s.append(f1)
 
     return {
-        "mIoU": float(np.mean(all_ious)) if all_ious else 0.0,
-        "mF1": float(np.mean(all_f1s)) if all_f1s else 0.0,
-        "mIoU_present": float(np.mean(present_ious)) if present_ious else 0.0,
-        "mF1_present": float(np.mean(present_f1s)) if present_f1s else 0.0,
+        "mIoU": float(np.mean(crop_ious)) if crop_ious else 0.0,
+        "mF1": float(np.mean(crop_f1s)) if crop_f1s else 0.0,
+        "mIoU_all": float(np.mean(all_ious)) if all_ious else 0.0,
         "overall_accuracy": overall_acc,
-        "n_classes_evaluated": len(all_ious),
-        "n_classes_present": len(present_ious),
+        "n_crop_classes": len(crop_ious),
         "n_classes_total": NUM_CLASSES,
         "per_class": per_class,
         "n_valid_pixels": int(valid.sum()),
@@ -466,7 +469,7 @@ def plot_per_class_iou(metrics, output_path, title="Per-Class IoU"):
     ax.set_xticks(range(n))
     ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
     ax.set_title(f"{title}  (mIoU={metrics['mIoU']:.4f}, mF1={metrics['mF1']:.4f}, "
-                 f"{metrics['n_classes_evaluated']} classes)", fontsize=13)
+                 f"{metrics['n_crop_classes']} classes)", fontsize=13)
     ax.axhline(y=metrics["mIoU"], color="red", linestyle="--", linewidth=1.5,
                label=f"mIoU = {metrics['mIoU']:.4f}")
     ax.legend(fontsize=10)
@@ -545,6 +548,11 @@ def main():
     parser.add_argument("--multi_temporal", type=int, default=None)
     parser.add_argument("--temporal_last", action="store_true")
 
+    # Trainer type (must match training)
+    parser.add_argument("--trainer",       type=str, default="senflood",
+                        choices=["senflood", "pastis"],
+                        help="Which trainer was used for training (default: senflood)")
+
     # Viz
     parser.add_argument("--max_viz",       type=int, default=8,
                         help="Max number of sample patches to visualize")
@@ -608,10 +616,16 @@ def main():
     ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
     ckpt_state = ckpt.get("state_dict", ckpt)
 
-    model = PASTISTrainer(
-        config=config_model, wand=False, name="eval",
-        transform=None, lookup_table=lookup_table,
-    )
+    if args.trainer == "senflood":
+        model = Model_SenFlood(
+            config=config_model, wand=False, name="eval",
+            transform=None, lookup_table=lookup_table,
+        )
+    else:
+        model = PASTISTrainer(
+            config=config_model, wand=False, name="eval",
+            transform=None, lookup_table=lookup_table,
+        )
     align_model_to_checkpoint(model, ckpt_state)
 
     if "state_dict" in ckpt:
@@ -632,10 +646,10 @@ def main():
     metrics = compute_metrics(result["all_preds"], result["all_labels"])
 
     print(f"\n  ┌─────────────────────────────────────────────┐")
-    print(f"  │  mIoU:          {metrics['mIoU']:>7.4f}  "
-          f"({metrics['n_classes_evaluated']} classes, PANGAEA)  │")
-    print(f"  │  mIoU (present): {metrics['mIoU_present']:>7.4f}  "
-          f"({metrics['n_classes_present']} classes)         │")
+    print(f"  │  mIoU (crops):  {metrics['mIoU']:>7.4f}  "
+          f"({metrics['n_crop_classes']} crop classes)       │")
+    print(f"  │  mIoU (all):    {metrics['mIoU_all']:>7.4f}  "
+          f"({metrics['n_classes_total']} classes incl. BG)  │")
     print(f"  │  mF1:           {metrics['mF1']:>7.4f}                          │")
     print(f"  │  OA:            {metrics['overall_accuracy']:>7.4f}                          │")
     print(f"  └─────────────────────────────────────────────┘")

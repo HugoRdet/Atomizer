@@ -82,31 +82,18 @@ class PASTISTrainer(pl.LightningModule):
 
         # =================================================================
         # METRICS
+        # Per-class IoU/Acc — mIoU computed over classes 1-18 only
+        # (excluding background class 0, matching PASTIS benchmark papers)
         # =================================================================
-        self.metric_IoU_train = torchmetrics.JaccardIndex(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_IoU_val = torchmetrics.JaccardIndex(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_IoU_test = torchmetrics.JaccardIndex(
-            task="multiclass", num_classes=self.num_classes,
-            average=None, ignore_index=self.ignore_index,
-        )
-        self.metric_acc_train = torchmetrics.Accuracy(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_acc_val = torchmetrics.Accuracy(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_acc_test = torchmetrics.Accuracy(
-            task="multiclass", num_classes=self.num_classes,
-            average=None, ignore_index=self.ignore_index,
-        )
+        for split in ("train", "val", "test"):
+            setattr(self, f"metric_IoU_{split}", torchmetrics.JaccardIndex(
+                task="multiclass", num_classes=self.num_classes,
+                average=None, ignore_index=self.ignore_index,
+            ))
+            setattr(self, f"metric_acc_{split}", torchmetrics.Accuracy(
+                task="multiclass", num_classes=self.num_classes,
+                average=None, ignore_index=self.ignore_index,
+            ))
 
         # =================================================================
         # MODEL
@@ -145,36 +132,20 @@ class PASTISTrainer(pl.LightningModule):
             self.stable_depth = config["Atomiser"].get("stable_depth", 0)
 
     # =====================================================================
-    # BATCH UNWRAPPING
-    # =====================================================================
-
-    def _unwrap_batch(self, batch):
-        """
-        Unwrap tasks dict back to flat format for the encoder.
-
-        New format: batch["tasks"]["pastis_segmentation"]["queries"]
-        Old format: batch["queries"]
-
-        The encoder expects flat format. This method converts new → old
-        if needed, and returns the batch in-place (no copy).
-        """
-        if "queries" not in batch and "tasks" in batch:
-            task_data = batch["tasks"].get(TASK_NAME, {})
-            batch["queries"] = task_data.get("queries", None)
-            batch["queries_mask"] = task_data.get("queries_mask", None)
-        return batch
-
-    # =====================================================================
     # FORWARD
     # =====================================================================
 
     def forward(self, batch, training=False, return_trajectory=False,
                 return_predicted_errors=False):
-        """Forward pass — delegates entirely to encoder."""
-        batch = self._unwrap_batch(batch)
+        """Forward pass — delegates entirely to encoder.
+        
+        The encoder accepts batch dicts directly and unpacks
+        groups/tasks internally.
+        """
         return self.encoder(
             batch,
             training=training,
+            task="reconstruction",
             return_trajectory=return_trajectory,
             return_predicted_errors=return_predicted_errors,
         )
@@ -190,7 +161,6 @@ class PASTISTrainer(pl.LightningModule):
         """
         Run forward, compute loss, return (loss, class_loss, preds, labels).
         """
-        batch = self._unwrap_batch(batch)
         supervise_error = self._should_supervise_error() and training
 
         result = self.forward(
@@ -200,13 +170,22 @@ class PASTISTrainer(pl.LightningModule):
             return_predicted_errors=supervise_error or (not training),
         )
 
+        
+
         if isinstance(result, dict):
             y_hat = result["predictions"]
         else:
             y_hat = result
 
+        # Get queries (from tasks wrapper or flat)
+        if "queries" in batch:
+            queries = batch["queries"]
+        else:
+            task_data = next(iter(batch["tasks"].values()))
+            queries = task_data["queries"]
+
         # Labels from column 4 of query tokens: [B, M, 8] -> [B, M]
-        labels = batch["queries"][:, :, 4].long()
+        labels = queries[:, :, 4].long()
 
         # Flatten: [B, M, C] -> [B*M, C],  [B, M] -> [B*M]
         y_hat_flat = rearrange(y_hat, "b t c -> (b t) c")
@@ -224,7 +203,7 @@ class PASTISTrainer(pl.LightningModule):
                 predicted_errors=result["predicted_errors"],
                 latents=result["latents"],
                 final_coords=result["final_coords"],
-                image_err=batch["image"],
+                image_err=batch.get("image", None),
                 geometry=self.encoder.input_processor.geometry,
                 grid_size=self.error_grid_size,
                 spacing=self.error_grid_spacing,
@@ -248,6 +227,8 @@ class PASTISTrainer(pl.LightningModule):
         total_loss, class_loss, preds, labels = self._compute_loss_and_preds(
             batch, training=True
         )
+
+
 
         self.metric_IoU_train.update(preds, labels)
         self.metric_acc_train.update(preds, labels)
@@ -286,22 +267,46 @@ class PASTISTrainer(pl.LightningModule):
         return class_loss
 
     # =====================================================================
+    # METRIC HELPERS
+    # =====================================================================
+
+    def _compute_crop_miou(self, per_class_iou: torch.Tensor) -> torch.Tensor:
+        """Compute mIoU over crop classes 1-18 (exclude background 0)."""
+        crop_ious = per_class_iou[1:]  # classes 1 to N-1
+        return crop_ious.mean()
+    
+
+
+    def _compute_crop_acc(self, per_class_acc: torch.Tensor) -> torch.Tensor:
+        """Compute mean accuracy over crop classes 1-18."""
+        crop_acc = per_class_acc[1:]
+        return crop_acc.mean()
+
+    # =====================================================================
     # EPOCH END HOOKS
     # =====================================================================
 
     def on_train_epoch_end(self):
-        self.log("train_mIoU", self.metric_IoU_train.compute(),
+        iou = self.metric_IoU_train.compute()
+        acc = self.metric_acc_train.compute()
+
+        self.log("train_mIoU", self._compute_crop_miou(iou),
                  on_epoch=True, prog_bar=True, logger=True)
-        self.log("train_accuracy", self.metric_acc_train.compute(),
+        self.log("train_accuracy", self._compute_crop_acc(acc),
                  on_epoch=True, prog_bar=True, logger=True)
+
         self.metric_IoU_train.reset()
         self.metric_acc_train.reset()
 
     def on_validation_epoch_end(self):
-        self.log("val_mIoU", self.metric_IoU_val.compute(),
+        iou = self.metric_IoU_val.compute()
+        acc = self.metric_acc_val.compute()
+
+        self.log("val_mIoU", self._compute_crop_miou(iou),
                  on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_accuracy", self.metric_acc_val.compute(),
+        self.log("val_accuracy", self._compute_crop_acc(acc),
                  on_epoch=True, prog_bar=True, logger=True)
+
         self.metric_IoU_val.reset()
         self.metric_acc_val.reset()
 
@@ -309,8 +314,10 @@ class PASTISTrainer(pl.LightningModule):
         test_iou = self.metric_IoU_test.compute()
         test_acc = self.metric_acc_test.compute()
 
-        self.log("test_mIoU", test_iou.mean(), on_epoch=True, logger=True)
-        self.log("test_accuracy", test_acc.mean(), on_epoch=True, logger=True)
+        self.log("test_mIoU", self._compute_crop_miou(test_iou),
+                 on_epoch=True, logger=True)
+        self.log("test_accuracy", self._compute_crop_acc(test_acc),
+                 on_epoch=True, logger=True)
 
         # Log per-class metrics
         for i, name in enumerate(self.CROP_NAMES):

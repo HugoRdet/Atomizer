@@ -49,15 +49,6 @@ class SoftDiceLoss(nn.Module):
 
     Matches the original C2Seg paper's DiceLoss(smooth=1e-5, p=1).
     Computes per-class Dice and averages over present classes.
-
-    Parameters
-    ----------
-    ignore_index : int
-        Label index to ignore (default: 255).
-    smooth : float
-        Smoothing factor to avoid division by zero.
-    p : int
-        Power for denominator (1 = linear Dice, 2 = squared Dice).
     """
 
     def __init__(self, ignore_index=255, smooth=1e-5, p=1):
@@ -67,19 +58,6 @@ class SoftDiceLoss(nn.Module):
         self.p = p
 
     def forward(self, logits, labels):
-        """
-        Parameters
-        ----------
-        logits : Tensor [N, C]
-            Raw predictions (before softmax).
-        labels : Tensor [N]
-            Ground truth class indices.
-
-        Returns
-        -------
-        Tensor : scalar Dice loss (1 - mean Dice coefficient).
-        """
-        # Mask out ignored pixels
         valid = labels != self.ignore_index
         if valid.sum() == 0:
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
@@ -88,30 +66,23 @@ class SoftDiceLoss(nn.Module):
         labels = labels[valid]
 
         num_classes = logits.shape[1]
-        probs = F.softmax(logits, dim=1)  # [N_valid, C]
+        probs = F.softmax(logits, dim=1)
+        one_hot = F.one_hot(labels, num_classes).float()
 
-        # One-hot encode labels: [N_valid, C]
-        one_hot = F.one_hot(labels, num_classes).float()  # [N_valid, C]
-
-        # Per-class Dice
-        # intersection: sum of (prob * one_hot) per class
-        # cardinality: sum of prob^p + sum of one_hot^p per class
-        intersection = (probs * one_hot).sum(dim=0)  # [C]
+        intersection = (probs * one_hot).sum(dim=0)
 
         if self.p == 1:
-            cardinality = probs.sum(dim=0) + one_hot.sum(dim=0)  # [C]
+            cardinality = probs.sum(dim=0) + one_hot.sum(dim=0)
         else:
             cardinality = (probs ** self.p).sum(dim=0) + (one_hot ** self.p).sum(dim=0)
 
         dice_per_class = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
 
-        # Only average over classes present in this batch
-        present = one_hot.sum(dim=0) > 0  # [C]
+        present = one_hot.sum(dim=0) > 0
         if present.sum() == 0:
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-        mean_dice = dice_per_class[present].mean()
-        return 1.0 - mean_dice
+        return 1.0 - dice_per_class[present].mean()
 
 
 # =============================================================================
@@ -127,9 +98,42 @@ SEGMENTATION_TASKS = (
     "murat_segmentation",
     "c2seg_segmentation",
     "pastis_segmentation",
+    "multiearth_deforestation",
 )
 RECONSTRUCTION_TASKS = ("reconstruction",)
 ALL_TASKS = SEGMENTATION_TASKS + RECONSTRUCTION_TASKS
+
+# Per-task class names for logging
+TASK_CLASS_NAMES = {
+    "c2seg_segmentation": {
+        0: "Background", 1: "Urban Fabric", 2: "Industrial",
+        3: "Street Network", 4: "Mine/Dump", 5: "Artif. Vegetated",
+        6: "Arable Land", 7: "Low Vegetation", 8: "Forests",
+        9: "Water",
+    },
+    "pastis_segmentation": {
+        0: "Background", 1: "Meadow", 2: "Soft Winter Wheat",
+        3: "Corn", 4: "Winter Barley", 5: "Winter Rapeseed",
+        6: "Spring Barley", 7: "Sunflower", 8: "Grapevine",
+        9: "Beet", 10: "Soy", 11: "Sorghum",
+        12: "Flax", 13: "Protein Crops", 14: "Other Cereals",
+        15: "Fruits/Veg", 16: "Other Crops", 17: "Grassland",
+        18: "Shrub/Forest",
+    },
+    "mdas_segmentation": {
+        0: "Pavement", 1: "Soil", 2: "Roof",
+        3: "Low vegetation", 4: "Tree", 5: "Water",
+    },
+    "esa_worldcover": {
+        0: "Tree cover", 1: "Shrubland", 2: "Grassland",
+        3: "Cropland", 4: "Built-up", 5: "Bare/sparse",
+        6: "Snow/ice", 7: "Water", 8: "Wetland",
+        9: "Mangroves", 10: "Moss/lichen",
+    },
+    "multiearth_deforestation": {
+        0: "Forest", 1: "Deforested",
+    },
+}
 
 
 class Model_Pretrain(pl.LightningModule):
@@ -138,8 +142,7 @@ class Model_Pretrain(pl.LightningModule):
 
     Shared encoder + task-specific head.
     Plain CrossEntropyLoss by default; per-task weighted CE for
-    imbalanced datasets (e.g., murat_segmentation).
-    Optional Dice loss for class-imbalanced segmentation (e.g., c2seg).
+    imbalanced datasets. Optional Dice loss for class-imbalanced tasks.
     """
 
     IGNORE_INDEX = 255
@@ -166,8 +169,9 @@ class Model_Pretrain(pl.LightningModule):
             "flairhub_lpis":      {"num_classes": 23, "type": "segmentation"},
             "mdas_segmentation":  {"num_classes": 6,  "type": "segmentation"},
             "murat_segmentation": {"num_classes": 2,  "type": "segmentation"},
-            "c2seg_segmentation": {"num_classes": 14, "type": "segmentation"},
+            "c2seg_segmentation": {"num_classes": 10, "type": "segmentation"},
             "pastis_segmentation": {"num_classes": 20, "type": "segmentation"},
+            "multiearth_deforestation": {"num_classes": 2, "type": "segmentation"},
             "reconstruction":     {"num_classes": 1,  "type": "reconstruction"},
         }
 
@@ -199,10 +203,8 @@ class Model_Pretrain(pl.LightningModule):
         # =====================================================================
         # LOSS
         # =====================================================================
-        # Default unweighted CE for most tasks
         self.seg_loss = nn.CrossEntropyLoss(ignore_index=self.IGNORE_INDEX)
 
-        # Per-task weighted CE for imbalanced datasets
         self.seg_loss_weighted = nn.ModuleDict({
             "murat_segmentation": nn.CrossEntropyLoss(
                 weight=torch.tensor([1.0, 19.0]),
@@ -210,9 +212,7 @@ class Model_Pretrain(pl.LightningModule):
             ),
         })
 
-        # Per-task Dice loss (CE + Dice) for class-imbalanced segmentation
-        # Matching original C2Seg: smooth=1e-5, p=1
-        self.dice_tasks = set()#{"c2seg_segmentation"}
+        self.dice_tasks = set()
         self.dice_loss = SoftDiceLoss(
             ignore_index=self.IGNORE_INDEX,
             smooth=1e-5,
@@ -220,7 +220,7 @@ class Model_Pretrain(pl.LightningModule):
         )
 
         # =====================================================================
-        # METRICS
+        # METRICS (only for tasks that exist)
         # =====================================================================
         self._init_metrics()
         self._train_tasks_seen = set()
@@ -260,6 +260,11 @@ class Model_Pretrain(pl.LightningModule):
                     task="multiclass", num_classes=nc,
                     average="macro", ignore_index=self.IGNORE_INDEX,
                 ))
+                # Per-class IoU for detailed logging
+                setattr(self, f"{split}_{task_name}_iou_per_class", torchmetrics.JaccardIndex(
+                    task="multiclass", num_classes=nc,
+                    average="none", ignore_index=self.IGNORE_INDEX,
+                ))
 
         for split in ["train", "val"]:
             setattr(self, f"{split}_recon_mse", torchmetrics.MeanSquaredError())
@@ -270,11 +275,21 @@ class Model_Pretrain(pl.LightningModule):
     # =========================================================================
 
     def _encode(self, batch, training=True):
-        """Encode groups → latents + coords."""
+        """Encode groups → latents + coords.
+
+        Uses stochastic sampling: picks a random (tpl, cross_k) pair
+        from encoder's train_sampling / val_sampling per batch.
+        """
         groups = batch["groups"]
-        tpl = self.encoder.tokens_per_latent
+
+        # ── Stochastic sampling from encoder ─────────────────────────
+        tpl, cross_k = self.encoder.sample_config(training)
 
         resolutions = sorted(groups.keys())
+
+        # geo_k_budget: prune 2× cross_k so stochastic sampling has variety
+        geo_k_budget = cross_k * 2
+
         grid_configs = {
             res: compute_grid_config(
                 resolution=res,
@@ -282,7 +297,7 @@ class Model_Pretrain(pl.LightningModule):
                 total_tokens=groups[res]["tokens"].shape[1],
                 tokens_per_latent=tpl,
                 sigma_factor=self.encoder.sigma_factor,
-                max_k=self.encoder.max_k,
+                max_k=geo_k_budget,
             )
             for res in resolutions
         }
@@ -291,6 +306,7 @@ class Model_Pretrain(pl.LightningModule):
             groups=groups,
             grid_configs=grid_configs,
             training=training,
+            cross_k=cross_k,
         )
 
         return encoder_output.latents_per_res, encoder_output.coords_per_res
@@ -354,7 +370,6 @@ class Model_Pretrain(pl.LightningModule):
         if "tasks" in batch:
             return self.forward_multitask(batch, training=training)
 
-        # Legacy single-task fallback
         if task_name is None:
             task_name = batch.get("task", "reconstruction")
 
@@ -369,17 +384,7 @@ class Model_Pretrain(pl.LightningModule):
     # =========================================================================
 
     def _compute_seg_loss(self, predictions, queries, task_name=None):
-        """
-        Segmentation loss from query col 4.
-
-        Uses task-specific weighted loss if available (e.g., murat_segmentation),
-        otherwise falls back to standard unweighted CrossEntropyLoss.
-
-        Adds Dice loss for tasks in self.dice_tasks (e.g., c2seg_segmentation),
-        matching the original C2Seg paper: loss = CE + Dice.
-
-        Returns None if no valid labels.
-        """
+        """Segmentation loss from query col 4."""
         labels = queries[:, :, 4].long()
         pred_flat = rearrange(predictions, "b m c -> (b m) c")
         label_flat = rearrange(labels, "b m -> (b m)")
@@ -388,14 +393,12 @@ class Model_Pretrain(pl.LightningModule):
         if valid_count == 0:
             return None, None, None
 
-        # Use task-specific weighted loss if available
         if task_name and task_name in self.seg_loss_weighted:
             loss_fn = self.seg_loss_weighted[task_name]
             loss = loss_fn(pred_flat, label_flat)
         else:
             loss = self.seg_loss(pred_flat, label_flat)
 
-        # Add Dice loss for applicable tasks
         if task_name and task_name in self.dice_tasks:
             dice = self.dice_loss(pred_flat, label_flat)
             loss = loss + dice
@@ -404,7 +407,7 @@ class Model_Pretrain(pl.LightningModule):
         return loss, preds, labels
 
     def _compute_recon_loss(self, predictions, queries, queries_mask):
-        """Reconstruction loss from query col 4, masked. Returns None if no valid queries."""
+        """Reconstruction loss from query col 4, masked."""
         targets = queries[:, :, 4]
         preds = predictions.squeeze(-1)
 
@@ -417,199 +420,151 @@ class Model_Pretrain(pl.LightningModule):
         return loss, preds, targets
 
     # =========================================================================
-    # TRAINING STEP
+    # SHARED STEP
     # =========================================================================
 
-    def training_step(self, batch, batch_idx):
-        all_predictions = self.forward_multitask(batch, training=True)
+    def _step(self, batch, split):
+        """Shared logic for training and validation steps."""
+        all_predictions = self.forward_multitask(
+            batch, training=(split == "train"))
 
-        # Initialize with grad_fn so backward() works even if all tasks
-        # produce no valid loss (e.g., all-ignore-index batch).
         if all_predictions:
             total_loss = sum(p.sum() * 0.0 for p in all_predictions.values())
         else:
             total_loss = sum(p.sum() * 0.0 for p in self.parameters())
 
+        tasks_seen = (self._train_tasks_seen if split == "train"
+                      else self._val_tasks_seen)
+
         for task_name, predictions in all_predictions.items():
             task_data = batch["tasks"][task_name]
             queries = task_data["queries"]
             queries_mask = task_data["queries_mask"]
 
-            self._train_tasks_seen.add(task_name)
+            tasks_seen.add(task_name)
 
             if torch.isnan(predictions).any() or torch.isinf(predictions).any():
-                predictions = torch.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+                predictions = torch.nan_to_num(
+                    predictions, nan=0.0, posinf=0.0, neginf=0.0)
 
             if task_name in SEGMENTATION_TASKS:
                 loss, preds, labels = self._compute_seg_loss(
-                    predictions, queries, task_name=task_name
-                )
+                    predictions, queries, task_name=task_name)
 
                 if loss is None or not torch.isfinite(loss):
                     continue
 
-                metric_mIoU = getattr(self, f"train_{task_name}_mIoU")
-                metric_acc = getattr(self, f"train_{task_name}_acc")
-                metric_mF1 = getattr(self, f"train_{task_name}_mF1")
-                metric_mIoU.update(preds, labels)
-                metric_acc.update(preds, labels)
-                metric_mF1.update(preds, labels)
+                # Update metrics
+                getattr(self, f"{split}_{task_name}_mIoU").update(preds, labels)
+                getattr(self, f"{split}_{task_name}_acc").update(preds, labels)
+                getattr(self, f"{split}_{task_name}_mF1").update(preds, labels)
+                getattr(self, f"{split}_{task_name}_iou_per_class").update(preds, labels)
 
-                self.log(f"train_{task_name}_loss", loss,
-                         on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f"{split}_{task_name}_loss", loss,
+                         on_step=(split == "train"), on_epoch=True,
+                         prog_bar=True, logger=True)
 
                 total_loss = total_loss + loss
 
             elif task_name in RECONSTRUCTION_TASKS:
                 loss, preds, targets = self._compute_recon_loss(
-                    predictions, queries, queries_mask
-                )
+                    predictions, queries, queries_mask)
 
                 if loss is None or not torch.isfinite(loss):
                     continue
 
-                self.train_recon_mse.update(preds, targets)
-                self.train_recon_mae.update(preds, targets)
+                getattr(self, f"{split}_recon_mse").update(preds, targets)
+                getattr(self, f"{split}_recon_mae").update(preds, targets)
 
-                self.log("train_recon_loss", loss,
-                         on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f"{split}_recon_loss", loss,
+                         on_step=(split == "train"), on_epoch=True,
+                         prog_bar=True, logger=True)
 
                 total_loss = total_loss + loss
 
-        self.log("train_loss", total_loss,
-                 on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"{split}_loss", total_loss,
+                 on_step=(split == "train"), on_epoch=True,
+                 prog_bar=True, logger=True)
 
         return total_loss
 
     # =========================================================================
-    # VALIDATION STEP
+    # TRAINING / VALIDATION STEPS
     # =========================================================================
+
+    def training_step(self, batch, batch_idx):
+        return self._step(batch, "train")
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        all_predictions = self.forward_multitask(batch, training=False)
-
-        total_loss = torch.tensor(0.0, device=self.device)
-
-        for task_name, predictions in all_predictions.items():
-            task_data = batch["tasks"][task_name]
-            queries = task_data["queries"]
-            queries_mask = task_data["queries_mask"]
-
-            self._val_tasks_seen.add(task_name)
-
-            if torch.isnan(predictions).any() or torch.isinf(predictions).any():
-                predictions = torch.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
-
-            if task_name in SEGMENTATION_TASKS:
-                loss, preds, labels = self._compute_seg_loss(
-                    predictions, queries, task_name=task_name
-                )
-
-                if loss is None or not torch.isfinite(loss):
-                    continue
-
-                metric_mIoU = getattr(self, f"val_{task_name}_mIoU")
-                metric_acc = getattr(self, f"val_{task_name}_acc")
-                metric_mF1 = getattr(self, f"val_{task_name}_mF1")
-                metric_mIoU.update(preds, labels)
-                metric_acc.update(preds, labels)
-                metric_mF1.update(preds, labels)
-
-                self.log(f"val_{task_name}_loss", loss,
-                         on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
-                total_loss = total_loss + loss
-
-            elif task_name in RECONSTRUCTION_TASKS:
-                loss, preds, targets = self._compute_recon_loss(
-                    predictions, queries, queries_mask
-                )
-
-                if loss is None or not torch.isfinite(loss):
-                    continue
-
-                self.val_recon_mse.update(preds, targets)
-                self.val_recon_mae.update(preds, targets)
-
-                self.log("val_recon_loss", loss,
-                         on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
-                total_loss = total_loss + loss
-
-        self.log("val_loss", total_loss,
-                 on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        return total_loss
+        return self._step(batch, "val")
 
     # =========================================================================
     # EPOCH END
     # =========================================================================
 
-    def on_train_epoch_end(self):
+    def _on_epoch_end(self, split):
+        tasks_seen = (self._train_tasks_seen if split == "train"
+                      else self._val_tasks_seen)
+
         miou_values = []
         for task_name in SEGMENTATION_TASKS:
-            if task_name not in self._train_tasks_seen:
+            if task_name not in tasks_seen:
                 continue
-            if not hasattr(self, f"train_{task_name}_mIoU"):
+            if not hasattr(self, f"{split}_{task_name}_mIoU"):
                 continue
 
-            metric_mIoU = getattr(self, f"train_{task_name}_mIoU")
-            metric_acc = getattr(self, f"train_{task_name}_acc")
-            metric_mF1 = getattr(self, f"train_{task_name}_mF1")
+            metric_mIoU = getattr(self, f"{split}_{task_name}_mIoU")
+            metric_acc = getattr(self, f"{split}_{task_name}_acc")
+            metric_mF1 = getattr(self, f"{split}_{task_name}_mF1")
+            metric_per_class = getattr(self, f"{split}_{task_name}_iou_per_class")
 
             miou = metric_mIoU.compute()
-            self.log(f"train_{task_name}_mIoU", miou, on_epoch=True, logger=True)
-            self.log(f"train_{task_name}_acc", metric_acc.compute(), on_epoch=True, logger=True)
-            self.log(f"train_{task_name}_mF1", metric_mF1.compute(), on_epoch=True, logger=True)
+            acc = metric_acc.compute()
+            mf1 = metric_mF1.compute()
+            per_class = metric_per_class.compute()
+
+            self.log(f"{split}_{task_name}_mIoU", miou,
+                     on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"{split}_{task_name}_acc", acc,
+                     on_epoch=True, logger=True)
+            self.log(f"{split}_{task_name}_mF1", mf1,
+                     on_epoch=True, logger=True)
+
+            # Per-class IoU with proper names
+            class_names = TASK_CLASS_NAMES.get(task_name, {})
+            nc = self.task_configs[task_name]["num_classes"]
+            for cls_idx in range(min(nc, len(per_class))):
+                cls_name = class_names.get(cls_idx, f"class_{cls_idx}")
+                self.log(f"{split}_{task_name}_IoU_{cls_name}", per_class[cls_idx],
+                         on_epoch=True, logger=True)
+
             miou_values.append(miou)
             metric_mIoU.reset()
             metric_acc.reset()
             metric_mF1.reset()
+            metric_per_class.reset()
 
         if miou_values:
-            self.log("train_avg_mIoU", torch.stack(miou_values).mean(),
+            self.log(f"{split}_avg_mIoU", torch.stack(miou_values).mean(),
                      on_epoch=True, prog_bar=True, logger=True)
 
-        if "reconstruction" in self._train_tasks_seen:
-            self.log("train_recon_mse", self.train_recon_mse.compute(), on_epoch=True, logger=True)
-            self.log("train_recon_mae", self.train_recon_mae.compute(), on_epoch=True, logger=True)
-            self.train_recon_mse.reset()
-            self.train_recon_mae.reset()
+        if "reconstruction" in tasks_seen:
+            recon_mse = getattr(self, f"{split}_recon_mse")
+            recon_mae = getattr(self, f"{split}_recon_mae")
+            self.log(f"{split}_recon_mse", recon_mse.compute(),
+                     on_epoch=True, logger=True)
+            self.log(f"{split}_recon_mae", recon_mae.compute(),
+                     on_epoch=True, logger=True)
+            recon_mse.reset()
+            recon_mae.reset()
 
-        self._train_tasks_seen.clear()
+        tasks_seen.clear()
+
+    def on_train_epoch_end(self):
+        self._on_epoch_end("train")
 
     def on_validation_epoch_end(self):
-        miou_values = []
-        for task_name in SEGMENTATION_TASKS:
-            if task_name not in self._val_tasks_seen:
-                continue
-            if not hasattr(self, f"val_{task_name}_mIoU"):
-                continue
-
-            metric_mIoU = getattr(self, f"val_{task_name}_mIoU")
-            metric_acc = getattr(self, f"val_{task_name}_acc")
-            metric_mF1 = getattr(self, f"val_{task_name}_mF1")
-
-            miou = metric_mIoU.compute()
-            self.log(f"val_{task_name}_mIoU", miou, on_epoch=True, prog_bar=True, logger=True)
-            self.log(f"val_{task_name}_acc", metric_acc.compute(), on_epoch=True, logger=True)
-            self.log(f"val_{task_name}_mF1", metric_mF1.compute(), on_epoch=True, logger=True)
-            miou_values.append(miou)
-            metric_mIoU.reset()
-            metric_acc.reset()
-            metric_mF1.reset()
-
-        if miou_values:
-            self.log("val_avg_mIoU", torch.stack(miou_values).mean(),
-                     on_epoch=True, prog_bar=True, logger=True)
-
-        if "reconstruction" in self._val_tasks_seen:
-            self.log("val_recon_mse", self.val_recon_mse.compute(),
-                     on_epoch=True, prog_bar=True, logger=True)
-            self.log("val_recon_mae", self.val_recon_mae.compute(), on_epoch=True, logger=True)
-            self.val_recon_mse.reset()
-            self.val_recon_mae.reset()
-
-        self._val_tasks_seen.clear()
+        self._on_epoch_end("val")
 
     # =========================================================================
     # OPTIMIZER

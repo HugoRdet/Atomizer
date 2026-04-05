@@ -147,6 +147,8 @@ class Model_SenFlood(pl.LightningModule):
             return_predicted_errors=supervise_error or (not training),
         )
 
+        
+
         if isinstance(result, dict):
             y_hat = result["predictions"]
         else:
@@ -157,9 +159,17 @@ class Model_SenFlood(pl.LightningModule):
 
         
 
+        
+
         # Flatten: [B, M, C] → [B*M, C],  [B, M] → [B*M]
         y_hat_flat = rearrange(y_hat, "b t c -> (b t) c")
         labels_flat = rearrange(labels, "b n -> (b n)")
+
+        # Right after: labels = batch["queries"][:, :, 4].long()
+        
+
+
+    
 
         class_loss = self.loss(y_hat_flat, labels_flat)
 

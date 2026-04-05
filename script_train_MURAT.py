@@ -255,7 +255,7 @@ parser.add_argument("--pretrained_ckpt", type=str, default=None,
                     help="Load pretrained encoder weights (e.g., from FLAIR-HUB MAE)")
 parser.add_argument("--num_workers",    type=int, default=4)
 parser.add_argument("--max_queries",    type=int, default=65_536)
-parser.add_argument("--grad_accum",     type=int, default=16)
+parser.add_argument("--grad_accum",     type=int, default=1)
 parser.add_argument("--max_epochs",     type=int, default=None,
                     help="Override config epochs")
 
@@ -385,7 +385,7 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=callbacks,
     default_root_dir="./checkpoints/murat/",
-    gradient_clip_val=1.0,
+    #gradient_clip_val=1.0,
     accumulate_grad_batches=args.grad_accum,
 )
 

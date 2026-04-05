@@ -1,548 +1,610 @@
 """
-Pre-training Script — Encode-Once Multi-Task (MMEarth + FLAIR-HUB)
-===================================================================
-Single encode, multiple decodes per sample (~2× speedup over interleaved).
+Segmentation Trainer — Single-Task, Encode-Once
+=====================================================
 
-Examples:
-    # MMEarth — all 3 tasks (default)
-    python train_pretrain_v2.py --xp_name test --config_model atomiser.yaml --dataset_name MMEarth
+Trainer for cross-sensor transfer experiments.
+Single segmentation task, plain CrossEntropyLoss, no loss weighting.
 
-    # MMEarth — seg only
-    python train_pretrain_v2.py --xp_name seg --config_model atomiser.yaml --dataset_name MMEarth \
-        --tasks esa_worldcover dynamic_world
+Per-task weighted loss supported for imbalanced datasets:
+  - murat_segmentation: weight=[1.0, 19.0] (5% buildings, 95% background)
 
-    # FLAIR-HUB — all 3 tasks (default)
-    python train_pretrain_v2.py --xp_name flair --config_model atomiser.yaml --dataset_name FlairHub \
-        --flairhub_path /path/to/FLAIR-HUB
+Per-task Dice loss supported for class-imbalanced segmentation:
+  - c2seg_segmentation: CE + Dice (matching the original C2Seg paper)
 
-    # FLAIR-HUB — COSIA + reconstruction only, cap at 50k samples
-    python train_pretrain_v2.py --xp_name flair_cosia --config_model atomiser.yaml --dataset_name FlairHub \
-        --tasks flairhub_cosia reconstruction --max_samples 50000
+Batch format:
+    {
+        "groups": {res: {"tokens": [B,N,8], "mask": [B,N], "shape": ...}},
+        "tasks": {
+            "<task_name>": {"queries": [B,M,8], "queries_mask": [B,M]},
+        },
+        "target_resolution": float,
+    }
 
-    # Resume from checkpoint
-    python train_pretrain_v2.py --xp_name test --config_model atomiser.yaml --dataset_name MMEarth \
-        --ckpt_path ./checkpoints/last.ckpt
+Architecture:
+    1. encode(groups) → latents, coords           [ONCE]
+    2. reconstruct(latents, coords, queries) → features
+    3. head(features) → predictions
+    4. CrossEntropyLoss(predictions, labels) [+ DiceLoss for some tasks]
 """
 
-# =============================================================================
-# IMPORTS
-# =============================================================================
-import os
-import time
-import argparse
 import torch
-import numpy as np
-
+import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import (
-    ModelCheckpoint,
-    GradientAccumulationScheduler,
-    LearningRateMonitor,
-)
-from torch.utils.data import DataLoader, DistributedSampler
-import torch.distributed as dist
+import torchmetrics
+from einops import rearrange
+from transformers import get_cosine_schedule_with_warmup
 
-seed_everything(42, workers=True)
-
-# --- Project imports ---
-from training.utils import read_yaml
-from training.utils import Lookup_encoding
-from training.trainer_pretraining_v2 import Model_Pretrain
-from training.utils.datasets.mmearth_multitask import MMEarthMultiTask
-from training.utils.datasets.flairhub_multitask import FlairHubMultiTask
-from training.utils.datasets.collate_multitask import collate_multitask
-from training.viz_callbacks_pretrain import (
-    PretrainSegVizCallback,
-    PretrainReconVizCallback,
-)
+from training.atomiser import Atomiser_Senflood
+from training.utils.datasets.token_grouping import compute_grid_config
 
 
 # =============================================================================
-# DATAMODULE
+# SOFT DICE LOSS
 # =============================================================================
 
-class MMEarthMultiTaskDataModule(pl.LightningDataModule):
+class SoftDiceLoss(nn.Module):
     """
-    Encode-once multi-task DataModule for MMEarth.
+    Soft Dice loss for multi-class segmentation.
 
-    Every sample contains encoder tokens + query sets for all enabled tasks.
-    Standard DistributedSampler — no chunking, no interleaving needed.
+    Matches the original C2Seg paper's DiceLoss(smooth=1e-5, p=1).
+    Computes per-class Dice and averages over present classes.
     """
 
-    def __init__(
-        self,
-        mmearth_path: str,
-        bands_yaml_path: str,
-        config_model: dict,
-        look_up,
-        batch_size: int = 1,
-        num_workers: int = 4,
-        subset: str = "MMEarth100k",
-        tasks: list = None,
-        max_queries_seg: int = 100_000,
-        max_queries_recon: int = 200_000,
-        max_samples: int = None,
-        val_fraction: float = 0.01,
-    ):
+    def __init__(self, ignore_index=255, smooth=1e-5, p=1):
         super().__init__()
-        self.mmearth_path = mmearth_path
-        self.bands_yaml_path = bands_yaml_path
-        self.config_model = config_model
-        self.look_up = look_up
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.subset = subset
-        self.tasks = tasks or ["esa_worldcover", "dynamic_world", "reconstruction"]
-        self.max_queries_seg = max_queries_seg
-        self.max_queries_recon = max_queries_recon
-        self.max_samples = max_samples
-        self.val_fraction = val_fraction
-        self.dataset_config = read_yaml(bands_yaml_path)
+        self.ignore_index = ignore_index
+        self.smooth = smooth
+        self.p = p
 
-    def setup(self, stage=None):
-        common_kwargs = dict(
-            root_path=self.mmearth_path,
-            dataset_config=self.dataset_config,
-            config_model=self.config_model,
-            look_up=self.look_up,
-            subset=self.subset,
-            tasks=self.tasks,
-            max_queries_seg=self.max_queries_seg,
-            max_queries_recon=self.max_queries_recon,
-            max_samples=self.max_samples,
-        )
+    def forward(self, logits, labels):
+        valid = labels != self.ignore_index
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-        self.train_dataset = MMEarthMultiTask(mode="train", **common_kwargs)
-        self.val_dataset = MMEarthMultiTask(mode="train", **common_kwargs)
+        logits = logits[valid]
+        labels = labels[valid]
 
-        # Deterministic train/val split
-        full_len = len(self.train_dataset)
-        val_len = max(8, int(full_len * self.val_fraction))
-        train_len = full_len - val_len
+        num_classes = logits.shape[1]
+        probs = F.softmax(logits, dim=1)
+        one_hot = F.one_hot(labels, num_classes).float()
 
-        generator = torch.Generator().manual_seed(42)
-        all_indices = torch.randperm(full_len, generator=generator).tolist()
+        intersection = (probs * one_hot).sum(dim=0)
 
-        self.train_dataset.tile_indices = [
-            self.train_dataset.tile_indices[i] for i in all_indices[:train_len]
-        ]
-        self.val_dataset.tile_indices = [
-            self.val_dataset.tile_indices[i] for i in all_indices[train_len:]
-        ]
-
-        print(f"[MultiTaskDM] tasks={self.tasks}")
-        print(f"[MultiTaskDM] train={train_len}, val={val_len}")
-
-    def _make_loader(self, dataset, shuffle=False):
-        sampler = None
-        if dist.is_available() and dist.is_initialized():
-            sampler = DistributedSampler(dataset, shuffle=shuffle)
-
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=(shuffle and sampler is None),
-            sampler=sampler,
-            num_workers=self.num_workers,
-            collate_fn=collate_multitask,
-            pin_memory=True,
-            persistent_workers=self.num_workers > 0,
-            prefetch_factor=2 if self.num_workers > 0 else None,
-        )
-
-    def train_dataloader(self):
-        return self._make_loader(self.train_dataset, shuffle=True)
-
-    def val_dataloader(self):
-        return self._make_loader(self.val_dataset, shuffle=False)
-
-    def test_dataloader(self):
-        return self.val_dataloader()
-
-
-class FlairHubMultiTaskDataModule(pl.LightningDataModule):
-    """
-    Encode-once multi-task DataModule for FLAIR-HUB.
-
-    Uses CSV-based splits (FLAIR-HUB_TRAIN.csv, FLAIR-HUB_VALID.csv).
-    Multi-resolution, multi-temporal tokens + per-task queries.
-    """
-
-    def __init__(
-        self,
-        flairhub_path: str,
-        bands_yaml_path: str,
-        config_model: dict,
-        look_up,
-        batch_size: int = 1,
-        num_workers: int = 4,
-        tasks: list = None,
-        max_queries_seg: int = 100_000,
-        max_queries_recon: int = 200_000,
-        max_samples: int = None,
-        csv_dir: str = None,
-    ):
-        super().__init__()
-        self.flairhub_path = flairhub_path
-        self.bands_yaml_path = bands_yaml_path
-        self.config_model = config_model
-        self.look_up = look_up
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.tasks = tasks or ["flairhub_cosia", "flairhub_lpis", "reconstruction"]
-        self.max_queries_seg = max_queries_seg
-        self.max_queries_recon = max_queries_recon
-        self.max_samples = max_samples
-        self.csv_dir = csv_dir
-        self.dataset_config = read_yaml(bands_yaml_path)
-
-    def setup(self, stage=None):
-        common_kwargs = dict(
-            root_path=self.flairhub_path,
-            dataset_config=self.dataset_config,
-            config_model=self.config_model,
-            look_up=self.look_up,
-            tasks=self.tasks,
-            max_queries_seg=self.max_queries_seg,
-            max_queries_recon=self.max_queries_recon,
-            max_samples=self.max_samples,
-            csv_dir=self.csv_dir,
-        )
-
-        self.train_dataset = FlairHubMultiTask(mode="train", **common_kwargs)
-        self.val_dataset = FlairHubMultiTask(mode="validation", **common_kwargs)
-
-        print(f"[FlairHubDM] tasks={self.tasks}")
-        print(f"[FlairHubDM] train={len(self.train_dataset)}, "
-              f"val={len(self.val_dataset)}")
-
-    def _make_loader(self, dataset, shuffle=False):
-        sampler = None
-        if dist.is_available() and dist.is_initialized():
-            sampler = DistributedSampler(dataset, shuffle=shuffle)
-
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=(shuffle and sampler is None),
-            sampler=sampler,
-            num_workers=self.num_workers,
-            collate_fn=collate_multitask,
-            pin_memory=True,
-            persistent_workers=self.num_workers > 0,
-            prefetch_factor=2 if self.num_workers > 0 else None,
-        )
-
-    def train_dataloader(self):
-        return self._make_loader(self.train_dataset, shuffle=True)
-
-    def val_dataloader(self):
-        return self._make_loader(self.val_dataset, shuffle=False)
-
-    def test_dataloader(self):
-        return self.val_dataloader()
-
-
-# =============================================================================
-# VALID TASKS
-# =============================================================================
-MMEARTH_TASKS = ["esa_worldcover", "dynamic_world", "reconstruction"]
-FLAIRHUB_TASKS = ["flairhub_cosia", "flairhub_lpis", "reconstruction"]
-ALL_TASKS = MMEARTH_TASKS + ["flairhub_cosia", "flairhub_lpis"]  # reconstruction shared
-
-# =============================================================================
-# ARGS
-# =============================================================================
-parser = argparse.ArgumentParser(description="Atomizer Pre-training (Encode-Once)")
-parser.add_argument("--xp_name",        type=str, required=True, help="Experiment name")
-parser.add_argument("--config_model",   type=str, required=True, help="Model config yaml file")
-parser.add_argument("--dataset_name",   type=str, required=True,
-                    choices=["MMEarth", "MMEarth100k", "MMEarth64", "FlairHub"],
-                    help="Dataset to use")
-parser.add_argument("--tasks",          type=str, nargs="+", default=None,
-                    help="Tasks to train on (default: all for chosen dataset)")
-# Paths
-parser.add_argument("--mmearth_path",   type=str, default="./data/MM-Earth",
-                    help="Path to MMEarth data")
-parser.add_argument("--flairhub_path",  type=str, default="./data/FLAIR-HUB/FLAIR-HUB",
-                    help="Path to FLAIR-HUB data")
-parser.add_argument("--flairhub_csv_dir", type=str, default=None,
-                    help="Path to FLAIR-HUB CSV split files (default: flairhub_path)")
-# Training
-parser.add_argument("--ckpt_path",      type=str, default=None, help="Resume from checkpoint")
-parser.add_argument("--num_workers",    type=int, default=4)
-parser.add_argument("--max_queries_seg",   type=int, default=100_000)
-parser.add_argument("--max_queries_recon", type=int, default=200_000)
-parser.add_argument("--max_samples",       type=int, default=None,
-                    help="Cap training set size (e.g. 100000). Default: use all.")
-
-args = parser.parse_args()
-
-# Resolve default tasks based on dataset
-is_flairhub = args.dataset_name == "FlairHub"
-if args.tasks is None:
-    args.tasks = FLAIRHUB_TASKS if is_flairhub else MMEARTH_TASKS
-
-xp_name = args.xp_name
-config_model = read_yaml("./training/configs/" + args.config_model)
-configs_dataset = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
-bands_yaml = "./data/bands_info/bands.yaml"
-
-task_label = "_".join(sorted(args.tasks))
-
-# =============================================================================
-# LOOKUP TABLE
-# =============================================================================
-lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
-
-# =============================================================================
-# WANDB
-# =============================================================================
-wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    import wandb
-    wandb.init(
-        name=f"{config_model['encoder']}_{args.dataset_name}_{task_label}",
-        project="Atomizer_Pretrain",
-        config={**config_model, "tasks": args.tasks, "dataset": args.dataset_name},
-    )
-    wandb_logger = WandbLogger(project="Atomizer_Pretrain")
-    wandb.define_metric("train_loss", step_metric="trainer/global_step")
-    wandb.define_metric("val_loss", step_metric="trainer/global_step")
-
-# =============================================================================
-# MODEL
-# =============================================================================
-model = Model_Pretrain(
-    config=config_model,
-    wand=True,
-    name=xp_name,
-    transform=None,
-    lookup_table=lookup_table,
-)
-
-# =============================================================================
-# DATA MODULE
-# =============================================================================
-if is_flairhub:
-    data_module = FlairHubMultiTaskDataModule(
-        flairhub_path=args.flairhub_path,
-        bands_yaml_path=bands_yaml,
-        config_model=config_model,
-        look_up=lookup_table,
-        batch_size=config_model["dataset"]["batchsize"],
-        num_workers=args.num_workers,
-        tasks=args.tasks,
-        max_queries_seg=args.max_queries_seg,
-        max_queries_recon=args.max_queries_recon,
-        max_samples=args.max_samples,
-        csv_dir=args.flairhub_csv_dir,
-    )
-else:
-    data_module = MMEarthMultiTaskDataModule(
-        mmearth_path=args.mmearth_path,
-        bands_yaml_path=bands_yaml,
-        config_model=config_model,
-        look_up=lookup_table,
-        batch_size=config_model["dataset"]["batchsize"],
-        num_workers=args.num_workers,
-        subset=args.dataset_name,
-        tasks=args.tasks,
-        max_queries_seg=args.max_queries_seg,
-        max_queries_recon=args.max_queries_recon,
-        max_samples=args.max_samples,
-    )
-
-# =============================================================================
-# CALLBACKS
-# =============================================================================
-lr_monitor = LearningRateMonitor(logging_interval="step")
-accumulator = GradientAccumulationScheduler(scheduling={0: 10})
-
-# Checkpoint — monitor seg metric if any seg task present, else recon
-ALL_SEG_TASKS = ["esa_worldcover", "dynamic_world", "flairhub_cosia", "flairhub_lpis"]
-has_seg = any(t in args.tasks for t in ALL_SEG_TASKS)
-
-if has_seg:
-    ckpt_monitor = "val_avg_mIoU"
-    ckpt_mode = "max"
-    ckpt_fmt = f"{config_model['encoder']}_{xp_name}-val_mIoU-{{epoch:02d}}-{{val_avg_mIoU:.4f}}"
-else:
-    ckpt_monitor = "val_recon_mse"
-    ckpt_mode = "min"
-    ckpt_fmt = f"{config_model['encoder']}_{xp_name}-val_mse-{{epoch:02d}}-{{val_recon_mse:.4f}}"
-
-checkpoint_val = ModelCheckpoint(
-    dirpath="./checkpoints/",
-    filename=ckpt_fmt,
-    monitor=ckpt_monitor,
-    mode=ckpt_mode,
-    save_top_k=1,
-    verbose=True,
-)
-
-checkpoint_resume = ModelCheckpoint(
-    dirpath="./checkpoints/",
-    filename=f"{config_model['encoder']}_{xp_name}-last-{{epoch:02d}}",
-    every_n_epochs=1,
-    save_top_k=1,
-    save_last=True,
-    verbose=True,
-)
-
-# Viz callbacks — auto-select based on which tasks are enabled
-viz_callbacks = []
-
-seg_tasks_in_use = [t for t in args.tasks if t != "reconstruction"]
-for task_name in seg_tasks_in_use:
-    viz_callbacks.append(
-        PretrainSegVizCallback(
-            task_name=task_name,
-            sample_indices=(0, 1, 2),
-            log_every_n_epochs=1,
-        )
-    )
-
-if "reconstruction" in args.tasks:
-    viz_callbacks.append(
-        PretrainReconVizCallback(
-            sample_indices=(0,),
-            log_every_n_epochs=1,
-        )
-    )
-
-callbacks = [accumulator, checkpoint_val, checkpoint_resume, lr_monitor] + viz_callbacks
-
-# =============================================================================
-# TRAINER
-# =============================================================================
-trainer = Trainer(
-    strategy="ddp_find_unused_parameters_true",
-    devices=-1,
-    max_epochs=config_model["trainer"]["epochs"],
-    accelerator="gpu",
-    precision="bf16-mixed",
-    logger=wandb_logger,
-    log_every_n_steps=5,
-    callbacks=callbacks,
-    default_root_dir="./checkpoints/",
-    gradient_clip_val=1.0,
-)
-
-# =============================================================================
-# TRAIN & TEST
-# =============================================================================
-trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
-trainer.test(model, datamodule=data_module)
-
-# =============================================================================
-# MEASURE COMPLEXITY (rank 0 only)
-# =============================================================================
-
-def _batch_to_device(batch: dict, device) -> dict:
-    out = {}
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = v.to(device)
-        elif isinstance(v, dict):
-            out[k] = _batch_to_device(v, device)
+        if self.p == 1:
+            cardinality = probs.sum(dim=0) + one_hot.sum(dim=0)
         else:
-            out[k] = v
-    return out
+            cardinality = (probs ** self.p).sum(dim=0) + (one_hot ** self.p).sum(dim=0)
+
+        dice_per_class = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+
+        present = one_hot.sum(dim=0) > 0
+        if present.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        return 1.0 - dice_per_class[present].mean()
 
 
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    from fvcore.nn import FlopCountAnalysis
+# =============================================================================
+# TASK REGISTRY
+# =============================================================================
 
-    print("\n" + "=" * 80)
-    print("MEASURING MODEL COMPLEXITY")
-    print("=" * 80 + "\n")
+SEGMENTATION_TASKS = (
+    "dynamic_world",
+    "esa_worldcover",
+    "flairhub_cosia",
+    "flairhub_lpis",
+    "mdas_segmentation",
+    "murat_segmentation",
+    "c2seg_segmentation",
+    "pastis_segmentation",
+    "multiearth_deforestation",
+)
+RECONSTRUCTION_TASKS = ("reconstruction",)
+ALL_TASKS = SEGMENTATION_TASKS + RECONSTRUCTION_TASKS
 
-    data_module.setup("test")
-    test_dataset = data_module.val_dataset
+# Per-task class names for logging
+TASK_CLASS_NAMES = {
+    "c2seg_segmentation": {
+        0: "Background", 1: "Urban Fabric", 2: "Industrial",
+        3: "Street Network", 4: "Mine/Dump", 5: "Artif. Vegetated",
+        6: "Arable Land", 7: "Low Vegetation", 8: "Forests",
+        9: "Water",
+    },
+    "pastis_segmentation": {
+        0: "Background", 1: "Meadow", 2: "Soft Winter Wheat",
+        3: "Corn", 4: "Winter Barley", 5: "Winter Rapeseed",
+        6: "Spring Barley", 7: "Sunflower", 8: "Grapevine",
+        9: "Beet", 10: "Soy", 11: "Sorghum",
+        12: "Flax", 13: "Protein Crops", 14: "Other Cereals",
+        15: "Fruits/Veg", 16: "Other Crops", 17: "Grassland",
+        18: "Shrub/Forest",
+    },
+    "mdas_segmentation": {
+        0: "Pavement", 1: "Soil", 2: "Roof",
+        3: "Low vegetation", 4: "Tree", 5: "Water",
+    },
+    "esa_worldcover": {
+        0: "Tree cover", 1: "Shrubland", 2: "Grassland",
+        3: "Cropland", 4: "Built-up", 5: "Bare/sparse",
+        6: "Snow/ice", 7: "Water", 8: "Wetland",
+        9: "Mangroves", 10: "Moss/lichen",
+    },
+    "multiearth_deforestation": {
+        0: "Forest", 1: "Deforested",
+    },
+}
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-    model.eval()
 
-    num_samples = min(25, len(test_dataset))
-    samples = [test_dataset[i] for i in range(num_samples)]
+class Model_Pretrain(pl.LightningModule):
+    """
+    Single-task segmentation trainer.
 
-    results = []
+    Shared encoder + task-specific head.
+    Plain CrossEntropyLoss by default; per-task weighted CE for
+    imbalanced datasets. Optional Dice loss for class-imbalanced tasks.
+    """
 
-    for input_size in [128]:
-        print(f"\nTesting input size: {input_size}x{input_size}")
+    IGNORE_INDEX = 255
 
-        batch_0 = collate_multitask([samples[0]])
-        batch_0 = _batch_to_device(batch_0, device)
+    def __init__(self, config, wand, name, transform, lookup_table):
+        super().__init__()
+        self.strict_loading = False
+        self.config = config
+        self.transform = transform
+        self.wand = wand
+        self.name = name
+        self.lookup_table = lookup_table
 
-        # Warmup
-        with torch.no_grad():
-            _ = model.forward_multitask(batch_0, training=False)
+        self.lr = float(config["trainer"]["lr"])
+        self.weight_decay = float(config["trainer"]["weight_decay"])
 
-        # FLOPs
-        batch_1 = collate_multitask([samples[1]])
-        batch_1 = _batch_to_device(batch_1, device)
+        # =====================================================================
+        # TASK CONFIGURATION
+        # =====================================================================
+        self.task_configs = {
+            "esa_worldcover":     {"num_classes": 11, "type": "segmentation"},
+            "dynamic_world":      {"num_classes": 9,  "type": "segmentation"},
+            "flairhub_cosia":     {"num_classes": 18, "type": "segmentation"},
+            "flairhub_lpis":      {"num_classes": 23, "type": "segmentation"},
+            "mdas_segmentation":  {"num_classes": 6,  "type": "segmentation"},
+            "murat_segmentation": {"num_classes": 2,  "type": "segmentation"},
+            "c2seg_segmentation": {"num_classes": 10, "type": "segmentation"},
+            "pastis_segmentation": {"num_classes": 20, "type": "segmentation"},
+            "multiearth_deforestation": {"num_classes": 2, "type": "segmentation"},
+            "reconstruction":     {"num_classes": 1,  "type": "reconstruction"},
+        }
 
-        try:
-            with torch.no_grad():
-                flops = FlopCountAnalysis(model, (batch_1,))
-                gflops = flops.total() / 1e9
-        except Exception as e:
-            print(f"  FLOPs measurement failed: {e}")
-            gflops = -1
+        # =====================================================================
+        # ENCODER (shared)
+        # =====================================================================
+        self.encoder = Atomiser_Senflood(
+            config=self.config, lookup_table=self.lookup_table
+        )
 
-        # Inference time
-        num_warmup, num_runs = 3, 20
-        with torch.no_grad():
-            for i in range(num_warmup):
-                b = collate_multitask([samples[i % num_samples]])
-                b = _batch_to_device(b, device)
-                _ = model.forward_multitask(b, training=False)
+        self.feature_dim = config["Atomiser"].get("latent_dim", 256)
 
-            torch.cuda.synchronize()
-            start = time.time()
-            for i in range(num_runs):
-                idx = (i + num_warmup) % num_samples
-                b = collate_multitask([samples[idx]])
-                b = _batch_to_device(b, device)
-                _ = model.forward_multitask(b, training=False)
-                torch.cuda.synchronize()
-            end = time.time()
+        # =====================================================================
+        # TASK-SPECIFIC HEADS
+        # =====================================================================
+        self.heads = nn.ModuleDict()
+        for task_name, task_cfg in self.task_configs.items():
+            if task_cfg["type"] == "segmentation":
+                self.heads[task_name] = nn.Sequential(
+                    nn.LayerNorm(self.feature_dim),
+                    nn.Linear(self.feature_dim, task_cfg["num_classes"]),
+                )
+            else:
+                self.heads[task_name] = nn.Sequential(
+                    nn.LayerNorm(self.feature_dim),
+                    nn.Linear(self.feature_dim, 1),
+                )
 
-        avg_time_ms = (end - start) / num_runs * 1000
+        # =====================================================================
+        # LOSS
+        # =====================================================================
+        self.seg_loss = nn.CrossEntropyLoss(ignore_index=self.IGNORE_INDEX)
 
-        first_res = next(iter(batch_0["groups"]))
-        num_tokens = batch_0["groups"][first_res]["tokens"].shape[1]
-
-        results.append({
-            "input_size": input_size,
-            "num_tokens": num_tokens,
-            "gflops": gflops,
-            "inference_time_ms": avg_time_ms,
+        self.seg_loss_weighted = nn.ModuleDict({
+            "murat_segmentation": nn.CrossEntropyLoss(
+                weight=torch.tensor([1.0, 19.0]),
+                ignore_index=self.IGNORE_INDEX,
+            ),
         })
 
-        print(f"  Tokens: {num_tokens}")
-        print(f"  GFLOPs: {gflops:.2f}")
-        print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
+        self.dice_tasks = set()
+        self.dice_loss = SoftDiceLoss(
+            ignore_index=self.IGNORE_INDEX,
+            smooth=1e-5,
+            p=1,
+        )
 
-    print("\n" + "=" * 80)
-    print(f"COMPLEXITY SUMMARY ({config_model['encoder']})")
-    print("=" * 80)
-    print(f"{'Input':<10} {'Tokens':<12} {'GFLOPs':<12} {'Time (ms)':<12}")
-    print("-" * 50)
-    for r in results:
-        print(f"{r['input_size']:<10} {r['num_tokens']:<12} {r['gflops']:<12.2f} {r['inference_time_ms']:<12.2f}")
-    print("=" * 80)
+        # =====================================================================
+        # METRICS (only for tasks that exist)
+        # =====================================================================
+        self._init_metrics()
+        self._train_tasks_seen = set()
+        self._val_tasks_seen = set()
 
-# =============================================================================
-# SAVE WANDB RUN ID
-# =============================================================================
-if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
-    run_id = wandb.run.id
-    print("WANDB_RUN_ID:", run_id)
-    os.makedirs("training/wandb_runs", exist_ok=True)
-    with open(f"training/wandb_runs/{xp_name}.txt", "w") as f:
-        f.write(run_id)
+        print(f"[Pretrain] Single-task trainer:")
+        for task_name, task_cfg in self.task_configs.items():
+            extras = []
+            if task_name in self.seg_loss_weighted:
+                extras.append("weighted CE")
+            if task_name in self.dice_tasks:
+                extras.append("CE + Dice")
+            extra_str = f" ({', '.join(extras)})" if extras else ""
+            print(f"  {task_name}: {task_cfg['type']} "
+                  f"({'classes=' + str(task_cfg['num_classes']) if task_cfg['type'] == 'segmentation' else 'MSE'}"
+                  f"{extra_str})")
+
+    # =========================================================================
+    # METRICS
+    # =========================================================================
+
+    def _init_metrics(self):
+        for task_name in SEGMENTATION_TASKS:
+            if task_name not in self.task_configs:
+                continue
+            nc = self.task_configs[task_name]["num_classes"]
+            for split in ["train", "val"]:
+                setattr(self, f"{split}_{task_name}_mIoU", torchmetrics.JaccardIndex(
+                    task="multiclass", num_classes=nc,
+                    average="macro", ignore_index=self.IGNORE_INDEX,
+                ))
+                setattr(self, f"{split}_{task_name}_acc", torchmetrics.Accuracy(
+                    task="multiclass", num_classes=nc,
+                    average="macro", ignore_index=self.IGNORE_INDEX,
+                ))
+                setattr(self, f"{split}_{task_name}_mF1", torchmetrics.F1Score(
+                    task="multiclass", num_classes=nc,
+                    average="macro", ignore_index=self.IGNORE_INDEX,
+                ))
+                # Per-class IoU for detailed logging
+                setattr(self, f"{split}_{task_name}_iou_per_class", torchmetrics.JaccardIndex(
+                    task="multiclass", num_classes=nc,
+                    average="none", ignore_index=self.IGNORE_INDEX,
+                ))
+
+        for split in ["train", "val"]:
+            setattr(self, f"{split}_recon_mse", torchmetrics.MeanSquaredError())
+            setattr(self, f"{split}_recon_mae", torchmetrics.MeanAbsoluteError())
+
+    # =========================================================================
+    # ENCODE / DECODE
+    # =========================================================================
+
+    def _encode(self, batch, training=True):
+        """Encode groups → latents + coords."""
+        groups = batch["groups"]
+        tpl = self.encoder.tokens_per_latent
+
+        resolutions = sorted(groups.keys())
+        grid_configs = {
+            res: compute_grid_config(
+                resolution=res,
+                shape=groups[res]["shape"],
+                total_tokens=groups[res]["tokens"].shape[1],
+                tokens_per_latent=tpl,
+                sigma_factor=self.encoder.sigma_factor,
+                max_k=self.encoder.max_k,
+            )
+            for res in resolutions
+        }
+
+        encoder_output = self.encoder.encode(
+            groups=groups,
+            grid_configs=grid_configs,
+            training=training,
+        )
+
+        return encoder_output.latents_per_res, encoder_output.coords_per_res
+
+    def _decode(self, latents_per_res, coords_per_res, queries, queries_mask,
+                target_resolution=None, training=True):
+        """Decode: latents + queries → pre-head features [B, M, D]."""
+        chunk_size = 10000
+        N = queries.shape[1]
+
+        if N > chunk_size:
+            feats = []
+            for i in range(0, N, chunk_size):
+                f = self.encoder.reconstruct(
+                    latents_per_res, coords_per_res,
+                    queries[:, i:i + chunk_size],
+                    queries_mask[:, i:i + chunk_size],
+                    target_resolution=target_resolution,
+                    training=training,
+                    return_features=True,
+                )
+                feats.append(f)
+            return torch.cat(feats, dim=1)
+        else:
+            return self.encoder.reconstruct(
+                latents_per_res, coords_per_res,
+                queries, queries_mask,
+                target_resolution=target_resolution,
+                training=training,
+                return_features=True,
+            )
+
+    # =========================================================================
+    # FORWARD
+    # =========================================================================
+
+    def forward_multitask(self, batch, training=True):
+        """Encode once, decode per task."""
+        latents_per_res, coords_per_res = self._encode(batch, training=training)
+
+        target_resolution = batch.get("target_resolution", None)
+
+        predictions = {}
+        for task_name, task_data in batch["tasks"].items():
+            if task_name not in self.heads:
+                continue
+
+            features = self._decode(
+                latents_per_res, coords_per_res,
+                task_data["queries"], task_data["queries_mask"],
+                target_resolution=target_resolution,
+                training=training,
+            )
+
+            predictions[task_name] = self.heads[task_name](features)
+
+        return predictions
+
+    def forward(self, batch, task_name=None, training=False):
+        """Dispatch to forward_multitask if batch has 'tasks' key."""
+        if "tasks" in batch:
+            return self.forward_multitask(batch, training=training)
+
+        if task_name is None:
+            task_name = batch.get("task", "reconstruction")
+
+        result = self.encoder(
+            batch, training=training,
+            task="reconstruction", return_features=True,
+        )
+        return self.heads[task_name](result["features"])
+
+    # =========================================================================
+    # LOSS
+    # =========================================================================
+
+    def _compute_seg_loss(self, predictions, queries, task_name=None):
+        """Segmentation loss from query col 4."""
+        labels = queries[:, :, 4].long()
+        pred_flat = rearrange(predictions, "b m c -> (b m) c")
+        label_flat = rearrange(labels, "b m -> (b m)")
+
+        valid_count = (label_flat != self.seg_loss.ignore_index).sum()
+        if valid_count == 0:
+            return None, None, None
+
+        if task_name and task_name in self.seg_loss_weighted:
+            loss_fn = self.seg_loss_weighted[task_name]
+            loss = loss_fn(pred_flat, label_flat)
+        else:
+            loss = self.seg_loss(pred_flat, label_flat)
+
+        if task_name and task_name in self.dice_tasks:
+            dice = self.dice_loss(pred_flat, label_flat)
+            loss = loss + dice
+
+        preds = torch.argmax(predictions, dim=-1)
+        return loss, preds, labels
+
+    def _compute_recon_loss(self, predictions, queries, queries_mask):
+        """Reconstruction loss from query col 4, masked."""
+        targets = queries[:, :, 4]
+        preds = predictions.squeeze(-1)
+
+        valid = ~queries_mask
+        valid_count = valid.sum()
+        if valid_count == 0:
+            return None, None, None
+
+        loss = nn.functional.mse_loss(preds[valid], targets[valid])
+        return loss, preds, targets
+
+    # =========================================================================
+    # SHARED STEP
+    # =========================================================================
+
+    def _step(self, batch, split):
+        """Shared logic for training and validation steps."""
+        all_predictions = self.forward_multitask(
+            batch, training=(split == "train"))
+
+        if all_predictions:
+            total_loss = sum(p.sum() * 0.0 for p in all_predictions.values())
+        else:
+            total_loss = sum(p.sum() * 0.0 for p in self.parameters())
+
+        tasks_seen = (self._train_tasks_seen if split == "train"
+                      else self._val_tasks_seen)
+
+        for task_name, predictions in all_predictions.items():
+            task_data = batch["tasks"][task_name]
+            queries = task_data["queries"]
+            queries_mask = task_data["queries_mask"]
+
+            tasks_seen.add(task_name)
+
+            if torch.isnan(predictions).any() or torch.isinf(predictions).any():
+                predictions = torch.nan_to_num(
+                    predictions, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if task_name in SEGMENTATION_TASKS:
+                loss, preds, labels = self._compute_seg_loss(
+                    predictions, queries, task_name=task_name)
+
+                if loss is None or not torch.isfinite(loss):
+                    continue
+
+                # Update metrics
+                getattr(self, f"{split}_{task_name}_mIoU").update(preds, labels)
+                getattr(self, f"{split}_{task_name}_acc").update(preds, labels)
+                getattr(self, f"{split}_{task_name}_mF1").update(preds, labels)
+                getattr(self, f"{split}_{task_name}_iou_per_class").update(preds, labels)
+
+                self.log(f"{split}_{task_name}_loss", loss,
+                         on_step=(split == "train"), on_epoch=True,
+                         prog_bar=True, logger=True)
+
+                total_loss = total_loss + loss
+
+            elif task_name in RECONSTRUCTION_TASKS:
+                loss, preds, targets = self._compute_recon_loss(
+                    predictions, queries, queries_mask)
+
+                if loss is None or not torch.isfinite(loss):
+                    continue
+
+                getattr(self, f"{split}_recon_mse").update(preds, targets)
+                getattr(self, f"{split}_recon_mae").update(preds, targets)
+
+                self.log(f"{split}_recon_loss", loss,
+                         on_step=(split == "train"), on_epoch=True,
+                         prog_bar=True, logger=True)
+
+                total_loss = total_loss + loss
+
+        self.log(f"{split}_loss", total_loss,
+                 on_step=(split == "train"), on_epoch=True,
+                 prog_bar=True, logger=True)
+
+        return total_loss
+
+    # =========================================================================
+    # TRAINING / VALIDATION STEPS
+    # =========================================================================
+
+    def training_step(self, batch, batch_idx):
+        return self._step(batch, "train")
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        return self._step(batch, "val")
+
+    # =========================================================================
+    # EPOCH END
+    # =========================================================================
+
+    def _on_epoch_end(self, split):
+        tasks_seen = (self._train_tasks_seen if split == "train"
+                      else self._val_tasks_seen)
+
+        miou_values = []
+        for task_name in SEGMENTATION_TASKS:
+            if task_name not in tasks_seen:
+                continue
+            if not hasattr(self, f"{split}_{task_name}_mIoU"):
+                continue
+
+            metric_mIoU = getattr(self, f"{split}_{task_name}_mIoU")
+            metric_acc = getattr(self, f"{split}_{task_name}_acc")
+            metric_mF1 = getattr(self, f"{split}_{task_name}_mF1")
+            metric_per_class = getattr(self, f"{split}_{task_name}_iou_per_class")
+
+            miou = metric_mIoU.compute()
+            acc = metric_acc.compute()
+            mf1 = metric_mF1.compute()
+            per_class = metric_per_class.compute()
+
+            self.log(f"{split}_{task_name}_mIoU", miou,
+                     on_epoch=True, prog_bar=True, logger=True)
+            self.log(f"{split}_{task_name}_acc", acc,
+                     on_epoch=True, logger=True)
+            self.log(f"{split}_{task_name}_mF1", mf1,
+                     on_epoch=True, logger=True)
+
+            # Per-class IoU with proper names
+            class_names = TASK_CLASS_NAMES.get(task_name, {})
+            nc = self.task_configs[task_name]["num_classes"]
+            for cls_idx in range(min(nc, len(per_class))):
+                cls_name = class_names.get(cls_idx, f"class_{cls_idx}")
+                self.log(f"{split}_{task_name}_IoU_{cls_name}", per_class[cls_idx],
+                         on_epoch=True, logger=True)
+
+            miou_values.append(miou)
+            metric_mIoU.reset()
+            metric_acc.reset()
+            metric_mF1.reset()
+            metric_per_class.reset()
+
+        if miou_values:
+            self.log(f"{split}_avg_mIoU", torch.stack(miou_values).mean(),
+                     on_epoch=True, prog_bar=True, logger=True)
+
+        if "reconstruction" in tasks_seen:
+            recon_mse = getattr(self, f"{split}_recon_mse")
+            recon_mae = getattr(self, f"{split}_recon_mae")
+            self.log(f"{split}_recon_mse", recon_mse.compute(),
+                     on_epoch=True, logger=True)
+            self.log(f"{split}_recon_mae", recon_mae.compute(),
+                     on_epoch=True, logger=True)
+            recon_mse.reset()
+            recon_mae.reset()
+
+        tasks_seen.clear()
+
+    def on_train_epoch_end(self):
+        self._on_epoch_end("train")
+
+    def on_validation_epoch_end(self):
+        self._on_epoch_end("val")
+
+    # =========================================================================
+    # OPTIMIZER
+    # =========================================================================
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        warmup_steps = min(1000, max(1, int(0.05 * total_steps)))
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
+
+    # =========================================================================
+    # SAVE / LOAD
+    # =========================================================================
+
+    def save_model(self, name=None):
+        suffix = f"_{name}" if name else ""
+        file_path = f"./pth_files/pretrain_{self.name}{suffix}.pth"
+        state = {
+            "encoder": self.encoder.state_dict(),
+            "heads": self.heads.state_dict(),
+        }
+        torch.save(state, file_path)
+        print(f"[Pretrain] Model saved to {file_path}")
+
+    def load_model(self, name=None, encoder_only=False):
+        suffix = f"_{name}" if name else ""
+        file_path = f"./pth_files/pretrain_{self.name}{suffix}.pth"
+        state = torch.load(file_path, weights_only=True)
+        self.encoder.load_state_dict(state["encoder"])
+        print(f"[Pretrain] Encoder loaded from {file_path}")
+        if not encoder_only and "heads" in state:
+            self.heads.load_state_dict(state["heads"])
+            print(f"[Pretrain] Heads loaded from {file_path}")
+
+    def load_encoder_for_downstream(self, checkpoint_path: str):
+        state = torch.load(checkpoint_path, weights_only=True)
+        self.encoder.load_state_dict(state["encoder"])
+        print(f"[Pretrain] Encoder loaded for downstream from {checkpoint_path}")

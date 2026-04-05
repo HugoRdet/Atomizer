@@ -275,6 +275,7 @@ model = build_model(
 trainer_module = BaselineTrainer(
     model=model,
     modality=args.sensor,
+    task="c2seg",
     lr=args.lr,
     weight_decay=args.weight_decay,
     num_classes=NUM_CLASSES,

@@ -56,9 +56,11 @@ TASK_CLASS_NAMES = {
     "c2seg": {
         0: "Background",     1: "Urban Fabric",     2: "Industrial",
         3: "Street Network", 4: "Mine/Dump",        5: "Artif. Vegetated",
-        6: "Arable Land",    7: "Permanent Crops",  8: "Pastures",
-        9: "Forests",       10: "Shrub",            11: "Open Spaces",
-        12: "Inland Wetlands", 13: "Surface Water",
+        6: "Arable Land",    7: "Low Vegetation",   8: "Forests",
+        9: "Water",
+    },
+    "multiearth": {
+        0: "Forest",         1: "Deforested",
     },
 }
 

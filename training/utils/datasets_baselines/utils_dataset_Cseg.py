@@ -51,24 +51,38 @@ except ImportError:
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════
 
-NUM_CLASSES = 14
+NUM_CLASSES = 10
 IGNORE_INDEX = 255
 
 CLASS_NAMES = {
     0: "Background",
-    1: "Surface Water",
-    2: "Street Network",
-    3: "Urban Fabric",
-    4: "Industrial/Commercial/Transport",
-    5: "Mine/Dump/Construction",
-    6: "Artificially Vegetated",
-    7: "Arable Land",
-    8: "Permanent Crops",
-    9: "Pastures",
-    10: "Forests",
-    11: "Shrub",
-    12: "Open Spaces",
-    13: "Inland Wetlands",
+    1: "Urban Fabric",
+    2: "Industrial/Commercial",
+    3: "Street Network",
+    4: "Mine/Dump/Construction",
+    5: "Artif. Vegetated",
+    6: "Arable Land",
+    7: "Low Vegetation",
+    8: "Forests",
+    9: "Water",
+}
+
+# Remap original 14 classes → merged 10 classes
+C2SEG_CLASS_REMAP = {
+    0: 0,    # Background
+    1: 1,    # Urban Fabric
+    2: 2,    # Industrial/Commercial
+    3: 3,    # Street Network
+    4: 4,    # Mine/Dump/Construction
+    5: 5,    # Artif. Vegetated
+    6: 6,    # Arable Land
+    7: 6,    # Permanent Crops → Arable Land
+    8: 7,    # Pastures → Low Vegetation
+    9: 8,    # Forests
+    10: 7,   # Shrub → Low Vegetation
+    11: 7,   # Open Spaces → Low Vegetation
+    12: 9,   # Inland Wetlands → Water
+    13: 9,   # Surface Water → Water
 }
 
 CHINA_LABEL_REMAP = {
@@ -491,6 +505,11 @@ class C2SegBaselineDataset(Dataset):
             for raw_val, new_val in CHINA_LABEL_REMAP.items():
                 remapped[label == raw_val] = new_val
             label = remapped
+        # Merge classes (14 → 10)
+        merged = torch.full_like(label, IGNORE_INDEX)
+        for old_val, new_val in C2SEG_CLASS_REMAP.items():
+            merged[label == old_val] = new_val
+        label = merged
         return label
 
     # ═════════════════════════════════════════════════════════════════

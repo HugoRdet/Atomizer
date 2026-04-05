@@ -481,7 +481,7 @@ def compute_grid_config(
     total_tokens: int = None,
     sigma_factor: float = 1.5,
     max_k: int = 2000,
-    min_pixels_per_latent: int = 4,
+    min_pixels_per_latent: int = 1,
 ) -> dict:
     """
     Compute latent grid configuration from total token count.
@@ -528,12 +528,14 @@ def compute_grid_config(
 
     # Number of latents from token budget
     num_latents = max(1, total_tokens // tokens_per_latent)
+    
 
     # Cap: never more latents than spatial positions allow.
     # Temporal tokens share spatial locations, so the latent grid
     # must fit within the H×W spatial extent.
     max_spatial_latents = max(1, (H * W) // min_pixels_per_latent)
     num_latents = min(num_latents, max_spatial_latents)
+
 
     # Arrange on spatial grid preserving aspect ratio
     aspect = W / H

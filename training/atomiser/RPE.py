@@ -1164,6 +1164,8 @@ class SelfAttentionRoPE(nn.Module):
     ):
         super().__init__()
         assert dim_head % 4 == 0, "dim_head must be divisible by 4 for 2D RoPE"
+
+        
         
         self.heads = heads
         self.dim_head = dim_head
@@ -1209,6 +1211,7 @@ class SelfAttentionRoPE(nn.Module):
         
         # Apply RoPE with physical compression
         if self.use_rope and self.rope is not None and pos_x is not None:
+            
             if num_spatial is not None and num_spatial < N:
                 # Hybrid: spatial + global latents
                 q_spatial, q_global = q[:, :num_spatial], q[:, num_spatial:]
