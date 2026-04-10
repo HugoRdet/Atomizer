@@ -340,7 +340,7 @@ callbacks = [
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
     use_distributed_sampler=False,
-    devices=2, max_epochs=config_model["trainer"]["epochs"],
+    devices=-1, max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu", precision="bf16-mixed",
     logger=wandb_logger, log_every_n_steps=5,
     callbacks=callbacks, default_root_dir=ckpt_dir,

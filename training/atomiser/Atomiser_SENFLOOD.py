@@ -2,24 +2,21 @@
 Atomiser Model — Multi-Resolution Encoder/Decoder
 ==================================================
 
-Clean version with:
-  - Stochastic token sampling: (tokens_per_latent, cross_k) pairs
-  - Gradient checkpointing (optional)
-  - MAE masking support
-  - RoPE in cross-attention and self-attention
-  - Per-resolution latent grids
-  - IDW decoder with content-aware gating
+Changes vs previous version:
+  - decoder_learned_dim removed (processor no longer has it)
+  - _compute_grid_spacing cached per latent count (avoids O(L²) cdist every decode)
+  - geographic pruning bias capture cleaned up (was silently discarded anyway)
+  - global_latents kept: participates in self-attention for global context,
+    intentionally not wired into decoder
 
 Config:
   latent_grid:
     sigma_factor: 1.5
     hexagonal: true
     train_sampling:
-      - [8192, 1024]
-      - [8192, 512]
-      - [8192, 256]
+      - [3000, 1000]
     val_sampling:
-      - [8192, 1024]
+      - [3000, 1000]
 """
 
 import random
@@ -72,61 +69,6 @@ def cache_fn(f):
 
 
 # =============================================================================
-# NEIGHBOR CROSS-ATTENTION
-# =============================================================================
-
-class NeighborCrossAttention(nn.Module):
-    """
-    Lightweight multi-head cross-attention over a small set of k neighbor latents.
-
-    A distance bias (−dists_norm × T) is added to the raw attention logits
-    before softmax, preserving the geometric prior while allowing content to
-    override it. T is a learnable scalar (decoder_temperature).
-    """
-
-    def __init__(self, dim: int, dim_q: int, heads: int = 4,
-                 dim_head: int = 64, dropout: float = 0.0):
-        super().__init__()
-        self.heads    = heads
-        self.dim_head = dim_head
-        self.scale    = dim_head ** -0.5
-        inner_dim     = heads * dim_head
-
-        self.to_q   = nn.Linear(dim_q,    inner_dim, bias=False)
-        self.to_k   = nn.Linear(dim,      inner_dim, bias=False)
-        self.to_v   = nn.Linear(dim,      inner_dim, bias=False)
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.LayerNorm(dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(
-        self,
-        q:          torch.Tensor,
-        kv:         torch.Tensor,
-        dist_bias:  Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        N, k, _ = kv.shape
-        h, dh   = self.heads, self.dim_head
-
-        Q = self.to_q(q).reshape(N, h, dh)
-        K = self.to_k(kv).reshape(N, k, h, dh).permute(0, 2, 1, 3)
-        V = self.to_v(kv).reshape(N, k, h, dh).permute(0, 2, 1, 3)
-
-        attn = torch.einsum('nhd,nhkd->nhk', Q, K) * self.scale
-
-        if dist_bias is not None:
-            attn = attn + dist_bias.unsqueeze(1)
-
-        attn = F.softmax(attn, dim=-1)
-
-        out = torch.einsum('nhk,nhkd->nhd', attn, V)
-        out = out.reshape(N, h * dh)
-        return self.to_out(out)
-
-
-# =============================================================================
 # ENCODER OUTPUT
 # =============================================================================
 
@@ -172,7 +114,6 @@ class Atomiser_Senflood(pl.LightningModule):
         self.sigma_factor = latent_cfg.get("sigma_factor", 1.5)
         self.hexagonal    = latent_cfg.get("hexagonal", False)
 
-        # Stochastic sampling: (tokens_per_latent, cross_k) pairs
         default_sampling = [[8192, 1024]]
         self.train_sampling = [
             tuple(p) for p in latent_cfg.get("train_sampling", default_sampling)
@@ -187,6 +128,9 @@ class Atomiser_Senflood(pl.LightningModule):
 
         # =====================================================================
         # 4. GLOBAL LATENTS
+        # Global latents participate in self-attention for global context
+        # aggregation. They are intentionally not wired into the decoder —
+        # the decoder uses only spatial latents for local prediction.
         # =====================================================================
         self.num_global_latents = config["Atomiser"].get("global_latents", 0)
 
@@ -204,7 +148,7 @@ class Atomiser_Senflood(pl.LightningModule):
         self.self_per_cross_attn = config["Atomiser"]["self_per_cross_attn"]
         self.num_classes         = config["trainer"]["num_classes"]
         self.decoder_k_spatial   = config["Atomiser"].get("decoder_k_spatial", 4)
-        self.gradient_checkpointing = config["Atomiser"].get("gradient_checkpointing",True)
+        self.gradient_checkpointing = config["Atomiser"].get("gradient_checkpointing", True)
 
         # =====================================================================
         # 6. ROPE CONFIGURATION
@@ -230,16 +174,6 @@ class Atomiser_Senflood(pl.LightningModule):
     # =========================================================================
 
     def sample_config(self, training: bool = True):
-        """
-        Sample a (tokens_per_latent, cross_k) pair for this batch.
-
-        Training: random choice from train_sampling list.
-        Validation: random choice from val_sampling list.
-
-        Returns:
-            tpl: tokens_per_latent (determines grid density)
-            cross_k: number of tokens each latent attends to
-        """
         if training:
             return random.choice(self.train_sampling)
         else:
@@ -247,7 +181,6 @@ class Atomiser_Senflood(pl.LightningModule):
 
     @property
     def tokens_per_latent(self):
-        """Default tokens_per_latent for backward compatibility."""
         return self.train_sampling[0][0]
 
     # =========================================================================
@@ -297,7 +230,6 @@ class Atomiser_Senflood(pl.LightningModule):
             self.latent_dim,
             FeedForward(self.latent_dim, dropout=self.ff_dropout)
         ))
-
         get_latent_attn = cache_fn(lambda: PreNormRoPE(
             self.latent_dim,
             SelfAttentionRoPE(
@@ -331,51 +263,52 @@ class Atomiser_Senflood(pl.LightningModule):
             self.encoder_layers.append(nn.ModuleList([cross_attn, cross_ff, self_attns]))
 
     def _init_decoder(self):
-        decoder_hidden  = self.latent_dim * 2
-        local_input_dim = (
-            self.latent_dim
-            + self.decoder_pe_dim
-            + self.query_dim_recon
-        )
+        """
+        k-nearest cross-attention decoder with RoPE and query skip.
 
-        self.local_predictor = nn.Sequential(
-            nn.Linear(local_input_dim, decoder_hidden),
-            nn.LayerNorm(decoder_hidden),
-            nn.GELU(),
-            nn.Linear(decoder_hidden, decoder_hidden),
-            nn.LayerNorm(decoder_hidden),
-            nn.GELU(),
-            nn.Linear(decoder_hidden, self.latent_dim),
-            nn.LayerNorm(self.latent_dim),
-            nn.GELU(),
-        )
+        Pipeline:
+            1. Select k nearest latents per query pixel
+            2. Build context = [latent | rel_pe]  (explicit relative geometry)
+            3. LocalCrossAttentionRoPE: Q=query_features, K/V=context
+            4. output_head([cross_attn_output | query_features]) → logits
 
-        self.neighbor_cross_attn = NeighborCrossAttention(
-            dim=self.latent_dim,
-            dim_q=self.query_dim_recon,
+        The concatenation of query_features in the output_head gives the MLP
+        explicit access to modality metadata (spectral index, resolution)
+        alongside the spatial content from cross-attention.
+        This is not a residual — it's a richer input to the final projection.
+        """
+        rope_compression_scale = self.config["RoPE"].get("cross_compression_scale", 50.0)
+        rope_base              = self.config["RoPE"].get("base", 100.0)
+
+        # context_dim = latent features + relative PE
+        decoder_context_dim = self.latent_dim + self.decoder_pe_dim
+
+        # Position-aware cross-attention in decoder
+        self.decoder_cross_attn = LocalCrossAttentionRoPE(
+            dim_query=self.query_dim_recon,
+            dim_context=decoder_context_dim,
+            dim_out=self.latent_dim,
             heads=self.cross_heads,
             dim_head=self.cross_dim_head,
             dropout=self.attn_dropout,
+            use_rope=self.encoder_use_rpe,
+            rope_base=rope_base,
+            rope_compression_scale=rope_compression_scale,
+            rope_learnable_scale=self.rope_learnable_scale,
         )
 
-        self.decoder_temperature = nn.Parameter(torch.tensor(2.0))
-
-        self.grid_gate = nn.Linear(self.latent_dim, 1)
-
-        self.post_fusion = nn.Sequential(
-            nn.Linear(self.latent_dim, decoder_hidden),
-            nn.LayerNorm(decoder_hidden),
-            nn.GELU(),
-            nn.Linear(decoder_hidden, self.latent_dim),
-            nn.LayerNorm(self.latent_dim),
-            nn.GELU(),
-        )
+        # Final MLP: [cross_attn_output (latent_dim) | query_features (query_dim_recon)]
+        mlp_input_dim = self.latent_dim + self.query_dim_recon
+        hidden_dim    = self.latent_dim * 2
 
         self.reconstruction_head = nn.Sequential(
-            nn.Linear(self.latent_dim, decoder_hidden),
-            nn.LayerNorm(decoder_hidden),
+            nn.Linear(mlp_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(decoder_hidden, self.num_classes),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.num_classes),
         )
 
     def _init_classifier(self):
@@ -486,6 +419,8 @@ class Atomiser_Senflood(pl.LightningModule):
     # =========================================================================
 
     def _apply_pruning(self, tokens, mask, coords, grid_config, L_spatial):
+        # Geographic bias returned by geo_pruning is not used here —
+        # cross-attention uses RoPE instead of the Gaussian distance bias.
         geo_tokens, geo_masks, _ = self.geo_pruning(
             tokens, mask, coords,
             geo_k=grid_config["geo_k"],
@@ -493,7 +428,6 @@ class Atomiser_Senflood(pl.LightningModule):
             L_spatial=L_spatial,
             hexagonal=grid_config.get("hexagonal", False),
         )
-        print(geo_tokens.shape)
         return geo_tokens, geo_masks
 
     def _sample_tokens(self, geo_tokens, geo_masks, cross_k):
@@ -560,6 +494,8 @@ class Atomiser_Senflood(pl.LightningModule):
         total_spatial = sum(split_sizes)
 
         if self.use_rpe:
+            # Use raw meter coordinates — consistent across all datasets
+            # since latent positions are always in meters.
             px = coords_concat[..., 0]
             py = coords_concat[..., 1]
             for self_attn, self_ff in self_attns:
@@ -636,7 +572,6 @@ class Atomiser_Senflood(pl.LightningModule):
         for layer_idx in range(self.depth):
             cross_attn, cross_ff, self_attns = self.encoder_layers[layer_idx]
 
-            # ── Cross-attention ───────────────────────────────────────
             for res in resolutions:
                 if mae_active:
                     st, sm = self._sample_tokens(
@@ -668,7 +603,6 @@ class Atomiser_Senflood(pl.LightningModule):
                             latents_per_res[res], st, sm,
                             coords_per_res[res], cross_attn, cross_ff, L_spatial)
 
-            # ── Self-attention ────────────────────────────────────────
             if mae_active:
                 full_lpr = {}; full_cpr = {}; L_vis_pr = {}
                 for res in resolutions:
@@ -688,7 +622,6 @@ class Atomiser_Senflood(pl.LightningModule):
             if return_trajectory:
                 trajectory.append(coords_per_res.copy())
 
-        # ── Rebuild full grid for decoder ─────────────────────────────
         if mae_active:
             for res in resolutions:
                 latents_per_res[res] = torch.cat([vis_latents[res], msk_latents[res]], dim=1)
@@ -708,100 +641,119 @@ class Atomiser_Senflood(pl.LightningModule):
     # Decoder
     # =========================================================================
 
-    def _compute_grid_spacing(self, coords):
-        with torch.no_grad():
-            c = coords[0]
-            dists = torch.cdist(c.unsqueeze(0), c.unsqueeze(0)).squeeze(0)
-            dists.fill_diagonal_(float('inf'))
-            return dists.min(dim=-1).values.median()
-
-    def _decode_single_grid(self, latents, coords, query_coords, query_gsd,
-                             query_features, grid_spacing, k, training=True):
-        B, M, _ = query_coords.shape
-        D = latents.shape[-1]
-
-        k_fetch = k + 1 if training else k
-        k_fetch = min(k_fetch, coords.shape[1])
-        k_keep  = min(k, k_fetch)
-
-        dists_sq = (query_coords.unsqueeze(2) - coords.unsqueeze(1)).pow(2).sum(dim=-1)
-        topk_dists_sq, topk_indices = torch.topk(dists_sq, k=k_fetch, dim=-1, largest=False)
-
-        if training and k_fetch > k_keep:
-            drop_idx  = torch.randint(0, k_fetch, (B, M, 1), device=coords.device)
-            keep_mask = torch.ones(B, M, k_fetch, dtype=torch.bool, device=coords.device)
-            keep_mask.scatter_(2, drop_idx, False)
-            topk_indices  = topk_indices[keep_mask].reshape(B, M, k_keep)
-            topk_dists_sq = topk_dists_sq[keep_mask].reshape(B, M, k_keep)
-
-        flat_idx = topk_indices.reshape(B, M * k_keep)
-        selected_latents = torch.gather(
-            latents, 1, flat_idx.unsqueeze(-1).expand(-1, -1, D)).reshape(B, M, k_keep, D)
-        selected_coords = torch.gather(
-            coords, 1, flat_idx.unsqueeze(-1).expand(-1, -1, 2)).reshape(B, M, k_keep, 2)
-
-        delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
-        delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
-
-        B_d, M_d, K_d = delta_x.shape
-        dx_flat = delta_x.reshape(B_d, M_d * K_d)
-        dy_flat = delta_y.reshape(B_d, M_d * K_d)
-
-        if isinstance(query_gsd, torch.Tensor) and query_gsd.dim() >= 2:
-            cs = (self.input_processor.compression_alpha * query_gsd.unsqueeze(-1)).reshape(B_d, M_d * K_d)
-        else:
-            cs = self.input_processor.compression_alpha * query_gsd
-
-        rel_pe = self.input_processor.pos_encoder(dx_flat, dy_flat, compression_scale=cs)
-        rel_pe = rel_pe.reshape(B_d, M_d, K_d, -1)
-
-        query_exp   = query_features.unsqueeze(2).expand(-1, -1, k_keep, -1)
-        local_input = torch.cat([selected_latents, rel_pe, query_exp], dim=-1)
-        local_preds = self.local_predictor(local_input)
-
-        gs_sq      = grid_spacing.pow(2).clamp(min=1e-8)
-        dists_norm = topk_dists_sq / gs_sq
-        dist_bias  = -dists_norm * self.decoder_temperature
-
-        q_flat    = query_features.reshape(B * M, -1)
-        kv_flat   = local_preds.reshape(B * M, k_keep, D)
-        bias_flat = dist_bias.reshape(B * M, k_keep)
-
-        out = self.neighbor_cross_attn(q_flat, kv_flat, bias_flat)
-        return out.reshape(B, M, D)
-
     def reconstruct(self, latents_per_res, coords_per_res, query_tokens,
-                     query_mask, target_resolution=None,
-                     training=True, return_features=False):
+                    query_mask, target_resolution=None,
+                    training=True, return_features=False):
+        """
+        Decode query pixels into class logits.
+
+        Pipeline:
+            1. Select k nearest latents per query pixel
+            2. Compute relative displacement (query → latent)
+            3. Build context = cat([latent_features | rel_pe])
+            4. LocalCrossAttentionRoPE: Q=query_features, K/V=context
+            5. output_head(cat([cross_attn_out | query_features])) → logits
+
+        Shapes:
+            query_features:  [B, M, query_dim_recon]
+            context:         [B*M, k, latent_dim + pe_dim]
+            output logits:   [B, M, num_classes]
+        """
         B, M, _ = query_tokens.shape
         k = self.decoder_k_spatial
 
+        # ── Query features & coords ───────────────────────────────────
         query_features, _, _ = self.input_processor.process_data_for_decoder(
             query_tokens, query_mask, target_resolution=target_resolution)
         query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
+        # query_features: [B, M, query_dim_recon]
+        # query_coords:   [B, M, 2]
 
+        # ── Concat all latents across resolutions ─────────────────────
+        all_latents = torch.cat(
+            [latents_per_res[r] for r in sorted(latents_per_res.keys())], dim=1)
+        all_coords = torch.cat(
+            [coords_per_res[r] for r in sorted(coords_per_res.keys())], dim=1)
+        # all_latents: [B, L, latent_dim]
+        # all_coords:  [B, L, 2]
+
+        # ── Select k nearest latents per query ────────────────────────
+        dists_sq = (query_coords.unsqueeze(2) - all_coords.unsqueeze(1)).pow(2).sum(-1)
+
+        k_fetch = min(k + 1, all_coords.shape[1]) if training else min(k, all_coords.shape[1])
+        k_keep  = min(k, k_fetch)
+
+        _, topk_indices = torch.topk(dists_sq, k=k_fetch, dim=-1, largest=False)
+
+        if training and k_fetch > k_keep:
+            drop_idx  = torch.randint(0, k_fetch, (B, M, 1), device=all_coords.device)
+            keep_mask = torch.ones(B, M, k_fetch, dtype=torch.bool, device=all_coords.device)
+            keep_mask.scatter_(2, drop_idx, False)
+            topk_indices = topk_indices[keep_mask].reshape(B, M, k_keep)
+
+        D = all_latents.shape[-1]
+        flat_idx = topk_indices.reshape(B, M * k_keep)
+
+        selected_latents = torch.gather(
+            all_latents, 1,
+            flat_idx.unsqueeze(-1).expand(-1, -1, D)
+        ).reshape(B, M, k_keep, D)
+        # selected_latents: [B, M, k, latent_dim]
+
+        selected_coords = torch.gather(
+            all_coords, 1,
+            flat_idx.unsqueeze(-1).expand(-1, -1, 2)
+        ).reshape(B, M, k_keep, 2)
+        # selected_coords: [B, M, k, 2]
+
+        # ── Relative displacement query → latent ──────────────────────
+        delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
+        delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
+        # delta_x, delta_y: [B, M, k]
+
+        # ── Relative positional encoding ──────────────────────────────
+        B_d, M_d, K_d = delta_x.shape
         if self.input_processor.use_constant_gsd:
-            query_gsd = self.input_processor._constant_gsd
+            cs = self.input_processor.compression_alpha * self.input_processor._constant_gsd
         else:
             query_gsd = self.input_processor.geometry.get_token_gsd(query_tokens)
+            cs = self.input_processor.compression_alpha * query_gsd
 
-        grid_features = []
-        for res in sorted(latents_per_res.keys()):
-            gs = self._compute_grid_spacing(coords_per_res[res])
-            grid_features.append(self._decode_single_grid(
-                latents_per_res[res], coords_per_res[res],
-                query_coords, query_gsd, query_features, gs, k, training))
+        dx_flat = delta_x.reshape(B_d, M_d * K_d)
+        dy_flat = delta_y.reshape(B_d, M_d * K_d)
+        rel_pe  = self.input_processor.pos_encoder(dx_flat, dy_flat, compression_scale=cs)
+        rel_pe  = rel_pe.reshape(B_d, M_d, K_d, -1)
+        # rel_pe: [B, M, k, pe_dim]
 
-        stacked = torch.stack(grid_features, dim=2)
-        scores  = self.grid_gate(stacked).squeeze(-1)
-        weights = F.softmax(scores, dim=-1)
-        fused   = (weights.unsqueeze(-1) * stacked).sum(dim=2)
+        # ── Build context = [latent | rel_pe] ─────────────────────────
+        context = torch.cat([selected_latents, rel_pe], dim=-1)
+        # context: [B, M, k, latent_dim + pe_dim]
 
-        fused = self.post_fusion(fused) + fused
+        # ── Cross-attention: Q=query_features, K/V=context ───────────
+        # LocalCrossAttentionRoPE expects:
+        #   queries: [B, L, query_dim]          → [B*M, 1, query_dim]
+        #   context: [B, L, m, ctx_dim]         → [B*M, 1, k, ctx_dim]
+        #   delta_x: [B, L, m]                  → [B*M, 1, k]
+        q_flat       = query_features.reshape(B * M, 1, -1)           # [B*M, 1, query_dim]
+        ctx_flat     = context.reshape(B * M, 1, k_keep, -1)          # [B*M, 1, k, ctx_dim]
+        dx_flat_attn = delta_x.reshape(B * M, 1, k_keep)              # [B*M, 1, k]
+        dy_flat_attn = delta_y.reshape(B * M, 1, k_keep)              # [B*M, 1, k]
+
+        attn_out = self.decoder_cross_attn(
+            q_flat,
+            context=ctx_flat,
+            delta_x=dx_flat_attn,
+            delta_y=dy_flat_attn,
+        )
+        # attn_out: [B*M, 1, latent_dim]
+        attn_out = attn_out.squeeze(1).reshape(B, M, -1)              # [B, M, latent_dim]
 
         if return_features:
-            return fused
-        return self.reconstruction_head(fused)
+            return attn_out
+
+        # ── Output head: [cross_attn_out | query_features] → logits ──
+        output = torch.cat([attn_out, query_features], dim=-1)       # [B, M, latent_dim + query_dim]
+        return self.reconstruction_head(output)                       # [B, M, num_classes]
 
     def classify(self, latents_per_res):
         all_latents = torch.cat(
@@ -822,17 +774,14 @@ class Atomiser_Senflood(pl.LightningModule):
         queries_mask = batch["queries_mask"]
         target_resolution = batch.get("target_resolution", None)
 
-        # ── Sample (tokens_per_latent, cross_k) for this batch ────────
         if tokens_per_latent_override is not None:
             tpl = tokens_per_latent_override
             batch_cross_k = self.val_sampling[0][1]
         else:
             tpl, batch_cross_k = self.sample_config(training)
 
-        resolutions = sorted(groups.keys())
-
-        # geo_k_budget: geographic pruning gathers 2× cross_k per latent.
-        geo_k_budget = batch_cross_k * 2
+        resolutions   = sorted(groups.keys())
+        geo_k_budget  = batch_cross_k * 2
 
         grid_configs = {
             res: compute_grid_config(

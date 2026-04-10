@@ -51,9 +51,10 @@ from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCa
 # ARGS
 # =============================================================================
 parser = argparse.ArgumentParser(description="Training script")
-parser.add_argument("--xp_name",       type=str, required=True, help="Experiment name")
-parser.add_argument("--config_model",  type=str, required=True, help="Model config yaml file")
-parser.add_argument("--dataset_name",  type=str, required=True, help="Name of the dataset used")
+parser.add_argument("--xp_name",      type=str,            required=True,  help="Experiment name")
+parser.add_argument("--config_model", type=str,            required=True,  help="Model config yaml file")
+parser.add_argument("--dataset_name", type=str,            required=True,  help="Name of the dataset used")
+parser.add_argument("--clipping",     action="store_true",                 help="Enable gradient clipping at 1.0")
 args = parser.parse_args()
 
 xp_name = args.xp_name
@@ -61,6 +62,8 @@ config_model = read_yaml("./training/configs/" + args.config_model)
 configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
 bands_yaml = "./data/bands_info/bands.yaml"
 
+if os.environ.get("LOCAL_RANK", "0") == "0":
+    print(f"[Train] Gradient clipping: {'ON (val=1.0)' if args.clipping else 'OFF'}")
 
 # =============================================================================
 # LOOKUP TABLE
@@ -85,24 +88,23 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # =============================================================================
 # MODEL
 # =============================================================================
-is_unet=False
+is_unet = False
 if is_unet:
     pass
-    
+
 else:
     model = Model_SenFlood(
         config=config_model,
         wand=True,
         name=xp_name,
-        transform=None,           # encoder creates its own TokenProcessor
+        transform=None,
         lookup_table=lookup_table,
     )
 
     #checkpoint_path = "./checkpoints/ATOMIZER_recon-val_mIoU-epoch=16-val_avg_mIoU=0.4233.ckpt"
-    # Option 1: Load checkpoint with strict=False (recommended)
     #model = Model_SenFlood.load_from_checkpoint(
     #    checkpoint_path,
-    #    strict=False,  # Allow missing keys (displacement MLP is new)
+    #    strict=False,
     #    config=config_model,
     #    wand=True,
     #    name=xp_name,
@@ -115,9 +117,9 @@ else:
 # =============================================================================
 data_module = UnifiedDataModule(
     path="./data/SENFLOOD",
-    batch_size=config_model["dataset"]["batchsize"],
+    batch_size=config_model["trainer"]["train_batch_size"],
     num_workers=4,
-    trans_modalities=None,        # v2 dataset handles tokenization internally
+    trans_modalities=None,
     trans_tokens=None,
     model=config_model["encoder"],
     dataset_config=read_yaml(bands_yaml),
@@ -129,8 +131,8 @@ data_module = UnifiedDataModule(
 # =============================================================================
 # CALLBACKS
 # =============================================================================
-lr_monitor = LearningRateMonitor(logging_interval="step")
-accumulator = GradientAccumulationScheduler(scheduling={0: 1})
+lr_monitor   = LearningRateMonitor(logging_interval="step")
+accumulator  = GradientAccumulationScheduler(scheduling={0: 2})
 
 checkpoint_val = ModelCheckpoint(
     dirpath="./checkpoints/",
@@ -141,21 +143,20 @@ checkpoint_val = ModelCheckpoint(
     verbose=True,
 )
 
+token_assign = TokenAssignmentCallbackSenFlood(
+    log_every_n_epochs=1,
+    sample_indices=[0],
+    save_dir="./viz_token_assignment",
+    use_wandb=True,
+)
 
-token_assign=TokenAssignmentCallbackSenFlood(
-        log_every_n_epochs= 1,
-        sample_indices=[0],
-        save_dir= "./viz_token_assignment",
-        use_wandb= True,
-    )
-
-#token_assign
 viz_callback = SegmentationVizCallback(
     sample_indices=[0, 1, 2],
     log_every_n_epochs=1,
     use_wandb=True,
 )
-callbacks = [accumulator, checkpoint_val, lr_monitor,viz_callback]
+
+callbacks = [accumulator, checkpoint_val, lr_monitor, viz_callback]
 
 # =============================================================================
 # TRAINER
@@ -170,7 +171,7 @@ trainer = Trainer(
     log_every_n_steps=5,
     callbacks=callbacks,
     default_root_dir="./checkpoints/",
-    gradient_clip_val=1.0
+    gradient_clip_val=1.0 if args.clipping else None,
 )
 
 # =============================================================================
@@ -193,7 +194,7 @@ def _batch_to_device(batch: dict, device) -> dict:
         elif isinstance(v, dict):
             out[k] = _batch_to_device(v, device)
         else:
-            out[k] = v  # scalars, tuples, strings — keep as-is
+            out[k] = v
     return out
 
 
@@ -204,15 +205,15 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     print("MEASURING MODEL COMPLEXITY")
     print("=" * 80 + "\n")
 
-    data_module.setup("test")
-    test_dataset = data_module.test_dataset
+    data_module.setup("fit")
+    train_dataset = data_module.train_dataset
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     model.eval()
 
-    num_samples = min(25, len(test_dataset))
-    samples = [test_dataset[i] for i in range(num_samples)]
+    num_samples = min(25, len(train_dataset))
+    samples = [train_dataset[i] for i in range(num_samples)]
 
     results = []
 
@@ -220,7 +221,6 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"\nTesting input size: {input_size}x{input_size}")
 
         if is_unet:
-            # ============= U-Net: simple image input =============
             image_0, label_0 = samples[0]
             image_0 = image_0.unsqueeze(0).to(device)
 
@@ -238,7 +238,6 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
                 print(f"  FLOPs measurement failed: {e}")
                 gflops = -1
 
-            # Inference time
             num_warmup, num_runs = 3, 20
             with torch.no_grad():
                 for i in range(num_warmup):
@@ -258,16 +257,12 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
             num_tokens = 15 * input_size * input_size
 
         else:
-            # ============= Atomizer: grouped dict batch =============
-            # Collate single sample into batch-of-1
             batch_0 = collate_grouped([samples[0]])
             batch_0 = _batch_to_device(batch_0, device)
 
-            # Warmup
             with torch.no_grad():
                 _ = model(batch_0)
 
-            # FLOPs
             batch_1 = collate_grouped([samples[1]])
             batch_1 = _batch_to_device(batch_1, device)
 
@@ -279,7 +274,6 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
                 print(f"  FLOPs measurement failed: {e}")
                 gflops = -1
 
-            # Inference time
             num_warmup, num_runs = 3, 20
             with torch.no_grad():
                 for i in range(num_warmup):
@@ -299,15 +293,14 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
             avg_time_ms = (end - start) / num_runs * 1000
 
-            # Count tokens from the first group
             first_res = next(iter(batch_0["groups"]))
             num_tokens = batch_0["groups"][first_res]["tokens"].shape[1]
 
         results.append({
-            "input_size": input_size,
-            "gsd_target": 10,
-            "num_tokens": num_tokens,
-            "gflops": gflops,
+            "input_size":       input_size,
+            "gsd_target":       10,
+            "num_tokens":       num_tokens,
+            "gflops":           gflops,
             "inference_time_ms": avg_time_ms,
         })
 
@@ -315,7 +308,6 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"  GFLOPs: {gflops:.2f}")
         print(f"  Inference time: {avg_time_ms:.2f} ms/tile")
 
-    # Summary
     print("\n" + "=" * 80)
     print(f"COMPLEXITY SUMMARY ({config_model['encoder']})")
     print("=" * 80)

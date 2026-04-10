@@ -142,6 +142,8 @@ class PASTISTrainer(pl.LightningModule):
         The encoder accepts batch dicts directly and unpacks
         groups/tasks internally.
         """
+
+        
         return self.encoder(
             batch,
             training=training,
@@ -272,7 +274,7 @@ class PASTISTrainer(pl.LightningModule):
 
     def _compute_crop_miou(self, per_class_iou: torch.Tensor) -> torch.Tensor:
         """Compute mIoU over crop classes 1-18 (exclude background 0)."""
-        crop_ious = per_class_iou[1:]  # classes 1 to N-1
+        crop_ious = per_class_iou[1:19]  # classes 1 to N-1
         return crop_ious.mean()
     
 

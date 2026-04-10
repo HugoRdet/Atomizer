@@ -31,6 +31,11 @@ class Sen1Floods11Dataset(Dataset):
         index (0-based into the merged S2+S1 stack) is used. Useful for debugging
         reconstruction and isolating per-band issues.
         Set to -1 or omit to use all bands (default).
+
+    Augmentations (training only):
+        D4 group: 4 rotations (0, 90, 180, 270°) × 2 flips = 8 transforms.
+        Applied consistently to both image [C, H, W] and label [H, W]
+        before token building, so token coordinates remain valid.
     """
 
     OPTICAL_RESOLUTION = 10.0
@@ -67,10 +72,6 @@ class Sen1Floods11Dataset(Dataset):
         self.reconstruction = config_model["trainer"].get("mode", "segmentation") == "reconstruction"
 
         # ── Single-channel mode ─────────────────────────────
-        # single_channel: index into the merged [S2(13) + S1(2)] band stack
-        #   -1 or absent → all 15 bands (default)
-        #    0..14       → only that band
-        #   list[int]    → only those bands
         sc = config_model["trainer"].get("single_channel", -1)
         if isinstance(sc, list):
             self.selected_channels = sorted(sc)
@@ -134,19 +135,66 @@ class Sen1Floods11Dataset(Dataset):
         print(f"[Sen1Floods11] Resolution idx: {self.resolution_idx} "
               f"(GSD={self.OPTICAL_RESOLUTION} m/px, all bands)")
         print(f"[Sen1Floods11] Time idx: -1 (no temporal info, zeroed by encoder)")
+        print(f"[Sen1Floods11] D4 augmentations: {'ON (train only)' if self.split == 'train' else 'OFF'}")
+
+    # =========================================================================
+    # D4 AUGMENTATION
+    # =========================================================================
+
+    @staticmethod
+    def _d4_augment(image: torch.Tensor, label: torch.Tensor):
+        """
+        Apply a random D4 transform to image [C, H, W] and label [H, W].
+
+        D4 = dihedral group of order 8:
+            4 rotations (0, 90, 180, 270°) × optional horizontal flip
+            = 8 equally likely transforms.
+
+        image and label are transformed identically so spatial
+        correspondence is preserved. Token coordinates remain valid
+        because they are derived from image shape after augmentation.
+        """
+        # Random horizontal flip (p=0.5)
+        if torch.rand(1).item() < 0.5:
+            image = torch.flip(image, dims=[2])   # [C, H, W] → flip W
+            label = torch.flip(label, dims=[1])   # [H, W]    → flip W
+
+        # Random rotation: 0, 90, 180, or 270 degrees
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            image = torch.rot90(image, k, dims=[1, 2])  # rotate H×W plane
+            label = torch.rot90(label, k, dims=[0, 1])  # rotate H×W plane
+
+        return image, label
+
+    @staticmethod
+    def _random_crop(image: torch.Tensor, label: torch.Tensor, size: int = 256):
+        """
+        Random spatial crop of image [C, H, W] and label [H, W] to size×size.
+
+        Applied after D4 augmentation (augment full 512, then crop) for
+        maximum spatial diversity. The TokenBuilder handles crops smaller
+        than the 512 reference grid correctly — the crop extracts a
+        different coordinate window depending on top/left offsets.
+        """
+        C, H, W = image.shape
+        assert H >= size and W >= size, (
+            f"Crop size {size} exceeds image size ({H}×{W})"
+        )
+        top  = torch.randint(0, H - size + 1, (1,)).item()
+        left = torch.randint(0, W - size + 1, (1,)).item()
+        image = image[:, top:top + size, left:left + size]
+        label = label[top:top + size, left:left + size]
+        return image, label
 
     # =========================================================================
     # CHANNEL SELECTION HELPER
     # =========================================================================
 
     def _select_channels(self, image):
-        """
-        Apply single-channel selection to a [C, H, W] image tensor.
-        Returns the selected subset of channels.
-        """
         if self.selected_channels is None:
             return image
-        return image[self.selected_channels]  # [len(selected), H, W]
+        return image[self.selected_channels]
 
     # =========================================================================
     # DATASET INTERFACE
@@ -156,7 +204,7 @@ class Sen1Floods11Dataset(Dataset):
         return len(self.s1_image_list)
 
     def __getitem__(self, index):
- 
+
         # ── Load ────────────────────────────────────────────
         with rasterio.open(self.s2_image_list[index]) as src:
             image_s2 = src.read().astype(np.float32)
@@ -176,12 +224,14 @@ class Sen1Floods11Dataset(Dataset):
 
         # ── Normalize ───────────────────────────────────────
         image_s2, image_s1 = self.normalize_image(image_s2, image_s1)
-        image_s2 = torch.clamp(image_s2, -10, 10)
-        image_s1 = torch.clamp(image_s1, -10, 10)
 
         # ── Merge & select channels ─────────────────────────
         image_full = torch.cat([image_s2, image_s1], dim=0)  # [15, H, W]
         image = self._select_channels(image_full)              # [C', H, W]
+
+        # ── D4 augmentation (training only) ─────────────────
+        if self.split == "train":
+            image, label = self._d4_augment(image, label)
 
         # ── Build tokens [N, 8] ─────────────────────────────
         resolution = self.OPTICAL_RESOLUTION
@@ -191,16 +241,21 @@ class Sen1Floods11Dataset(Dataset):
         if self.reconstruction:
             queries = image_tokens.clone()
             queries[:, 4] = queries[:, 0].clone()  # reflectance → label col
-            # Subsample
             perm = torch.randperm(queries.shape[0])[:self.max_tokens_reconstruction]
             queries = queries[perm]
         else:
-            queries = self.token_builder.subsample_queries(
-                seg_queries,
-                max_queries=self.max_tokens_reconstruction,
-                ignore_index=self.IGNORE_INDEX,
-                prioritize_valid=True,
-            )
+            if self.split == "train":
+                # Training: subsample for memory/speed
+                queries = self.token_builder.subsample_queries(
+                    seg_queries,
+                    max_queries=self.max_tokens_reconstruction,
+                    ignore_index=self.IGNORE_INDEX,
+                    prioritize_valid=True,
+                )
+            else:
+                # Val/test: all pixels for accurate evaluation
+                # reconstruct() handles chunking internally (chunk_size=10_000)
+                queries = seg_queries
 
         # ── Masks ───────────────────────────────────────────
         attention_mask = torch.zeros(image_tokens.shape[0])
@@ -257,11 +312,8 @@ class Sen1Floods11Dataset(Dataset):
 
     def get_viz_sample(self, index: int) -> dict:
         """
-        Viz sample — mode-aware.
-        Reconstruction: all tokens as queries, col 4 = reflectance.
-        Segmentation: all pixels as queries, includes label + image.
+        Viz sample — mode-aware. No augmentation applied (deterministic).
         """
-    
         with rasterio.open(self.s2_image_list[index]) as src:
             image_s2 = src.read().astype(np.float32)
         with rasterio.open(self.s1_image_list[index]) as src:
@@ -278,15 +330,14 @@ class Sen1Floods11Dataset(Dataset):
         label = torch.from_numpy(label)
 
         image_s2, image_s1 = self.normalize_image(image_s2, image_s1)
-        image_s2 = torch.clamp(image_s2, -10, 10)
-        image_s1 = torch.clamp(image_s1, -10, 10)
 
         image_full = torch.cat([image_s2, image_s1], dim=0)
         image = self._select_channels(image_full)
         C, H, W = image.shape
 
+        # No augmentation in viz — always deterministic
+
         if self.reconstruction:
-            # All image tokens as queries
             dummy_label = torch.full((H, W), self.IGNORE_INDEX, dtype=torch.long)
             tokens = self.token_builder.build_tokens(
                 image=image,
@@ -318,7 +369,6 @@ class Sen1Floods11Dataset(Dataset):
                 "n_real": tokens.shape[0],
             }
         else:
-            # Segmentation: all pixels as queries, no subsampling
             image_tokens, queries = self._build_tokens(image, label, self.OPTICAL_RESOLUTION)
             queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
             attention_mask = torch.zeros(image_tokens.shape[0])

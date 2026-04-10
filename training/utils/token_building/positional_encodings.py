@@ -70,7 +70,7 @@ class PolarRelativeEncoder(nn.Module):
         # A. Convert Cartesian → Polar
         # ─────────────────────────────────────────────────────
         r = torch.sqrt(delta_x**2 + delta_y**2 + 1e-8)  # Radius
-        theta = torch.atan2(delta_y, delta_x)           # Angle [-π, π]
+        theta = torch.atan2(delta_y, delta_x)            # Angle [-π, π]
         
         # ─────────────────────────────────────────────────────
         # B. Compress & Normalize
@@ -84,20 +84,18 @@ class PolarRelativeEncoder(nn.Module):
         # ─────────────────────────────────────────────────────
         # C. Fourier Encoding (DIFFERENT for radius vs theta)
         # ─────────────────────────────────────────────────────
-        # Radius: log-spaced frequencies for multi-scale distance
         r_enc = fourier_encode(
             r_normalized, 
             max_freq=self.max_freq_r, 
             num_bands=self.num_bands_r,
-            log_sampling=True,  # Important for radius!
+            log_sampling=False,
         )
         
-        # Theta: integer frequencies for rotational symmetry
         theta_enc = fourier_encode(
             theta_normalized, 
             max_freq=self.max_freq_theta, 
             num_bands=self.num_bands_theta,
-            log_sampling=False,  # Linear for angles
+            log_sampling=False,
         )
         
         return torch.cat([r_enc, theta_enc], dim=-1)
@@ -111,26 +109,38 @@ class CartesianRelativeEncoder(nn.Module):
     Encodes relative positions using Cartesian Coordinates.
     
     Pipeline:
-    Position indices -> Relative (dx, dy) -> Fourier
-    
-    Compression formula:
-        compressed = pos / (scale + |pos|)
-        Maps (-∞, ∞) -> (-1, 1), preserving sign
+        (delta_x, delta_y) → compress → Fourier → [x_enc, y_enc]
+
+    Compression formula (RoPE-style, preserves sign):
+        compressed = pos / (scale + |pos|)  ∈ (-1, 1)
+
+    Config keys (under Atomiser):
+        pos_num_freq_bands: number of Fourier frequency bands per axis
+        pos_max_freq:       maximum frequency
+        compression_alpha:  compression scale passed at runtime from processor
+                            (fallback: position_compression_scale)
+
+    Output dim: 2 × (1 + 2 × pos_num_freq_bands)
+        e.g. pos_num_freq_bands=128 → 2 × 257 = 514
     """
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
-        self.num_bands = config["Atomiser"].get("cartesian_num_bands", 32)
-        self.max_freq = config["Atomiser"].get("cartesian_max_freq", 32)
+        # Read the correct YAML keys (pos_num_freq_bands / pos_max_freq)
+        self.num_bands = config["Atomiser"].get("pos_num_freq_bands", 32)
+        self.max_freq  = config["Atomiser"].get("pos_max_freq", 32)
+
+        # Fallback compression scale (normally overridden at runtime by processor)
         self.compression_scale = config["Atomiser"].get("position_compression_scale", 10.0)
        
-        # Output: X + Y (each with raw + Fourier features)
+        # Output: X + Y, each encoded as (raw value + Fourier features)
         self.per_component_dim = 1 + 2 * self.num_bands
         self.out_dim = self.per_component_dim * 2
         
-        print(f"[CartesianRelativeEncoder] out_dim={self.out_dim} "
-              f"({self.per_component_dim} per axis)")
+        print(f"[CartesianRelativeEncoder] num_bands={self.num_bands}, "
+              f"max_freq={self.max_freq}, "
+              f"out_dim={self.out_dim} ({self.per_component_dim} per axis)")
 
     def forward(
         self, 
@@ -142,11 +152,15 @@ class CartesianRelativeEncoder(nn.Module):
         Encode relative positions in Cartesian coordinates.
         
         Args:
-            delta_x, delta_y: [...] Relative position in INDEX SPACE
-            compression_scale: Optional override for compression scale
+            delta_x, delta_y: [...] Relative position in physical space (meters)
+            compression_scale: Override for compression scale (passed by processor
+                               as compression_alpha * gsd)
+        
+        Returns:
+            encoding: [..., out_dim]
         """
         device = delta_x.device
-        dtype = delta_x.dtype
+        dtype  = delta_x.dtype
         
         if compression_scale is None:
             compression_scale = self.compression_scale
@@ -155,24 +169,16 @@ class CartesianRelativeEncoder(nn.Module):
             compression_scale = torch.tensor(compression_scale, device=device, dtype=dtype)
         
         # ─────────────────────────────────────────────────────
-        # A. Compress (RoPE-style, preserves sign)
+        # A. Compress: (-∞, ∞) → (-1, 1), preserving sign
         # ─────────────────────────────────────────────────────
         dx_normalized = delta_x / (compression_scale + torch.abs(delta_x))
         dy_normalized = delta_y / (compression_scale + torch.abs(delta_y))
         
         # ─────────────────────────────────────────────────────
-        # B. Fourier Encoding
+        # B. Fourier Encoding (same params for both axes)
         # ─────────────────────────────────────────────────────
-        x_enc = fourier_encode(
-            dx_normalized, 
-            max_freq=self.max_freq, 
-            num_bands=self.num_bands,
-        )
-        y_enc = fourier_encode(
-            dy_normalized, 
-            max_freq=self.max_freq, 
-            num_bands=self.num_bands,
-        )
+        x_enc = fourier_encode(dx_normalized, max_freq=self.max_freq, num_bands=self.num_bands)
+        y_enc = fourier_encode(dy_normalized, max_freq=self.max_freq, num_bands=self.num_bands)
         
         return torch.cat([x_enc, y_enc], dim=-1)
 
@@ -183,27 +189,7 @@ class CartesianRelativeEncoder(nn.Module):
 def build_position_encoder(config: Dict[str, Any]) -> nn.Module:
     """
     Factory function for position encoders.
-    
-    Config options:
-        position_encoding_type: "POLAR" | "CARTESIAN"
-        
-    Polar (recommended):
-        - Rotation-invariant
-        - Aligns with radial attention bias
-        - Separate radius/angle encoding
-        
-    Cartesian:
-        - Simpler, baseline
-        - Axis-aligned features
+    Always returns CartesianRelativeEncoder (active mode).
+    PolarRelativeEncoder is available but not wired in.
     """
-    strategy = config["Atomiser"].get("position_encoding_type", "POLAR")
-    
-    if strategy == "POLAR":
-        return PolarRelativeEncoder(config)
-    elif strategy == "CARTESIAN":
-        return CartesianRelativeEncoder(config)
-    else:
-        raise ValueError(
-            f"Unknown position encoding strategy: {strategy}. "
-            f"Valid options: POLAR, CARTESIAN"
-        )
+    return CartesianRelativeEncoder(config)
