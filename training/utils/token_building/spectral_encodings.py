@@ -13,6 +13,7 @@ ABSTRACT_CHANNELS = {
     # Sentinel-1 SAR polarizations
     "VV":    {"bandwidth": -1,   "central_wavelength": -1},
     "VH":    {"bandwidth": -2,   "central_wavelength": -2},
+    "VV_VH": {"bandwidth": -3,   "central_wavelength": -3},
 
     # Elevation / DEM
     "ELEVATION": {"bandwidth": -10, "central_wavelength": -10},

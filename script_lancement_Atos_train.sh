@@ -15,12 +15,7 @@ fi
 ## === Then load the module and activate your env ===
 conda activate venv
 
-python3 script_train_senflood.py --xp_name senflood_baseline --config_model config_test-Atomiser_Atos_One.yaml --dataset_name  u_regular  --clipping
-python3 script_train_senflood.py --xp_name senflood_baseline --config_model config_test-Atomiser_Atos_One.yaml --dataset_name  u_regular 
-
-python3 script_train_senflood.py --xp_name senflood_baseline --config_model config_test-Atomiser_Atos_two.yaml --dataset_name  u_regular 
-python3 script_train_senflood.py --xp_name senflood_baseline --config_model config_test-Atomiser_Atos_two.yaml --dataset_name  u_regular  --clipping
-
+python script_train_PASTIS.py --xp_name s2s1_768_last12 --use_s1 --multi_temporal 6
 
  
 # Call training script with experiment name used in the arguments

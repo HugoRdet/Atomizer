@@ -46,6 +46,7 @@ from .RPE import (
 )
 
 from .geographic_pruning import GeographicPruning
+from .error_supervision import compute_latent_errors, compute_error_predictor_loss
 
 
 # =============================================================================
@@ -161,7 +162,117 @@ class Atomiser_Senflood(pl.LightningModule):
             print("[Atomiser] Gradient checkpointing: ENABLED")
 
         # =====================================================================
-        # 7. INITIALIZE COMPONENTS
+        # 7. ERROR PREDICTOR
+        # =====================================================================
+        self.use_error_predictor = config["Atomiser"].get("use_error_predictor", False)
+        if self.use_error_predictor:
+            self.lambda_error = float(config["Atomiser"].get("lambda_error", 0.1))
+            print(f"[Atomiser] Error predictor ENABLED (lambda={self.lambda_error})")
+        else:
+            print(f"[Atomiser] Error predictor DISABLED")
+
+        # =====================================================================
+        # 7c. TARGETED DEPTH-2
+        # Second cross-attention + self-attention pass on top-k high-error
+        # latents only. Uses shared encoder weights (zero new parameters).
+        # Much cheaper than full depth=2: only 2.5% of latents re-encoded.
+        # =====================================================================
+        self.use_targeted_depth2 = config["Atomiser"].get(
+            "use_targeted_depth2", False)
+        if self.use_targeted_depth2:
+            td2 = config["Atomiser"].get("targeted_depth2", {})
+            self.td2_k          = int(td2.get("k", 50))
+            self.td2_cross_k    = int(td2.get("cross_k", 2000))  # full geo pool
+            self.td2_self_attn  = int(td2.get("self_attn", 2))
+            print(f"[Atomiser] Targeted depth-2 ENABLED: "
+                  f"k={self.td2_k}, cross_k={self.td2_cross_k}, "
+                  f"self_attn={self.td2_self_attn}")
+        else:
+            print(f"[Atomiser] Targeted depth-2 DISABLED")
+
+        # =====================================================================
+        # 7b. REFINEMENT
+        # =====================================================================
+        self.use_refinement = config["Atomiser"].get("use_refinement", False)
+        if self.use_refinement:
+            ref_cfg = config["Atomiser"].get("refinement", {})
+            self.k_refine            = int(ref_cfg.get("k_refine", 50))
+            self.refine_grid_size    = int(ref_cfg.get("grid_size", 2))   # 2→2×2=4 latents
+            self.refine_tpl          = int(ref_cfg.get("tokens_per_latent", 500))
+            self.refine_cross_k      = int(ref_cfg.get("cross_k", 500))
+            self.refine_self_local   = int(ref_cfg.get("self_attn_local", 2))
+            self.refine_self_global  = int(ref_cfg.get("self_attn_global", 2))
+            # grid offset: half the typical latent spacing fraction
+            self.refine_offset_factor = float(ref_cfg.get("offset_factor", 0.25))
+            print(f"[Atomiser] Refinement ENABLED: k={self.k_refine}, "
+                  f"grid={self.refine_grid_size}×{self.refine_grid_size}, "
+                  f"tpl={self.refine_tpl}, cross_k={self.refine_cross_k}")
+
+            # Compression scale for mini-latent local self-attention.
+            # Should be tuned to the physical scale of the refinement zone.
+            # With offset_factor=0.5 and spacing=115m, mini-latents span
+            # ~230m diagonally. A scale of ~1250m keeps positions well within
+            # the linear regime (compressed pos ≈ 0.044 at 57.5m offset)
+            # while still giving meaningful RoPE rotations.
+            # The formula-derived value (offset * spacing * 3 ≈ 172m) was
+            # too aggressive — positions saturated too quickly.
+            refine_cs = float(ref_cfg.get(
+                "self_attn_compression_scale",
+                1250.0,   # safe default: linear regime, learnable from here
+            ))
+            rope_base = config["RoPE"].get("base", 100.0)
+
+            self.refine_self_attn = PreNormRoPE(
+                self.latent_dim,
+                SelfAttentionRoPE(
+                    dim=self.latent_dim,
+                    heads=self.latent_heads,
+                    dim_head=self.latent_dim_head,
+                    dropout=self.attn_dropout,
+                    use_rope=True,
+                    rope_base=rope_base,
+                    rope_compression_scale=refine_cs,
+                    rope_learnable_scale=self.rope_learnable_scale,
+                )
+            )
+            self.refine_self_ff = PreNorm(
+                self.latent_dim,
+                FeedForward(self.latent_dim, dropout=self.ff_dropout),
+            )
+            print(f"[Atomiser] Refinement local SA compression scale: {refine_cs:.1f}m")
+
+            # Dedicated cross-attention for refinement level.
+            # Separate from encoder_layers[0] so it can specialize in
+            # high-frequency boundary detection rather than inheriting
+            # the coarse averaging behavior of the main encoder.
+            # Gradient signal comes exclusively from boundary pixels
+            # via mini-latents → learns discriminative feature extraction.
+            cross_rope_cs = self.config["RoPE"].get("cross_compression_scale", 50.0)
+            self.refine_cross_attn = PreNorm(
+                self.latent_dim,
+                LocalCrossAttentionRoPE(
+                    dim_query=self.latent_dim,
+                    dim_context=self.input_dim,
+                    dim_out=self.latent_dim,
+                    heads=self.cross_heads,
+                    dim_head=self.cross_dim_head,
+                    dropout=self.attn_dropout,
+                    use_rope=self.encoder_use_rpe,
+                    rope_base=rope_base,
+                    rope_compression_scale=cross_rope_cs,
+                    rope_learnable_scale=self.rope_learnable_scale,
+                )
+            )
+            self.refine_cross_ff = PreNorm(
+                self.latent_dim,
+                FeedForward(self.latent_dim, dropout=self.ff_dropout),
+            )
+            print(f"[Atomiser] Refinement dedicated cross-attention ENABLED")
+        else:
+            print(f"[Atomiser] Refinement DISABLED")
+
+        # =====================================================================
+        # 8. INITIALIZE COMPONENTS
         # =====================================================================
         self._init_latents()
         self._init_geographic_pruning()
@@ -193,6 +304,12 @@ class Atomiser_Senflood(pl.LightningModule):
 
         self.mask_token = nn.Parameter(torch.randn(self.latent_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02, a=-2., b=2.)
+
+        # Learned initialization for refinement (mini) latents.
+        # Separate from spatial_latent_content so mini-latents can specialize
+        # in detecting fine-grained boundary/hole patterns from the start.
+        self.refinement_latent_content = nn.Parameter(torch.randn(self.latent_dim))
+        nn.init.trunc_normal_(self.refinement_latent_content, std=0.02, a=-2., b=2.)
 
         if self.num_global_latents > 0:
             self.global_latents = nn.Parameter(
@@ -264,45 +381,60 @@ class Atomiser_Senflood(pl.LightningModule):
 
     def _init_decoder(self):
         """
-        k-nearest cross-attention decoder with RoPE and query skip.
+        Pooled decoder: global learned query + context with rel_pe + random drop.
 
         Pipeline:
             1. Select k nearest latents per query pixel
-            2. Build context = [latent | rel_pe]  (explicit relative geometry)
-            3. LocalCrossAttentionRoPE: Q=query_features, K/V=context
-            4. output_head([cross_attn_output | query_features]) → logits
+            2. Build context = cat([latent, rel_pe])  — no MLP projection
+            3. Bernoulli drop on context tokens (training only)
+            4. Cross-attention: Q = global learned vector, K/V = context
+            5. MLP head → logits
 
-        The concatenation of query_features in the output_head gives the MLP
-        explicit access to modality metadata (spectral index, resolution)
-        alongside the spatial content from cross-attention.
-        This is not a residual — it's a richer input to the final projection.
+        Design motivation:
+          - Context is just cat([latent, rel_pe]). The cross-attention's
+            internal K/V projections absorb the positional signal —
+            no redundant MLP needed. Latents already refined by encoder.
+          - Global learned query is task-transferable and pixel-agnostic —
+            forces K/V to carry all pixel-specific information.
+          - Bernoulli drop prevents collapse onto the nearest latent.
         """
-        rope_compression_scale = self.config["RoPE"].get("cross_compression_scale", 50.0)
-        rope_base              = self.config["RoPE"].get("base", 100.0)
+        # ── Context dimension = latent_dim + rel_pe_dim ───────────────
+        # We use a MultiheadAttention with separate kdim/vdim since the
+        # K/V carry the position-augmented context, while Q is latent_dim.
+        self.decoder_context_dim = self.latent_dim + self.decoder_pe_dim
 
-        # context_dim = latent features + relative PE
-        decoder_context_dim = self.latent_dim + self.decoder_pe_dim
+        # ── Global learned query ──────────────────────────────────────
+        # Single vector, shared across all query pixels.
+        # K/V differ per pixel, so attention output still differs per pixel.
+        self.global_query = nn.Parameter(torch.randn(1, 1, self.latent_dim))
+        nn.init.trunc_normal_(self.global_query, std=0.02, a=-2., b=2.)
 
-        # Position-aware cross-attention in decoder
-        self.decoder_cross_attn = LocalCrossAttentionRoPE(
-            dim_query=self.query_dim_recon,
-            dim_context=decoder_context_dim,
-            dim_out=self.latent_dim,
-            heads=self.cross_heads,
-            dim_head=self.cross_dim_head,
+        # ── Cross-attention (Q dim != K/V dim) ────────────────────────
+        # Q     : [B*M, 1, latent_dim]
+        # K,V   : [B*M, k, latent_dim + decoder_pe_dim]
+        # Output: [B*M, 1, latent_dim]
+        # MultiheadAttention handles kdim/vdim != embed_dim via internal projections.
+        self.decoder_cross_attn = nn.MultiheadAttention(
+            embed_dim=self.latent_dim,
+            kdim=self.decoder_context_dim,
+            vdim=self.decoder_context_dim,
+            num_heads=self.cross_heads,
             dropout=self.attn_dropout,
-            use_rope=self.encoder_use_rpe,
-            rope_base=rope_base,
-            rope_compression_scale=rope_compression_scale,
-            rope_learnable_scale=self.rope_learnable_scale,
+            batch_first=True,
         )
 
-        # Final MLP: [cross_attn_output (latent_dim) | query_features (query_dim_recon)]
-        mlp_input_dim = self.latent_dim + self.query_dim_recon
-        hidden_dim    = self.latent_dim * 2
+        # ── Bernoulli drop probability ────────────────────────────────
+        # Applied per-latent during training only.
+        # p=0.25 drops 1 of 4 latents on average, forcing the decoder
+        # to extract useful info from non-nearest neighbors.
+        self.decoder_drop_p = self.config["Atomiser"].get("decoder_drop_p", 0.25)
+        print(f"[Atomiser] Pooled decoder: k={self.decoder_k_spatial}, "
+              f"drop_p={self.decoder_drop_p}")
 
+        # ── Final segmentation head ───────────────────────────────────
+        hidden_dim = self.latent_dim * 2
         self.reconstruction_head = nn.Sequential(
-            nn.Linear(mlp_input_dim, hidden_dim),
+            nn.Linear(self.latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -310,6 +442,19 @@ class Atomiser_Senflood(pl.LightningModule):
             nn.GELU(),
             nn.Linear(hidden_dim, self.num_classes),
         )
+
+        # ── Error predictor ───────────────────────────────────────────
+        # Predicts per-latent segmentation difficulty (soft CE).
+        # Input latents are DETACHED — no gradient flows to the encoder.
+        # Supervised by compute_latent_errors() using the k-nearest
+        # assignment already computed in reconstruct().
+        if self.use_error_predictor:
+            self.error_predictor = nn.Sequential(
+                nn.Linear(self.latent_dim, self.latent_dim // 4),
+                nn.GELU(),
+                nn.Linear(self.latent_dim // 4, 1),
+                nn.Softplus(),  # positive output — matches CE target range
+            )
 
     def _init_classifier(self):
         if self.config["Atomiser"].get("final_classifier_head", True):
@@ -395,7 +540,7 @@ class Atomiser_Senflood(pl.LightningModule):
         all_spatial = []
         all_coords  = []
         split_sizes = []
-        for res in sorted(latents_per_res.keys()):
+        for res in sorted(latents_per_res.keys(), key=str):
             all_spatial.append(latents_per_res[res])
             all_coords.append(coords_per_res[res])
             split_sizes.append(latents_per_res[res].shape[1])
@@ -488,7 +633,7 @@ class Atomiser_Senflood(pl.LightningModule):
 
     def _self_attention_step_multiresolution(self, latents_per_res, coords_per_res,
                                               global_latents, self_attns):
-        resolutions = sorted(latents_per_res.keys())
+        resolutions = sorted(latents_per_res.keys(), key=str)
         latents_concat, coords_concat, split_sizes = self.concatenate_latents_for_self_attn(
             latents_per_res, coords_per_res, global_latents)
         total_spatial = sum(split_sizes)
@@ -632,8 +777,8 @@ class Atomiser_Senflood(pl.LightningModule):
             coords_per_res=coords_per_res,
             trajectory=trajectory,
             global_latents=global_latents,
-            geo_cache={r: (gt, gm, gc)
-                       for r, (gt, gm, gc, _) in geo_cache.items()} if mae_active else None,
+            geo_cache={r: (gt, gm, gc, ck)
+                       for r, (gt, gm, gc, ck) in geo_cache.items()},
             masked_indices_per_res=masked_indices_per_res if mae_active else None,
         )
 
@@ -643,53 +788,46 @@ class Atomiser_Senflood(pl.LightningModule):
 
     def reconstruct(self, latents_per_res, coords_per_res, query_tokens,
                     query_mask, target_resolution=None,
-                    training=True, return_features=False):
+                    training=True, return_features=False,
+                    return_topk=False):
         """
-        Decode query pixels into class logits.
+        Decode query pixels into class logits using pooled decoder.
 
         Pipeline:
             1. Select k nearest latents per query pixel
             2. Compute relative displacement (query → latent)
-            3. Build context = cat([latent_features | rel_pe])
-            4. LocalCrossAttentionRoPE: Q=query_features, K/V=context
-            5. output_head(cat([cross_attn_out | query_features])) → logits
+            3. context = cat([latent, rel_pe])           (no MLP)
+            4. Bernoulli drop (training only) — forces non-reliance on nearest
+            5. Cross-attn: Q=global_query, K/V=context
+            6. Segmentation head → logits
 
         Shapes:
-            query_features:  [B, M, query_dim_recon]
-            context:         [B*M, k, latent_dim + pe_dim]
-            output logits:   [B, M, num_classes]
+            query_coords:   [B, M, 2]
+            selected:       [B, M, k, latent_dim]
+            rel_pe:         [B, M, k, pe_dim]
+            context:        [B, M, k, latent_dim + pe_dim]
+            attn_out:       [B, M, latent_dim]
+            output logits:  [B, M, num_classes]
         """
         B, M, _ = query_tokens.shape
         k = self.decoder_k_spatial
 
-        # ── Query features & coords ───────────────────────────────────
-        query_features, _, _ = self.input_processor.process_data_for_decoder(
-            query_tokens, query_mask, target_resolution=target_resolution)
+        # ── Query coords (for k-nearest + rel_pe) ─────────────────────
         query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
-        # query_features: [B, M, query_dim_recon]
-        # query_coords:   [B, M, 2]
 
         # ── Concat all latents across resolutions ─────────────────────
         all_latents = torch.cat(
-            [latents_per_res[r] for r in sorted(latents_per_res.keys())], dim=1)
+            [latents_per_res[r] for r in sorted(latents_per_res.keys(), key=str)], dim=1)
         all_coords = torch.cat(
-            [coords_per_res[r] for r in sorted(coords_per_res.keys())], dim=1)
-        # all_latents: [B, L, latent_dim]
-        # all_coords:  [B, L, 2]
+            [coords_per_res[r] for r in sorted(coords_per_res.keys(), key=str)], dim=1)
 
         # ── Select k nearest latents per query ────────────────────────
         dists_sq = (query_coords.unsqueeze(2) - all_coords.unsqueeze(1)).pow(2).sum(-1)
 
-        k_fetch = min(k + 1, all_coords.shape[1]) if training else min(k, all_coords.shape[1])
-        k_keep  = min(k, k_fetch)
+        k_fetch = min(k, all_coords.shape[1])
+        k_keep  = k_fetch
 
         _, topk_indices = torch.topk(dists_sq, k=k_fetch, dim=-1, largest=False)
-
-        if training and k_fetch > k_keep:
-            drop_idx  = torch.randint(0, k_fetch, (B, M, 1), device=all_coords.device)
-            keep_mask = torch.ones(B, M, k_fetch, dtype=torch.bool, device=all_coords.device)
-            keep_mask.scatter_(2, drop_idx, False)
-            topk_indices = topk_indices[keep_mask].reshape(B, M, k_keep)
 
         D = all_latents.shape[-1]
         flat_idx = topk_indices.reshape(B, M * k_keep)
@@ -698,18 +836,15 @@ class Atomiser_Senflood(pl.LightningModule):
             all_latents, 1,
             flat_idx.unsqueeze(-1).expand(-1, -1, D)
         ).reshape(B, M, k_keep, D)
-        # selected_latents: [B, M, k, latent_dim]
 
         selected_coords = torch.gather(
             all_coords, 1,
             flat_idx.unsqueeze(-1).expand(-1, -1, 2)
         ).reshape(B, M, k_keep, 2)
-        # selected_coords: [B, M, k, 2]
 
         # ── Relative displacement query → latent ──────────────────────
         delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
         delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
-        # delta_x, delta_y: [B, M, k]
 
         # ── Relative positional encoding ──────────────────────────────
         B_d, M_d, K_d = delta_x.shape
@@ -725,39 +860,395 @@ class Atomiser_Senflood(pl.LightningModule):
         rel_pe  = rel_pe.reshape(B_d, M_d, K_d, -1)
         # rel_pe: [B, M, k, pe_dim]
 
-        # ── Build context = [latent | rel_pe] ─────────────────────────
+        # ── Build context = cat([latent, rel_pe]) ─────────────────────
+        # No MLP — K/V projections inside cross-attention absorb the
+        # positional signal. Saves memory and compute.
         context = torch.cat([selected_latents, rel_pe], dim=-1)
         # context: [B, M, k, latent_dim + pe_dim]
 
-        # ── Cross-attention: Q=query_features, K/V=context ───────────
-        # LocalCrossAttentionRoPE expects:
-        #   queries: [B, L, query_dim]          → [B*M, 1, query_dim]
-        #   context: [B, L, m, ctx_dim]         → [B*M, 1, k, ctx_dim]
-        #   delta_x: [B, L, m]                  → [B*M, 1, k]
-        q_flat       = query_features.reshape(B * M, 1, -1)           # [B*M, 1, query_dim]
-        ctx_flat     = context.reshape(B * M, 1, k_keep, -1)          # [B*M, 1, k, ctx_dim]
-        dx_flat_attn = delta_x.reshape(B * M, 1, k_keep)              # [B*M, 1, k]
-        dy_flat_attn = delta_y.reshape(B * M, 1, k_keep)              # [B*M, 1, k]
+        # ── Bernoulli drop (training only) ────────────────────────────
+        # Drop each latent independently with p=drop_p.
+        # Ensures at least 1 latent kept per pixel.
+        if training and self.decoder_drop_p > 0:
+            keep_probs = torch.full(
+                (B, M, k_keep), 1.0 - self.decoder_drop_p,
+                device=context.device)
+            keep_mask = torch.bernoulli(keep_probs).bool()          # [B, M, k]
 
-        attn_out = self.decoder_cross_attn(
-            q_flat,
-            context=ctx_flat,
-            delta_x=dx_flat_attn,
-            delta_y=dy_flat_attn,
+            # Guard: if a pixel has 0 kept latents, force keep its nearest
+            none_kept = ~keep_mask.any(dim=-1, keepdim=True)        # [B, M, 1]
+            if none_kept.any():
+                keep_mask = keep_mask.clone()
+                keep_mask[..., 0] = keep_mask[..., 0] | none_kept.squeeze(-1)
+        else:
+            keep_mask = torch.ones(B, M, k_keep, dtype=torch.bool,
+                                    device=context.device)
+
+        # ── Cross-attention: Q=global_query, K/V=context ──────────────
+        # Q dim = latent_dim, K/V dim = latent_dim + pe_dim
+        # MultiheadAttention handles kdim/vdim != embed_dim internally.
+        BM = B * M
+        kv_flat     = context.reshape(BM, k_keep, -1)                  # [B*M, k, D+pe]
+        q_flat      = self.global_query.expand(BM, 1, -1).contiguous() # [B*M, 1, D]
+        key_pad_flat = (~keep_mask).reshape(BM, k_keep)                # [B*M, k]
+
+        attn_out, _ = self.decoder_cross_attn(
+            query=q_flat, key=kv_flat, value=kv_flat,
+            key_padding_mask=key_pad_flat,
+            need_weights=False,
         )
         # attn_out: [B*M, 1, latent_dim]
-        attn_out = attn_out.squeeze(1).reshape(B, M, -1)              # [B, M, latent_dim]
+        attn_out = attn_out.squeeze(1).reshape(B, M, -1)               # [B, M, latent_dim]
 
         if return_features:
             return attn_out
 
-        # ── Output head: [cross_attn_out | query_features] → logits ──
-        output = torch.cat([attn_out, query_features], dim=-1)       # [B, M, latent_dim + query_dim]
-        return self.reconstruction_head(output)                       # [B, M, num_classes]
+        # ── Segmentation head ─────────────────────────────────────────
+        logits = self.reconstruction_head(attn_out)                   # [B, M, num_classes]
+
+        if return_topk:
+            # Reuse topk assignment for error supervision
+            topk_dists_sq_kept = torch.gather(dists_sq, 2, topk_indices)
+            return logits, topk_indices, topk_dists_sq_kept
+
+        return logits
+
+    # =========================================================================
+    # Refinement
+    # =========================================================================
+
+    def _spawn_refinement_grid(
+        self,
+        topk_coords:   torch.Tensor,   # [B, k, 2]  high-error latent positions
+        latent_spacing: float,          # meters — used to set grid offset
+    ) -> torch.Tensor:
+        """
+        Spawn a grid_size×grid_size pattern of mini-latent positions around
+        each of the k high-error latents.
+
+        With grid_size=2 and offset_factor=0.25:
+            offset = latent_spacing * 0.25
+            offsets = [(-o,-o), (-o,+o), (+o,-o), (+o,+o)]
+
+        Returns:
+            refine_coords: [B, k*grid_size², 2]  mini-latent meter positions
+        """
+        B, k, _ = topk_coords.shape
+        g        = self.refine_grid_size
+        offset   = latent_spacing * self.refine_offset_factor
+        device   = topk_coords.device
+
+        # Build offset grid: g×g offsets centered at 0
+        steps = torch.linspace(-offset * (g - 1) / 2,
+                                offset * (g - 1) / 2, g, device=device)
+        gy, gx = torch.meshgrid(steps, steps, indexing="ij")
+        offsets = torch.stack([gx.flatten(), gy.flatten()], dim=-1)  # [g², 2]
+
+        # Expand and add: [B, k, 1, 2] + [1, 1, g², 2] → [B, k, g², 2]
+        refine_coords = (topk_coords.unsqueeze(2)
+                         + offsets.unsqueeze(0).unsqueeze(0))
+        return refine_coords.reshape(B, k * g * g, 2)                # [B, k*g², 2]
+
+    def _estimate_latent_spacing(self, coords: torch.Tensor) -> float:
+        """
+        Estimate typical latent spacing from the first few latents.
+        Uses a small sample to avoid O(L²) cost.
+        Fast approximation: median of nearest-neighbor distances on a 20-pt subset.
+        """
+        c = coords[0, :min(50, coords.shape[1])]  # [≤50, 2]
+        with torch.no_grad():
+            d = torch.cdist(c.unsqueeze(0), c.unsqueeze(0)).squeeze(0)
+            d.fill_diagonal_(float("inf"))
+            spacing = d.min(dim=-1).values.median().item()
+        return spacing
+
+    def refine(
+        self,
+        latents_per_res: dict,
+        coords_per_res:  dict,
+        groups:          dict,
+        predicted_errors: torch.Tensor,  # [B, L]
+        geo_cache:       dict,
+        training:        bool,
+    ) -> tuple:
+        """
+        Refinement step: spawn mini-latents at high-error zones and re-encode.
+
+        Pipeline:
+            1. TopK high-error latents → positions [B, k, 2]
+            2. Spawn g×g grid → refine_coords [B, k*g², 2]
+            3. Init refine_latents from refinement_latent_content
+            4. Reuse geo_cache token pools for the topk latents (free)
+            5. Cross-attention: refine_latents × local tokens (500 tpl, 500 cross_k)
+            6. Self-attention ×refine_self_local: mini-latents only
+            7. Self-attention ×refine_self_global: full merged pool
+            8. Return updated latents_per_res + refine_coords merged in
+
+        Args:
+            latents_per_res:  {res: [B, L, D]}  original latents after encode
+            coords_per_res:   {res: [B, L, 2]}  original latent coords
+            groups:           batch["groups"]
+            predicted_errors: [B, L]  from error_predictor (detached)
+            geo_cache:        {res: (geo_tokens, geo_masks, gc, cross_k)}
+            training:         bool
+
+        Returns:
+            latents_per_res_updated: dict with refined latents merged in
+            coords_per_res_updated:  dict with refined coords merged in
+        """
+        B      = predicted_errors.shape[0]
+        device = predicted_errors.device
+
+        # ── Concatenate all latents/coords ────────────────────────────
+        resolutions  = sorted(latents_per_res.keys(), key=str)
+        all_latents  = torch.cat([latents_per_res[r] for r in resolutions], dim=1)
+        all_coords   = torch.cat([coords_per_res[r]  for r in resolutions], dim=1)
+        L            = all_latents.shape[1]
+
+        # ── 1. TopK high-error latents ────────────────────────────────
+        # Use only the first L_geo latents for topk selection —
+        # geo_cache only has entries for the original L latents from
+        # the first encode, not for any refinement latents added later.
+        res = resolutions[0]
+        geo_tokens_all, geo_masks_all, gc, _ = geo_cache[res]
+        L_geo = geo_tokens_all.shape[1]  # original latent count
+
+        # Only score original latents, not refinement latents
+        errors_for_topk = predicted_errors[:, :L_geo]
+        k               = min(self.k_refine, L_geo)
+        topk_idx        = torch.topk(errors_for_topk, k, dim=-1).indices  # [B, k]
+
+        # Gather coords from original latents only
+        all_coords_original = all_coords[:, :L_geo]
+        topk_coords = torch.gather(
+            all_coords_original, 1,
+            topk_idx.unsqueeze(-1).expand(-1, -1, 2))                  # [B, k, 2]
+        # ── 2. Spawn g×g grid around each high-error latent ──────────
+        spacing       = self._estimate_latent_spacing(all_coords)
+        refine_coords = self._spawn_refinement_grid(topk_coords, spacing)
+        # refine_coords: [B, k*g², 2]
+        n_refine = refine_coords.shape[1]  # k * g²
+
+        # ── 3. Initialize refinement latents ─────────────────────────
+        refine_latents = repeat(
+            self.refinement_latent_content,
+            "d -> b n d", b=B, n=n_refine)                             # [B, k*g², D]
+
+        # ── 4. Reuse geo_cache token pools ────────────────────────────
+        # Each group of g² mini-latents shares the token pool of its
+        # parent high-error latent — already computed, zero extra cost.
+
+        g2 = self.refine_grid_size ** 2
+        topk_idx_exp = (topk_idx
+                        .unsqueeze(-1).unsqueeze(-1)
+                        .expand(-1, -1, geo_tokens_all.shape[2], 8))   # [B, k, geo_k, 8]
+        topk_geo_tokens = torch.gather(
+            geo_tokens_all, 1, topk_idx_exp)                           # [B, k, geo_k, 8]
+        topk_geo_masks = torch.gather(
+            geo_masks_all, 1,
+            topk_idx.unsqueeze(-1).expand(
+                -1, -1, geo_masks_all.shape[2]))                       # [B, k, geo_k]
+
+        # Repeat token pool for each of the g² mini-latents per parent
+        # [B, k, geo_k, 8] → [B, k*g², geo_k, 8]
+        refine_geo_tokens = topk_geo_tokens.unsqueeze(2).expand(
+            -1, -1, g2, -1, -1).reshape(B, n_refine,
+                                         topk_geo_tokens.shape[2], 8)
+        refine_geo_masks  = topk_geo_masks.unsqueeze(2).expand(
+            -1, -1, g2, -1).reshape(B, n_refine,
+                                     topk_geo_masks.shape[2])
+
+        # ── 5. Cross-attention for refinement latents ─────────────────
+        # Uses dedicated refine_cross_attn — separate weights from the
+        # main encoder so it can specialize in high-frequency boundary
+        # detection rather than inheriting coarse averaging behavior.
+        st, sm = self._sample_tokens(
+            refine_geo_tokens, refine_geo_masks,
+            cross_k=self.refine_cross_k)
+
+        refine_latents = self._cross_attention_step(
+            refine_latents, st, sm,
+            refine_coords, self.refine_cross_attn, self.refine_cross_ff,
+            L_spatial=n_refine,
+        )
+
+        # ── 6. Self-attention: mini-latents only ──────────────────────
+        # Uses refine_self_attn with a small compression scale tuned to
+        # the mini-latent spacing (~29m) rather than the full image extent.
+        # This ensures the 4 latents in each 2×2 grid are distinguishable
+        # from each other by their position. The standard encoder self-attn
+        # (compression_scale=2560m) would make them nearly indistinguishable.
+        px = refine_coords[..., 0]
+        py = refine_coords[..., 1]
+        for _ in range(self.refine_self_local):
+            refine_latents = (self.refine_self_attn(
+                refine_latents, pos_x=px, pos_y=py,
+                num_spatial=n_refine) + refine_latents)
+            refine_latents = self.refine_self_ff(refine_latents) + refine_latents
+
+        # ── 7. Self-attention: full merged pool ───────────────────────
+        # Uses encoder_layers[0] self-attns — large compression scale
+        # (2560m) well-calibrated for original latent spacing (~115m).
+        _, _, self_attns = self.encoder_layers[0]
+        merged_latents = torch.cat([all_latents, refine_latents], dim=1)  # [B, L+n, D]
+        merged_coords  = torch.cat([all_coords,  refine_coords],  dim=1)  # [B, L+n, 2]
+
+        for sa_idx in range(self.refine_self_global):
+            self_attn, self_ff = self_attns[sa_idx % len(self_attns)]
+            if self.use_rpe:
+                px = merged_coords[..., 0]
+                py = merged_coords[..., 1]
+                merged_latents = (self_attn(
+                    merged_latents, pos_x=px, pos_y=py,
+                    num_spatial=merged_latents.shape[1]) + merged_latents)
+            else:
+                merged_latents = self_attn(merged_latents) + merged_latents
+            merged_latents = self_ff(merged_latents) + merged_latents
+
+        # ── 8. Pack back into per-res dicts ───────────────────────────
+        # Keep original per-resolution structure intact.
+        # Add refinement latents under a dedicated "refinement" key.
+        # The decoder already does:
+        #   torch.cat([latents_per_res[r] for r in sorted(keys)], dim=1)
+        # so "refinement" will be concatenated automatically alongside
+        # the original resolution slots. Works for both single-res
+        # (Sen1Floods11) and multi-res (PASTIS) without modification.
+        #
+        # Note: after global self-attention the merged_latents contain
+        # updated versions of both original and refinement latents.
+        # We split them back here so each slot stays consistent.
+        latents_per_res_updated = {}
+        coords_per_res_updated  = {}
+
+        # Restore original resolution slots with their updated latents
+        # (they were updated by the global self-attention)
+        offset = 0
+        for r in resolutions:
+            n = latents_per_res[r].shape[1]
+            latents_per_res_updated[r] = merged_latents[:, offset:offset + n]
+            coords_per_res_updated[r]  = merged_coords[:, offset:offset + n]
+            offset += n
+
+        # Add refinement latents as a separate slot
+        latents_per_res_updated["refinement"] = merged_latents[:, offset:]
+        coords_per_res_updated["refinement"]  = merged_coords[:, offset:]
+
+        return latents_per_res_updated, coords_per_res_updated
+
+    # =========================================================================
+    # Targeted Depth-2
+    # =========================================================================
+
+    def _targeted_depth2(
+        self,
+        latents_per_res:  dict,
+        coords_per_res:   dict,
+        predicted_errors: torch.Tensor,  # [B, L]
+        geo_cache:        dict,
+        global_latents:   Optional[torch.Tensor],
+    ) -> dict:
+        """
+        Second cross-attention + self-attention pass on top-k high-error latents.
+
+        Uses shared encoder_layers[0] weights — zero new parameters.
+        Cost: O(k × geo_k) cross-attn + O(L²) self-attn
+              ≈ 2.5% of a full second encode for k=50, L=1966.
+
+        Pipeline:
+            1. topk(errors, k) → select k high-error latent indices
+            2. Gather their geo_cache token pools (full pool, no subsampling)
+            3. Cross-attention: k latents × geo_k tokens (shared weights)
+            4. Write updated k latents back into latents_per_res
+            5. Full self-attention on all L latents to propagate updates
+        """
+        resolutions = sorted(latents_per_res.keys(), key=str)
+        res         = resolutions[0]  # geo_cache uses first resolution
+
+        # ── Concat original latents ───────────────────────────────────
+        all_latents = torch.cat(
+            [latents_per_res[r] for r in resolutions
+             if r != "refinement"], dim=1)                 # [B, L, D]
+        all_coords  = torch.cat(
+            [coords_per_res[r]  for r in resolutions
+             if r != "refinement"], dim=1)                 # [B, L, 2]
+        B, L, D = all_latents.shape
+
+        # ── 1. TopK high-error latents ────────────────────────────────
+        geo_tokens_all, geo_masks_all, gc, _ = geo_cache[res]
+        L_geo = geo_tokens_all.shape[1]  # original latent count only
+
+        errors_for_topk = predicted_errors[:, :L_geo]
+        k = min(self.td2_k, L_geo)
+        topk_idx = torch.topk(errors_for_topk, k, dim=-1).indices  # [B, k]
+
+        # ── 2. Gather latents + coords + token pools ──────────────────
+        topk_latents = torch.gather(
+            all_latents, 1,
+            topk_idx.unsqueeze(-1).expand(-1, -1, D))                # [B, k, D]
+        topk_coords  = torch.gather(
+            all_coords, 1,
+            topk_idx.unsqueeze(-1).expand(-1, -1, 2))                # [B, k, 2]
+
+        geo_k = geo_tokens_all.shape[2]
+        topk_geo_tokens = torch.gather(
+            geo_tokens_all, 1,
+            topk_idx.unsqueeze(-1).unsqueeze(-1)
+                    .expand(-1, -1, geo_k, 8))                       # [B, k, geo_k, 8]
+        topk_geo_masks  = torch.gather(
+            geo_masks_all, 1,
+            topk_idx.unsqueeze(-1).expand(-1, -1, geo_k))            # [B, k, geo_k]
+
+        # ── 3. Second cross-attention (shared weights) ────────────────
+        # Use up to td2_cross_k tokens — default 2000 (full geo pool)
+        cross_attn, cross_ff, _ = self.encoder_layers[0]
+        st, sm = self._sample_tokens(
+            topk_geo_tokens, topk_geo_masks,
+            cross_k=self.td2_cross_k)
+
+        # _cross_attention_step expects [B, L_total, D] where first L_spatial
+        # are spatial. Wrap topk_latents with no global latents appended.
+        topk_latents_updated = self._cross_attention_step(
+            topk_latents, st, sm,
+            topk_coords, cross_attn, cross_ff,
+            L_spatial=k,
+        )
+        # Output: [B, k, D]  (no global latents so shape unchanged)
+
+        # ── 4. Write updated latents back ─────────────────────────────
+        all_latents = all_latents.clone()
+        all_latents.scatter_(
+            1,
+            topk_idx.unsqueeze(-1).expand(-1, -1, D),
+            topk_latents_updated,
+        )
+
+        # ── 5. Full self-attention to propagate boundary updates ──────
+        # Rebuild per-res dicts with updated latents
+        updated_per_res = {}
+        updated_coords  = {}
+        offset = 0
+        for r in resolutions:
+            if r == "refinement":
+                continue
+            n = latents_per_res[r].shape[1]
+            updated_per_res[r] = all_latents[:, offset:offset + n]
+            updated_coords[r]  = all_coords[:,  offset:offset + n]
+            offset += n
+
+        # Carry over refinement slot if present
+        if "refinement" in latents_per_res:
+            updated_per_res["refinement"] = latents_per_res["refinement"]
+            updated_coords["refinement"]  = coords_per_res["refinement"]
+
+        _, _, self_attns = self.encoder_layers[0]
+        updated_per_res, global_latents =             self._self_attention_step_multiresolution(
+                updated_per_res, updated_coords, global_latents, self_attns)
+
+        return updated_per_res
 
     def classify(self, latents_per_res):
         all_latents = torch.cat(
-            [latents_per_res[res] for res in sorted(latents_per_res.keys())], dim=1)
+            [latents_per_res[res] for res in sorted(latents_per_res.keys(), key=str)], dim=1)
         return self.to_logits(all_latents)
 
     # =========================================================================
@@ -767,7 +1258,7 @@ class Atomiser_Senflood(pl.LightningModule):
     def forward(self, batch, training=True, task="reconstruction",
                 return_trajectory=False, return_predicted_errors=False,
                 return_features=False, tokens_per_latent_override=None,
-                mask_ratio: float = 0.0):
+                mask_ratio: float = 0.0, return_for_error=False):
 
         groups       = batch["groups"]
         queries      = batch["queries"]
@@ -814,33 +1305,116 @@ class Atomiser_Senflood(pl.LightningModule):
             }
 
         if task in ("reconstruction", "visualization"):
+            # ── Error predictor (runs on detached latents) ─────────────
+            # Always computed when enabled — used for supervision (train)
+            # and for refinement selection (val/test).
+            predicted_errors = None
+            all_latents_for_err = torch.cat(
+                [latents_per_res[r] for r in sorted(latents_per_res.keys(), key=str)], dim=1)
+            if self.use_error_predictor:
+                predicted_errors = self.error_predictor(
+                    all_latents_for_err.detach()   # detach: no grad to encoder
+                ).squeeze(-1)                       # [B, L]
+
+            # ── Refinement (mini-latents) ──────────────────────────────
+            if (self.use_refinement
+                    and predicted_errors is not None
+                    and encoder_output.geo_cache is not None):
+                latents_per_res, coords_per_res = self.refine(
+                    latents_per_res=latents_per_res,
+                    coords_per_res=coords_per_res,
+                    groups=groups,
+                    predicted_errors=predicted_errors,
+                    geo_cache=encoder_output.geo_cache,
+                    training=training,
+                )
+
+            # ── Targeted depth-2 ───────────────────────────────────────
+            # Second cross-attention + self-attention on top-k high-error
+            # latents. Shared weights, zero new parameters, ~2.5% extra cost.
+            if (self.use_targeted_depth2
+                    and predicted_errors is not None
+                    and encoder_output.geo_cache is not None):
+                latents_per_res = self._targeted_depth2(
+                    latents_per_res=latents_per_res,
+                    coords_per_res=coords_per_res,
+                    predicted_errors=predicted_errors,
+                    geo_cache=encoder_output.geo_cache,
+                    global_latents=encoder_output.global_latents,
+                )
+
+            # ── Decode ─────────────────────────────────────────────────
+            # return_topk=True on first chunk only — for error supervision
+            # we only need the assignment from a representative chunk.
+            # For simplicity we collect topk from all chunks and concat.
             chunk_size = 10_000
             N = queries.shape[1]
+            need_topk = return_for_error and self.use_error_predictor
+
             if N > chunk_size:
-                preds = []
+                preds_list      = []
+                topk_idx_list   = []
+                topk_dists_list = []
                 for i in range(0, N, chunk_size):
-                    preds.append(self.reconstruct(
+                    chunk_result = self.reconstruct(
                         latents_per_res, coords_per_res,
                         queries[:, i:i+chunk_size],
                         queries_mask[:, i:i+chunk_size],
                         target_resolution=target_resolution,
-                        training=training, return_features=return_features))
-                output = torch.cat(preds, dim=1)
+                        training=training,
+                        return_features=return_features,
+                        return_topk=need_topk,
+                    )
+                    if need_topk:
+                        preds_list.append(chunk_result[0])
+                        topk_idx_list.append(chunk_result[1])
+                        topk_dists_list.append(chunk_result[2])
+                    else:
+                        preds_list.append(chunk_result)
+                output = torch.cat(preds_list, dim=1)
+                if need_topk:
+                    topk_indices  = torch.cat(topk_idx_list,   dim=1)
+                    topk_dists_sq = torch.cat(topk_dists_list, dim=1)
             else:
-                output = self.reconstruct(
+                chunk_result = self.reconstruct(
                     latents_per_res, coords_per_res,
                     queries, queries_mask,
                     target_resolution=target_resolution,
-                    training=training, return_features=return_features)
+                    training=training,
+                    return_features=return_features,
+                    return_topk=need_topk,
+                )
+                if need_topk:
+                    output, topk_indices, topk_dists_sq = chunk_result
+                else:
+                    output = chunk_result
 
             if return_features:
                 return {"features": output, "latents_per_res": latents_per_res,
                         "coords_per_res": coords_per_res, "encoder_output": encoder_output}
 
+            # ── Return dict for error supervision ───────────────────────
+            if return_for_error and need_topk:
+                all_coords = torch.cat(
+                    [coords_per_res[r] for r in sorted(coords_per_res.keys(), key=str)], dim=1)
+                # num_latents must reflect the TOTAL latent count after
+                # refinement — topk_indices in reconstruct index into the
+                # full merged pool (original + refinement latents).
+                all_latents_post = torch.cat(
+                    [latents_per_res[r] for r in sorted(latents_per_res.keys(), key=str)], dim=1)
+                return {
+                    "predictions":      output,
+                    "predicted_errors": predicted_errors,  # [B, L_original]
+                    "topk_indices":     topk_indices,       # [B, M, k]
+                    "topk_dists_sq":    topk_dists_sq,      # [B, M, k]
+                    "num_latents":      all_latents_post.shape[1],  # L_original + n_refine
+                    "latent_coords":    all_coords,          # [B, L_total, 2] for viz
+                }
+
             if task == "visualization" or return_predicted_errors:
                 return {'predictions': output, 'latents_per_res': latents_per_res,
                         'coords_per_res': coords_per_res, 'trajectory': trajectory,
-                        'predicted_errors': None}
+                        'predicted_errors': predicted_errors}
             return output
         else:
             return self.classify(latents_per_res)
@@ -875,20 +1449,28 @@ class Atomiser_Senflood(pl.LightningModule):
         self._set_requires_grad(self.input_processor, True)
 
     def freeze_decoder(self):
-        self._set_requires_grad(self.local_predictor, False)
-        self._set_requires_grad(self.neighbor_cross_attn, False)
-        self.decoder_temperature.requires_grad = False
-        self._set_requires_grad(self.grid_gate, False)
-        self._set_requires_grad(self.post_fusion, False)
+        self._set_requires_grad(self.decoder_cross_attn, False)
         self._set_requires_grad(self.reconstruction_head, False)
+        if self.use_error_predictor:
+            self._set_requires_grad(self.error_predictor, False)
+        if self.use_refinement:
+            self.refinement_latent_content.requires_grad = False
+            self._set_requires_grad(self.refine_cross_attn, False)
+            self._set_requires_grad(self.refine_cross_ff, False)
+            self._set_requires_grad(self.refine_self_attn, False)
+            self._set_requires_grad(self.refine_self_ff, False)
 
     def unfreeze_decoder(self):
-        self._set_requires_grad(self.local_predictor, True)
-        self._set_requires_grad(self.neighbor_cross_attn, True)
-        self.decoder_temperature.requires_grad = True
-        self._set_requires_grad(self.grid_gate, True)
-        self._set_requires_grad(self.post_fusion, True)
+        self._set_requires_grad(self.decoder_cross_attn, True)
         self._set_requires_grad(self.reconstruction_head, True)
+        if self.use_error_predictor:
+            self._set_requires_grad(self.error_predictor, True)
+        if self.use_refinement:
+            self.refinement_latent_content.requires_grad = True
+            self._set_requires_grad(self.refine_cross_attn, True)
+            self._set_requires_grad(self.refine_cross_ff, True)
+            self._set_requires_grad(self.refine_self_attn, True)
+            self._set_requires_grad(self.refine_self_ff, True)
 
     def freeze_classifier(self):
         self._set_requires_grad(self.to_logits, False)

@@ -16,11 +16,6 @@ Examples:
     # S2-only, from scratch
     python train_pastis.py --xp_name pastis_s2only
 
-    # S2 + S1, last 5 timesteps, from pretrained encoder
-    python train_pastis.py --xp_name pastis_s2s1_last5 \
-        --use_s1 --temporal_last --multi_temporal 5 \
-        --pretrained_encoder ./checkpoints/encoder.pth
-
     # S2 + S1 + SPOT, full temporal
     python train_pastis.py --xp_name pastis_full \
         --use_s1 --use_spot --multi_temporal 10
@@ -52,6 +47,7 @@ from training.utils.datasets.token_grouping import collate_multitask
 from training.utils.datasets.token_builder import TokenBuilder
 
 from training.trainer_SENFLOOD import Model_SenFlood
+from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCallback
 
 # =============================================================================
 # KNOWN RESOLUTIONS
@@ -110,6 +106,19 @@ def load_pretrained_encoder(model, ckpt_path):
 
 
 # =============================================================================
+# COLLATE
+# =============================================================================
+
+def pastis_collate(samples):
+    batch = collate_multitask(samples)
+    if "queries" not in batch and "tasks" in batch:
+        task_data = next(iter(batch["tasks"].values()))
+        batch["queries"] = task_data["queries"]
+        batch["queries_mask"] = task_data["queries_mask"]
+    return batch
+
+
+# =============================================================================
 # DATAMODULE
 # =============================================================================
 
@@ -124,17 +133,15 @@ class PastisDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         use_s1: bool = True,
         use_spot: bool = True,
-        temporal_last: bool = False,
     ):
         super().__init__()
-        self.root_path = root_path
+        self.root_path    = root_path
         self.config_model = config_model
-        self.look_up = look_up
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.use_s1 = use_s1
-        self.use_spot = use_spot
-        self.temporal_last = temporal_last
+        self.look_up      = look_up
+        self.batch_size   = batch_size
+        self.num_workers  = num_workers
+        self.use_s1       = use_s1
+        self.use_spot     = use_spot
 
     def _make_dataset(self, mode: str):
         return PastisHDDataset(
@@ -144,7 +151,6 @@ class PastisDataModule(pl.LightningDataModule):
             look_up=self.look_up,
             use_s1=self.use_s1,
             use_spot=self.use_spot,
-            temporal_last=self.temporal_last,
         )
 
     def setup(self, stage=None):
@@ -153,8 +159,8 @@ class PastisDataModule(pl.LightningDataModule):
         self._setup_done = True
 
         self.train_dataset = self._make_dataset("train")
-        self.val_dataset = self._make_dataset("validation")
-        self.test_dataset = self._make_dataset("test")
+        self.val_dataset   = self._make_dataset("validation")
+        self.test_dataset  = self._make_dataset("test")
 
         modalities = ["S2"]
         if self.use_s1:
@@ -175,7 +181,7 @@ class PastisDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset, batch_size=self.batch_size,
             shuffle=(shuffle and sampler is None), sampler=sampler,
-            num_workers=self.num_workers, collate_fn=pastis_collate,  # ← THIS
+            num_workers=self.num_workers, collate_fn=pastis_collate,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
             prefetch_factor=2 if self.num_workers > 0 else None,
@@ -206,6 +212,11 @@ parser.add_argument("--pretrained_encoder", type=str, default=None,
 parser.add_argument("--num_workers",    type=int, default=4)
 parser.add_argument("--grad_accum",     type=int, default=1)
 
+# Test-only mode
+parser.add_argument("--test_only",      action="store_true",
+                    help="Skip training, load checkpoint from config trainer.checkpoint_path "
+                         "(or --ckpt_path) and run test split only")
+
 # Modality toggles
 parser.add_argument("--use_s1",         action="store_true",
                     help="Enable S1A SAR data (default: S2-only)")
@@ -215,16 +226,14 @@ parser.add_argument("--use_spot",       action="store_true",
 # Temporal config
 parser.add_argument("--multi_temporal", type=int, default=None,
                     help="Number of temporal frames (overrides config)")
-parser.add_argument("--temporal_last",  action="store_true",
-                    help="Take last N timesteps instead of uniform sampling")
 
 args = parser.parse_args()
 
 # =============================================================================
 # CONFIG & LOOKUP
 # =============================================================================
-config_model = read_yaml("./training/configs/" + args.config_model)
-bands_yaml_path = "./data/bands_info/bands.yaml"
+config_model         = read_yaml("./training/configs/" + args.config_model)
+bands_yaml_path      = "./data/bands_info/bands.yaml"
 configs_dataset_path = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 
 # Override multi_temporal in config if specified via CLI
@@ -250,12 +259,11 @@ if args.use_spot:
 modality_str = "+".join(modalities)
 
 multi_temporal = config_model.get("dataset", {}).get("multi_temporal", 10)
-temporal_str = f"{multi_temporal} frames ({'last' if args.temporal_last else 'uniform'})"
 
 print(f"\n[PASTIS] Experiment:   {args.xp_name}")
 print(f"[PASTIS] Data dir:     {args.data_dir}")
 print(f"[PASTIS] Modalities:   {modality_str}")
-print(f"[PASTIS] Temporal:     {temporal_str}")
+print(f"[PASTIS] Temporal:     {multi_temporal} frames (uniform via linspace)")
 
 # =============================================================================
 # WANDB
@@ -269,25 +277,13 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         name=run_name, project="PASTIS",
         config={
             **config_model,
-            "modalities": modalities,
-            "use_s1": args.use_s1,
-            "use_spot": args.use_spot,
-            "temporal_last": args.temporal_last,
+            "modalities":     modalities,
+            "use_s1":         args.use_s1,
+            "use_spot":       args.use_spot,
             "multi_temporal": multi_temporal,
         },
     )
     wandb_logger = WandbLogger(project="PASTIS")
-
-def pastis_collate(samples):
-    batch = collate_multitask(samples)
-    if "queries" not in batch and "tasks" in batch:
-        task_data = next(iter(batch["tasks"].values()))
-        batch["queries"] = task_data["queries"]
-        batch["queries_mask"] = task_data["queries_mask"]
-    return batch
-
-# Change 3: in PastisDataModule._make_loader, use pastis_collate
-collate_fn=pastis_collate  # was collate_multitask
 
 # =============================================================================
 # DATA MODULE
@@ -296,11 +292,10 @@ data_module = PastisDataModule(
     root_path=args.data_dir,
     config_model=config_model,
     look_up=lookup_table,
-    batch_size=config_model["dataset"]["batchsize"],
+    batch_size=config_model["trainer"]["batchsize"],
     num_workers=args.num_workers,
     use_s1=args.use_s1,
     use_spot=args.use_spot,
-    temporal_last=args.temporal_last,
 )
 data_module.setup()
 print(f"[PASTIS] Lookup table: {len(lookup_table.table_wave)} entries")
@@ -322,6 +317,13 @@ if args.pretrained_encoder:
 ckpt_dir = f"./checkpoints/pastis/"
 os.makedirs(ckpt_dir, exist_ok=True)
 
+viz_callback = SegmentationVizCallback(
+    dataset_preset="pastis",
+    sample_indices=[0, 1, 2],
+    log_every_n_epochs=1,
+    use_wandb=True,
+)
+
 callbacks = [
     ModelCheckpoint(
         dirpath=ckpt_dir,
@@ -335,6 +337,7 @@ callbacks = [
         every_n_epochs=1, save_top_k=1, save_last=True, verbose=True,
     ),
     LearningRateMonitor(logging_interval="step"),
+    viz_callback,
 ]
 
 trainer = Trainer(
@@ -348,15 +351,51 @@ trainer = Trainer(
 )
 
 # =============================================================================
-# TRAIN
+# TRAIN / TEST
 # =============================================================================
-print(f"\n{'='*60}")
-print(f"  PASTIS-HD — {modality_str}")
-print(f"  Temporal: {temporal_str}")
-print(f"  Train: folds 1,2,3 → Val: fold 4 → Test: fold 5")
-print(f"{'='*60}\n")
+if args.test_only:
+    # ── Test-only mode: load checkpoint and run test split ──────────────
+    ckpt_to_load = (
+        args.ckpt_path
+        or config_model.get("trainer", {}).get("checkpoint_path")
+    )
+    if ckpt_to_load is None:
+        raise ValueError(
+            "--test_only requires a checkpoint. Either pass --ckpt_path "
+            "or set trainer.checkpoint_path in the config YAML."
+        )
 
-trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
+    print(f"\n{'='*60}")
+    print(f"  PASTIS-HD — TEST ONLY")
+    print(f"  Checkpoint: {ckpt_to_load}")
+    print(f"  Modalities: {modality_str}")
+    print(f"  Temporal:   {multi_temporal} frames")
+    print(f"{'='*60}\n")
+
+    # Load weights into the already-constructed model
+    ckpt = torch.load(ckpt_to_load, map_location="cpu", weights_only=False)
+    state = ckpt.get("state_dict", ckpt)
+    result = model.load_state_dict(state, strict=False)
+    print(f"[PASTIS] Loaded checkpoint — "
+          f"missing: {len(result.missing_keys)}, "
+          f"unexpected: {len(result.unexpected_keys)}")
+    if result.missing_keys:
+        print(f"[PASTIS] First 5 missing: {result.missing_keys[:5]}")
+    if result.unexpected_keys:
+        print(f"[PASTIS] First 5 unexpected: {result.unexpected_keys[:5]}")
+
+    # Run validation + test
+    trainer.validate(model, datamodule=data_module)
+    trainer.test(model, datamodule=data_module)
+else:
+    # ── Normal training ─────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"  PASTIS-HD — {modality_str}")
+    print(f"  Temporal: {multi_temporal} frames (linspace)")
+    print(f"  Train: folds 1,2,3 → Val: fold 4 → Test: fold 5")
+    print(f"{'='*60}\n")
+
+    trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
 
 if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
