@@ -35,7 +35,8 @@ Config:
             n_layers: 2
             dim_feedforward: 1024
             dropout: 0.1
-            max_T: 1000
+            num_freq_bands: 24             # K for Fourier DOY encoding (out_dim = 2K)
+            cycle_period: 365.0
             positional_encoding: true
 """
 
@@ -43,6 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import math
 from typing import Dict, List, Tuple, Optional
 
 from training.atomiser import Atomiser_Senflood
@@ -149,11 +151,22 @@ class TemporalTransformer(nn.Module):
     """
     Temporal aggregator using self-attention over T+1 tokens (CLS + T).
 
+    Time encoding: **Fourier features on actual DOY** (day-of-year),
+    **concatenated** to content features rather than added. This gives
+    time-info dedicated channels and uses physically-meaningful encoding
+    (day 47 produces the same vector regardless of registration order).
+
+    The CLS token gets a learnable time-embedding vector in the concat
+    space (since it has no physical DOY).
+
     Architecture:
-        1. Prepend learnable CLS token to sequence
-        2. Add positional encoding (sinusoidal on time_indices, zero for CLS)
-        3. Run N layers of self-attention + FFN
-        4. Readout CLS token as aggregated representation
+        1. Prepend learnable CLS to sequence                     [B*L, T+1, D]
+        2. Build Fourier(DOY) features for timestamps            [B*L, T, 2K]
+           Prepend learnable CLS time-embed                      [B*L, T+1, 2K]
+        3. Concatenate content + time features                   [B*L, T+1, D + 2K]
+        4. Project back to D_model                               [B*L, T+1, D]
+        5. Run N layers of self-attention + FFN
+        6. Readout CLS → LayerNorm                               [B*L, D]
 
     Interface matches LTAE: [B*L, T, D] → [B*L, D].
     """
@@ -161,11 +174,13 @@ class TemporalTransformer(nn.Module):
     def __init__(
         self,
         in_channels: int,
+        lookup_table,
         n_head: int = 8,
         n_layers: int = 2,
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
-        T: int = 1000,
+        num_freq_bands: int = 24,
+        cycle_period: float = 365.0,
         positional_encoding: bool = True,
     ):
         super().__init__()
@@ -174,16 +189,35 @@ class TemporalTransformer(nn.Module):
         self.n_head              = n_head
         self.n_layers            = n_layers
         self.positional_encoding = positional_encoding
-        self.T_max               = T
+        self.lookup_table        = lookup_table
 
-        # Learnable CLS token
+        # Fourier DOY encoding parameters
+        self.num_freq_bands = num_freq_bands
+        self.cycle_period   = float(cycle_period)
+        self.time_dim       = 2 * num_freq_bands if positional_encoding else 0
+
+        # Learnable CLS token (content dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
         nn.init.normal_(self.cls_token, std=0.02)
 
-        # Sinusoidal PE table (same format as LTAE for consistency)
+        # Learnable time embedding for CLS (time dim) — CLS has no physical DOY
         if positional_encoding:
-            self.register_buffer(
-                "pe_table", self._build_pe_table(T, self.d_model))
+            self.cls_time = nn.Parameter(torch.zeros(1, 1, self.time_dim))
+            nn.init.normal_(self.cls_time, std=0.02)
+
+            # Fourier angular frequencies: 1, 2, ..., K cycles per period
+            freqs = torch.arange(1, num_freq_bands + 1, dtype=torch.float32)
+            angular_freqs = 2.0 * math.pi * freqs / self.cycle_period         # [K]
+            self.register_buffer("angular_freqs", angular_freqs)
+
+            # idx → DOY map (built lazily from lookup_table)
+            self._doy_buffer_built = False
+
+        # Projection: concat(D + time_dim) → D
+        if self.time_dim > 0:
+            self.input_proj = nn.Linear(self.d_model + self.time_dim, self.d_model)
+        else:
+            self.input_proj = nn.Identity()
 
         # Standard transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -196,43 +230,98 @@ class TemporalTransformer(nn.Module):
             norm_first=True,   # pre-LN for stability
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
         self.out_norm = nn.LayerNorm(self.d_model)
 
-    @staticmethod
-    def _build_pe_table(T: int, d: int) -> torch.Tensor:
-        pe  = torch.zeros(T, d)
-        pos = torch.arange(0, T, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d, 2, dtype=torch.float32)
-                        * (-torch.log(torch.tensor(10000.0)) / d))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        return pe
+    def _build_doy_buffer(self):
+        """Build idx → DOY map from lookup_table.table_time."""
+        num_times = self.lookup_table.num_time_indices
+        doy_map = torch.zeros(num_times, dtype=torch.float32)
+        for time_key, idx in self.lookup_table.table_time.items():
+            if isinstance(time_key, (int, float)):
+                doy_map[idx] = float(time_key)
+            elif isinstance(time_key, str):
+                # ISO date → DOY
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(time_key)
+                    doy_map[idx] = float(dt.timetuple().tm_yday)
+                except Exception:
+                    doy_map[idx] = 0.0
+            elif isinstance(time_key, tuple) and len(time_key) >= 2:
+                doy_map[idx] = float(time_key[1])
+            else:
+                doy_map[idx] = 0.0
+
+        # Register as buffer so it moves with .to(device)
+        if hasattr(self, "doy_map"):
+            delattr(self, "doy_map")
+        self.register_buffer("doy_map", doy_map.to(self.angular_freqs.device))
+        self._doy_buffer_built = True
+
+    def _fourier_doy(self, time_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Map time_indices → DOY → Fourier features.
+
+        Args:
+            time_indices: [B*L, T] integer time_idx values
+
+        Returns:
+            [B*L, T, 2K] Fourier features. time_idx < 0 produces zero vector.
+        """
+        if not self._doy_buffer_built:
+            self._build_doy_buffer()
+
+        # Rebuild if new times were registered after module creation
+        if time_indices.max() >= self.doy_map.shape[0]:
+            self._build_doy_buffer()
+
+        is_na  = time_indices < 0
+        idx_cl = time_indices.clamp(0, self.doy_map.shape[0] - 1).long()
+        doy    = self.doy_map[idx_cl]                                  # [B*L, T]
+
+        # Angles: [B*L, T, K]
+        angles = doy.unsqueeze(-1) * self.angular_freqs.view(1, 1, -1)
+
+        sin_enc = torch.sin(angles)
+        cos_enc = torch.cos(angles)
+        features = torch.stack([sin_enc, cos_enc], dim=-1).reshape(
+            *time_indices.shape, self.time_dim)                         # [B*L, T, 2K]
+
+        if is_na.any():
+            features = features.masked_fill(is_na.unsqueeze(-1), 0.0)
+
+        return features
 
     def forward(
         self,
-        x: torch.Tensor,                   # [B*L, T, D]
-        time_indices: Optional[torch.Tensor] = None,  # [B*L, T]
-    ) -> torch.Tensor:                     # [B*L, D]
+        x: torch.Tensor,                                      # [B*L, T, D]
+        time_indices: Optional[torch.Tensor] = None,          # [B*L, T]
+    ) -> torch.Tensor:                                        # [B*L, D]
         BL, T, D = x.shape
 
         # Prepend CLS: [B*L, T+1, D]
         cls = self.cls_token.expand(BL, 1, D)
         seq = torch.cat([cls, x], dim=1)
 
-        # Positional encoding: CLS gets zero, rest get time-indexed PE
         if self.positional_encoding and time_indices is not None:
-            time_indices = time_indices.clamp(0, self.T_max - 1).long()
-            pe_seq = self.pe_table[time_indices]                       # [B*L, T, D]
-            pe_cls = torch.zeros(BL, 1, D, device=x.device, dtype=pe_seq.dtype)
-            pe     = torch.cat([pe_cls, pe_seq], dim=1)                # [B*L, T+1, D]
-            seq    = seq + pe
+            # Fourier(DOY) for real timestamps
+            time_feats = self._fourier_doy(time_indices)                 # [B*L, T, 2K]
+
+            # Learnable time-embed for CLS
+            cls_time = self.cls_time.expand(BL, 1, self.time_dim)        # [B*L, 1, 2K]
+            time_feats_full = torch.cat([cls_time, time_feats], dim=1)   # [B*L, T+1, 2K]
+
+            # Concatenate along feature dim: [B*L, T+1, D + 2K]
+            seq = torch.cat([seq, time_feats_full], dim=-1)
+
+            # Project back to d_model
+            seq = self.input_proj(seq)                                   # [B*L, T+1, D]
 
         # Self-attention + FFN stack
-        seq = self.transformer(seq)                                    # [B*L, T+1, D]
+        seq = self.transformer(seq)                                      # [B*L, T+1, D]
 
         # Readout CLS
-        cls_out = seq[:, 0, :]                                         # [B*L, D]
+        cls_out = seq[:, 0, :]                                           # [B*L, D]
         return self.out_norm(cls_out)
 
 
@@ -288,17 +377,21 @@ class AtomiserLTAE(pl.LightningModule):
             tr_cfg = temporal_cfg.get("transformer", {})
             self.temporal = TemporalTransformer(
                 in_channels         = self.atomiser.latent_dim,
+                lookup_table        = lookup_table,
                 n_head              = tr_cfg.get("n_head", 8),
                 n_layers            = tr_cfg.get("n_layers", 2),
                 dim_feedforward     = tr_cfg.get("dim_feedforward",
                                                  4 * self.atomiser.latent_dim),
                 dropout             = tr_cfg.get("dropout", 0.1),
-                T                   = tr_cfg.get("max_T", 1000),
+                num_freq_bands      = tr_cfg.get("num_freq_bands", 24),
+                cycle_period        = tr_cfg.get("cycle_period", 365.0),
                 positional_encoding = tr_cfg.get("positional_encoding", True),
             )
             print(f"[AtomiserLTAE] Temporal module: TemporalTransformer "
                   f"(n_head={self.temporal.n_head}, n_layers={self.temporal.n_layers}, "
                   f"d_model={self.temporal.d_model}, "
+                  f"K={self.temporal.num_freq_bands}, "
+                  f"period={self.temporal.cycle_period}, "
                   f"PE={self.temporal.positional_encoding})")
 
         else:
