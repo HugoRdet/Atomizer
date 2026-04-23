@@ -212,6 +212,10 @@ parser.add_argument("--pretrained_encoder", type=str, default=None,
 parser.add_argument("--num_workers",    type=int, default=4)
 parser.add_argument("--grad_accum",     type=int, default=1)
 
+# Wandb resume
+parser.add_argument("--wandb_run_id",   type=str, default=None,
+                    help="Wandb run ID to resume logging into (use with --ckpt_path)")
+
 # Test-only mode
 parser.add_argument("--test_only",      action="store_true",
                     help="Skip training, load checkpoint from config trainer.checkpoint_path "
@@ -273,8 +277,10 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
     pretrain_tag = "pretrained" if args.pretrained_encoder else "scratch"
     run_name = f"PASTIS_{args.xp_name}_{modality_str}_{pretrain_tag}"
-    wandb.init(
-        name=run_name, project="PASTIS",
+
+    wandb_init_kwargs = dict(
+        name=run_name,
+        project="PASTIS",
         config={
             **config_model,
             "modalities":     modalities,
@@ -283,6 +289,16 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
             "multi_temporal": multi_temporal,
         },
     )
+
+    # Resume an existing wandb run if requested
+    if args.wandb_run_id is not None:
+        wandb_init_kwargs["id"]      = args.wandb_run_id
+        wandb_init_kwargs["resume"]  = "must"        # fail if run doesn't exist
+        print(f"[PASTIS] Resuming wandb run: {args.wandb_run_id}")
+    else:
+        print(f"[PASTIS] Starting new wandb run: {run_name}")
+
+    wandb.init(**wandb_init_kwargs)
     wandb_logger = WandbLogger(project="PASTIS")
 
 # =============================================================================
@@ -393,6 +409,10 @@ else:
     print(f"  PASTIS-HD — {modality_str}")
     print(f"  Temporal: {multi_temporal} frames (linspace)")
     print(f"  Train: folds 1,2,3 → Val: fold 4 → Test: fold 5")
+    if args.ckpt_path is not None:
+        print(f"  RESUMING from: {args.ckpt_path}")
+        if args.wandb_run_id:
+            print(f"  Wandb run:     {args.wandb_run_id}")
     print(f"{'='*60}\n")
 
     trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
