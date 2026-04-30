@@ -1,44 +1,30 @@
 """
-Perceiver Segmentation Model — Multi-Task / Multi-Temporal
-============================================================
+Perceiver Classification Model
+================================
 
-Wraps PerceiverIO for dense pixel-wise segmentation, with native
-support for multi-temporal inputs.
+Wraps PerceiverIO for image-level classification. Same input tokenization
+as PerceiverSeg (one token per pixel, with Fourier position + time
+encoding), but the decoder output is a single learned query token —
+equivalent to attention-pooling over the latent set.
+
+This mirrors Atomizer-IO's classification approach (single query token
+attending to the processor latents), so the per-task comparison stays
+clean: same latent-bottleneck mechanism, only difference is the
+input tokenization.
 
 Input:  [B, C, H, W]              single-frame
-     or [B, T, C, H, W]           multi-temporal
-        + doy: [B, T] long        day-of-year per frame (multi-temporal)
-                                  or None (single-frame uses learned vec)
+     or [B, T, C, H, W]           multi-temporal (rare for cls tasks)
+        + doy: [B, T] long        day-of-year per frame, or None
 
-Output: [B, num_classes, H, W]    logits
+Output: [B, num_classes]          classification logits
 
 Pipeline:
-    Multi-frame (T >= 1):
-        1. Flatten: [B, T, C, H, W] -> [B, T*H*W, C]
-        2. Per-token spatial position from Fourier (varies per pixel,
-           tied across frames at same pixel).
-        3. Per-token time encoding from doy, broadcast to all H*W
-           pixels of frame t. If doy is None, use a learned vector.
-        4. Concat [reflectance, pos, time] -> input tokens.
-        5. Build queries on the H*W spatial grid only:
-              query_pos    = Fourier(spatial)
-              query_time   = learned vector  (always — queries are
-                                              time-agnostic by design)
-              query_input  = [pos, time] -> Linear -> [H*W, query_dim]
-        6. PerceiverIO.encode(tokens).decode(queries)
-           -> [B, H*W, num_classes]
-        7. Reshape -> [B, num_classes, H, W]
-
-Time-agnostic queries: cross-attention naturally aggregates over the
-T*H*W input tokens, picking up time-relevant info per spatial location
-without committing the query to a specific frame. Matches Atomizer-IO's
-philosophy.
-
-Single learned time vector: shared across all tasks. Used for
-(a) single-frame tasks (no real time), and
-(b) the query side of every task (time-agnostic).
-The model can route specific features through this vector if it needs
-to identify single-frame vs multi-frame contexts.
+    1. Build input tokens (identical to PerceiverSeg):
+       per pixel-frame: [reflectance(C), Fourier(x, y), Fourier(t) or learned]
+    2. Single learned query token: [1, query_dim]
+       -> [B, 1, query_dim] via repeat
+    3. PerceiverIO.encode(tokens).decode(query) -> [B, 1, num_classes]
+    4. Squeeze -> [B, num_classes]
 """
 
 import torch
@@ -49,15 +35,14 @@ from .fourier import FourierPositionalEncoding, FourierTimeEncoding
 from .perceiver_io import PerceiverIO
 
 
-class PerceiverSeg(nn.Module):
+class PerceiverCls(nn.Module):
     """
-    Perceiver-IO for semantic segmentation, with native multi-temporal support.
+    Perceiver-IO for image-level classification, with native multi-temporal support.
 
     Args:
-        in_channels: Number of input bands per frame (e.g., 15 for the
-                     canonical 13 S2 + 2 SAR layout).
-        num_classes: Number of segmentation classes.
-        img_size: Spatial size (H = W). Used for query construction.
+        in_channels: Number of input bands per frame.
+        num_classes: Number of classification classes.
+        img_size:    Spatial size (H = W). Used for token positional encoding.
         num_latents, latent_dim, depth, etc.: standard Perceiver-IO config.
         num_freq_bands, max_freq: Fourier-encoder config (shared by
                                   position and time).
@@ -66,8 +51,8 @@ class PerceiverSeg(nn.Module):
     def __init__(
         self,
         in_channels=15,
-        num_classes=14,
-        img_size=512,
+        num_classes=10,
+        img_size=64,
         num_latents=256,
         latent_dim=256,
         depth=6,
@@ -98,17 +83,20 @@ class PerceiverSeg(nn.Module):
         time_dim = self.time_encoder.get_output_dim()
 
         # ── Learned "no time" vector ─────────────────────
-        # Used for single-frame inputs (no real DOY) and for queries
-        # (which are time-agnostic by design). Shared across all tasks.
+        # Used for single-frame inputs. Shared across all tasks.
         self.no_time_vector = nn.Parameter(torch.zeros(time_dim))
         nn.init.normal_(self.no_time_vector, std=0.02)
 
         # ── Token / query dims ───────────────────────────
         # Token = [reflectance(C), pos, time]
         input_dim = in_channels + pos_dim + time_dim
-        # Query = projection of [pos, time] (time = learned vector always)
         query_dim = latent_dim
-        self.query_proj = nn.Linear(pos_dim + time_dim, query_dim)
+
+        # ── Single learned classification query token ────
+        # Acts as a CLS token: attends to the processor latents
+        # to pool a global representation for classification.
+        self.cls_query = nn.Parameter(torch.zeros(1, query_dim))
+        nn.init.normal_(self.cls_query, std=0.02)
 
         # ── Core Perceiver-IO ────────────────────────────
         self.perceiver = PerceiverIO(
@@ -130,13 +118,14 @@ class PerceiverSeg(nn.Module):
         )
 
         n_params = sum(p.numel() for p in self.parameters())
-        print(f"[PerceiverSeg] in_channels={in_channels}, "
+        print(f"[PerceiverCls] in_channels={in_channels}, "
               f"num_classes={num_classes}, img_size={img_size}")
-        print(f"[PerceiverSeg] input_dim={input_dim} "
+        print(f"[PerceiverCls] input_dim={input_dim} "
               f"(channels={in_channels} + pos={pos_dim} + time={time_dim})")
-        print(f"[PerceiverSeg] latents={num_latents}x{latent_dim}, "
+        print(f"[PerceiverCls] latents={num_latents}x{latent_dim}, "
               f"depth={depth}, self_per_cross={self_per_cross_attn}")
-        print(f"[PerceiverSeg] Parameters: {n_params:,}")
+        print(f"[PerceiverCls] query: single learned CLS token (attention pool)")
+        print(f"[PerceiverCls] Parameters: {n_params:,}")
 
     # ─────────────────────────────────────────────────────
     # Forward
@@ -152,7 +141,7 @@ class PerceiverSeg(nn.Module):
                 or None                    fall back to learned vector
 
         Returns:
-            logits: [B, num_classes, H, W]
+            logits: [B, num_classes]
         """
         # ── Normalize input rank ─────────────────────────
         if image.dim() == 4:
@@ -173,8 +162,6 @@ class PerceiverSeg(nn.Module):
         # pos: [H*W, pos_dim]
 
         # ── Per-token time encoding ──────────────────────
-        # Either Fourier-encoded DOY (T frames -> T distinct vectors,
-        # broadcast over H*W pixels) or the learned vector.
         if doy is not None and T > 1:
             # doy: [B, T] -> [B, T, time_dim]
             time_per_frame = self.time_encoder(doy.to(image.device))
@@ -190,26 +177,23 @@ class PerceiverSeg(nn.Module):
         pixels = rearrange(image, 'b t c h w -> b (t h w) c')
 
         # 2. Position: [H*W, pos_dim] -> [B, T*H*W, pos_dim]
-        #    Same pos repeated for every (t, h, w) at fixed (h, w).
         pos_for_tokens = repeat(pos, '(h w) d -> b (t h w) d', b=B, t=T, h=H, w=W)
 
         # 3. Time: [B, T, time_dim] -> [B, T*H*W, time_dim]
-        #    Same time vector for all H*W pixels of frame t.
         time_for_tokens = repeat(
             time_per_frame, 'b t d -> b (t h w) d', h=H, w=W,
         )
 
         tokens = torch.cat([pixels, pos_for_tokens, time_for_tokens], dim=-1)
 
-        # ── Build queries: [B, H*W, query_dim], time-agnostic ──
-        query_time = self.no_time_vector.to(image.dtype) \
+        # ── Build single CLS query: [B, 1, query_dim] ────
+        queries = self.cls_query.to(image.dtype) \
             .view(1, 1, -1) \
-            .expand(B, H * W, -1)
-        query_pos = repeat(pos, 'n d -> b n d', b=B)
-        queries = self.query_proj(torch.cat([query_pos, query_time], dim=-1))
+            .expand(B, 1, -1)
 
         # ── Perceiver-IO ─────────────────────────────────
         logits = self.perceiver(tokens, queries=queries)
-        # [B, H*W, num_classes]
+        # [B, 1, num_classes]
 
-        return rearrange(logits, 'b (h w) c -> b c h w', h=H, w=W)
+        return logits.squeeze(1)
+        # [B, num_classes]

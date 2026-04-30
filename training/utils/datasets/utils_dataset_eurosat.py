@@ -56,61 +56,38 @@ def _decode_pickle_attr(attr_value):
     the LITERAL repr of a bytes object — e.g. the string "b'\\x80\\x04...'"
     rather than the bytes b"\\x80\\x04...".
 
-    The pickled dict contains 'label' (what we want) but also references
-    to geobench classes that may not be installed locally. We use a
-    custom Unpickler that returns a stub object for missing classes —
-    we don't need to actually instantiate the band metadata, just to
-    extract the integer label.
+    Try multiple decoding paths in order. On total failure, raises
+    RuntimeError with the first 60 chars of the input for diagnosis.
     """
     import codecs
-    import io
-
-    class _StubClass:
-        """Placeholder for any class pickle can't import."""
-        def __init__(self, *args, **kwargs):
-            pass
-        def __setstate__(self, state):
-            pass
-
-    class _LenientUnpickler(pickle.Unpickler):
-        def find_class(self, module, name):
-            try:
-                return super().find_class(module, name)
-            except (ModuleNotFoundError, ImportError, AttributeError):
-                return _StubClass
-
-    def _lenient_loads(raw_bytes):
-        return _LenientUnpickler(io.BytesIO(raw_bytes)).load()
 
     errors = []
 
-    # Convert input to bytes (try several paths)
-    raw_bytes = None
+    # Path 1: direct pickle.loads (handles bytes, np.bytes_)
+    try:
+        return pickle.loads(attr_value)
+    except Exception as e:
+        errors.append(f"direct: {type(e).__name__}: {e}")
 
-    # Path 1: already bytes
-    if isinstance(attr_value, (bytes, bytearray)):
-        raw_bytes = bytes(attr_value)
-
-    # Path 2: numpy void / array — has tobytes()
-    if raw_bytes is None and hasattr(attr_value, "tobytes"):
+    # Path 2: .tobytes() — handles np.void, np.ndarray
+    if hasattr(attr_value, "tobytes"):
         try:
-            raw_bytes = attr_value.tobytes()
+            return pickle.loads(attr_value.tobytes())
         except Exception as e:
             errors.append(f"tobytes: {type(e).__name__}: {e}")
 
-    # Path 3: ndarray of bytes
-    if raw_bytes is None and isinstance(attr_value, np.ndarray) and attr_value.size > 0:
+    # Path 3: ndarray of bytes; pick first element
+    if isinstance(attr_value, np.ndarray) and attr_value.size > 0:
         elem = attr_value.flat[0]
-        if isinstance(elem, (bytes, bytearray)):
-            raw_bytes = bytes(elem)
-        elif hasattr(elem, "tobytes"):
-            try:
-                raw_bytes = elem.tobytes()
-            except Exception as e:
-                errors.append(f"ndarray[0].tobytes: {type(e).__name__}: {e}")
+        try:
+            return pickle.loads(elem)
+        except Exception as e:
+            errors.append(f"ndarray[0]: {type(e).__name__}: {e}")
 
-    # Path 4: str containing the printed repr of bytes (e.g. "b'\\x80\\x04...'")
-    if raw_bytes is None and isinstance(attr_value, str):
+    # Path 4: str that's the printed repr of a bytes literal
+    # e.g. "b'\\x80\\x04...'" — common geo-bench format
+    if isinstance(attr_value, str):
+        # Strip b' / b" prefix and trailing quote
         if attr_value.startswith("b'") and attr_value.endswith("'"):
             inner = attr_value[2:-1]
         elif attr_value.startswith('b"') and attr_value.endswith('"'):
@@ -119,40 +96,29 @@ def _decode_pickle_attr(attr_value):
             inner = None
 
         if inner is not None:
+            # Use codecs.escape_decode — more permissive than ast.literal_eval.
+            # Decodes \x.., \n, \t, etc. — bytes escapes — without requiring
+            # full Python-literal syntax.
             try:
-                inner_latin = inner.encode("latin-1")
-                decoded, _ = codecs.escape_decode(inner_latin)
-                raw_bytes = decoded
+                inner_bytes = inner.encode("latin-1")
+                raw, _ = codecs.escape_decode(inner_bytes)
+                return pickle.loads(raw)
             except Exception as e:
                 errors.append(f"escape_decode: {type(e).__name__}: {e}")
 
-        # Path 4b: str as latin-1 (last resort)
-        if raw_bytes is None:
-            try:
-                raw_bytes = attr_value.encode("latin-1")
-            except Exception as e:
-                errors.append(f"latin-1: {type(e).__name__}: {e}")
+        # Path 5: latin-1 round-trip (last resort)
+        try:
+            return pickle.loads(attr_value.encode("latin-1"))
+        except Exception as e:
+            errors.append(f"latin-1: {type(e).__name__}: {e}")
 
-    if raw_bytes is None:
-        raise RuntimeError(
-            f"Could not extract bytes from HDF5 pickle attribute. "
-            f"Type: {type(attr_value).__name__}, "
-            f"length: {len(attr_value) if hasattr(attr_value, '__len__') else 'N/A'}, "
-            f"first 60: {repr(attr_value[:60]) if hasattr(attr_value, '__getitem__') else '?'}\n"
-            f"Errors: {errors}"
-        )
-
-    # Now unpickle with stub-classes for missing imports.
-    try:
-        return _lenient_loads(raw_bytes)
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not unpickle HDF5 attribute even with lenient unpickler. "
-            f"Bytes length: {len(raw_bytes)}, "
-            f"first 30 bytes: {raw_bytes[:30]!r}\n"
-            f"Final error: {type(e).__name__}: {e}\n"
-            f"Earlier errors: {errors}"
-        )
+    raise RuntimeError(
+        f"Could not decode HDF5 pickle attribute. "
+        f"Type: {type(attr_value).__name__}, "
+        f"length: {len(attr_value) if hasattr(attr_value, '__len__') else 'N/A'}, "
+        f"first 60: {repr(attr_value[:60]) if hasattr(attr_value, '__getitem__') else '?'}\n"
+        f"Errors: {errors}"
+    )
 
 
 class EuroSATDataset(Dataset):

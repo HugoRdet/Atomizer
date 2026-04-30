@@ -15,7 +15,7 @@ fi
 ## === Then load the module and activate your env ===
 conda activate venv
 
-python script_train_PASTIS.py --xp_name s2s1_768_last12 --use_s1 --multi_temporal 6 --ckpt_path ./checkpoints/pastis/pastis_pastis_e2e_ltae-epoch=21-val_mIoU=0.4640.ckpt --wandb_run_id lz6bfex8
+python script_train_PASTIS.py --xp_name s2s1_768_last12 --use_s1  --use_spot --multi_temporal 6 --ckpt_path ./checkpoints/pastis/pastis_pastis_e2e_ltae-epoch=21-val_mIoU=0.4640.ckpt --wandb_run_id lz6bfex8
 
  
 # Call training script with experiment name used in the arguments

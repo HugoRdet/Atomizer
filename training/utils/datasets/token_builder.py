@@ -40,6 +40,9 @@ class TokenBuilder:
     # Unseen resolutions are auto-registered with default ref_size=512.
     REFERENCE_SIZES = {
         10.0: 512,  # Sentinel-2/Sentinel-1/EnMAP at 10m
+        15.0: 512,
+        0.1:512,
+        0.5:512
     }
     
     # Default reference grid size for auto-registered resolutions

@@ -158,6 +158,10 @@ class Lookup_encoding(pl.LightningModule):
         # Reference grid sizes (matching TokenBuilder.REFERENCE_SIZES)
         reference_modalities = [
             (10.0, 512),  # Sentinel-2/Sentinel-1 at 10m
+            (15.0,512),
+            (0.1,512),
+            (0.5,512)
+
         ]
 
    

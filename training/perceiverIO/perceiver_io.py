@@ -4,16 +4,24 @@ Perceiver-IO Encoder-Decoder
 
 Task-agnostic Perceiver-IO following Jaegle et al. (2021).
 
-Encoder:
-    Input tokens [B, N, D_in] → cross-attention with latents →
-    self-attention layers → latent representation [B, L, D_latent]
+Now factored into three classes:
 
-Decoder:
-    Query tokens [B, M, D_query] × cross-attention with latents →
-    output [B, M, D_query] → logits [B, M, D_out]
+    PerceiverEncoder  : input tokens -> latent representation.
+                        Shared across tasks in multi-task setups.
+    PerceiverDecoder  : latents + queries -> output logits.
+                        One decoder per task in multi-task setups
+                        (different num_classes -> different to_logits;
+                         different query strategies live above this).
+    PerceiverIO       : composition of the two for single-task use.
+                        Public API unchanged from the original module:
+                        same constructor signature, same forward(),
+                        same encode()/decode() methods.
 
-The encoder uses iterative cross-attention (depth > 1 repeats
-cross-attn → self-attn blocks). Weight tying optional.
+Existing single-task code (PerceiverSeg, PerceiverCls, etc.) using
+PerceiverIO works unchanged — only the internal layout changed.
+For multi-task, a wrapper can instantiate one PerceiverEncoder and a
+ModuleDict of PerceiverDecoders, sharing the encoder while specialising
+the decoder per task.
 """
 
 from functools import wraps
@@ -45,37 +53,29 @@ def cache_fn(f):
 
 
 # =============================================================================
-# PERCEIVER-IO
+# ENCODER
 # =============================================================================
 
-class PerceiverIO(nn.Module):
+class PerceiverEncoder(nn.Module):
     """
-    Perceiver-IO: encoder maps arbitrary input to fixed latents,
-    decoder maps latents to arbitrary output via query cross-attention.
+    Perceiver-IO encoder: input tokens -> latent representation via
+    iterative cross-attention + self-attention.
 
     Args:
-        input_dim: Dimension of input tokens (channels + fourier pos).
-        query_dim: Dimension of decoder query tokens.
-        output_dim: Dimension of final output (e.g., num_classes).
+        input_dim: Dimension of input tokens.
         num_latents: Number of latent vectors.
         latent_dim: Dimension of each latent vector.
-        depth: Number of encoder cross-attn → self-attn blocks.
-        cross_heads: Heads for cross-attention.
-        latent_heads: Heads for latent self-attention.
-        cross_dim_head: Dim per head in cross-attention.
-        latent_dim_head: Dim per head in self-attention.
-        self_per_cross_attn: Number of self-attn blocks per cross-attn.
-        weight_tie_layers: Share weights across depth > 1 blocks.
-        attn_dropout: Attention dropout.
-        ff_dropout: Feedforward dropout.
-        decoder_ff: Add feedforward after decoder cross-attention.
+        depth: Number of cross-attn -> self-attn blocks.
+        cross_heads, latent_heads: head counts.
+        cross_dim_head, latent_dim_head: dim per head.
+        self_per_cross_attn: self-attn blocks per cross-attn.
+        weight_tie_layers: share weights across blocks (block 0 always unique).
+        attn_dropout, ff_dropout: dropouts.
     """
 
     def __init__(
         self,
         input_dim,
-        query_dim,
-        output_dim,
         num_latents=512,
         latent_dim=512,
         depth=6,
@@ -87,15 +87,15 @@ class PerceiverIO(nn.Module):
         weight_tie_layers=False,
         attn_dropout=0.0,
         ff_dropout=0.0,
-        decoder_ff=False,
     ):
         super().__init__()
 
         # Learnable latent array
         self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
         nn.init.trunc_normal_(self.latents, std=0.02)
+        self.latent_dim = latent_dim
 
-        # ── Encoder layers ──────────────────────────────────────────
+        # ── Encoder layer factories ─────────────────────────────────
         get_cross_attn = cache_fn(lambda: PreNorm(
             latent_dim,
             Attention(
@@ -143,31 +143,13 @@ class PerceiverIO(nn.Module):
                 self_attns,
             ]))
 
-        # ── Decoder ─────────────────────────────────────────────────
-        self.decoder_cross_attn = PreNorm(
-            query_dim,
-            Attention(
-                query_dim, latent_dim,
-                heads=cross_heads, dim_head=cross_dim_head,
-                dropout=attn_dropout,
-            ),
-            context_dim=latent_dim,
-        )
-        self.decoder_ff = (
-            PreNorm(query_dim, FeedForward(query_dim, dropout=ff_dropout))
-            if decoder_ff else None
-        )
-
-        # Output projection
-        self.to_logits = nn.Linear(query_dim, output_dim)
-
-    def encode(self, data, mask=None):
+    def forward(self, data, mask=None):
         """
         Encode input tokens into latent representation.
 
         Args:
             data: [B, N, input_dim] input tokens.
-            mask: [B, N] bool mask (True = valid token).
+            mask: [B, N] bool mask (True = valid token), or None.
 
         Returns:
             latents: [B, L, latent_dim]
@@ -185,6 +167,188 @@ class PerceiverIO(nn.Module):
 
         return x
 
+
+# =============================================================================
+# DECODER
+# =============================================================================
+
+class PerceiverDecoder(nn.Module):
+    """
+    Perceiver-IO decoder: queries cross-attend to latents, optional
+    feedforward, then linear projection to output_dim.
+
+    A single PerceiverDecoder is task-specific: the to_logits projection
+    fixes the output dimension. In multi-task settings, instantiate one
+    PerceiverDecoder per task and dispatch on task name.
+
+    Note: this module operates on already-prepared queries — query
+    construction (Fourier position encodings, learned CLS tokens, etc.)
+    lives in the higher-level model wrapper.
+
+    Args:
+        query_dim: Dimension of decoder query tokens.
+        latent_dim: Dimension of encoder latents.
+        output_dim: Dimension of final output (e.g., num_classes).
+        cross_heads: Heads for the decoder cross-attention.
+        cross_dim_head: Dim per head.
+        attn_dropout, ff_dropout: dropouts.
+        decoder_ff: Add feedforward after the decoder cross-attention.
+    """
+
+    def __init__(
+        self,
+        query_dim,
+        latent_dim,
+        output_dim,
+        cross_heads=1,
+        cross_dim_head=64,
+        attn_dropout=0.0,
+        ff_dropout=0.0,
+        decoder_ff=False,
+    ):
+        super().__init__()
+
+        self.decoder_cross_attn = PreNorm(
+            query_dim,
+            Attention(
+                query_dim, latent_dim,
+                heads=cross_heads, dim_head=cross_dim_head,
+                dropout=attn_dropout,
+            ),
+            context_dim=latent_dim,
+        )
+        self.decoder_ff = (
+            PreNorm(query_dim, FeedForward(query_dim, dropout=ff_dropout))
+            if decoder_ff else None
+        )
+        self.to_logits = nn.Linear(query_dim, output_dim)
+
+    def forward(self, latents, queries):
+        """
+        Args:
+            latents: [B, L, latent_dim] from encoder.
+            queries: [B, M, query_dim] decoder queries.
+
+        Returns:
+            logits: [B, M, output_dim]
+        """
+        out = self.decoder_cross_attn(queries, context=latents)
+        if self.decoder_ff is not None:
+            out = out + self.decoder_ff(out)
+        return self.to_logits(out)
+
+
+# =============================================================================
+# PERCEIVER-IO (composition; preserves original public API)
+# =============================================================================
+
+class PerceiverIO(nn.Module):
+    """
+    Perceiver-IO: encoder maps arbitrary input to fixed latents,
+    decoder maps latents to arbitrary output via query cross-attention.
+
+    Thin composition of PerceiverEncoder + PerceiverDecoder. The public
+    API (constructor signature, forward(), encode(), decode()) is the
+    same as the pre-refactor implementation, so existing single-task
+    code (PerceiverSeg, PerceiverCls) keeps working without changes.
+
+    Args:
+        input_dim: Dimension of input tokens.
+        query_dim: Dimension of decoder query tokens.
+        output_dim: Dimension of final output (e.g., num_classes).
+        num_latents, latent_dim, depth: encoder size config.
+        cross_heads, latent_heads: head counts (cross_heads is shared
+                                   between encoder and decoder cross-attention).
+        cross_dim_head, latent_dim_head: dim per head.
+        self_per_cross_attn: encoder self-attn per cross-attn.
+        weight_tie_layers: share weights across encoder blocks > 0.
+        attn_dropout, ff_dropout: dropouts.
+        decoder_ff: add feedforward after decoder cross-attention.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        query_dim,
+        output_dim,
+        num_latents=512,
+        latent_dim=512,
+        depth=6,
+        cross_heads=1,
+        latent_heads=8,
+        cross_dim_head=64,
+        latent_dim_head=64,
+        self_per_cross_attn=1,
+        weight_tie_layers=False,
+        attn_dropout=0.0,
+        ff_dropout=0.0,
+        decoder_ff=False,
+    ):
+        super().__init__()
+
+        self.encoder = PerceiverEncoder(
+            input_dim=input_dim,
+            num_latents=num_latents,
+            latent_dim=latent_dim,
+            depth=depth,
+            cross_heads=cross_heads,
+            latent_heads=latent_heads,
+            cross_dim_head=cross_dim_head,
+            latent_dim_head=latent_dim_head,
+            self_per_cross_attn=self_per_cross_attn,
+            weight_tie_layers=weight_tie_layers,
+            attn_dropout=attn_dropout,
+            ff_dropout=ff_dropout,
+        )
+        self.decoder = PerceiverDecoder(
+            query_dim=query_dim,
+            latent_dim=latent_dim,
+            output_dim=output_dim,
+            cross_heads=cross_heads,
+            cross_dim_head=cross_dim_head,
+            attn_dropout=attn_dropout,
+            ff_dropout=ff_dropout,
+            decoder_ff=decoder_ff,
+        )
+
+    # ── Backward-compat: keep .latents and .encoder_layers reachable ──
+    # Some external code might inspect these attributes; expose them via
+    # property pass-throughs so the refactor is fully transparent.
+    @property
+    def latents(self):
+        return self.encoder.latents
+
+    @property
+    def encoder_layers(self):
+        return self.encoder.encoder_layers
+
+    @property
+    def decoder_cross_attn(self):
+        return self.decoder.decoder_cross_attn
+
+    @property
+    def decoder_ff(self):
+        return self.decoder.decoder_ff
+
+    @property
+    def to_logits(self):
+        return self.decoder.to_logits
+
+    # ── Original API ────────────────────────────────────────────────
+
+    def encode(self, data, mask=None):
+        """
+        Encode input tokens into latent representation.
+
+        Args:
+            data: [B, N, input_dim] input tokens.
+            mask: [B, N] bool mask (True = valid token), or None.
+
+        Returns:
+            latents: [B, L, latent_dim]
+        """
+        return self.encoder(data, mask=mask)
+
     def decode(self, latents, queries):
         """
         Decode from latents using query tokens.
@@ -196,12 +360,7 @@ class PerceiverIO(nn.Module):
         Returns:
             logits: [B, M, output_dim]
         """
-        out = self.decoder_cross_attn(queries, context=latents)
-
-        if self.decoder_ff is not None:
-            out = out + self.decoder_ff(out)
-
-        return self.to_logits(out)
+        return self.decoder(latents, queries)
 
     def forward(self, data, mask=None, queries=None):
         """
@@ -210,14 +369,13 @@ class PerceiverIO(nn.Module):
         Args:
             data: [B, N, input_dim]
             mask: [B, N] optional
-            queries: [B, M, query_dim]
+            queries: [B, M, query_dim] (or None to return latents only).
 
         Returns:
-            logits: [B, M, output_dim]
+            logits: [B, M, output_dim] if queries is provided,
+                    else latents: [B, L, latent_dim]
         """
         latents = self.encode(data, mask=mask)
-
         if queries is None:
             return latents
-
         return self.decode(latents, queries)

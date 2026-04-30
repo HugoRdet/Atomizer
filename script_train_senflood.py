@@ -132,7 +132,7 @@ data_module = UnifiedDataModule(
 # CALLBACKS
 # =============================================================================
 lr_monitor   = LearningRateMonitor(logging_interval="step")
-accumulator  = GradientAccumulationScheduler(scheduling={0: 2})
+accumulator  = GradientAccumulationScheduler(scheduling={0: 4})
 
 checkpoint_val = ModelCheckpoint(
     dirpath="./checkpoints/",

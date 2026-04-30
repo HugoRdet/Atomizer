@@ -140,7 +140,9 @@ class UnifiedDataModule(pl.LightningDataModule):
                                 'PastisS2ReconDataset',
                                 'MMEarthReconstruction',
                                 'MMEarthSegDW',
-                                'MMEarthSegESA'
+                                'MMEarthSegESA',
+                                'ForestNetDataset',
+                                "pv4ger"
                                 }
     
     def __init__(

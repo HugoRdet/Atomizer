@@ -210,7 +210,7 @@ parser.add_argument("--ckpt_path",      type=str, default=None,
 parser.add_argument("--pretrained_encoder", type=str, default=None,
                     help="Load pretrained encoder weights (no head)")
 parser.add_argument("--num_workers",    type=int, default=4)
-parser.add_argument("--grad_accum",     type=int, default=1)
+parser.add_argument("--grad_accum",     type=int, default=4)
 
 # Wandb resume
 parser.add_argument("--wandb_run_id",   type=str, default=None,
