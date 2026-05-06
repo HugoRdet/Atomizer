@@ -42,7 +42,10 @@ class TokenBuilder:
         10.0: 512,  # Sentinel-2/Sentinel-1/EnMAP at 10m
         15.0: 512,
         0.1:512,
-        0.5:512
+        0.5:512,
+        30.0:512,
+        0.2:512,
+        1.6: 512
     }
     
     # Default reference grid size for auto-registered resolutions

@@ -34,22 +34,83 @@ import torch
 
 def seg_collate(batch):
     """
-    Collate single-frame segmentation samples (T=1 tasks).
+    Collate segmentation samples (works for both single-frame and
+    multi-temporal tasks).
 
     Each sample is a dict produced by a `*MTDataset.__getitem__`:
-        {"image": {"input": [15, H, W]}, "target": [H, W],
-         "valid_mask": [H, W], "original_size": [2], "metadata": {...}}
+        {"image": {"input": [15, H, W] or [T, 15, H, W]},
+         "target": [H, W],
+         "valid_mask": [H, W],
+         "original_size": [2],
+         "metadata": {...},
+         "dates": {"input": [T]}      # optional, multi-temporal only
+        }
 
     Returns:
-        {"image": {"input": [B, 15, H, W]}, "target": [B, H, W],
-         "valid_mask": [B, H, W], "original_size": [B, 2],
-         "metadata": [...]}
+        {"image": {"input": [B, 15, H, W] or [B, T, 15, H, W]},
+         "target": [B, H, W],
+         "valid_mask": [B, H, W],
+         "original_size": [B, 2],
+         "metadata": [...],
+         "dates": {"input": [B, T]}   # only if input samples carry dates
+        }
     """
     images        = torch.stack([s["image"]["input"] for s in batch], dim=0)
     targets       = torch.stack([s["target"]         for s in batch], dim=0)
     valid_masks   = torch.stack([s["valid_mask"]     for s in batch], dim=0)
     original_size = torch.stack([s["original_size"]  for s in batch], dim=0)
     metadata      = [s["metadata"] for s in batch]
+
+    out = {
+        "image": {"input": images},
+        "target": targets,
+        "valid_mask": valid_masks,
+        "original_size": original_size,
+        "metadata": metadata,
+    }
+
+    if "dates" in batch[0]:
+        out["dates"] = {
+            "input": torch.stack([s["dates"]["input"] for s in batch], dim=0)
+        }
+
+    return out
+
+
+def cls_collate(batch):
+    """
+    Collate classification samples (single-frame, scalar target).
+
+    Each sample is a dict produced by a classification `*MTDataset.__getitem__`:
+        {"image": {"input": [15, H, W]},
+         "target": scalar long (class index, as tensor or int),
+         "valid_mask": [H, W],
+         "original_size": [2],
+         "metadata": {...}}
+
+    Returns:
+        {"image": {"input": [B, 15, H, W]},
+         "target": [B],                    # long
+         "valid_mask": [B, H, W],
+         "original_size": [B, 2],
+         "metadata": [...]}
+
+    valid_mask and original_size are kept for symmetry with seg batches.
+    The current shared MultiTaskResNetUPerNet.cls_head pools globally
+    over the encoder's deepest feature without using these — switching
+    to masked pooling later only requires reading these keys.
+    """
+    images        = torch.stack([s["image"]["input"] for s in batch], dim=0)
+    valid_masks   = torch.stack([s["valid_mask"]     for s in batch], dim=0)
+    original_size = torch.stack([s["original_size"]  for s in batch], dim=0)
+    metadata      = [s["metadata"] for s in batch]
+
+    # Targets may arrive as scalar tensors or Python ints — handle both.
+    targets_raw = [s["target"] for s in batch]
+    if isinstance(targets_raw[0], torch.Tensor):
+        targets = torch.stack(targets_raw, dim=0).long()
+    else:
+        targets = torch.tensor(targets_raw, dtype=torch.long)
 
     return {
         "image": {"input": images},

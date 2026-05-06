@@ -142,7 +142,8 @@ class UnifiedDataModule(pl.LightningDataModule):
                                 'MMEarthSegDW',
                                 'MMEarthSegESA',
                                 'ForestNetDataset',
-                                "pv4ger"
+                                "pv4ger",
+                                "BurnScarsDataset"
                                 }
     
     def __init__(

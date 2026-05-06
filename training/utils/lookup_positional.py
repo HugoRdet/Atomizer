@@ -73,30 +73,33 @@ ABSTRACT_CHANNELS = {
     # Sentinel-1 SAR polarizations
     "VV":    {"bandwidth": -1, "central_wavelength": -1},
     "VH":    {"bandwidth": -2, "central_wavelength": -2},
-    "VV_VH": {"bandwidth": -3, "central_wavelength": -3},  # VV/VH ratio
-
+    "VV_VH": {"bandwidth": -3, "central_wavelength": -3},
+ 
     # Elevation / DEM
     "ELEVATION": {"bandwidth": -10, "central_wavelength": -10},
-    "DEM":       {"bandwidth": -10, "central_wavelength": -10},  # Alias
-
+    "DEM":       {"bandwidth": -10, "central_wavelength": -10},
+ 
     # Slope / Aspect
     "SLOPE":  {"bandwidth": -11, "central_wavelength": -11},
     "ASPECT": {"bandwidth": -12, "central_wavelength": -12},
-
+ 
     # Canopy Height
     "CANOPY_HEIGHT": {"bandwidth": -13, "central_wavelength": -13},
-
+ 
+    # FLAIR-HUB DEM (DSM + DTM as separate channels)
+    "DSM": {"bandwidth": -14, "central_wavelength": -14},
+    "DTM": {"bandwidth": -15, "central_wavelength": -15},
+ 
     # Indices
     "NDVI":  {"bandwidth": -20, "central_wavelength": -20},
     "NDWI":  {"bandwidth": -21, "central_wavelength": -21},
     "MNDWI": {"bandwidth": -22, "central_wavelength": -22},
-
+ 
     # Generic placeholders
     "ABSTRACT_1": {"bandwidth": -100, "central_wavelength": -100},
     "ABSTRACT_2": {"bandwidth": -101, "central_wavelength": -101},
     "ABSTRACT_3": {"bandwidth": -102, "central_wavelength": -102},
 }
-
 
 class Lookup_encoding(pl.LightningModule):
     """
@@ -160,7 +163,10 @@ class Lookup_encoding(pl.LightningModule):
             (10.0, 512),  # Sentinel-2/Sentinel-1 at 10m
             (15.0,512),
             (0.1,512),
-            (0.5,512)
+            (0.5,512),
+            (30.0,512),
+            (0.2,512),
+            (1.6,512)
 
         ]
 
@@ -643,4 +649,65 @@ def create_multimodal_bands_info(include_elevation: bool = False) -> dict:
                 "central_wavelength": ABSTRACT_CHANNELS["ELEVATION"]["central_wavelength"],
             },
         }
+    return bands_info
+
+def create_flairhub_bands_info() -> dict:
+    bands_info = {
+        # VHR aerial
+        "bands_aerial_info": {
+            "AERIAL_R":   {"bandwidth": 80,  "central_wavelength": 660, "idx": 0},
+            "AERIAL_G":   {"bandwidth": 80,  "central_wavelength": 550, "idx": 1},
+            "AERIAL_B":   {"bandwidth": 80,  "central_wavelength": 470, "idx": 2},
+            "AERIAL_NIR": {"bandwidth": 100, "central_wavelength": 840, "idx": 3},
+        },
+        # SPOT
+        "bands_spot_info": {
+            "SPOT_R":   {"bandwidth": 120, "central_wavelength": 660, "idx": 0},
+            "SPOT_G":   {"bandwidth": 120, "central_wavelength": 560, "idx": 1},
+            "SPOT_B":   {"bandwidth": 140, "central_wavelength": 490, "idx": 2},
+            "SPOT_NIR": {"bandwidth": 120, "central_wavelength": 825, "idx": 3},
+        },
+        # DEM
+        "bands_dem_info": {
+            "DSM": {
+                "bandwidth":         ABSTRACT_CHANNELS["DSM"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["DSM"]["central_wavelength"],
+                "idx": 0,
+            },
+            "DTM": {
+                "bandwidth":         ABSTRACT_CHANNELS["DTM"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["DTM"]["central_wavelength"],
+                "idx": 1,
+            },
+        },
+        # Sentinel-2 (all 13 bands; dataset filters to 10 used by FLAIR-HUB)
+        "bands_sen2_info": {
+            "B01": {"bandwidth": 20,  "central_wavelength": 443,  "idx": 0},
+            "B02": {"bandwidth": 65,  "central_wavelength": 490,  "idx": 1},
+            "B03": {"bandwidth": 35,  "central_wavelength": 560,  "idx": 2},
+            "B04": {"bandwidth": 30,  "central_wavelength": 665,  "idx": 3},
+            "B05": {"bandwidth": 15,  "central_wavelength": 705,  "idx": 4},
+            "B06": {"bandwidth": 15,  "central_wavelength": 740,  "idx": 5},
+            "B07": {"bandwidth": 20,  "central_wavelength": 783,  "idx": 6},
+            "B08": {"bandwidth": 115, "central_wavelength": 842,  "idx": 7},
+            "B8A": {"bandwidth": 20,  "central_wavelength": 865,  "idx": 8},
+            "B09": {"bandwidth": 20,  "central_wavelength": 945,  "idx": 9},
+            "B10": {"bandwidth": 30,  "central_wavelength": 1375, "idx": 10},
+            "B11": {"bandwidth": 90,  "central_wavelength": 1610, "idx": 11},
+            "B12": {"bandwidth": 180, "central_wavelength": 2190, "idx": 12},
+        },
+        # Sentinel-1
+        "bands_sen1_info": {
+            "VV": {
+                "bandwidth":         ABSTRACT_CHANNELS["VV"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VV"]["central_wavelength"],
+                "idx": 0,
+            },
+            "VH": {
+                "bandwidth":         ABSTRACT_CHANNELS["VH"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VH"]["central_wavelength"],
+                "idx": 1,
+            },
+        },
+    }
     return bands_info

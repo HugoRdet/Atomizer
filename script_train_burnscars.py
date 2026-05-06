@@ -1,15 +1,41 @@
 """
-HLS Burn Scars Training Script (v2)
-====================================
-Uses grouped-token batch format:
-    batch = {
-        "groups": {res: {"tokens": [B,N,6], "mask": [B,N], "shape": (C,H,W)}},
-        "queries":      [B, M, 6],
-        "queries_mask":  [B, M],
-        "label":         [B, H, W],
-        "target_resolution": float,
-        "image":         [B, C, H, W],
-    }
+HLS Burn Scars Training Script — Atomizer
+==========================================
+
+Trains Atomizer on HLS BurnScars binary segmentation.
+
+  - 6 HLS bands @ 30m
+  - 512×512 native, kept full (no crop)
+  - Reuses Model_SenFlood (generic seg trainer)
+  - Reuses collate_grouped + UnifiedDataModule
+
+Splits:
+  - Train: 90% of training/ folder (stratified, random_state=23, PANGAEA-compat)
+  - Val:   10% of training/ folder (same stratified split)
+  - Test:  all of validation/ folder
+
+Examples:
+    # From scratch
+    python train_burnscars_atomiser.py \
+        --xp_name burnscars_v1 \
+        --config_model config_atomiser_burnscars.yaml \
+        --dataset_name u_regular
+
+    # Resume training from a Lightning checkpoint
+    python train_burnscars_atomiser.py \
+        --xp_name burnscars_v1_resumed \
+        --config_model config_atomiser_burnscars.yaml \
+        --dataset_name u_regular \
+        --ckpt_path ./checkpoints/atomiserburnscars_v1-...ckpt \
+        --wandb_run_id <run_id_of_the_aborted_run>
+
+    # Test-only on a saved checkpoint
+    python train_burnscars_atomiser.py \
+        --xp_name burnscars_v1_test \
+        --config_model config_atomiser_burnscars.yaml \
+        --dataset_name u_regular \
+        --ckpt_path ./checkpoints/atomiserburnscars_v1-best.ckpt \
+        --test_only
 """
 
 # =============================================================================
@@ -18,8 +44,8 @@ Uses grouped-token batch format:
 import os
 import time
 import argparse
+
 import torch
-import numpy as np
 
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.loggers import WandbLogger
@@ -34,31 +60,79 @@ seed_everything(42, workers=True)
 # --- Project imports ---
 from training.utils import read_yaml
 from training.utils import Lookup_encoding
-
-# v2 classes (grouped token format)
 from training.trainer_SENFLOOD import Model_SenFlood
-from training.utils.datasets.utils_dataset_BURNSCARS import HLSBurnScarsDataset
+from training.utils.datasets.utils_dataset_BURNSCARS import BurnScarsDataset
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.token_grouping import collate_grouped
+from training.utils.datasets.token_builder import TokenBuilder
+
+
+# =============================================================================
+# RESOLUTION REGISTRATION
+# =============================================================================
+
+# Same set as PASTIS-HD's register_all_resolutions — covers HLS (30m),
+# Sentinel-2 (10m, 20m), SPOT (1m), and a few intermediate values for
+# any future modality. ref_size=2048 is the maximum image size at any
+# resolution for the positional encoding's coordinate range.
+ALL_KNOWN_RESOLUTIONS = {
+    1.0:  2048,
+    2.5:  2048,
+    10.0: 2048,
+    20.0: 2048,
+    30.0: 2048,
+}
+
+
+def register_all_resolutions(lookup_table):
+    """
+    Register every known resolution in the lookup table + TokenBuilder.
+
+    Required so the dataset's `lookup_table.get_resolution_idx(30.0)`
+    call inside `__init__` succeeds. Same pattern as PASTIS-HD.
+    """
+    for res, ref_size in ALL_KNOWN_RESOLUTIONS.items():
+        TokenBuilder.REFERENCE_SIZES[res] = ref_size
+        lookup_table.get_or_register_modality(res, ref_size)
+        lookup_table.get_resolution_idx(res)
+
 
 # =============================================================================
 # ARGS
 # =============================================================================
-parser = argparse.ArgumentParser(description="HLS Burn Scars training script")
-parser.add_argument("--xp_name",       type=str, required=True, help="Experiment name")
-parser.add_argument("--config_model",  type=str, required=True, help="Model config yaml file")
-parser.add_argument("--dataset_name",  type=str, required=True, help="Name of the dataset used")
+parser = argparse.ArgumentParser(description="HLS BurnScars Atomizer training")
+parser.add_argument("--xp_name",      type=str, required=True,
+                    help="Experiment name")
+parser.add_argument("--config_model", type=str, default="config_test-BURNSCARS.yaml",
+                    help="Model config yaml under ./training/configs/")
+
+parser.add_argument("--data_dir",     type=str, default="./data/hls_burn_scars",
+                    help="Path to HLS BurnScars data root")
+parser.add_argument("--num_workers",  type=int, default=4)
+parser.add_argument("--ckpt_path",    type=str, default=None,
+                    help="Resume training from Lightning checkpoint")
+parser.add_argument("--wandb_run_id", type=str, default=None,
+                    help="Wandb run ID to resume into (use with --ckpt_path)")
+parser.add_argument("--test_only",    action="store_true",
+                    help="Skip training, load --ckpt_path and run val+test only")
 args = parser.parse_args()
 
-xp_name = args.xp_name
-config_model = read_yaml("./training/configs/" + args.config_model)
-configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
-bands_yaml = "./data/bands_info/bands.yaml"
+xp_name         = args.xp_name
+config_model    = read_yaml("./training/configs/" + args.config_model)
+configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
+bands_yaml      = "./data/bands_info/bands.yaml"
 
 # =============================================================================
 # LOOKUP TABLE
 # =============================================================================
-lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
+lookup_table = Lookup_encoding(
+    read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
+register_all_resolutions(lookup_table)
+
+print(f"\n[BurnScars] Experiment:   {xp_name}")
+print(f"[BurnScars] Config model:  {args.config_model}")
+print(f"[BurnScars] Data dir:      {args.data_dir}")
+print(f"[BurnScars] Lookup table:  {len(lookup_table.table_wave)} entries")
 
 # =============================================================================
 # WANDB
@@ -66,58 +140,83 @@ lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml)
 wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
-    wandb.init(
-        name=config_model["encoder"],
+
+    wandb_init_kwargs = dict(
+        name=f"BurnScars_{config_model['encoder']}_{xp_name}",
         project="BurnScars",
         config=config_model,
     )
+    if args.wandb_run_id is not None:
+        wandb_init_kwargs["id"]     = args.wandb_run_id
+        wandb_init_kwargs["resume"] = "must"
+        print(f"[BurnScars] Resuming wandb run: {args.wandb_run_id}")
+    else:
+        print(f"[BurnScars] Starting new wandb run: {wandb_init_kwargs['name']}")
+
+    wandb.init(**wandb_init_kwargs)
     wandb_logger = WandbLogger(project="BurnScars")
     wandb.define_metric("train_loss", step_metric="trainer/global_step")
-    wandb.define_metric("val_loss", step_metric="trainer/global_step")
+    wandb.define_metric("val_loss",   step_metric="trainer/global_step")
 
 # =============================================================================
 # MODEL
 # =============================================================================
+# Class names for cleaner logging — turns "test_IoU_class_1" into
+# "test_IoU_burn". Optional but nice to have.
+class_names = ["no_burn", "burn"]
+
 model = Model_SenFlood(
     config=config_model,
     wand=True,
     name=xp_name,
     transform=None,
     lookup_table=lookup_table,
+    class_names=class_names,
 )
 
 # =============================================================================
 # DATA MODULE
 # =============================================================================
+# `dataset_config` is the bands.yaml dict — BurnScarsDataset reads
+# `dataset_config["bands_hls_info"]` from it. Same convention as
+# Sen1Floods11 (which reads `dataset_config["bands_senflood"]`).
 data_module = UnifiedDataModule(
-    path="./data/hls_burn_scars",
-    batch_size=config_model["dataset"]["batchsize"],
-    num_workers=4,
+    path=args.data_dir,
+    batch_size=config_model["trainer"]["batchsize"],
+    num_workers=args.num_workers,
     trans_modalities=None,
     trans_tokens=None,
     model=config_model["encoder"],
     dataset_config=read_yaml(bands_yaml),
     config_model=config_model,
     look_up=lookup_table,
-    dataset_class=HLSBurnScarsDataset,
+    dataset_class=BurnScarsDataset,
 )
 
 # =============================================================================
 # CALLBACKS
 # =============================================================================
-lr_monitor = LearningRateMonitor(logging_interval="step")
+lr_monitor  = LearningRateMonitor(logging_interval="step")
 accumulator = GradientAccumulationScheduler(scheduling={0: 1})
 
-checkpoint_val = ModelCheckpoint(
+checkpoint_best = ModelCheckpoint(
     dirpath="./checkpoints/",
-    filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_loss:.4f}}",
+    filename=f"{config_model['encoder']}{xp_name}-{{epoch:02d}}-{{val_mIoU:.4f}}",
     monitor="val_mIoU",
     mode="max",
     save_top_k=1,
     verbose=True,
 )
+checkpoint_last = ModelCheckpoint(
+    dirpath="./checkpoints/",
+    filename=f"{config_model['encoder']}{xp_name}-last-{{epoch:02d}}",
+    every_n_epochs=1,
+    save_top_k=1,
+    save_last=True,
+    verbose=True,
+)
 
-callbacks = [accumulator, checkpoint_val, lr_monitor]
+callbacks = [accumulator, checkpoint_best, checkpoint_last, lr_monitor]
 
 # =============================================================================
 # TRAINER
@@ -135,14 +234,47 @@ trainer = Trainer(
 )
 
 # =============================================================================
-# TRAIN & TEST
+# TRAIN / TEST
 # =============================================================================
-trainer.fit(model, datamodule=data_module)
-trainer.test(model, datamodule=data_module)
+if args.test_only:
+    if args.ckpt_path is None:
+        raise ValueError(
+            "--test_only requires --ckpt_path to load weights from."
+        )
+
+    print(f"\n{'='*60}")
+    print(f"  BurnScars — TEST ONLY")
+    print(f"  Checkpoint: {args.ckpt_path}")
+    print(f"{'='*60}\n")
+
+    ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("state_dict", ckpt)
+    result = model.load_state_dict(state, strict=False)
+    print(f"[BurnScars] Loaded checkpoint — "
+          f"missing: {len(result.missing_keys)}, "
+          f"unexpected: {len(result.unexpected_keys)}")
+    if result.missing_keys:
+        print(f"[BurnScars] First 5 missing: {result.missing_keys[:5]}")
+    if result.unexpected_keys:
+        print(f"[BurnScars] First 5 unexpected: {result.unexpected_keys[:5]}")
+
+    trainer.validate(model, datamodule=data_module)
+    trainer.test(model, datamodule=data_module)
+else:
+    print(f"\n{'='*60}")
+    print(f"  BurnScars — TRAINING")
+    if args.ckpt_path is not None:
+        print(f"  RESUMING from: {args.ckpt_path}")
+        if args.wandb_run_id:
+            print(f"  Wandb run:     {args.wandb_run_id}")
+    print(f"{'='*60}\n")
+
+    trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
+    trainer.test(model, datamodule=data_module)
 
 
 # =============================================================================
-# MEASURE COMPLEXITY
+# COMPLEXITY MEASUREMENT
 # =============================================================================
 
 def _batch_to_device(batch: dict, device) -> dict:
@@ -158,8 +290,14 @@ def _batch_to_device(batch: dict, device) -> dict:
     return out
 
 
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    from fvcore.nn import FlopCountAnalysis
+# Skip complexity measurement in test_only mode — not the primary purpose,
+# and the timing/FLOP block can be slow on large datasets.
+if not args.test_only and os.environ.get("LOCAL_RANK", "0") == "0":
+    try:
+        from fvcore.nn import FlopCountAnalysis
+    except ImportError:
+        FlopCountAnalysis = None
+        print("[BurnScars] fvcore not installed — skipping FLOP measurement")
 
     print("\n" + "=" * 80)
     print("MEASURING MODEL COMPLEXITY")
@@ -183,21 +321,20 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         batch_0 = collate_grouped([samples[0]])
         batch_0 = _batch_to_device(batch_0, device)
 
-        # Warmup
         with torch.no_grad():
             _ = model(batch_0)
 
         # FLOPs
-        batch_1 = collate_grouped([samples[1]])
-        batch_1 = _batch_to_device(batch_1, device)
-
-        try:
-            with torch.no_grad():
-                flops = FlopCountAnalysis(model, (batch_1,))
-                gflops = flops.total() / 1e9
-        except Exception as e:
-            print(f"  FLOPs measurement failed: {e}")
-            gflops = -1
+        gflops = -1
+        if FlopCountAnalysis is not None:
+            batch_1 = collate_grouped([samples[1]])
+            batch_1 = _batch_to_device(batch_1, device)
+            try:
+                with torch.no_grad():
+                    flops = FlopCountAnalysis(model, (batch_1,))
+                    gflops = flops.total() / 1e9
+            except Exception as e:
+                print(f"  FLOPs measurement failed: {e}")
 
         # Inference time
         num_warmup, num_runs = 3, 20
@@ -219,15 +356,15 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
         avg_time_ms = (end - start) / num_runs * 1000
 
-        first_res = next(iter(batch_0["groups"]))
+        first_res  = next(iter(batch_0["groups"]))
         num_tokens = batch_0["groups"][first_res]["tokens"].shape[1]
 
         results.append({
-            "input_size": input_size,
-            "gsd_target": 30,
-            "num_tokens": num_tokens,
-            "gflops": gflops,
-            "inference_time_ms": avg_time_ms,
+            "input_size":         input_size,
+            "gsd_target":         30,
+            "num_tokens":         num_tokens,
+            "gflops":             gflops,
+            "inference_time_ms":  avg_time_ms,
         })
 
         print(f"  Tokens: {num_tokens}")
@@ -241,15 +378,18 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     print(f"{'Input':<10} {'Tokens':<12} {'GFLOPs':<12} {'Time (ms)':<12}")
     print("-" * 50)
     for r in results:
-        print(f"{r['input_size']:<10} {r['num_tokens']:<12} {r['gflops']:<12.2f} {r['inference_time_ms']:<12.2f}")
+        print(f"{r['input_size']:<10} {r['num_tokens']:<12} "
+              f"{r['gflops']:<12.2f} {r['inference_time_ms']:<12.2f}")
     print("=" * 80)
+
 
 # =============================================================================
 # SAVE WANDB RUN ID
 # =============================================================================
 if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
+    import wandb
     run_id = wandb.run.id
     print("WANDB_RUN_ID:", run_id)
     os.makedirs("training/wandb_runs", exist_ok=True)
-    with open(f"training/wandb_runs/{xp_name}.txt", "w") as f:
+    with open(f"training/wandb_runs/burnscars_{xp_name}.txt", "w") as f:
         f.write(run_id)

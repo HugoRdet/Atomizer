@@ -8,7 +8,7 @@ Drives training and validation for a multi-task baseline:
       with `accumulate_grad_batches=num_tasks`, the optimizer sees the
       gradient of the *mean* per-task loss — equal task weights with
       LR semantics that match single-task training.
-    - Tracks per-task primary metric (mIoU for seg, top-1 acc for cls)
+    - Tracks per-task primary metric (mIoU for seg, macro_f1 for cls)
       on validation. Logs each, plus their mean as `val/mean_primary`,
       which is the metric used for `ModelCheckpoint(monitor=...)`.
 
@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.classification import (
     MulticlassAccuracy,
+    MulticlassF1Score,
     MulticlassJaccardIndex,
 )
 
@@ -63,9 +64,14 @@ def _build_seg_metrics(num_classes: int) -> nn.ModuleDict:
 
 
 def _build_cls_metrics(num_classes: int) -> nn.ModuleDict:
+    # macro_f1 is the primary metric used in the single-task table —
+    # robust to class imbalance, matches the convention in PANGAEA-style
+    # benchmarks. top1 and macro_acc are kept for completeness so the
+    # full set of cls metrics is logged for every run.
     return nn.ModuleDict({
         "top1": MulticlassAccuracy(num_classes=num_classes, average="micro"),
         "macro_acc": MulticlassAccuracy(num_classes=num_classes, average="macro"),
+        "macro_f1": MulticlassF1Score(num_classes=num_classes, average="macro"),
     })
 
 
@@ -95,7 +101,7 @@ class MultiTaskTrainer(pl.LightningModule):
         warmup_steps:    linear warmup steps.
         primary_metric_per_type:
                          which metric to use for the cross-task mean. Defaults to
-                         {"seg": "miou", "cls": "top1"}.
+                         {"seg": "miou", "cls": "macro_f1"}.
     """
 
     def __init__(
@@ -115,7 +121,10 @@ class MultiTaskTrainer(pl.LightningModule):
         self.task_configs = task_configs
         self.task_names = list(task_configs.keys())
         self.num_tasks = len(self.task_names)
-        self.primary = primary_metric_per_type or {"seg": "miou", "cls": "top1"}
+        # Default cls primary = macro_f1 (matches the single-task table
+        # convention). Override via primary_metric_per_type if you need a
+        # different selection metric.
+        self.primary = primary_metric_per_type or {"seg": "miou", "cls": "macro_f1"}
 
         # Per-task metric ModuleDicts, one set per split.
         self.val_metrics  = nn.ModuleDict({
@@ -124,6 +133,16 @@ class MultiTaskTrainer(pl.LightningModule):
         self.test_metrics = nn.ModuleDict({
             t: _build_metrics_for_task(c) for t, c in task_configs.items()
         })
+
+        # Track which tasks were actually seen in the current val/test
+        # epoch. Used to skip metric aggregation for tasks that received
+        # no batches — relevant during the per-task test phase where only
+        # one task's dataloader is iterated. Without this, untested tasks'
+        # metrics either return NaN or 0.0 (depending on the metric class),
+        # both of which pollute the logged values and the mean_primary
+        # aggregate.
+        self._val_seen_tasks: set = set()
+        self._test_seen_tasks: set = set()
 
     # ─────────────────────────────────────────────────────────────
     # Forward / loss
@@ -180,6 +199,7 @@ class MultiTaskTrainer(pl.LightningModule):
         # Update per-task metrics. torchmetrics handles ignore_index for seg.
         for m in self.val_metrics[task].values():
             m.update(preds, target)
+        self._val_seen_tasks.add(task)
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         task = batch["task"]
@@ -196,17 +216,33 @@ class MultiTaskTrainer(pl.LightningModule):
                  batch_size=bs, add_dataloader_idx=False)
         for m in self.test_metrics[task].values():
             m.update(preds, target)
+        self._test_seen_tasks.add(task)
 
     # ─────────────────────────────────────────────────────────────
     # Epoch-end aggregation
     # ─────────────────────────────────────────────────────────────
 
-    def _aggregate_split(self, metrics_dict: nn.ModuleDict, split: str):
-        """Compute, log, and reset per-task metrics; return primary metric values."""
+    def _aggregate_split(self, metrics_dict: nn.ModuleDict, split: str,
+                         seen_tasks: set):
+        """Compute, log, and reset per-task metrics; return primary metric values.
+
+        Only aggregates tasks that received batches this epoch. This
+        matters during the per-task test phase where one task's
+        dataloader is iterated but the trainer holds metric containers
+        for all tasks. Skipping un-seen tasks avoids:
+          - Logging spurious 0.0 / NaN values for those tasks
+          - Polluting the mean_primary aggregate
+        """
         primary_values = []
         for task in self.task_names:
             cfg = self.task_configs[task]
             m_set = metrics_dict[task]
+            if task not in seen_tasks:
+                # Reset (in case any state lingers from a prior epoch)
+                # and skip — no logging, no mean_primary contribution.
+                for metric in m_set.values():
+                    metric.reset()
+                continue
             for name, metric in m_set.items():
                 v = metric.compute()
                 self.log(f"{split}/{task}/{name}", v, sync_dist=True,
@@ -219,11 +255,17 @@ class MultiTaskTrainer(pl.LightningModule):
             self.log(f"{split}/mean_primary", mean_primary,
                      sync_dist=True, prog_bar=True, add_dataloader_idx=False)
 
+    def on_validation_epoch_start(self):
+        self._val_seen_tasks = set()
+
+    def on_test_epoch_start(self):
+        self._test_seen_tasks = set()
+
     def on_validation_epoch_end(self):
-        self._aggregate_split(self.val_metrics, "val")
+        self._aggregate_split(self.val_metrics, "val", self._val_seen_tasks)
 
     def on_test_epoch_end(self):
-        self._aggregate_split(self.test_metrics, "test")
+        self._aggregate_split(self.test_metrics, "test", self._test_seen_tasks)
 
     # ─────────────────────────────────────────────────────────────
     # Optimizer + scheduler

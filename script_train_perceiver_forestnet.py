@@ -1,35 +1,35 @@
 """
-EuroSAT Perceiver-IO Classification Script
-=============================================
+ForestNet Perceiver-IO Classification Script
+================================================
 
-Trains the Perceiver-IO classification baseline on EuroSAT (geo-bench
-m-eurosat) — 10-class S2 land-cover classification, 13 bands, 64x64.
+Trains the Perceiver-IO classification baseline on geo-bench m-forestnet —
+12-class Landsat-8 deforestation classification, 6 bands, 332x332 native
+(center-cropped to 320x320 to be a multiple of 16).
 
 Token layout (matches PerceiverCls.forward):
-    Per-token feature = [reflectance(C=13), Fourier(x, y), no_time_vector]
-    Input tokens     = [B, H*W, C + pos_dim + time_dim]    # H*W = 4096
+    Per-token feature = [reflectance(C=6), Fourier(x, y), no_time_vector]
+    Input tokens     = [B, H*W, C + pos_dim + time_dim]    # H*W = 102,400
     Output query     = [B, 1, query_dim]                    # single CLS token
     Output           = [B, num_classes]
 
-Single-frame so no DOY is passed; the model's `no_time_vector` is used
-for both tokens and the implicit query-time slot.
+Single-frame so no DOY is passed.
 
-Same dataset protocol as the EuroSAT baseline:
-    - Geo-bench default partition (train/valid/test, ~2000/1000/1000)
+Same dataset protocol as the ForestNet baseline:
+    - Geo-bench default partition (train/valid/test)
     - Per-band z-score normalization from band_stats.json
+    - Center crop 332 -> 320
     - D4 augmentation in training
 
-Memory note: 64x64 input means only 4096 tokens. Even with the parameter-
-parity Perceiver-IO config (latent_dim=768, num_latents=512), this is by
-far the cheapest task in the suite. Comfortable at large batch sizes.
+Memory note: 320x320 produces ~102k tokens. With latent_dim=768,
+num_latents=512, BS=8 fits comfortably; bump up if you have room.
 
 Examples:
-    python script_train_eurosat_perceiver.py --xp_name perceiver_eurosat \
-        --batch_size 32 --lr 1e-4 --epochs 80
+    python script_train_forestnet_perceiver.py --xp_name perceiver_forestnet \
+        --batch_size 8 --lr 1e-4 --epochs 80
 
     # Test-only mode
-    python script_train_eurosat_perceiver.py --xp_name perceiver_eurosat \
-        --test_only ./checkpoints/eurosat_perceiver/bl_perceiver_eurosat-best.ckpt
+    python script_train_forestnet_perceiver.py --xp_name perceiver_forestnet \
+        --test_only ./checkpoints/forestnet_perceiver/bl_perceiver_forestnet-best.ckpt
 """
 
 import argparse
@@ -49,8 +49,8 @@ from torch.utils.data import DataLoader
 
 seed_everything(42, workers=True)
 
-from training.utils.datasets_baselines.utils_dataset_eurosat_baseline import (
-    EuroSATBaselineDataset,
+from training.utils.datasets_baselines.utils_dataset_forestnet_baselines import (
+    ForestNetBaselineDataset,
 )
 from training.perceiverIO.perceiver_cls import PerceiverCls
 from training.trainer_baselines_classification import ClassificationBaselineTrainer
@@ -60,24 +60,30 @@ from training.trainer_baselines_classification import ClassificationBaselineTrai
 # CONSTANTS
 # =============================================================================
 
-NUM_CLASSES  = EuroSATBaselineDataset.NUM_CLASSES        # 10
-NUM_CHANNELS = EuroSATBaselineDataset.NUM_CHANNELS       # 13 S2 bands
-PATCH_SIZE   = EuroSATBaselineDataset.PATCH_SIZE         # 64
-MODALITY_KEY = "s2"
+NUM_CLASSES  = ForestNetBaselineDataset.NUM_CLASSES        # 12
+NUM_CHANNELS = ForestNetBaselineDataset.NUM_CHANNELS       # 6 (Landsat-8)
+DEFAULT_CROP = 320                                         # divisible by 16
+MODALITY_KEY = "landsat"
 
 
 # =============================================================================
 # COLLATE
 # =============================================================================
 
-def eurosat_collate(batch):
-    """Stack per-modality images, stack scalar targets, keep metadata as list."""
+def forestnet_collate(batch):
+    """
+    Stack per-modality images, stack int targets into a long tensor,
+    keep metadata as a list.
+
+    Differs from eurosat_collate: ForestNet returns target as a Python int
+    (not torch.tensor), so torch.stack would fail.
+    """
     images = {}
     sensor_keys = list(batch[0]["image"].keys())
     for key in sensor_keys:
         images[key] = torch.stack([s["image"][key] for s in batch])
 
-    targets  = torch.stack([s["target"] for s in batch])
+    targets  = torch.tensor([s["target"] for s in batch], dtype=torch.long)
     metadata = [s["metadata"] for s in batch]
 
     return {
@@ -91,17 +97,17 @@ def eurosat_collate(batch):
 # ARGS
 # =============================================================================
 
-parser = argparse.ArgumentParser(description="EuroSAT Perceiver-IO Classification")
+parser = argparse.ArgumentParser(description="ForestNet Perceiver-IO Classification")
 parser.add_argument("--xp_name",   type=str, required=True)
 parser.add_argument("--data_dir",  type=str,
-                    default="./data/geo-bench-1.0/classification_v1.0/m-eurosat")
+                    default="./data/geo-bench-1.0/classification_v1.0/m-forestnet")
 
 # Test-only mode
 parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a .ckpt file. Skip training, test directly.")
 
 # Training
-parser.add_argument("--batch_size",   type=int, default=4)
+parser.add_argument("--batch_size",   type=int, default=8)
 parser.add_argument("--lr",           type=float, default=1e-4)
 parser.add_argument("--weight_decay", type=float, default=1e-2)
 parser.add_argument("--label_smoothing", type=float, default=0.0)
@@ -110,9 +116,11 @@ parser.add_argument("--num_workers",  type=int, default=4)
 parser.add_argument("--patience",     type=int, default=20)
 parser.add_argument("--grad_accum",   type=int, default=1)
 
-# Spatial — EuroSAT native is 64x64
-parser.add_argument("--img_size", type=int, default=PATCH_SIZE,
-                    help=f"Spatial size. Default {PATCH_SIZE} (full EuroSAT patch).")
+# Spatial — ForestNet native is 332, cropped to 320 by default
+parser.add_argument("--crop_size", type=int, default=DEFAULT_CROP,
+                    help=f"Center crop size from 332 native. Default {DEFAULT_CROP}.")
+parser.add_argument("--img_size", type=int, default=DEFAULT_CROP,
+                    help="Spatial size for token construction. Must match crop_size.")
 
 # Perceiver-IO config (matches the rest of the row for parameter parity)
 parser.add_argument("--num_latents",        type=int, default=512)
@@ -134,17 +142,32 @@ args = parser.parse_args()
 
 
 # =============================================================================
+# SANITY
+# =============================================================================
+
+if args.crop_size != args.img_size:
+    raise ValueError(
+        f"--crop_size ({args.crop_size}) must equal --img_size ({args.img_size}). "
+        f"The Perceiver token positional encoding uses img_size at construction; "
+        f"the cropped patch size must match."
+    )
+
+
+# =============================================================================
 # DATASETS
 # =============================================================================
 
-train_ds = EuroSATBaselineDataset(
-    root_path=args.data_dir, mode="train", augment=True,
+train_ds = ForestNetBaselineDataset(
+    root_path=args.data_dir, mode="train",
+    crop_size=args.crop_size, augment=True,
 )
-val_ds = EuroSATBaselineDataset(
-    root_path=args.data_dir, mode="validation", augment=False,
+val_ds = ForestNetBaselineDataset(
+    root_path=args.data_dir, mode="validation",
+    crop_size=args.crop_size, augment=False,
 )
-test_ds = EuroSATBaselineDataset(
-    root_path=args.data_dir, mode="test", augment=False,
+test_ds = ForestNetBaselineDataset(
+    root_path=args.data_dir, mode="test",
+    crop_size=args.crop_size, augment=False,
 )
 
 
@@ -153,9 +176,9 @@ test_ds = EuroSATBaselineDataset(
 # =============================================================================
 
 print(f"\n{'='*60}")
-print(f"  EuroSAT Perceiver-IO Classification")
-print(f"  Channels:     {NUM_CHANNELS} (S2 — 13 bands)")
-print(f"  Patch size:   {args.img_size}x{args.img_size}")
+print(f"  ForestNet Perceiver-IO Classification")
+print(f"  Channels:     {NUM_CHANNELS} (Landsat-8: B,G,R,NIR,SWIR1,SWIR2)")
+print(f"  Patch size:   {args.img_size}x{args.img_size} (center-cropped from 332)")
 print(f"  Tokens:       {args.img_size ** 2:,} per sample")
 print(f"  Query:        single learned CLS token (attention pool)")
 print(f"  Latents:      {args.num_latents} x {args.latent_dim}")
@@ -179,7 +202,7 @@ print(f"  Test:  {len(test_ds)} samples")
 
 loader_kwargs = dict(
     num_workers=args.num_workers,
-    collate_fn=eurosat_collate,
+    collate_fn=forestnet_collate,
     pin_memory=True,
     persistent_workers=args.num_workers > 0,
     prefetch_factor=4 if args.num_workers > 0 else None,
@@ -242,10 +265,10 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         run_name = f"BL_{args.xp_name}_perceiver"
         wandb.init(
             name=run_name,
-            project="Atomizer_EuroSAT_Baselines",
+            project="Atomizer_ForestNet_Baselines",
             config=vars(args),
         )
-        wandb_logger = WandbLogger(project="Atomizer_EuroSAT_Baselines")
+        wandb_logger = WandbLogger(project="Atomizer_ForestNet_Baselines")
     except Exception:
         print("  WandB not available, logging to console only.")
 
@@ -254,7 +277,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # TRAIN (skipped in --test_only mode)
 # =============================================================================
 
-ckpt_dir = "./checkpoints/eurosat_perceiver/"
+ckpt_dir = "./checkpoints/forestnet_perceiver/"
 os.makedirs(ckpt_dir, exist_ok=True)
 
 if args.test_only is None:
@@ -298,7 +321,7 @@ if args.test_only is None:
     )
 
     print(f"\n{'='*60}")
-    print(f"  Starting: perceiver on EuroSAT")
+    print(f"  Starting: perceiver on ForestNet")
     print(f"{'='*60}\n")
 
     trainer.fit(trainer_module, train_loader, val_loader)
