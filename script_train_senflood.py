@@ -52,14 +52,13 @@ from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCa
 # =============================================================================
 parser = argparse.ArgumentParser(description="Training script")
 parser.add_argument("--xp_name",      type=str,            required=True,  help="Experiment name")
-parser.add_argument("--config_model", type=str,            required=True,  help="Model config yaml file")
-parser.add_argument("--dataset_name", type=str,            required=True,  help="Name of the dataset used")
+parser.add_argument("--dataset_name", type=str,  help="Name of the dataset used")
 parser.add_argument("--clipping",     action="store_true",                 help="Enable gradient clipping at 1.0")
 args = parser.parse_args()
 
 xp_name = args.xp_name
-config_model = read_yaml("./training/configs/" + args.config_model)
-configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
+config_model = read_yaml("./training/configs/config_test-SENFLOOD.yaml")
+configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 bands_yaml = "./data/bands_info/bands.yaml"
 
 if os.environ.get("LOCAL_RANK", "0") == "0":
@@ -132,7 +131,7 @@ data_module = UnifiedDataModule(
 # CALLBACKS
 # =============================================================================
 lr_monitor   = LearningRateMonitor(logging_interval="step")
-accumulator  = GradientAccumulationScheduler(scheduling={0: 4})
+accumulator  = GradientAccumulationScheduler(scheduling={0: 2})
 
 checkpoint_val = ModelCheckpoint(
     dirpath="./checkpoints/",

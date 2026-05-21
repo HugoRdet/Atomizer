@@ -1,160 +1,526 @@
-"""
-MNIST Dataset — New format (8-column tokens, batch dict output)
-================================================================
-
-Token format:
-    [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
-     col 0  1  2       3          4        5            6            7
-
-Returns:
-{
-    "groups": {
-        0.2: {
-            "tokens": [N, 8],
-            "mask":   [N],
-            "shape":  (28, 28),
-        },
-    },
-    "queries":      [M, 8],
-    "queries_mask":  [M],
-    "label":         scalar (digit class),
-}
-"""
-
 import os
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchvision
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from .token_builder import TokenBuilder
 
 
 class MNISTSparseCanvas(Dataset):
     """
-    MNIST digit classification dataset in Atomiser token format.
+    MNIST Dataset — grouped token format (8 columns).
 
-    Each 28×28 grayscale image is tokenized into 784 tokens (1 band).
-    Resolution = 0.2 m/px (arbitrary but consistent with previous setup).
-    No temporal info (time_idx = -1).
+    Each 28×28 grayscale image is tokenized into one token per pixel-band.
+    With NUM_BANDS=1 this gives 784 tokens per image. The dataset mirrors
+    the structure of Sen1Floods11Dataset:
+
+    Token format:
+        [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
+         col 0  1  2       3          4        5            6            7
+
+    Modes:
+        - classification (default): queries = pixel positions, col 4 = digit class
+                                    (broadcast per pixel for parity with the
+                                    segmentation pipeline; the scalar `label`
+                                    key is what the classification head should use).
+        - reconstruction:           queries = image tokens, col 4 = reflectance.
+
+    MNIST-specific notes:
+        - D4 augmentation is INTENTIONALLY OFF. Digits are not symmetric:
+            6 ↔ 9 under 180° rotation; 2/4/5/7 lose meaning under horizontal flip.
+          Sen1Floods11 satellite imagery is roughly D4-invariant; MNIST is not.
+        - Single grayscale band. We borrow the spectral metadata of a real
+          optical band (S2 B02, 490 nm / bw 65 nm) so the lookup table stays
+          consistent across datasets.
+        - The `label` key is always present (scalar digit class), even in
+          reconstruction mode — it's a per-image property, unlike the per-pixel
+          labels in Sen1Floods11 that get folded into col 4.
     """
 
-    RESOLUTION = 0.2          # m/px
+    RESOLUTION = 0.2          # m/px (arbitrary; must match train script registration)
     NUM_BANDS = 1
     NUM_CLASSES = 10
     CANVAS_SIZE = 28
+    IGNORE_INDEX = 255        # unused for MNIST (no per-pixel labels), kept for symmetry
     TIME_IDX_NA = -1
 
     def __init__(
         self,
-        canvas_size: int = 28,
-        num_bands: int = 1,
+        root_path: str = "./data",
+        transform=None,
+        model=None,
+        modality_mode="train",
         mode: str = "train",
+        dataset_config=None,
         config_model: dict = None,
         look_up=None,
         num_samples: int = None,
         **kwargs,
     ):
         super().__init__()
-        self.mode = mode
+
+        self.root_path = root_path
+        self.split = mode
         self.look_up = look_up
         self.config_model = config_model
 
-        # Token builder for consistent coordinate encoding
+        # Initialize TokenBuilder
         self.token_builder = TokenBuilder(look_up)
 
-        # Config
-        self.max_queries = config_model["trainer"].get("max_tokens_reconstruction", 784)
+        # Config parameters
+        self.nb_tokens = config_model["trainer"]["max_tokens"]
+        self.max_tokens_reconstruction = config_model["trainer"]["max_tokens_reconstruction"]
+        self.reconstruction = (
+            config_model["trainer"].get("mode", "classification") == "reconstruction"
+        )
 
-        # Band metadata — single grayscale band (use arbitrary wavelength)
-        # We register it as a "virtual" optical band
+        # ── Single-channel mode (degenerate for MNIST but kept for parity) ─
+        sc = config_model["trainer"].get("single_channel", -1)
+        if isinstance(sc, list):
+            self.selected_channels = sorted(sc)
+        elif isinstance(sc, int) and sc >= 0:
+            self.selected_channels = [sc]
+        else:
+            self.selected_channels = None  # all bands
+
+        if self.selected_channels is not None:
+            for ch in self.selected_channels:
+                assert 0 <= ch < self.NUM_BANDS, (
+                    f"single_channel index {ch} out of range [0, {self.NUM_BANDS})"
+                )
+            print(f"[MNIST] SINGLE-CHANNEL MODE: using band indices {self.selected_channels}")
+
+        if self.reconstruction:
+            print(f"[MNIST] Mode: RECONSTRUCTION (queries = image tokens, col 4 = reflectance)")
+        else:
+            print(f"[MNIST] Mode: CLASSIFICATION (queries = pixels, scalar digit `label`)")
+
+        # Band metadata (single virtual band borrowed from S2 B02)
         self.spectral_indices = self._build_spectral_indices()
-        self.resolution_idx = look_up.get_resolution_idx(self.RESOLUTION)
+        if self.selected_channels is not None:
+            self.spectral_indices = self.spectral_indices[self.selected_channels]
+
+        # Resolution index
+        self.resolution_idx = self.look_up.get_resolution_idx(self.RESOLUTION)
 
         # Load MNIST
+        is_train = self.split == "train"
         self.mnist = torchvision.datasets.MNIST(
-            root="./data", train=(mode == "train"), download=True
+            root=self.root_path, train=is_train, download=True
         )
         self.num_samples = (
             min(num_samples, len(self.mnist)) if num_samples else len(self.mnist)
         )
 
-        print(f"[MNIST] Mode: {mode}, Samples: {self.num_samples}")
-        print(f"[MNIST] Resolution: {self.RESOLUTION} m/px, "
-              f"Resolution idx: {self.resolution_idx}")
-        print(f"[MNIST] Spectral indices: {self.spectral_indices.tolist()}")
+        # Normalization
+        self.norm_stats = self._load_or_compute_normalization()
 
-    def _build_spectral_indices(self):
-        """
-        Register a single grayscale band in the lookup table.
-        Uses the first available optical band (e.g., B02 at 490nm/65bw).
-        """
-        # Use B02-like wavelength for the single grayscale channel
-        key = (65, 490)  # bandwidth=65, wavelength=490 (Sentinel-2 B02)
-        if key in self.look_up.table_wave:
-            idx = self.look_up.table_wave[key]
-        else:
-            # Fallback: use first available
-            first_key = next(iter(self.look_up.table_wave))
-            idx = self.look_up.table_wave[first_key]
-            print(f"[MNIST] Warning: using fallback spectral key {first_key}")
+        # ── Random subsampling ───────────────────────────────────────
+        # At each __getitem__ call, keep a random subset of the 784 pixel
+        # tokens. The kept positions are *irregular per sample* but remain
+        # uniformly distributed across the canvas (unlike foreground-only
+        # filtering, which would cluster latents in the digit region).
+        #
+        # Use this to test the architecture's flexibility to arbitrary
+        # sparse inputs: train with subsample_keep_rate=1.0, then evaluate
+        # checkpoints with rates 0.75 / 0.5 / 0.25 to measure graceful
+        # degradation.
+        #
+        # Companion option `latent_layout`:
+        #   "grid"      (default) — encoder builds its usual regular grid.
+        #                Latent count is derived from total_tokens, so it
+        #                still adapts to the dropped count, but positions
+        #                stay on a regular lattice.
+        #   "at_tokens" — encoder places one latent at each kept token's
+        #                position (irregular, sparse layout matching the
+        #                kept pixel set).
+        #
+        # batch_size MUST be 1 since token count varies per sample.
+        self.subsample_keep_rate = float(
+            config_model["trainer"].get("subsample_keep_rate", 1.0)
+        )
+        self.subsample_mode = config_model["trainer"].get(
+            "subsample_mode", "uniform"
+        )
+        self.pixel_threshold = float(
+            config_model["trainer"].get("pixel_threshold", 0.5)
+        )
+        self.latent_layout = config_model["trainer"].get("latent_layout", "grid")
+        assert 0.0 < self.subsample_keep_rate <= 1.0, (
+            f"subsample_keep_rate must be in (0, 1]; got {self.subsample_keep_rate}"
+        )
+        assert self.subsample_mode in ("uniform", "background_only"), (
+            f"subsample_mode must be 'uniform' or 'background_only'; "
+            f"got {self.subsample_mode!r}"
+        )
+        assert self.latent_layout in ("grid", "at_tokens"), (
+            f"latent_layout must be 'grid' or 'at_tokens'; "
+            f"got {self.latent_layout!r}"
+        )
 
-        return torch.tensor([idx], dtype=torch.long)
+        print(f"[MNIST] Split: {self.split} ({'train' if is_train else 'test'} set), "
+              f"Samples: {self.num_samples}")
+        print(f"[MNIST] Loaded {len(self.spectral_indices)} band(s)")
+        print(f"[MNIST] Resolution idx: {self.resolution_idx} "
+              f"(GSD={self.RESOLUTION} m/px)")
+        print(f"[MNIST] Time idx: -1 (no temporal info, zeroed by encoder)")
+        print(f"[MNIST] D4 augmentations: OFF (digits are not symmetric)")
+        print(f"[MNIST] subsample_mode={self.subsample_mode!r}, "
+              f"subsample_keep_rate={self.subsample_keep_rate:.3f} "
+              f"(threshold={self.pixel_threshold} on raw [0,1] values) "
+              f"| latent_layout={self.latent_layout!r}")
+
+        # One-shot debug print fires on the first __getitem__ call per
+        # DataLoader worker, so you get concrete evidence that the pixel
+        # filter is actually changing the attention mask (and not silently
+        # leaving every token valid).
+        self._filter_debug_logged = False
+
+    # =========================================================================
+    # AUGMENTATION
+    # =========================================================================
+    # NOTE: D4 (rotations + flips) and random crop are intentionally OMITTED
+    # for MNIST. They corrupt digit identity. If you want augmentation, prefer
+    # small random shifts / elastic deformations, applied here before tokenization.
+
+    # =========================================================================
+    # CHANNEL SELECTION HELPER (degenerate but kept for API parity)
+    # =========================================================================
+
+    def _select_channels(self, image):
+        if self.selected_channels is None:
+            return image
+        return image[self.selected_channels]
+
+    # =========================================================================
+    # DATASET INTERFACE
+    # =========================================================================
 
     def __len__(self):
         return self.num_samples
 
-    def __getitem__(self, idx):
-        digit_img, digit_label = self.mnist[idx % len(self.mnist)]
-        digit_tensor = torch.tensor(
-            np.array(digit_img), dtype=torch.float32
-        ) / 255.0
+    def __getitem__(self, index):
 
-        # [1, 28, 28] — single band
-        image = digit_tensor.unsqueeze(0)
-        H, W = self.CANVAS_SIZE, self.CANVAS_SIZE
+        # ── Load ────────────────────────────────────────────
+        digit_img, digit_label = self.mnist[index % len(self.mnist)]
+        image = torch.tensor(np.array(digit_img), dtype=torch.float32) / 255.0  # [H, W]
+        image = image.unsqueeze(0)                                              # [1, H, W]
 
-        # Dummy label map for token builder (not used for classification)
-        dummy_label = torch.zeros(H, W, dtype=torch.long)
+        # ── Clean (MNIST has no NaNs but kept for symmetry) ─
+        image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ── Normalize ───────────────────────────────────────
+        image = self.normalize_image(image)
+
+        # ── Channel selection (no-op for 1 band) ────────────
+        image = self._select_channels(image)
+        C, H, W = image.shape
+
+        # Per-pixel label map filled with the digit class. For Sen1Floods11
+        # this column carries the segmentation label; for MNIST we fold the
+        # global class in so col 4 stays semantically meaningful, but the
+        # trainer should still use the scalar `label` key for the loss.
+        label_map = torch.full((H, W), int(digit_label), dtype=torch.long)
 
         # ── Build tokens [N, 8] ─────────────────────────────
+        resolution = self.RESOLUTION
+        image_tokens, seg_queries = self._build_tokens(image, label_map, resolution)
+
+        # ── Build queries (mode-dependent) ──────────────────
+        if self.reconstruction:
+            queries = image_tokens.clone()
+            queries[:, 4] = queries[:, 0].clone()  # reflectance → label col
+            if queries.shape[0] > self.max_tokens_reconstruction:
+                perm = torch.randperm(queries.shape[0])[:self.max_tokens_reconstruction]
+                queries = queries[perm]
+        else:
+            if self.split == "train":
+                # Training: subsample for memory/speed.
+                # prioritize_valid is moot here (MNIST has no IGNORE_INDEX pixels)
+                # but we use the same call as Sen1Floods11 for API parity.
+                queries = self.token_builder.subsample_queries(
+                    seg_queries,
+                    max_queries=self.max_tokens_reconstruction,
+                    ignore_index=self.IGNORE_INDEX,
+                    prioritize_valid=True,
+                )
+            else:
+                # Val/test: all pixels (only 784 for MNIST, no chunking needed)
+                queries = seg_queries
+
+        # ── Masks (0 = valid, matches Sen1Floods11 __getitem__) ─
+        attention_mask = torch.zeros(image_tokens.shape[0])
+        queries_mask = torch.zeros(queries.shape[0])
+
+        # ── Random subsampling (HARD-DROP) ─
+        # Two modes:
+        #   "uniform"         — keep a uniformly-random fraction of all 784
+        #                       tokens. The kept set covers the canvas
+        #                       uniformly per sample.
+        #   "background_only" — always keep the foreground (above-threshold)
+        #                       pixels; subsample only the background pixels
+        #                       at the configured rate. Isolates how much
+        #                       background context the model actually needs.
+        # batch_size=1 is required since N varies per sample.
+        if self.subsample_mode == "uniform":
+            if self.subsample_keep_rate < 1.0:
+                N = image_tokens.shape[0]
+                n_keep = max(1, int(round(N * self.subsample_keep_rate)))
+                perm = torch.randperm(N)[:n_keep]
+                # Sort to keep token order spatially monotonic.
+                perm, _ = torch.sort(perm)
+                image_tokens   = image_tokens[perm]
+                attention_mask = torch.zeros(image_tokens.shape[0])
+
+                if not self._filter_debug_logged:
+                    col0_min = float(image_tokens[:, 0].min())
+                    col0_max = float(image_tokens[:, 0].max())
+                    print(
+                        f"[MNIST/{self.split}] uniform subsample "
+                        f"(pid={os.getpid()}, idx={index}): "
+                        f"keep_rate={self.subsample_keep_rate:.3f} | "
+                        f"col0 range=[{col0_min:+.3f}, {col0_max:+.3f}] | "
+                        f"kept={n_keep}/{N} | "
+                        f"latent_layout={self.latent_layout!r}"
+                    )
+                    self._filter_debug_logged = True
+
+        else:  # "background_only"
+            if self.subsample_keep_rate < 1.0:
+                mean = float(self.norm_stats["mean"][0])
+                std  = float(self.norm_stats["std"][0])
+                threshold_norm = (self.pixel_threshold - mean) / std
+
+                is_fg = image_tokens[:, 0] >= threshold_norm   # white pixels
+                fg_idx = torch.where(is_fg)[0]
+                bg_idx = torch.where(~is_fg)[0]
+
+                n_bg = bg_idx.numel()
+                n_bg_keep = max(0, int(round(n_bg * self.subsample_keep_rate)))
+                if n_bg_keep < n_bg:
+                    perm = torch.randperm(n_bg)[:n_bg_keep]
+                    bg_idx = bg_idx[perm]
+
+                # Safety: ensure at least one token survives.
+                if fg_idx.numel() == 0 and bg_idx.numel() == 0:
+                    bg_idx = torch.tensor([image_tokens[:, 0].argmin().item()])
+
+                # Combine, sort, slice.
+                all_idx = torch.cat([fg_idx, bg_idx])
+                all_idx, _ = torch.sort(all_idx)
+                image_tokens   = image_tokens[all_idx]
+                attention_mask = torch.zeros(image_tokens.shape[0])
+
+                if not self._filter_debug_logged:
+                    n_fg = int(fg_idx.numel())
+                    n_bg_kept = int(bg_idx.numel())
+                    print(
+                        f"[MNIST/{self.split}] bg-only subsample "
+                        f"(pid={os.getpid()}, idx={index}): "
+                        f"thr_raw={self.pixel_threshold:.3f} → "
+                        f"thr_norm={threshold_norm:+.3f} | "
+                        f"keep_rate={self.subsample_keep_rate:.3f} | "
+                        f"fg={n_fg} (all kept) + bg={n_bg_kept}/{n_bg} "
+                        f"= {image_tokens.shape[0]} total | "
+                        f"latent_layout={self.latent_layout!r}"
+                    )
+                    self._filter_debug_logged = True
+
+        # ── Return ──────────────────────────────────────────
+        result = {
+            "groups": {
+                resolution: {
+                    "tokens": image_tokens,
+                    "mask": attention_mask,
+                    "shape": tuple(image.shape),     # (C, H, W), like Sen1Floods11
+                },
+            },
+            "queries": queries,
+            "queries_mask": queries_mask,
+            "target_resolution": resolution,
+            "latent_layout": self.latent_layout,    # "grid" or "at_tokens"
+            "image": image,
+            # Always include digit class — it's a per-image property, unlike
+            # Sen1Floods11 where the label is per-pixel and folded into col 4.
+            "label": torch.tensor(int(digit_label), dtype=torch.long),
+        }
+
+        return result
+
+    # =========================================================================
+    # TOKEN BUILDING
+    # =========================================================================
+
+    def _build_tokens(self, image, label_map, resolution):
         image_tokens = self.token_builder.build_tokens(
             image=image,
-            label=dummy_label,
-            resolution=self.RESOLUTION,
+            label=label_map,
+            resolution=resolution,
             spectral_indices=self.spectral_indices,
             resolution_idx=self.resolution_idx,
             time_idx=self.TIME_IDX_NA,
         )
 
-        # ── Queries (same as image tokens for classification) ──
+        first_spectral_idx = self.spectral_indices[0]
         queries = self.token_builder.build_queries(
-            label=dummy_label,
-            resolution=self.RESOLUTION,
-            first_spectral_idx=self.spectral_indices[0],
+            label=label_map,
+            resolution=resolution,
+            first_spectral_idx=first_spectral_idx,
             resolution_idx=self.resolution_idx,
             time_idx=self.TIME_IDX_NA,
         )
 
-        # Subsample queries if needed
-        if queries.shape[0] > self.max_queries:
-            perm = torch.randperm(queries.shape[0])[:self.max_queries]
-            queries = queries[perm]
+        return image_tokens, queries
 
-        # ── Masks ───────────────────────────────────────────
-        token_mask = torch.zeros(image_tokens.shape[0], dtype=torch.bool)
-        queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
+    # =========================================================================
+    # VIZ SAMPLES
+    # =========================================================================
 
-        return {
-            "groups": {
-                self.RESOLUTION: {
-                    "tokens": image_tokens,
-                    "mask": token_mask,
-                    "shape": (H, W),
+    def get_viz_sample(self, index: int) -> dict:
+        """
+        Viz sample — mode-aware. No augmentation applied (deterministic).
+        """
+        digit_img, digit_label = self.mnist[index % len(self.mnist)]
+        image = torch.tensor(np.array(digit_img), dtype=torch.float32) / 255.0
+        image = image.unsqueeze(0)
+        image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+        image = self.normalize_image(image)
+        image = self._select_channels(image)
+        C, H, W = image.shape
+
+        label_map = torch.full((H, W), int(digit_label), dtype=torch.long)
+        digit_label_t = torch.tensor(int(digit_label), dtype=torch.long)
+
+        if self.reconstruction:
+            tokens = self.token_builder.build_tokens(
+                image=image,
+                label=label_map,
+                resolution=self.RESOLUTION,
+                spectral_indices=self.spectral_indices,
+                resolution_idx=self.resolution_idx,
+                time_idx=self.TIME_IDX_NA,
+            )
+            tokens[:, 4] = tokens[:, 0].clone()
+
+            queries = tokens.clone()
+            queries_mask = torch.zeros(tokens.shape[0], dtype=torch.bool)
+            attention_mask = torch.zeros(tokens.shape[0])
+
+            return {
+                "groups": {
+                    self.RESOLUTION: {
+                        "tokens": tokens,
+                        "mask": attention_mask,
+                        "shape": (C, H, W),
+                    },
                 },
-            },
-            "queries": queries,
-            "queries_mask": queries_mask,
-            "label": torch.tensor(digit_label, dtype=torch.long),
+                "queries": queries,
+                "queries_mask": queries_mask,
+                "target_resolution": self.RESOLUTION,
+                "image": image,
+                "image_shape": (C, H, W),
+                "n_real": tokens.shape[0],
+                "label": digit_label_t,
+            }
+        else:
+            image_tokens, queries = self._build_tokens(image, label_map, self.RESOLUTION)
+            queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
+            attention_mask = torch.zeros(image_tokens.shape[0])
+
+            return {
+                "groups": {
+                    self.RESOLUTION: {
+                        "tokens": image_tokens,
+                        "mask": attention_mask,
+                        "shape": (C, H, W),
+                    },
+                },
+                "queries": queries,
+                "queries_mask": queries_mask,
+                "label": digit_label_t,
+                "target_resolution": self.RESOLUTION,
+                "image": image,
+            }
+
+    # =========================================================================
+    # NORMALIZATION
+    # =========================================================================
+
+    def _load_or_compute_normalization(self):
+        norm_file = os.path.join(self.root_path, "mnist_norm_stats.pt")
+
+        if os.path.exists(norm_file):
+            print(f"[MNIST] Loading normalization stats from {norm_file}")
+            stats = torch.load(norm_file, weights_only=True)
+            self._print_norm_stats(stats)
+            return stats
+
+        if self.split != "train":
+            print(f"[MNIST] WARNING: No normalization file at {norm_file}, "
+                  f"using identity (mean=0, std=1)")
+            return {
+                "mean": torch.zeros(self.NUM_BANDS),
+                "std":  torch.ones(self.NUM_BANDS),
+            }
+
+        print(f"[MNIST] Computing normalization from {len(self.mnist)} train samples...")
+        stats = self._compute_normalization_stats()
+        torch.save(stats, norm_file)
+        print(f"[MNIST] Saved normalization stats to {norm_file}")
+        self._print_norm_stats(stats)
+        return stats
+
+    def _compute_normalization_stats(self):
+        """
+        Streaming mean/std over the full train split, in [0, 1] reflectance space.
+        Single channel → returns 1-element tensors.
+        """
+        total_sum = 0.0
+        total_sq = 0.0
+        total_n = 0
+        for i in tqdm(range(len(self.mnist)), desc="Computing MNIST normalization"):
+            img, _ = self.mnist[i]
+            arr = np.array(img, dtype=np.float64) / 255.0
+            total_sum += arr.sum()
+            total_sq += (arr ** 2).sum()
+            total_n += arr.size
+        mean = total_sum / max(total_n, 1)
+        var = total_sq / max(total_n, 1) - mean ** 2
+        std = float(np.sqrt(max(var, 0.0)))
+        return {
+            "mean": torch.tensor([mean], dtype=torch.float32),
+            "std":  torch.tensor([std],  dtype=torch.float32),
         }
+
+    def _print_norm_stats(self, stats):
+        print(f"[MNIST] mean: {stats['mean'].numpy()}")
+        print(f"[MNIST] std:  {stats['std'].numpy()}")
+
+    def normalize_image(self, image):
+        """Per-channel z-score normalization."""
+        mean = self.norm_stats["mean"].view(self.NUM_BANDS, 1, 1)
+        std = self.norm_stats["std"].view(self.NUM_BANDS, 1, 1)
+        return (image - mean) / std
+
+    # =========================================================================
+    # BAND METADATA
+    # =========================================================================
+
+    def _build_spectral_indices(self):
+        """
+        MNIST has a single grayscale band. We borrow the spectral metadata of a
+        real optical band (Sentinel-2 B02, 490 nm / bw 65 nm) so the shared
+        lookup table stays consistent. If that key isn't registered, we fall
+        back to the first available entry.
+        """
+        key = (65, 490)  # Sentinel-2 B02 (bandwidth=65, wavelength=490)
+        if key in self.look_up.table_wave:
+            idx = self.look_up.table_wave[key]
+        else:
+            first_key = next(iter(self.look_up.table_wave))
+            idx = self.look_up.table_wave[first_key]
+            print(f"[MNIST] Warning: spectral key {key} missing from lookup, "
+                  f"falling back to {first_key}")
+        return torch.tensor([idx], dtype=torch.long)

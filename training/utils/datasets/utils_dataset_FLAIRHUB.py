@@ -17,16 +17,21 @@ Labels:
 
 Resolution groups (Atomizer-native multi-resolution):
     0.2m: VHR + DEM (when both used)         → 4 + 2 = 6 channels
-    1.6m: SPOT (when used)                    → 4 channels
+          When spot_as_vhr=True, SPOT joins this group (upsampled to 512×512)
+    1.6m: SPOT (when spot_as_vhr=False)       → 4 channels
     10.0m: S2 + S1 ASC + S1 DESC time series → (10 + 2 + 2) channels × ~6 timesteps
 
 Cross-sensor transfer (the headline experiment):
     Train with use_vhr=True,  use_spot=False
-    Test  with use_vhr=False, use_spot=True
+    Test  with use_vhr=False, use_spot=True, spot_as_vhr=True
     Same model checkpoint, different test-time modality flags.
-    No fine-tuning; the model has never seen SPOT during training.
-    Atomic tokenization with metadata-aware spectral encoding allows
-    the model to extrapolate across related sensors.
+
+    `spot_as_vhr=True` upsamples SPOT 64×64 → 512×512 and tags tokens with
+    the VHR resolution_idx (0.2m), so the optical input maintains the same
+    spatial density as during training. The spectral metadata stays SPOT-
+    specific (different bandwidth/wavelength from VHR), so the model still
+    knows it's looking at a different sensor — just at the same spatial
+    scale.
 
 Token format (8 cols, same across all modalities):
     [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
@@ -81,6 +86,11 @@ class FlairHubDataset(Dataset):
         use_vhr:         Use AERIAL_RGBI (4 ch @ 0.2m).
         use_spot:        Use SPOT_RGBI (4 ch @ 1.6m). Default off — flip on
                          for cross-sensor transfer test.
+        spot_as_vhr:     If True, upsample SPOT 64×64 → 512×512 (bilinear)
+                         and tokenize at VHR resolution (0.2m, vhr_resolution_idx).
+                         SPOT joins the 0.2m group alongside DEM (and VHR if
+                         enabled). Spectral indices stay SPOT-specific (different
+                         bandwidth/wavelength signature). Default False.
         use_dem:         Use DEM_ELEV (2 ch @ 0.2m, DSM + DTM).
         use_s2:          Use SENTINEL2_TS time series.
         use_s1:          Use SENTINEL1-ASC_TS + SENTINEL1-DESC_TS time series.
@@ -148,6 +158,8 @@ class FlairHubDataset(Dataset):
         look_up=None,
         use_vhr: bool = True,
         use_spot: bool = False,
+        spot_as_vhr: bool = False,
+        spot_norm_as_vhr: bool = False,
         use_dem: bool = True,
         use_s2: bool = True,
         use_s1: bool = True,
@@ -162,17 +174,25 @@ class FlairHubDataset(Dataset):
                 raise ImportError(f"{lib} required for FLAIR-HUB dataset")
         if not (use_vhr or use_spot):
             raise ValueError("At least one of use_vhr / use_spot must be True.")
+        if spot_as_vhr and not use_spot:
+            print("[FLAIR-HUB] WARNING: spot_as_vhr=True but use_spot=False, "
+                  "the flag will have no effect.")
+        if spot_norm_as_vhr and not use_spot:
+            print("[FLAIR-HUB] WARNING: spot_norm_as_vhr=True but use_spot=False, "
+                  "the flag will have no effect.")
 
-        self.root_path     = root_path
-        self.split         = mode
-        self.look_up       = look_up
-        self.config_model  = config_model
+        self.root_path      = root_path
+        self.split          = mode
+        self.look_up        = look_up
+        self.config_model   = config_model
         self.dataset_config = dataset_config
-        self.use_vhr       = use_vhr
-        self.use_spot      = use_spot
-        self.use_dem       = use_dem
-        self.use_s2        = use_s2
-        self.use_s1        = use_s1
+        self.use_vhr        = use_vhr
+        self.use_spot       = use_spot
+        self.spot_as_vhr    = spot_as_vhr
+        self.spot_norm_as_vhr = spot_norm_as_vhr
+        self.use_dem        = use_dem
+        self.use_s2         = use_s2
+        self.use_s1         = use_s1
         self.multi_temporal = multi_temporal
 
         self.token_builder = TokenBuilder(look_up)
@@ -212,7 +232,15 @@ class FlairHubDataset(Dataset):
               f"split='{self.split}'")
         modality_str = []
         if self.use_vhr:  modality_str.append(f"VHR({self.NUM_VHR_BANDS}ch@{self.VHR_RESOLUTION}m)")
-        if self.use_spot: modality_str.append(f"SPOT({self.NUM_SPOT_BANDS}ch@{self.SPOT_RESOLUTION}m)")
+        if self.use_spot:
+            if self.spot_as_vhr:
+                res_label = f"@{self.VHR_RESOLUTION}m [resized from {self.SPOT_RESOLUTION}m]"
+            else:
+                res_label = f"@{self.SPOT_RESOLUTION}m"
+            norm_label = " [VHR-norm]" if self.spot_norm_as_vhr else ""
+            modality_str.append(
+                f"SPOT({self.NUM_SPOT_BANDS}ch{res_label}{norm_label})"
+            )
         if self.use_dem:  modality_str.append(f"DEM({self.NUM_DEM_BANDS}ch@{self.VHR_RESOLUTION}m)")
         if self.use_s2:   modality_str.append(f"S2({self.NUM_S2_BANDS}ch×T@{self.SAT_RESOLUTION}m)")
         if self.use_s1:   modality_str.append(f"S1({self.NUM_S1_BANDS}ch×2T@{self.SAT_RESOLUTION}m)")
@@ -462,28 +490,38 @@ class FlairHubDataset(Dataset):
         label = self._remap_label(label)
         label = torch.from_numpy(label.astype(np.int64))
 
-        # ── 0.2m group: VHR + DEM ───────────────────────────
+        # ── 0.2m group: VHR + DEM (+ SPOT-resized if spot_as_vhr) ──
         hires_tokens_list = []
+        hires_channels    = 0
+
         if self.use_vhr:
             vhr_tokens = self._load_and_tokenize_vhr(row, label)
             hires_tokens_list.append(vhr_tokens)
+            hires_channels += self.NUM_VHR_BANDS
+
+        if self.use_spot and self.spot_as_vhr:
+            # SPOT resized to 512×512 and tokenized as a VHR-resolution sensor.
+            # Joins the 0.2m group; its tokens share latent placement with VHR/DEM.
+            spot_tokens, _ = self._load_and_tokenize_spot(row, label)
+            hires_tokens_list.append(spot_tokens)
+            hires_channels += self.NUM_SPOT_BANDS
 
         if self.use_dem:
             dem_tokens = self._load_and_tokenize_dem(row, label)
             hires_tokens_list.append(dem_tokens)
+            hires_channels += self.NUM_DEM_BANDS
 
         if hires_tokens_list:
             hires_tokens = torch.cat(hires_tokens_list, dim=0)
             groups[self.VHR_RESOLUTION] = {
                 "tokens": hires_tokens,
                 "mask":   torch.zeros(hires_tokens.shape[0], dtype=torch.bool),
-                "shape":  (self.NUM_VHR_BANDS + self.NUM_DEM_BANDS,
-                           self.VHR_SIZE, self.VHR_SIZE),
+                "shape":  (hires_channels, self.VHR_SIZE, self.VHR_SIZE),
             }
 
-        # ── 1.6m group: SPOT ────────────────────────────────
-        if self.use_spot:
-            spot_tokens, spot_label = self._load_and_tokenize_spot(row, label)
+        # ── 1.6m group: SPOT (native, only when spot_as_vhr=False) ──
+        if self.use_spot and not self.spot_as_vhr:
+            spot_tokens, _ = self._load_and_tokenize_spot(row, label)
             groups[self.SPOT_RESOLUTION] = {
                 "tokens": spot_tokens,
                 "mask":   torch.zeros(spot_tokens.shape[0], dtype=torch.bool),
@@ -514,12 +552,20 @@ class FlairHubDataset(Dataset):
         # ── Build queries from label at VHR resolution ──────
         # Queries follow PASTIS convention: per-pixel at the highest available
         # spatial resolution. Subsample to max_tokens_reconstruction.
+        # Pick the first spectral_idx from whatever 0.2m source is active.
+        if self.use_vhr:
+            first_spectral = self.vhr_spectral_indices[0]
+        elif self.use_spot and self.spot_as_vhr:
+            first_spectral = self.spot_spectral_indices[0]
+        elif self.use_dem:
+            first_spectral = self.dem_spectral_indices[0]
+        else:
+            first_spectral = None
+
         queries = self.token_builder.build_queries(
             label=label,
             resolution=self.VHR_RESOLUTION,
-            first_spectral_idx=(self.vhr_spectral_indices[0] if self.use_vhr
-                                else self.dem_spectral_indices[0] if self.use_dem
-                                else None),
+            first_spectral_idx=first_spectral,
             resolution_idx=self.vhr_resolution_idx,
             time_idx=self.TIME_IDX_NA,
         )
@@ -594,26 +640,50 @@ class FlairHubDataset(Dataset):
 
     def _load_spot_image(self, row):
         """
-        Load SPOT_RGBI. Returns (image [C, H, W], label_at_spot_res [H, W]).
+        Load SPOT_RGBI. Returns (image [C, H, W], label [H, W]).
 
-        Label is downsampled from VHR resolution (512×512 @ 0.2m) to
-        SPOT resolution (64×64 @ 1.6m) via nearest-neighbor.
+        Behavior depends on `self.spot_as_vhr`:
+          False (default): native 64×64 image, label nearest-downsampled to
+                           64×64 to match SPOT spatial size.
+          True:            bilinearly upsampled 64×64 → 512×512 image,
+                           full-resolution 512×512 label preserved.
+                           Used for cross-sensor transfer where we want the
+                           SPOT input to occupy the same token grid as VHR.
         """
         path = self._resolve_path(row["SPOT_RGBI"])
         with rasterio.open(path) as src:
             img = src.read().astype(np.float32)                # [4, 64, 64]
         img = torch.from_numpy(img)
-        img = self._normalize(img, "spot")
+        # Normalization: by default use SPOT's own stats. When
+        # spot_norm_as_vhr=True, normalize using VHR (aerial) stats instead,
+        # which is a diagnostic for whether cross-sensor degradation is
+        # driven by pixel-value distribution shift rather than other
+        # architectural factors.
+        norm_key = "aerial" if self.spot_norm_as_vhr else "spot"
+        img = self._normalize(img, norm_key)
         img = torch.clamp(img, -10, 10)
         img = torch.nan_to_num(img, nan=0.0, posinf=10.0, neginf=-10.0)
 
-        # Downsample label to SPOT resolution for tokenization
-        # (SPOT tokens carry their own per-pixel label)
+        # Load label at full VHR resolution (always).
         label_path = self._resolve_path(row["AERIAL_LABEL-COSIA"])
         with rasterio.open(label_path) as src:
             label_full = src.read(1).astype(np.int64)
         label_full = self._remap_label(label_full)
         label_full_t = torch.from_numpy(label_full)
+
+        if self.spot_as_vhr:
+            # Bilinear upsample SPOT 64×64 → 512×512 for cross-sensor test.
+            # Token density now matches VHR training.
+            img = torch.nn.functional.interpolate(
+                img.unsqueeze(0),
+                size=(self.VHR_SIZE, self.VHR_SIZE),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)                                       # [4, 512, 512]
+            # Full-resolution label, no downsampling.
+            return img, label_full_t.long()
+
+        # Default: native 64×64 SPOT with downsampled label.
         label_spot = torch.nn.functional.interpolate(
             label_full_t.float().unsqueeze(0).unsqueeze(0),
             size=(self.SPOT_SIZE, self.SPOT_SIZE),
@@ -622,7 +692,30 @@ class FlairHubDataset(Dataset):
         return img, label_spot
 
     def _load_and_tokenize_spot(self, row, label_full):
+        """
+        Tokenize SPOT. Resolution_idx depends on `spot_as_vhr`:
+          False: SPOT_RESOLUTION (1.6m), spot_resolution_idx
+                 → tokens go in the 1.6m group.
+          True:  VHR_RESOLUTION (0.2m), vhr_resolution_idx
+                 → tokens go in the 0.2m group alongside VHR/DEM.
+                 Spectral indices stay SPOT-specific (different
+                 bandwidth/wavelength than VHR), so the model still
+                 sees a sensor mismatch via spectral metadata.
+        """
         image, label_spot = self._load_spot_image(row)
+
+        if self.spot_as_vhr:
+            tokens = self.token_builder.build_tokens(
+                image=image,                                   # [4, 512, 512]
+                label=label_spot,                              # [512, 512]
+                resolution=self.VHR_RESOLUTION,                # 0.2m
+                spectral_indices=self.spot_spectral_indices,   # SPOT bands
+                resolution_idx=self.vhr_resolution_idx,        # VHR's idx
+                time_idx=self.TIME_IDX_NA,
+            )
+            return tokens, label_spot
+
+        # Default: native SPOT.
         tokens = self.token_builder.build_tokens(
             image=image,
             label=label_spot,

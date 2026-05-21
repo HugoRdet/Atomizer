@@ -148,7 +148,7 @@ os.makedirs(ckpt_dir, exist_ok=True)
 
 if args.test_only is None:
     lr_monitor   = LearningRateMonitor(logging_interval="step")
-    accumulator  = GradientAccumulationScheduler(scheduling={0: 2})
+    accumulator  = GradientAccumulationScheduler(scheduling={0: 4})
 
     checkpoint_val = ModelCheckpoint(
         dirpath=ckpt_dir,

@@ -9,9 +9,17 @@ Default modalities (matches the headline experiment):
     VHR (AERIAL_RGBI) + DEM + Sentinel-2 + Sentinel-1 ASC + Sentinel-1 DESC
 
 Cross-sensor transfer experiment (run as a SECOND launch):
-    Train  with --use_vhr --no_use_spot   (default)
-    Test   with --no_use_vhr --use_spot   (--test_only --ckpt_path <best>)
+    Train  with --use_vhr true  --use_spot false                (default)
+    Test   with --use_vhr false --use_spot true --spot_as_vhr true
+           and --test_only --ckpt_path <best>
     Same checkpoint, different test-time modality flags. No retraining.
+
+    `--spot_as_vhr true` upsamples SPOT 64x64 -> 512x512 (bilinear) and tags
+    its tokens with the VHR resolution_idx (0.2m). SPOT then joins the 0.2m
+    group alongside DEM, preserving the same latent grid density as during
+    VHR training. The spectral metadata stays SPOT-specific (different
+    bandwidth/wavelength signature than VHR), so the model still sees a
+    sensor mismatch via spectral encoding even though the spatial scale matches.
 
 Examples
 --------
@@ -23,10 +31,10 @@ Examples
         --ckpt_path ./checkpoints/flairhub/atomiser_flairhub_v1-best.ckpt \
         --wandb_run_id <id_of_aborted_run>
 
-    # Cross-sensor transfer test: train was VHR, evaluate on SPOT
-    python script_train_flairhub.py --xp_name flair_v1_spot_test \
+    # Cross-sensor transfer test: train was VHR, evaluate on SPOT-resized
+    python script_train_flairhub.py --xp_name flair_v1_spot_xfer \
         --ckpt_path ./checkpoints/flairhub/atomiser_flairhub_v1-best.ckpt \
-        --test_only --no_use_vhr --use_spot
+        --test_only --use_vhr false --use_spot true --spot_as_vhr true
 """
 
 # =============================================================================
@@ -99,6 +107,16 @@ parser.add_argument("--batch_size",   type=int, default=None,
 # Modality flags
 parser.add_argument("--use_vhr",     type=str2bool, default=True)
 parser.add_argument("--use_spot",    type=str2bool, default=False)
+parser.add_argument("--spot_as_vhr", type=str2bool, default=False,
+                    help="When use_spot=True, upsample SPOT 64x64 -> 512x512 "
+                         "(bilinear) and treat as a VHR-resolution sensor "
+                         "(joins the 0.2m group). Preserves latent grid "
+                         "density vs VHR training. For cross-sensor transfer.")
+parser.add_argument("--spot_norm_as_vhr", type=str2bool, default=False,
+                    help="When use_spot=True, normalize SPOT pixel values "
+                         "using VHR (aerial) statistics instead of SPOT's own. "
+                         "Diagnostic for whether cross-sensor degradation is "
+                         "driven by pixel-value distribution shift.")
 parser.add_argument("--use_dem",     type=str2bool, default=True)
 parser.add_argument("--use_s2",      type=str2bool, default=True)
 parser.add_argument("--use_s1",      type=str2bool, default=True)
@@ -162,7 +180,10 @@ config_model["trainer"]["epochs"] = args.epochs
 print(f"\n{'='*70}")
 print(f"  FLAIR-HUB Atomizer — Experiment: {args.xp_name}")
 print(f"{'='*70}")
-print(f"  Modalities:  VHR={args.use_vhr}  SPOT={args.use_spot}  "
+_spot_label = ""
+if args.use_spot:
+    _spot_label = " (resized→0.2m)" if args.spot_as_vhr else " (native 1.6m)"
+print(f"  Modalities:  VHR={args.use_vhr}  SPOT={args.use_spot}{_spot_label}  "
       f"DEM={args.use_dem}  S2={args.use_s2}  S1={args.use_s1}")
 print(f"  Temporal:    {args.multi_temporal} timesteps (linspace)")
 print(f"  Batch size:  {batch_size}")
@@ -186,8 +207,13 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         config={
             **config_model,
             "modalities": {
-                "vhr": args.use_vhr, "spot": args.use_spot,
-                "dem": args.use_dem, "s2": args.use_s2, "s1": args.use_s1,
+                "vhr":              args.use_vhr,
+                "spot":             args.use_spot,
+                "spot_as_vhr":      args.spot_as_vhr,
+                "spot_norm_as_vhr": args.spot_norm_as_vhr,
+                "dem":              args.use_dem,
+                "s2":               args.use_s2,
+                "s1":               args.use_s1,
             },
             "multi_temporal": args.multi_temporal,
             "batch_size":     batch_size,
@@ -219,6 +245,8 @@ def build_dataset(mode: str):
         look_up=lookup_table,
         use_vhr=args.use_vhr,
         use_spot=args.use_spot,
+        spot_as_vhr=args.spot_as_vhr,
+        spot_norm_as_vhr=args.spot_norm_as_vhr,
         use_dem=args.use_dem,
         use_s2=args.use_s2,
         use_s1=args.use_s1,

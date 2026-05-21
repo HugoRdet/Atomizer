@@ -9,6 +9,11 @@ Precomputed cells are cached by token shape + latent positions hash.
 For large token counts (>50k), an on-the-fly chunked top-k path is used
 instead of precomputation to avoid combinatorial cache explosion from
 variable-length inputs (e.g., FLAIR-HUB with temporal dropout).
+
+Note: the bias returned by this module is a binary attention mask
+(0 for valid positions, -inf for invalid). The `sigma` parameter is
+retained in the forward signature for API compatibility but is no
+longer used to weight in-cell positions.
 """
 
 import torch
@@ -36,12 +41,12 @@ class GeographicPruning(nn.Module):
     Safety guarantees:
         - Empty Voronoi cells produce index 0 + mask=True (masked out)
         - All gather indices clamped to [0, N-1]
-        - Bias set to -inf for invalid positions → zero attention weight
+        - Bias set to -inf for invalid positions, 0 for valid positions
         - Cache key includes latent position hash to prevent collisions
     """
     
     MIN_CELL_SIZE = 1
-    ON_THE_FLY_THRESHOLD = 200_000_000  # tokens above this skip precomputation
+    ON_THE_FLY_THRESHOLD = 100_000_000  # tokens above this skip precomputation
     
     def __init__(
         self,
@@ -249,9 +254,8 @@ class GeographicPruning(nn.Module):
         device = tokens.device
         dtype = tokens.dtype
 
-        print(f"[GeoPruning] On-the-fly: N={N}, L={L}, k={k} ...")  # ADD THIS
+        print(f"[GeoPruning] On-the-fly: N={N}, L={L}, k={k} ...")
     
-        
         with torch.no_grad():
             pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)  # [N, 2]
             lat_coords = latent_coords[0]  # [L, 2]
@@ -307,11 +311,11 @@ class GeographicPruning(nn.Module):
             selection_valid, selected_indices, torch.zeros_like(selected_indices)
         )
         
-        # Gaussian bias with -inf for invalid positions
-        bias = -selected_dist_sq / (2 * (sigma ** 2))
-        bias = torch.where(
-            selection_valid, bias,
-            torch.tensor(float('-inf'), device=device, dtype=dtype),
+        # Binary attention mask: 0 for valid positions, -inf for invalid.
+        # The `sigma` argument is kept in the signature for API compatibility
+        # but is no longer used; in-cell positions are not distance-weighted.
+        bias = torch.zeros_like(selected_dist_sq).masked_fill(
+            ~selection_valid, float('-inf')
         )
         
         # Gather tokens and masks
@@ -321,7 +325,7 @@ class GeographicPruning(nn.Module):
         # Force-mask invalid positions
         masks_per_latent = masks_per_latent | (~selection_valid)
 
-        print(f"[GeoPruning] On-the-fly done.")  # ADD THIS
+        print(f"[GeoPruning] On-the-fly done.")
         
         return tokens_per_latent, masks_per_latent, bias.to(dtype)
     
@@ -422,12 +426,12 @@ class GeographicPruning(nn.Module):
         )
         
         # =====================================================================
-        # Gaussian bias with -inf for invalid positions
+        # Binary attention mask: 0 for valid positions, -inf for invalid.
+        # The `sigma` argument is kept in the signature for API compatibility
+        # but is no longer used; in-cell positions are not distance-weighted.
         # =====================================================================
-        bias = -selected_dist_sq / (2 * (sigma ** 2))
-        bias = torch.where(
-            selection_valid, bias,
-            torch.tensor(float('-inf'), device=device, dtype=dtype),
+        bias = torch.zeros_like(selected_dist_sq).masked_fill(
+            ~selection_valid, float('-inf')
         )
         
         # =====================================================================

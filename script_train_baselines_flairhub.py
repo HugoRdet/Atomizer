@@ -35,6 +35,7 @@ import os
 import argparse
 
 import torch
+import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
@@ -54,7 +55,9 @@ from training.utils.datasets_baselines.utils_dataset_flairhub_baselines import (
 
 
 from training.ResNet.model_resnet_upernet import build_resnet_upernet
+from training.ResNet.model_resnet_fuse     import build_resnet_upernet_per_modality
 from training.VIT.model_vit_upernet     import ViTUPerNet
+from training.VIT.model_vit_fuse        import build_vit_upernet_per_modality
 from training.unet.model_unet           import UNet
 from training.trainer_baselines        import (
     BaselineTrainer, TASK_CLASS_NAMES,
@@ -93,18 +96,81 @@ TASK_CLASS_NAMES["flairhub"] = {
 # =============================================================================
 
 def flairhub_collate(batch):
-    """Stack the 'flairhub' modality and target."""
-    images = {
-        "flairhub": torch.stack([s["image"]["flairhub"] for s in batch]),
-    }
+    """
+    Stack image and target. Supports both:
+      - Concat mode:       batch[i]["image"] = {"flairhub": tensor}
+      - Per-modality mode: batch[i]["image"] = {"flairhub_pm": dict_of_tensors}
+
+    For per-modality mode, the inner dict is collated key-by-key
+    (each branch tensor stacked across batch).
+    """
+    image_keys = list(batch[0]["image"].keys())
+    images = {}
+    for k in image_keys:
+        v0 = batch[0]["image"][k]
+        if isinstance(v0, dict):
+            # Per-modality: inner dict of branch tensors
+            images[k] = {
+                bk: torch.stack([s["image"][k][bk] for s in batch])
+                for bk in v0.keys()
+            }
+        else:
+            # Concat: single tensor per sample
+            images[k] = torch.stack([s["image"][k] for s in batch])
+
     targets  = torch.stack([s["target"] for s in batch])
     metadata = [s["metadata"] for s in batch]
     return {"image": images, "target": targets, "metadata": metadata}
 
 
+# ---------------------------------------------------------------------------
+# Per-modality dataset wrapper
+# ---------------------------------------------------------------------------
+# `BaselineTrainer` accesses `batch["image"][self.modality]` to get its input.
+# For per-modality runs, we need the model to receive a dict of branch
+# tensors. We put that dict under a single synthetic modality key
+# ("flairhub_pm") so the trainer's existing access pattern still works:
+#   batch["image"]["flairhub_pm"] == {"optical": ..., "dem": ..., ...}
+# The model's forward then takes that dict directly.
+
+class _PerModalityWrap(torch.utils.data.Dataset):
+    """Wraps a FlairHubBaselineDataset(per_modality=True) so its 'image'
+    field holds a SINGLE key 'flairhub_pm' whose value is the inner
+    branch dict. This keeps BaselineTrainer's access pattern intact."""
+
+    def __init__(self, ds):
+        self.ds = ds
+        # Forward attributes used elsewhere (e.g. patch_rows for subset filter).
+        self.patch_rows = ds.patch_rows
+        self.NUM_CLASSES = ds.NUM_CLASSES
+        self.IGNORE_INDEX = ds.IGNORE_INDEX
+        self.num_channels = getattr(ds, "num_channels", 0)
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        sample = self.ds[idx]
+        # sample["image"] is currently a dict like {"optical": ..., "dem": ..., ...}
+        sample["image"] = {"flairhub_pm": sample["image"]}
+        return sample
+
+
 # =============================================================================
 # MODEL BUILDER
 # =============================================================================
+
+class _PerModalityModelWrapper(nn.Module):
+    """Adapter: BaselineTrainer calls `model(image)`. For per-modality we
+    want `model(image_dict)`. The dataset puts the dict under a single
+    'flairhub_pm' key, so trainer passes that dict here directly."""
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, image_dict):
+        return self.inner(image_dict)
+
 
 def build_model(model_name: str, in_channels: int, num_classes: int, args):
     if model_name == "resnet":
@@ -114,6 +180,42 @@ def build_model(model_name: str, in_channels: int, num_classes: int, args):
             num_classes=num_classes,
             decoder_channels=args.decoder_channels,
         )
+    elif model_name == "resnet_pm":
+        # Per-modality fusion (FLAIR-HUB style): 4 branches + concat fusion.
+        inner = build_resnet_upernet_per_modality(
+            num_classes=num_classes,
+            use_vhr_or_spot=(args.use_vhr or args.use_spot),
+            use_dem=args.use_dem,
+            use_s2=args.use_s2,
+            use_s1=args.use_s1,
+            num_frames=args.multi_temporal,
+            resnet_variant=args.resnet_variant,
+            branch_target_size=512,
+            decoder_channels=args.decoder_channels,
+        )
+        return _PerModalityModelWrapper(inner)
+    elif model_name == "vit_pm":
+        # Per-modality ViT: optical/DEM at 512×512 (patch 16), satellite
+        # branches at native 10×10 (patch 2 → 5×5 patches per frame), with
+        # per-FPN-LTAE for temporal aggregation.
+        inner = build_vit_upernet_per_modality(
+            num_classes=num_classes,
+            use_vhr_or_spot=(args.use_vhr or args.use_spot),
+            use_dem=args.use_dem,
+            use_s2=args.use_s2,
+            use_s1=args.use_s1,
+            num_frames=args.multi_temporal,
+            embed_dim=args.vit_embed_dim,
+            depth=args.vit_depth,
+            num_heads=args.vit_num_heads,
+            output_layers=tuple(args.vit_output_layers),
+            decoder_channels=args.decoder_channels,
+            optical_dem_img_size=args.img_size,
+            optical_dem_patch=args.vit_patch_size,
+            sat_img_size=10,
+            sat_patch=2,
+        )
+        return _PerModalityModelWrapper(inner)
     elif model_name == "vit":
         return ViTUPerNet(
             in_channels=in_channels,
@@ -149,19 +251,24 @@ def str2bool(v):
 parser = argparse.ArgumentParser(description="FLAIR-HUB Baseline Training")
 parser.add_argument("--xp_name",  type=str, required=True)
 parser.add_argument("--model",    type=str, default="resnet",
-                    choices=["resnet", "vit", "unet"])
+                    choices=["resnet", "resnet_pm", "vit", "vit_pm", "unet"])
 parser.add_argument("--root_path", type=str, default="./data/FLAIR-HUB")
 
 # Modality flags (must match the Atomizer setup for fair comparison)
 parser.add_argument("--use_vhr",  type=str2bool, default=True)
 parser.add_argument("--use_spot", type=str2bool, default=False)
+parser.add_argument("--spot_norm_as_vhr", type=str2bool, default=False,
+                    help="When use_spot=True, normalize SPOT pixel values "
+                         "using VHR (aerial) statistics instead of SPOT's own. "
+                         "Diagnostic for whether cross-sensor degradation is "
+                         "driven by pixel-value distribution shift.")
 parser.add_argument("--use_dem",  type=str2bool, default=True)
 parser.add_argument("--use_s2",   type=str2bool, default=True)
 parser.add_argument("--use_s1",   type=str2bool, default=True)
 parser.add_argument("--multi_temporal", type=int, default=6)
 
 # Training
-parser.add_argument("--batch_size",   type=int, default=4)
+parser.add_argument("--batch_size",   type=int, default=2)
 parser.add_argument("--lr",           type=float, default=1e-4)
 parser.add_argument("--weight_decay", type=float, default=1e-2)
 parser.add_argument("--epochs",       type=int, default=30)
@@ -210,7 +317,10 @@ print(f"\n{'='*70}")
 print(f"  FLAIR-HUB Baseline — {args.model}")
 if args.model == "resnet":
     print(f"  Variant:     {args.resnet_variant}")
-print(f"  Modalities:  VHR={args.use_vhr}  SPOT={args.use_spot}  "
+_spot_norm_label = ""
+if args.use_spot and args.spot_norm_as_vhr:
+    _spot_norm_label = " [VHR-norm]"
+print(f"  Modalities:  VHR={args.use_vhr}  SPOT={args.use_spot}{_spot_norm_label}  "
       f"DEM={args.use_dem}  S2={args.use_s2}  S1={args.use_s1}")
 print(f"  Temporal:    {args.multi_temporal} timesteps (linspace)")
 print(f"  Batch size:  {args.batch_size}")
@@ -219,30 +329,40 @@ print(f"  GPUs:        {torch.cuda.device_count()}")
 print(f"{'='*70}\n")
 
 print("[Datasets] Building...")
+_per_mod = args.model in ("resnet_pm", "vit_pm")
+
 train_ds = FlairHubBaselineDataset(
     root_path=args.root_path, mode="train",
     use_vhr=args.use_vhr, use_spot=args.use_spot,
+    spot_norm_as_vhr=args.spot_norm_as_vhr,
     use_dem=args.use_dem, use_s2=args.use_s2, use_s1=args.use_s1,
     multi_temporal=args.multi_temporal,
+    per_modality=_per_mod,
 )
 val_ds = FlairHubBaselineDataset(
     root_path=args.root_path, mode="validation",
     use_vhr=args.use_vhr, use_spot=args.use_spot,
+    spot_norm_as_vhr=args.spot_norm_as_vhr,
     use_dem=args.use_dem, use_s2=args.use_s2, use_s1=args.use_s1,
     multi_temporal=args.multi_temporal,
+    per_modality=_per_mod,
 )
 test_ds = FlairHubBaselineDataset(
     root_path=args.root_path, mode="test",
     use_vhr=args.use_vhr, use_spot=args.use_spot,
+    spot_norm_as_vhr=args.spot_norm_as_vhr,
     use_dem=args.use_dem, use_s2=args.use_s2, use_s1=args.use_s1,
     multi_temporal=args.multi_temporal,
+    per_modality=_per_mod,
 )
 print(f"[Datasets] Pre-subset: train={len(train_ds)}  "
       f"val={len(val_ds)}  test={len(test_ds)}")
 
-# Channel count from one sample
+# Channel count from one sample (concat mode only — per-modality has no
+# single channel count since each branch has its own).
 NUM_CHANNELS = train_ds.num_channels
-print(f"[Datasets] Channels per sample: {NUM_CHANNELS}")
+if not _per_mod:
+    print(f"[Datasets] Channels per sample: {NUM_CHANNELS}")
 
 
 # ── Subset filtering (matches Atomizer pipeline) ───────────────────
@@ -269,21 +389,29 @@ if args.subset_indices is not None:
 print(f"[Datasets] Final: train={len(train_ds)}  "
       f"val={len(val_ds)}  test={len(test_ds)}")
 
+# ── Wrap per-modality datasets so the inner branch dict appears under
+#   a single key ("flairhub_pm") — keeps BaselineTrainer's modality
+#   lookup intact (it does batch["image"][modality]).
+if _per_mod:
+    train_ds = _PerModalityWrap(train_ds)
+    val_ds   = _PerModalityWrap(val_ds)
+    test_ds  = _PerModalityWrap(test_ds)
+    _MODALITY_KEY = "flairhub_pm"
+else:
+    _MODALITY_KEY = "flairhub"
+
 
 # =============================================================================
 # DATALOADERS (DDP-aware)
 # =============================================================================
 
 def make_loader(dataset, shuffle: bool, batch_size: int):
-    sampler = None
-    if dist.is_available() and dist.is_initialized():
-        sampler = DistributedSampler(dataset, shuffle=shuffle)
-
+    """Build a DataLoader. Lightning will wrap the sampler with a
+    DistributedSampler automatically at fit-time when DDP is active."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(shuffle and sampler is None),
-        sampler=sampler,
+        shuffle=shuffle,
         num_workers=args.num_workers,
         collate_fn=flairhub_collate,
         pin_memory=True,
@@ -307,8 +435,9 @@ model = build_model(args.model, NUM_CHANNELS,
 
 trainer_module = BaselineTrainer(
     model=model,
-    modality="flairhub",
-    temporal=False,                  # we already flatten T into channels
+    modality=_MODALITY_KEY,
+    temporal=False,                  # we already flatten T into channels (concat mode)
+                                     # or handle T inside model (per-modality mode)
     task="flairhub",
     lr=args.lr,
     weight_decay=args.weight_decay,
@@ -371,7 +500,6 @@ callbacks = [
 
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
-    use_distributed_sampler=False,
     devices=-1,
     max_epochs=args.epochs,
     accelerator="gpu",
