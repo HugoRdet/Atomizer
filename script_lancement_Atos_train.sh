@@ -22,12 +22,14 @@ conda activate venv
 #python3 script_ablation_senflood.py --fraction 0.50 --ckpt_path ./checkpoints/ATOMIZERsenflood_baseline-val_loss-epoch=139-val_loss=0.0668.ckpt --xp_name DSQ
 #python3 script_ablation_senflood.py --fraction 0.25 --ckpt_path ./checkpoints/ATOMIZERsenflood_baseline-val_loss-epoch=139-val_loss=0.0668.ckpt --xp_name DSQqsd
 #python3 script_ablation_senflood.py --fraction 0.1 --ckpt_path ./checkpoints/ATOMIZERsenflood_baseline-val_loss-epoch=139-val_loss=0.0668.ckpt --xp_name bouhouhou
- python3 script_train_flair.py --xp_name flair_v1_spot_train --use_vhr false --use_spot true --spot_as_vhr true --spot_norm_as_vhr false --use_dem true --use_s2 true --use_s1 true --subset_indices ./data/FLAIR-HUB/subset_indices.json --multi_temporal 6 
-#python3 script_train_senflood.py --xp_name senflood_baseline --clipping   
+python3 script_train_flair.py --xp_name flair_v1_spot_train --use_vhr true --use_spot false --use_dem true --use_s2 true --use_s1 true --subset_indices ./data/FLAIR-HUB/subset_indices.json --multi_temporal 6
+#CUDA_VISIBLE_DEVICES=0 python3 script_train_fractal.py --xp_name fractal_smoke_test  --epochs 20 --batch_size 2 --num_workers 16
+#python3 script_train_flair.py --xp_name flair_v1_spot_train --use_vhr false --use_spot true --spot_as_vhr true --spot_norm_as_vhr false --use_dem true --use_s2 true --use_s1 true --subset_indices ./data/FLAIR-HUB/subset_indices.json --multi_temporal 6
+#python3 script_train_senflood.py --xp_name senflood_baseline --clipping
 #python3 script_train_xview.py --xp_name fdhslkjqfd
-#python3 script_train_baselines_flairhub.py --xp_name resnet_pm_v1  --model resnet_pm --resnet_variant resnet50  --subset_indices ./data/FLAIR-HUB/subset_indices.json  --epochs 30 --batch_size 2 --grad_accum 4  --num_workers 4 --lr 1e-4 
-#python3 script_train_baselines_flairhub.py --xp_name vit_pm_v1 --model vit_pm --subset_indices ./data/FLAIR-HUB/subset_indices.json --epochs 30  --batch_size 2 --grad_accum 1 --num_workers 8 --img_size 512 --lr 1e-4 
-#python3 script_train_baselines_flairhub.py --xp_name vit_concat_v1  --model vit  --subset_indices ./data/FLAIR-HUB/subset_indices.json  --epochs 30   --batch_size 1   --grad_accum 3   --num_workers 4   --img_size 512 
+#python3 script_train_baselines_flairhub.py --xp_name resnet_pm_v1  --model resnet_pm --resnet_variant resnet50  --subset_indices ./data/FLAIR-HUB/subset_indices.json  --epochs 30 --batch_size 2 --grad_accum 4  --num_workers 4 --lr 1e-4
+#python3 script_train_baselines_flairhub.py --xp_name vit_pm_v1 --model vit_pm --subset_indices ./data/FLAIR-HUB/subset_indices.json --epochs 30  --batch_size 2 --grad_accum 1 --num_workers 8 --img_size 512 --lr 1e-4
+#python3 script_train_baselines_flairhub.py --xp_name vit_concat_v1  --model vit  --subset_indices ./data/FLAIR-HUB/subset_indices.json  --epochs 30   --batch_size 1   --grad_accum 3   --num_workers 4   --img_size 512
 #python script_train_baselines_flairhub.py --xp_name resnet50_v1 --model resnet --resnet_variant resnet50 --subset_indices ./data/FLAIR-HUB/subset_indices.json --epochs 30  --batch_size 2 --num_workers 32
 # Call training script with experiment name used in the arguments
 #sh TrainEval.sh "$EXPERIMENT_NAME" config_test-Atomiser_Atos.yaml regular
@@ -37,4 +39,3 @@ conda activate venv
 #python script_train_pretraining.py --xp_name esa_test --config_model config_test-Atomiser_Atos_One.yaml --dataset_name mmearth --task all
 
 #sh TrainEval_SENFLOOD.sh "$EXPERIMENT_NAME" "$MODEL_NAME" u_regular
-

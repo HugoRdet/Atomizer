@@ -1,556 +1,549 @@
 """
-FLAIR-HUB Baseline Training Script (ResNet/ViT/UNet)
-======================================================
+Centralized token building utilities for remote sensing datasets.
 
-Train segmentation baselines on FLAIR-HUB with the same multi-modal
-multi-resolution input that Atomizer sees, fused via upsampling +
-channel concatenation (the standard "zero-padding" baseline).
-
-All modalities are bilinearly upsampled to 0.2m (512×512) and concatenated
-into a single channel dimension. With default flags (VHR + DEM + S2 + S1),
-the input is [B, 90, 512, 512].
-
-Cross-sensor transfer (matches Atomizer setup):
-    Train: --use_vhr --no_use_spot
-    Test:  --no_use_vhr --use_spot --test_only --ckpt_path <best>
-    Same ResNet weights, SPOT replaces VHR in the leading 4 channels.
-
-Examples
---------
-    # ResNet50 on the same FLAIR-HUB subset Atomizer used
-    python script_train_flairhub_baselines.py --xp_name resnet50_v1 \\
-        --model resnet --resnet_variant resnet50 \\
-        --subset_indices ./data/FLAIR-HUB/subset_indices.json \\
-        --epochs 30
-
-    # Cross-sensor transfer test
-    python script_train_flairhub_baselines.py --xp_name resnet50_v1_spot_test \\
-        --model resnet --resnet_variant resnet50 \\
-        --subset_indices ./data/FLAIR-HUB/subset_indices.json \\
-        --ckpt_path ./checkpoints/flairhub_baselines/bl_resnet50_v1_resnet-best.ckpt \\
-        --test_only --no_use_vhr --use_spot
+Uses a reference grid system where all crops at a given resolution
+extract coordinates from a shared reference grid (e.g., 512×512).
+This ensures consistent coordinate spaces across different crop sizes.
 """
 
-import os
-import argparse
-
 import torch
-import torch.nn as nn
-import pytorch_lightning as pl
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import (
-    ModelCheckpoint, LearningRateMonitor, EarlyStopping,
-)
-from torch.utils.data import DataLoader, DistributedSampler
-import torch.distributed as dist
-
-seed_everything(42, workers=True)
-
-# Project imports
-from training.utils.datasets_baselines.utils_dataset_flairhub_baselines import (
-    FlairHubBaselineDataset,
-)
+import einops
 
 
-from training.ResNet.model_resnet_upernet import build_resnet_upernet
-from training.ResNet.model_resnet_fuse     import build_resnet_upernet_per_modality
-from training.VIT.model_vit_upernet     import ViTUPerNet
-from training.VIT.model_vit_fuse        import build_vit_upernet_per_modality
-from training.unet.model_unet           import UNet
-from training.trainer_baselines        import (
-    BaselineTrainer, TASK_CLASS_NAMES,
-)
-
-
-# =============================================================================
-# Register FLAIR-HUB class names in the trainer's task registry.
-# (Modifies module-level dict — safe because we own the import.)
-# =============================================================================
-TASK_CLASS_NAMES["flairhub"] = {
-    0:  "building",
-    1:  "greenhouse",
-    2:  "swimming_pool",
-    3:  "impervious",
-    4:  "pervious",
-    5:  "bare_soil",
-    6:  "water",
-    7:  "snow",
-    8:  "herbaceous",
-    9:  "agricultural",
-    10: "plowed",
-    11: "vineyard",
-    12: "deciduous",
-    13: "coniferous",
-    14: "brushwood",
-    15: "clear_cut",
-    16: "ligneous",
-    17: "mixed",
-    18: "undefined",
-}
-
-
-# =============================================================================
-# COLLATE
-# =============================================================================
-
-def flairhub_collate(batch):
+class TokenBuilder:
     """
-    Stack image and target. Supports both:
-      - Concat mode:       batch[i]["image"] = {"flairhub": tensor}
-      - Per-modality mode: batch[i]["image"] = {"flairhub_pm": dict_of_tensors}
+    Centralized token builder for remote sensing datasets.
 
-    For per-modality mode, the inner dict is collated key-by-key
-    (each branch tensor stacked across batch).
+    Uses reference grid indexing: instead of creating position encodings
+    for each crop size, maintains reference grids (e.g., 512×512) and
+    extracts windows from them.
+
+    Benefits:
+    - All crops share the same coordinate space
+    - No dynamic modality registration for different crop sizes
+    - Consistent positioning between training and validation
+    - Handles edge crops naturally
+    - Auto-registers unseen resolutions (e.g., from resolution augmentation)
+
+    Args:
+        lookup_table: Lookup_encoding instance for position/spectral/query offsets
+
+    Example:
+        >>> lookup = Lookup_encoding(config)
+        >>> builder = TokenBuilder(lookup)
+        >>> # 240×240 crop extracts indices [136:376] from 512 reference
+        >>> x_idx, y_idx = builder.get_position_coordinates((12, 240, 240), 10.0)
+        >>> tokens = builder.build_tokens(image, label, resolution=10.0, ...)
     """
-    image_keys = list(batch[0]["image"].keys())
-    images = {}
-    for k in image_keys:
-        v0 = batch[0]["image"][k]
-        if isinstance(v0, dict):
-            # Per-modality: inner dict of branch tensors
-            images[k] = {
-                bk: torch.stack([s["image"][k][bk] for s in batch])
-                for bk in v0.keys()
-            }
-        else:
-            # Concat: single tensor per sample
-            images[k] = torch.stack([s["image"][k] for s in batch])
 
-    targets  = torch.stack([s["target"] for s in batch])
-    metadata = [s["metadata"] for s in batch]
-    return {"image": images, "target": targets, "metadata": metadata}
-
-
-# ---------------------------------------------------------------------------
-# Per-modality dataset wrapper
-# ---------------------------------------------------------------------------
-# `BaselineTrainer` accesses `batch["image"][self.modality]` to get its input.
-# For per-modality runs, we need the model to receive a dict of branch
-# tensors. We put that dict under a single synthetic modality key
-# ("flairhub_pm") so the trainer's existing access pattern still works:
-#   batch["image"]["flairhub_pm"] == {"optical": ..., "dem": ..., ...}
-# The model's forward then takes that dict directly.
-
-class _PerModalityWrap(torch.utils.data.Dataset):
-    """Wraps a FlairHubBaselineDataset(per_modality=True) so its 'image'
-    field holds a SINGLE key 'flairhub_pm' whose value is the inner
-    branch dict. This keeps BaselineTrainer's access pattern intact."""
-
-    def __init__(self, ds):
-        self.ds = ds
-        # Forward attributes used elsewhere (e.g. patch_rows for subset filter).
-        self.patch_rows = ds.patch_rows
-        self.NUM_CLASSES = ds.NUM_CLASSES
-        self.IGNORE_INDEX = ds.IGNORE_INDEX
-        self.num_channels = getattr(ds, "num_channels", 0)
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, idx):
-        sample = self.ds[idx]
-        # sample["image"] is currently a dict like {"optical": ..., "dem": ..., ...}
-        sample["image"] = {"flairhub_pm": sample["image"]}
-        return sample
-
-
-# =============================================================================
-# MODEL BUILDER
-# =============================================================================
-
-class _PerModalityModelWrapper(nn.Module):
-    """Adapter: BaselineTrainer calls `model(image)`. For per-modality we
-    want `model(image_dict)`. The dataset puts the dict under a single
-    'flairhub_pm' key, so trainer passes that dict here directly."""
-    def __init__(self, inner):
-        super().__init__()
-        self.inner = inner
-
-    def forward(self, image_dict):
-        return self.inner(image_dict)
-
-
-def build_model(model_name: str, in_channels: int, num_classes: int, args):
-    if model_name == "resnet":
-        return build_resnet_upernet(
-            variant=args.resnet_variant,
-            in_channels=in_channels,
-            num_classes=num_classes,
-            decoder_channels=args.decoder_channels,
-        )
-    elif model_name == "resnet_pm":
-        # Per-modality fusion (FLAIR-HUB style): 4 branches + concat fusion.
-        inner = build_resnet_upernet_per_modality(
-            num_classes=num_classes,
-            use_vhr_or_spot=(args.use_vhr or args.use_spot),
-            use_dem=args.use_dem,
-            use_s2=args.use_s2,
-            use_s1=args.use_s1,
-            num_frames=args.multi_temporal,
-            resnet_variant=args.resnet_variant,
-            branch_target_size=512,
-            decoder_channels=args.decoder_channels,
-        )
-        return _PerModalityModelWrapper(inner)
-    elif model_name == "vit_pm":
-        # Per-modality ViT: optical/DEM at 512×512 (patch 16), satellite
-        # branches at native 10×10 (patch 2 → 5×5 patches per frame), with
-        # per-FPN-LTAE for temporal aggregation.
-        inner = build_vit_upernet_per_modality(
-            num_classes=num_classes,
-            use_vhr_or_spot=(args.use_vhr or args.use_spot),
-            use_dem=args.use_dem,
-            use_s2=args.use_s2,
-            use_s1=args.use_s1,
-            num_frames=args.multi_temporal,
-            embed_dim=args.vit_embed_dim,
-            depth=args.vit_depth,
-            num_heads=args.vit_num_heads,
-            output_layers=tuple(args.vit_output_layers),
-            decoder_channels=args.decoder_channels,
-            optical_dem_img_size=args.img_size,
-            optical_dem_patch=args.vit_patch_size,
-            sat_img_size=10,
-            sat_patch=2,
-        )
-        return _PerModalityModelWrapper(inner)
-    elif model_name == "vit":
-        return ViTUPerNet(
-            in_channels=in_channels,
-            num_classes=num_classes,
-            img_size=args.img_size,
-            embed_dim=args.vit_embed_dim,
-            depth=args.vit_depth,
-            num_heads=args.vit_num_heads,
-            patch_size=args.vit_patch_size,
-            output_layers=tuple(args.vit_output_layers),
-            decoder_channels=args.decoder_channels,
-        )
-    elif model_name == "unet":
-        return UNet(
-            in_channels=in_channels,
-            num_classes=num_classes,
-            topology=tuple(args.unet_topology),
-        )
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
-
-
-# =============================================================================
-# ARGS
-# =============================================================================
-
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    return str(v).lower() in ("yes", "true", "t", "1")
-
-
-parser = argparse.ArgumentParser(description="FLAIR-HUB Baseline Training")
-parser.add_argument("--xp_name",  type=str, required=True)
-parser.add_argument("--model",    type=str, default="resnet",
-                    choices=["resnet", "resnet_pm", "vit", "vit_pm", "unet"])
-parser.add_argument("--root_path", type=str, default="./data/FLAIR-HUB")
-
-# Modality flags (must match the Atomizer setup for fair comparison)
-parser.add_argument("--use_vhr",  type=str2bool, default=True)
-parser.add_argument("--use_spot", type=str2bool, default=False)
-parser.add_argument("--spot_norm_as_vhr", type=str2bool, default=False,
-                    help="When use_spot=True, normalize SPOT pixel values "
-                         "using VHR (aerial) statistics instead of SPOT's own. "
-                         "Diagnostic for whether cross-sensor degradation is "
-                         "driven by pixel-value distribution shift.")
-parser.add_argument("--use_dem",  type=str2bool, default=True)
-parser.add_argument("--use_s2",   type=str2bool, default=True)
-parser.add_argument("--use_s1",   type=str2bool, default=True)
-parser.add_argument("--multi_temporal", type=int, default=6)
-
-# Training
-parser.add_argument("--batch_size",   type=int, default=2)
-parser.add_argument("--lr",           type=float, default=1e-4)
-parser.add_argument("--weight_decay", type=float, default=1e-2)
-parser.add_argument("--epochs",       type=int, default=30)
-parser.add_argument("--num_workers",  type=int, default=4)
-parser.add_argument("--patience",     type=int, default=20)
-parser.add_argument("--grad_accum",   type=int, default=1)
-
-# ResNet
-parser.add_argument("--resnet_variant", type=str, default="resnet50",
-                    choices=["resnet_super_small", "resnet_small",
-                             "resnet50", "resnet101", "resnet152"])
-
-# UNet
-parser.add_argument("--unet_topology", type=int, nargs="+",
-                    default=[64, 128, 256, 512, 1024])
-
-# ViT
-parser.add_argument("--img_size",          type=int, default=512)
-parser.add_argument("--vit_embed_dim",     type=int, default=384)
-parser.add_argument("--vit_depth",         type=int, default=12)
-parser.add_argument("--vit_num_heads",     type=int, default=6)
-parser.add_argument("--vit_patch_size",    type=int, default=16)
-parser.add_argument("--vit_output_layers", type=int, nargs="+",
-                    default=[2, 5, 8, 11])
-
-# Decoder (shared by ViT and ResNet)
-parser.add_argument("--decoder_channels", type=int, default=256)
-
-# Subset
-parser.add_argument("--subset_indices", type=str, default=None,
-                    help="Path to subset_indices.json from select_flair_subset.py.")
-
-# Resume / test
-parser.add_argument("--ckpt_path",    type=str, default=None)
-parser.add_argument("--wandb_run_id", type=str, default=None)
-parser.add_argument("--test_only",    action="store_true")
-
-args = parser.parse_args()
-
-
-# =============================================================================
-# DATASETS
-# =============================================================================
-
-print(f"\n{'='*70}")
-print(f"  FLAIR-HUB Baseline — {args.model}")
-if args.model == "resnet":
-    print(f"  Variant:     {args.resnet_variant}")
-_spot_norm_label = ""
-if args.use_spot and args.spot_norm_as_vhr:
-    _spot_norm_label = " [VHR-norm]"
-print(f"  Modalities:  VHR={args.use_vhr}  SPOT={args.use_spot}{_spot_norm_label}  "
-      f"DEM={args.use_dem}  S2={args.use_s2}  S1={args.use_s1}")
-print(f"  Temporal:    {args.multi_temporal} timesteps (linspace)")
-print(f"  Batch size:  {args.batch_size}")
-print(f"  Epochs:      {args.epochs}")
-print(f"  GPUs:        {torch.cuda.device_count()}")
-print(f"{'='*70}\n")
-
-print("[Datasets] Building...")
-_per_mod = args.model in ("resnet_pm", "vit_pm")
-
-train_ds = FlairHubBaselineDataset(
-    root_path=args.root_path, mode="train",
-    use_vhr=args.use_vhr, use_spot=args.use_spot,
-    spot_norm_as_vhr=args.spot_norm_as_vhr,
-    use_dem=args.use_dem, use_s2=args.use_s2, use_s1=args.use_s1,
-    multi_temporal=args.multi_temporal,
-    per_modality=_per_mod,
-)
-val_ds = FlairHubBaselineDataset(
-    root_path=args.root_path, mode="validation",
-    use_vhr=args.use_vhr, use_spot=args.use_spot,
-    spot_norm_as_vhr=args.spot_norm_as_vhr,
-    use_dem=args.use_dem, use_s2=args.use_s2, use_s1=args.use_s1,
-    multi_temporal=args.multi_temporal,
-    per_modality=_per_mod,
-)
-test_ds = FlairHubBaselineDataset(
-    root_path=args.root_path, mode="test",
-    use_vhr=args.use_vhr, use_spot=args.use_spot,
-    spot_norm_as_vhr=args.spot_norm_as_vhr,
-    use_dem=args.use_dem, use_s2=args.use_s2, use_s1=args.use_s1,
-    multi_temporal=args.multi_temporal,
-    per_modality=_per_mod,
-)
-print(f"[Datasets] Pre-subset: train={len(train_ds)}  "
-      f"val={len(val_ds)}  test={len(test_ds)}")
-
-# Channel count from one sample (concat mode only — per-modality has no
-# single channel count since each branch has its own).
-NUM_CHANNELS = train_ds.num_channels
-if not _per_mod:
-    print(f"[Datasets] Channels per sample: {NUM_CHANNELS}")
-
-
-# ── Subset filtering (matches Atomizer pipeline) ───────────────────
-if args.subset_indices is not None:
-    import json as _json
-    print(f"[Datasets] Loading subset from: {args.subset_indices}")
-    with open(args.subset_indices) as f:
-        subset = _json.load(f)
-    split_key = {
-        "train": "train_patch_ids",
-        "validation": "val_patch_ids",
-        "test": "test_patch_ids",
+    # Reference grid sizes per resolution (large enough for any expected crop).
+    # Unseen resolutions are auto-registered with default ref_size=512.
+    REFERENCE_SIZES = {
+        10.0: 512,  # Sentinel-2/Sentinel-1/EnMAP at 10m
+        15.0: 512,
+        0.1:512,
+        0.5:512,
+        30.0:512,
+        0.2:512,
+        1.6: 512
     }
-    for ds, name in [(train_ds, "train"), (val_ds, "validation"),
-                     (test_ds, "test")]:
-        wanted = set(subset.get(split_key[name], []))
-        if not wanted:
-            continue
-        before = len(ds.patch_rows)
-        ds.patch_rows = [r for r in ds.patch_rows
-                         if r["patch_id"] in wanted]
-        print(f"[Datasets]   {name}: {before} → {len(ds.patch_rows)}")
 
-print(f"[Datasets] Final: train={len(train_ds)}  "
-      f"val={len(val_ds)}  test={len(test_ds)}")
+    # Default reference grid size for auto-registered resolutions
+    DEFAULT_REF_SIZE = 512
 
-# ── Wrap per-modality datasets so the inner branch dict appears under
-#   a single key ("flairhub_pm") — keeps BaselineTrainer's modality
-#   lookup intact (it does batch["image"][modality]).
-if _per_mod:
-    train_ds = _PerModalityWrap(train_ds)
-    val_ds   = _PerModalityWrap(val_ds)
-    test_ds  = _PerModalityWrap(test_ds)
-    _MODALITY_KEY = "flairhub_pm"
-else:
-    _MODALITY_KEY = "flairhub"
+    def __init__(self, lookup_table):
+        """
+        Initialize TokenBuilder with reference grid system.
 
+        Args:
+            lookup_table: Lookup_encoding instance
+        """
+        self.lookup = lookup_table
 
-# =============================================================================
-# DATALOADERS (DDP-aware)
-# =============================================================================
+        # Pre-register reference grids
+        self._register_reference_grids()
 
-def make_loader(dataset, shuffle: bool, batch_size: int):
-    """Build a DataLoader. Lightning will wrap the sampler with a
-    DistributedSampler automatically at fit-time when DDP is active."""
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=args.num_workers,
-        collate_fn=flairhub_collate,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None,
-        drop_last=shuffle,
-    )
+    def _register_reference_grids(self):
+        """Pre-register reference grid sizes for all known resolutions."""
+        print("[TokenBuilder] Registering reference grids:")
+        for resolution, ref_size in sorted(self.REFERENCE_SIZES.items()):
+            offset = self.lookup.get_or_register_modality(resolution, ref_size)
+            print(f"  ({resolution}m, {ref_size}px) → offset {offset}")
 
+    def _ensure_resolution_registered(self, resolution):
+        """
+        Ensure a resolution is registered in the reference grid system.
 
-train_loader = make_loader(train_ds, shuffle=True,  batch_size=args.batch_size)
-val_loader   = make_loader(val_ds,   shuffle=False, batch_size=args.batch_size)
-test_loader  = make_loader(test_ds,  shuffle=False, batch_size=args.batch_size)
+        Auto-registers unseen resolutions with DEFAULT_REF_SIZE.
+        Called by get_position_coordinates and get_query_coordinates
+        before accessing REFERENCE_SIZES.
 
+        Args:
+            resolution: float - GSD in meters/pixel
 
-# =============================================================================
-# MODEL + TRAINER MODULE
-# =============================================================================
+        Returns:
+            ref_size: int - reference grid size for this resolution
+        """
+        if resolution not in self.REFERENCE_SIZES:
+            ref_size = self.DEFAULT_REF_SIZE
+            self.REFERENCE_SIZES[resolution] = ref_size
+            offset = self.lookup.get_or_register_modality(resolution, ref_size)
+            print(f"[TokenBuilder] Auto-registered resolution {resolution}m "
+                  f"→ ref_size={ref_size}, offset={offset}")
 
-model = build_model(args.model, NUM_CHANNELS,
-                    FlairHubBaselineDataset.NUM_CLASSES, args)
+        return self.REFERENCE_SIZES[resolution]
 
-trainer_module = BaselineTrainer(
-    model=model,
-    modality=_MODALITY_KEY,
-    temporal=False,                  # we already flatten T into channels (concat mode)
-                                     # or handle T inside model (per-modality mode)
-    task="flairhub",
-    lr=args.lr,
-    weight_decay=args.weight_decay,
-    num_classes=FlairHubBaselineDataset.NUM_CLASSES,
-    ignore_index=FlairHubBaselineDataset.IGNORE_INDEX,
-)
+    # =========================================================================
+    # COORDINATE GENERATION (Reference Grid Indexing)
+    # =========================================================================
 
+    def get_position_coordinates(self, image_shape, resolution):
+        """
+        Generate position coordinates by extracting from reference grid.
 
-# =============================================================================
-# WANDB
-# =============================================================================
+        All crops at a given resolution extract their coordinates from
+        a shared reference grid, ensuring consistent coordinate space.
 
-wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    try:
-        import wandb
-        run_name = f"BL_FLAIR_{args.xp_name}_{args.model}"
-        if args.model == "resnet":
-            run_name += f"_{args.resnet_variant}"
-        init_kwargs = dict(
-            name=run_name,
-            project="Atomizer-FLAIR-Baselines",
-            config={**vars(args), "num_channels": NUM_CHANNELS},
+        Args:
+            image_shape: (C, H, W) or (H, W) - actual crop dimensions
+            resolution: float - GSD in meters/pixel
+
+        Returns:
+            x_indices: [C, H, W, 1] - x position indices from reference grid
+            y_indices: [C, H, W, 1] - y position indices from reference grid
+
+        Example:
+            Reference grid: 512×512 (indices 0-511, center at 256)
+
+            Crop 240×240:
+            - Center: 256, Half: 120
+            - Extract: [136:376, 136:376]
+            - Indices: [136, 137, ..., 255, 256, 257, ..., 375]
+
+            Crop 160×240 (edge crop):
+            - Y: [176:336] (80 pixels each side of 256)
+            - X: [136:376] (120 pixels each side of 256)
+            - Both use indices from SAME reference grid
+        """
+        # Handle both (C, H, W) and (H, W)
+        if len(image_shape) == 3:
+            C, H, W = image_shape
+        elif len(image_shape) == 2:
+            H, W = image_shape
+            C = 1
+        else:
+            raise ValueError(f"image_shape must be (C,H,W) or (H,W), got {image_shape}")
+
+        # Auto-register if needed
+        ref_size = self._ensure_resolution_registered(resolution)
+
+        # Validate crop fits in reference
+        if H > ref_size or W > ref_size:
+            raise ValueError(
+                f"Crop size ({H}×{W}) exceeds reference size ({ref_size}×{ref_size}) "
+                f"at resolution {resolution}m. Increase REFERENCE_SIZES[{resolution}]."
+            )
+
+        # Get global offset for reference grid
+        global_offset = self.lookup.get_or_register_modality(resolution, ref_size)
+
+        # Calculate extraction window (centered in reference grid)
+        ref_center = ref_size // 2
+        half_h = H // 2
+        half_w = W // 2
+
+        # Extract indices from reference grid
+        # For 240×240 from 512: [256-120:256+120] = [136:376]
+        y_start = ref_center - half_h
+        y_end = y_start + H  # Ensures exactly H elements
+        x_start = ref_center - half_w
+        x_end = x_start + W  # Ensures exactly W elements
+
+        y_coords = torch.arange(y_start, y_end, dtype=torch.float32)
+        x_coords = torch.arange(x_start, x_end, dtype=torch.float32)
+
+        # Validate extracted window size
+        assert len(y_coords) == H, f"y_coords length {len(y_coords)} != H {H}"
+        assert len(x_coords) == W, f"x_coords length {len(x_coords)} != W {W}"
+
+        # Create grids and add global offset
+        x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing="xy")
+        x_grid = x_grid + global_offset
+        y_grid = y_grid + global_offset
+
+        # Expand to [C, H, W, 1] format
+        x_indices = einops.repeat(x_grid, "h w -> c h w 1", c=C)
+        y_indices = einops.repeat(y_grid, "h w -> c h w 1", c=C)
+
+        return x_indices, y_indices
+
+    def get_query_coordinates(self, image_shape, resolution):
+        """
+        Generate query coordinate indices using reference grid.
+
+        All crops at the same resolution share the same query offset
+        (from the reference grid registration).
+
+        Args:
+            image_shape: (C, H, W) or (H, W) - image/crop dimensions
+            resolution: float - GSD in meters/pixel
+
+        Returns:
+            query_indices: [C, H, W, 1] - query offset for all pixels
+
+        Note:
+            All pixels in a given resolution share the same query offset,
+            regardless of crop size. This is a modality-level identifier.
+        """
+        # Handle both (C, H, W) and (H, W)
+        if len(image_shape) == 3:
+            C, H, W = image_shape
+        elif len(image_shape) == 2:
+            H, W = image_shape
+            C = 1
+        else:
+            raise ValueError(f"image_shape must be (C,H,W) or (H,W), got {image_shape}")
+
+        # Auto-register if needed
+        ref_size = self._ensure_resolution_registered(resolution)
+
+        global_offset = self.lookup.get_query_offset(resolution, ref_size)
+
+        # All pixels get the same query offset
+        return torch.full((C, H, W, 1), global_offset, dtype=torch.float32)
+
+    # =========================================================================
+    # HIGH-LEVEL TOKEN CONSTRUCTION
+    # =========================================================================
+
+    def build_tokens(
+        self,
+        image,
+        label,
+        resolution,
+        spectral_indices,
+        resolution_idx,
+        time_idx=-1,
+    ):
+        """
+        Build complete token array for image data.
+
+        Token format: [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
+                       col 0    1  2       3          4        5            6            7
+
+        Args:
+            image: [C, H, W] - image data (reflectance/radiance values)
+            label: [H, W] - per-pixel labels
+            resolution: float - GSD in meters/pixel
+            spectral_indices: [C] - spectral lookup indices for each band
+            resolution_idx: int - resolution group index
+            time_idx: int - temporal index (-1 for N/A)
+
+        Returns:
+            tokens: [C*H*W, 8] - flattened token array
+
+        Example:
+            >>> image = torch.randn(12, 240, 240)  # 12 bands
+            >>> label = torch.randint(0, 15, (240, 240))
+            >>> spectral_indices = torch.tensor([...])  # 12 wavelength indices
+            >>> tokens = builder.build_tokens(
+            ...     image, label, resolution=10.0,
+            ...     spectral_indices=spectral_indices,
+            ...     resolution_idx=0, time_idx=-1
+            ... )
+            >>> tokens.shape  # [12*240*240, 8] = [691200, 8]
+        """
+        C, H, W = image.shape
+
+        # Get position and query coordinates (from reference grid)
+        x_indices, y_indices = self.get_position_coordinates((C, H, W), resolution)
+        query_indices = self.get_query_coordinates((C, H, W), resolution)
+
+        # Expand spectral indices to [C*H*W]
+        spectral_coords = spectral_indices.repeat_interleave(H * W)
+
+        # Expand label to [C, H, W]
+        label_expanded = label.unsqueeze(0).expand(C, -1, -1)
+
+        # Create resolution and time columns
+        resolution_col = torch.full((C, H, W, 1), resolution_idx, dtype=torch.float32)
+        time_col = torch.full((C, H, W, 1), time_idx, dtype=torch.float32)
+
+        # Concatenate all features
+        # [value, x, y, spectral, label, query, resolution, time]
+        tokens = torch.cat([
+            image.unsqueeze(-1),                           # [C, H, W, 1] - col 0
+            x_indices.float(),                              # [C, H, W, 1] - col 1
+            y_indices.float(),                              # [C, H, W, 1] - col 2
+            spectral_coords.view(C, H, W, 1).float(),      # [C, H, W, 1] - col 3
+            label_expanded.unsqueeze(-1).float(),          # [C, H, W, 1] - col 4
+            query_indices.float(),                          # [C, H, W, 1] - col 5
+            resolution_col,                                 # [C, H, W, 1] - col 6
+            time_col,                                       # [C, H, W, 1] - col 7
+        ], dim=-1)
+
+        # Flatten to [C*H*W, 8]
+        return einops.rearrange(tokens, "c h w f -> (c h w) f")
+
+    def build_queries(
+        self,
+        label,
+        resolution,
+        first_spectral_idx,
+        resolution_idx,
+        time_idx=-1,
+    ):
+        """
+        Build query token array.
+
+        Query tokens are used for reconstruction/prediction tasks. They have
+        the same format as image tokens but with value=0 (to be predicted).
+
+        Token format: [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
+                       col 0    1  2       3          4        5            6            7
+
+        Args:
+            label: [H, W] - per-pixel labels
+            resolution: float - GSD in meters/pixel
+            first_spectral_idx: int - spectral index to use (typically first band)
+            resolution_idx: int - resolution group index
+            time_idx: int - temporal index (-1 for N/A)
+
+        Returns:
+            queries: [H*W, 8] - query token array
+
+        Example:
+            >>> label = torch.randint(0, 15, (240, 240))
+            >>> queries = builder.build_queries(
+            ...     label, resolution=10.0,
+            ...     first_spectral_idx=0,
+            ...     resolution_idx=0, time_idx=-1
+            ... )
+            >>> queries.shape  # [240*240, 8] = [57600, 8]
+        """
+        H, W = label.shape
+
+        # Get position and query coordinates (from reference grid)
+        x_indices, y_indices = self.get_position_coordinates((1, H, W), resolution)
+        query_indices = self.get_query_coordinates((1, H, W), resolution)
+
+        # Build query tokens (value=0, single channel)
+        queries = torch.cat([
+            torch.zeros(1, H, W, 1),                                      # col 0 - value (to predict)
+            x_indices.float(),                                            # col 1 - x position
+            y_indices.float(),                                            # col 2 - y position
+            torch.full((1, H, W, 1), first_spectral_idx, dtype=torch.float),  # col 3 - spectral
+            label.unsqueeze(0).unsqueeze(-1).float(),                     # col 4 - label
+            query_indices.float(),                                        # col 5 - query offset
+            torch.full((1, H, W, 1), resolution_idx, dtype=torch.float),  # col 6 - resolution
+            torch.full((1, H, W, 1), time_idx, dtype=torch.float),        # col 7 - time
+        ], dim=-1)
+
+        # Flatten to [H*W, 8]
+        return einops.rearrange(queries, "c h w f -> (c h w) f")
+
+    def build_sparse_tokens(
+        self,
+        values,                # [N] or [N, C] — point values (e.g., elevation)
+        positions,             # [N, 2] — (x_pix, y_pix) in patch-local pixel coords
+        labels,                # [N] — per-point labels
+        resolution,            # float — GSD context (0.2m for LIDAR aligned with VHR)
+        spectral_indices,      # [C] or scalar — spectral lookup index per channel
+        resolution_idx,        # int — resolution group index
+        patch_size_px,         # int — reference patch size in pixels (250 for FRACTAL)
+        time_idx=-1,
+    ):
+        """
+        Build tokens for sparse/irregular inputs (e.g., LIDAR points).
+
+        Args:
+            values: [N] for single-channel, or [N, C] for multi-channel sparse data.
+                    For LIDAR elevation: [N] tensor of z-values (normalized).
+            positions: [N, 2] — (x_pix, y_pix) coordinates in patch-local pixel space.
+                      Should be in [0, patch_size_px) range. The reference-grid
+                      centering offset is added here, NOT by the caller.
+            labels: [N] — per-point class labels (post-remap, in [0, num_classes)
+                    or IGNORE_INDEX).
+            resolution: float — GSD this modality is registered at. For LIDAR
+                        aligned with VHR, use 0.2.
+            spectral_indices: [C] or scalar — lookup indices for each channel.
+                              For LIDAR with one elevation channel: scalar (int)
+                              or [1].
+            resolution_idx: int — resolution group id from the lookup table.
+            patch_size_px: int — the nominal pixel size of the patch at this
+                           resolution (e.g., 250 for a 50m patch at 0.2m). Used to
+                           center positions in the reference grid the same way
+                           build_tokens does for dense rasters of shape (H, W).
+            time_idx: int — temporal index. -1 for atemporal data (LIDAR).
+
+        Returns:
+            tokens: [N*C, 8] (or [N, 8] for single-channel input) — same token
+                    format as build_tokens.
+        """
+        # ── Coerce shapes ────────────────────────────────────────────
+        if values.dim() == 1:
+            values = values.unsqueeze(-1)             # [N, 1]
+        N, C = values.shape
+
+        if isinstance(spectral_indices, int):
+            spectral_indices = torch.tensor([spectral_indices], dtype=torch.long)
+        elif spectral_indices.dim() == 0:
+            spectral_indices = spectral_indices.view(1)
+        assert spectral_indices.shape[0] == C, (
+            f"spectral_indices has {spectral_indices.shape[0]} channels, "
+            f"but values has C={C}"
         )
-        if args.wandb_run_id is not None:
-            init_kwargs["id"] = args.wandb_run_id
-            init_kwargs["resume"] = "must"
-            print(f"[WandB] Resuming run {args.wandb_run_id}")
-        wandb.init(**init_kwargs)
-        wandb_logger = WandbLogger(project="Atomizer-FLAIR-Baselines")
-    except Exception as e:
-        print(f"[WandB] not available: {e}")
+
+        # ── Auto-register the resolution (matches build_tokens behavior) ─
+        ref_size = self._ensure_resolution_registered(resolution)
+        if patch_size_px > ref_size:
+            raise ValueError(
+                f"patch_size_px ({patch_size_px}) exceeds reference grid "
+                f"({ref_size}) at resolution {resolution}m. "
+                f"Increase REFERENCE_SIZES[{resolution}]."
+            )
+
+        # ── Apply reference-grid centering (mirror of get_position_coordinates) ─
+        # In build_tokens, a dense raster of size (H, W) is centered in the
+        # reference grid: pixel (i, j) → reference position (i + (ref_size//2 -
+        # H//2), j + (ref_size//2 - W//2)) + global_offset. We do the same here.
+        global_offset = self.lookup.get_or_register_modality(resolution, ref_size)
+        ref_center = ref_size // 2
+        half = patch_size_px // 2
+        origin = ref_center - half                    # same offset build_tokens uses
+
+        x_pix = positions[:, 0].float() + origin + global_offset   # [N]
+        y_pix = positions[:, 1].float() + origin + global_offset   # [N]
+
+        # ── Query offset (same for all tokens at this resolution) ────
+        query_offset = self.lookup.get_query_offset(resolution, ref_size)
+
+        # ── Repeat per-point fields to [N*C] ─────────────────────────
+        # values: [N, C] → flatten to [N*C, 1]; channels vary fastest
+        val_flat       = einops.rearrange(values, "n c -> (n c) 1").float()
+        x_flat         = einops.repeat(x_pix,   "n -> (n c)", c=C).unsqueeze(-1)
+        y_flat         = einops.repeat(y_pix,   "n -> (n c)", c=C).unsqueeze(-1)
+        label_flat     = einops.repeat(labels.float(), "n -> (n c)", c=C).unsqueeze(-1)
+        spectral_flat  = einops.repeat(spectral_indices.float(), "c -> (n c)", n=N).unsqueeze(-1)
+        query_flat     = torch.full((N * C, 1), float(query_offset))
+        resolution_flat = torch.full((N * C, 1), float(resolution_idx))
+        time_flat      = torch.full((N * C, 1), float(time_idx))
+
+        tokens = torch.cat([
+            val_flat,        # col 0
+            x_flat,          # col 1
+            y_flat,          # col 2
+            spectral_flat,   # col 3
+            label_flat,      # col 4
+            query_flat,      # col 5
+            resolution_flat, # col 6
+            time_flat,       # col 7
+        ], dim=-1)
+        return tokens
 
 
-# =============================================================================
-# CALLBACKS + TRAINER
-# =============================================================================
+    def build_sparse_queries(
+        self,
+        positions,             # [N, 2] in patch-local pixel coords
+        labels,                # [N] per-point labels
+        resolution,
+        first_spectral_idx,
+        resolution_idx,
+        patch_size_px,
+        time_idx=-1,
+    ):
+        """
+        Build query tokens for sparse outputs (per-point segmentation).
 
-ckpt_dir = "./checkpoints/flairhub_baselines/"
-os.makedirs(ckpt_dir, exist_ok=True)
+        Identical structure to build_queries() but for irregular positions.
+        Used when the target is per-point classification (FRACTAL LIDAR).
+        """
+        N = positions.shape[0]
 
-callbacks = [
-    ModelCheckpoint(
-        dirpath=ckpt_dir,
-        filename=f"bl_{args.xp_name}_{args.model}-{{epoch:02d}}-{{val_mIoU:.4f}}",
-        monitor="val_mIoU", mode="max",
-        save_top_k=1, verbose=True,
-    ),
-    ModelCheckpoint(
-        dirpath=ckpt_dir,
-        filename=f"bl_{args.xp_name}_{args.model}-last",
-        every_n_epochs=1, save_last=True,
-    ),
-    EarlyStopping(
-        monitor="val_mIoU", mode="max",
-        patience=args.patience, verbose=True,
-    ),
-    LearningRateMonitor(logging_interval="step"),
-]
+        ref_size = self._ensure_resolution_registered(resolution)
+        if patch_size_px > ref_size:
+            raise ValueError(
+                f"patch_size_px ({patch_size_px}) exceeds reference grid "
+                f"({ref_size}) at resolution {resolution}m."
+            )
 
-trainer = Trainer(
-    strategy=DDPStrategy(find_unused_parameters=True),
-    devices=-1,
-    max_epochs=args.epochs,
-    accelerator="gpu",
-    precision="bf16-mixed",
-    sync_batchnorm=True,                  # safe with DDP + small per-rank batches
-    logger=wandb_logger,
-    log_every_n_steps=10,
-    callbacks=callbacks,
-    default_root_dir=ckpt_dir,
-    gradient_clip_val=1.0,
-    accumulate_grad_batches=args.grad_accum,
-)
+        global_offset = self.lookup.get_or_register_modality(resolution, ref_size)
+        query_offset  = self.lookup.get_query_offset(resolution, ref_size)
+        ref_center    = ref_size // 2
+        half          = patch_size_px // 2
+        origin        = ref_center - half
 
+        x_pix = positions[:, 0].float() + origin + global_offset   # [N]
+        y_pix = positions[:, 1].float() + origin + global_offset   # [N]
 
-# =============================================================================
-# TRAIN / TEST
-# =============================================================================
-
-if args.test_only:
-    if args.ckpt_path is None:
-        raise ValueError("--test_only requires --ckpt_path.")
-
-    print(f"\n{'='*70}\n  FLAIR-HUB Baseline — TEST ONLY\n"
-          f"  ckpt: {args.ckpt_path}\n{'='*70}\n")
-
-    ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
-    state = ckpt.get("state_dict", ckpt)
-    result = trainer_module.load_state_dict(state, strict=False)
-    print(f"[FLAIR-HUB-BL] missing: {len(result.missing_keys)}  "
-          f"unexpected: {len(result.unexpected_keys)}")
-    trainer.test(trainer_module, test_loader, verbose=True)
-else:
-    print(f"\n{'='*70}\n  FLAIR-HUB Baseline — TRAINING\n{'='*70}\n")
-    if args.ckpt_path is not None:
-        print(f"  Resuming from: {args.ckpt_path}")
-    trainer.fit(trainer_module, train_loader, val_loader,
-                ckpt_path=args.ckpt_path)
-
-    print(f"\n{'='*70}\n  FLAIR-HUB Baseline — FINAL TEST\n{'='*70}\n")
-    trainer.test(trainer_module, test_loader, verbose=True, ckpt_path="best")
+        queries = torch.cat([
+            torch.zeros(N, 1),                                     # col 0: value (to predict)
+            x_pix.unsqueeze(-1),                                   # col 1
+            y_pix.unsqueeze(-1),                                   # col 2
+            torch.full((N, 1), float(first_spectral_idx)),         # col 3
+            labels.float().unsqueeze(-1),                          # col 4
+            torch.full((N, 1), float(query_offset)),               # col 5
+            torch.full((N, 1), float(resolution_idx)),             # col 6
+            torch.full((N, 1), float(time_idx)),                   # col 7
+        ], dim=-1)
+        return queries
 
 
-# =============================================================================
-# SAVE WANDB RUN ID
-# =============================================================================
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
 
-if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
-    import wandb
-    os.makedirs("training/wandb_runs", exist_ok=True)
-    run_id = wandb.run.id
-    out = f"training/wandb_runs/bl_flairhub_{args.xp_name}_{args.model}.txt"
-    with open(out, "w") as f:
-        f.write(run_id)
-    print(f"[WandB] run_id={run_id}  saved to {out}")
+    @staticmethod
+    def subsample_queries(queries, max_queries, ignore_index=255, prioritize_valid=True):
+        """
+        Subsample query tokens with optional prioritization of valid labels.
+
+        Args:
+            queries: [N, 8] - query token array
+            max_queries: int - maximum number of queries to return
+            ignore_index: int - label value to consider invalid (default: 255)
+            prioritize_valid: bool - if True, prioritize valid labels (default: True)
+
+        Returns:
+            subsampled_queries: [max_queries, 8] - subsampled queries
+
+        Strategy:
+            If prioritize_valid=True:
+            1. Select all valid labels if count <= max_queries
+            2. Otherwise, randomly sample max_queries valid labels
+            3. Fill remaining slots with invalid labels if needed
+
+            If prioritize_valid=False:
+            - Uniform random sampling
+        """
+        if queries.shape[0] <= max_queries:
+            return queries
+
+        if not prioritize_valid:
+            perm = torch.randperm(queries.shape[0])[:max_queries]
+            return queries[perm]
+
+        # Prioritize valid labels
+        query_labels = queries[:, 4]  # col 4 is label
+        valid_mask = (query_labels != ignore_index)
+        valid_indices = torch.where(valid_mask)[0]
+        invalid_indices = torch.where(~valid_mask)[0]
+
+        if len(valid_indices) >= max_queries:
+            # Enough valid labels - sample from them
+            perm = torch.randperm(len(valid_indices))[:max_queries]
+            selected = valid_indices[perm]
+        else:
+            # Not enough valid - take all valid + some invalid
+            n_invalid_needed = max_queries - len(valid_indices)
+            n_invalid_needed = min(n_invalid_needed, len(invalid_indices))
+
+            if n_invalid_needed > 0:
+                invalid_perm = torch.randperm(len(invalid_indices))[:n_invalid_needed]
+                selected = torch.cat([valid_indices, invalid_indices[invalid_perm]])
+                # Shuffle combined set
+                selected = selected[torch.randperm(len(selected))]
+            else:
+                selected = valid_indices
+
+        return queries[selected]

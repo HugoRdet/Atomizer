@@ -13,21 +13,21 @@ import einops
 class TokenBuilder:
     """
     Centralized token builder for remote sensing datasets.
-    
+
     Uses reference grid indexing: instead of creating position encodings
     for each crop size, maintains reference grids (e.g., 512×512) and
     extracts windows from them.
-    
+
     Benefits:
     - All crops share the same coordinate space
     - No dynamic modality registration for different crop sizes
     - Consistent positioning between training and validation
     - Handles edge crops naturally
     - Auto-registers unseen resolutions (e.g., from resolution augmentation)
-    
+
     Args:
         lookup_table: Lookup_encoding instance for position/spectral/query offsets
-    
+
     Example:
         >>> lookup = Lookup_encoding(config)
         >>> builder = TokenBuilder(lookup)
@@ -35,7 +35,7 @@ class TokenBuilder:
         >>> x_idx, y_idx = builder.get_position_coordinates((12, 240, 240), 10.0)
         >>> tokens = builder.build_tokens(image, label, resolution=10.0, ...)
     """
-    
+
     # Reference grid sizes per resolution (large enough for any expected crop).
     # Unseen resolutions are auto-registered with default ref_size=512.
     REFERENCE_SIZES = {
@@ -47,40 +47,40 @@ class TokenBuilder:
         0.2:512,
         1.6: 512
     }
-    
+
     # Default reference grid size for auto-registered resolutions
     DEFAULT_REF_SIZE = 512
-    
+
     def __init__(self, lookup_table):
         """
         Initialize TokenBuilder with reference grid system.
-        
+
         Args:
             lookup_table: Lookup_encoding instance
         """
         self.lookup = lookup_table
-        
+
         # Pre-register reference grids
         self._register_reference_grids()
-    
+
     def _register_reference_grids(self):
         """Pre-register reference grid sizes for all known resolutions."""
         print("[TokenBuilder] Registering reference grids:")
         for resolution, ref_size in sorted(self.REFERENCE_SIZES.items()):
             offset = self.lookup.get_or_register_modality(resolution, ref_size)
             print(f"  ({resolution}m, {ref_size}px) → offset {offset}")
-    
+
     def _ensure_resolution_registered(self, resolution):
         """
         Ensure a resolution is registered in the reference grid system.
-        
+
         Auto-registers unseen resolutions with DEFAULT_REF_SIZE.
         Called by get_position_coordinates and get_query_coordinates
         before accessing REFERENCE_SIZES.
-        
+
         Args:
             resolution: float - GSD in meters/pixel
-            
+
         Returns:
             ref_size: int - reference grid size for this resolution
         """
@@ -90,36 +90,36 @@ class TokenBuilder:
             offset = self.lookup.get_or_register_modality(resolution, ref_size)
             print(f"[TokenBuilder] Auto-registered resolution {resolution}m "
                   f"→ ref_size={ref_size}, offset={offset}")
-        
+
         return self.REFERENCE_SIZES[resolution]
-    
+
     # =========================================================================
     # COORDINATE GENERATION (Reference Grid Indexing)
     # =========================================================================
-    
+
     def get_position_coordinates(self, image_shape, resolution):
         """
         Generate position coordinates by extracting from reference grid.
-        
+
         All crops at a given resolution extract their coordinates from
         a shared reference grid, ensuring consistent coordinate space.
-        
+
         Args:
             image_shape: (C, H, W) or (H, W) - actual crop dimensions
             resolution: float - GSD in meters/pixel
-        
+
         Returns:
             x_indices: [C, H, W, 1] - x position indices from reference grid
             y_indices: [C, H, W, 1] - y position indices from reference grid
-        
+
         Example:
             Reference grid: 512×512 (indices 0-511, center at 256)
-            
+
             Crop 240×240:
             - Center: 256, Half: 120
             - Extract: [136:376, 136:376]
             - Indices: [136, 137, ..., 255, 256, 257, ..., 375]
-            
+
             Crop 160×240 (edge crop):
             - Y: [176:336] (80 pixels each side of 256)
             - X: [136:376] (120 pixels each side of 256)
@@ -133,64 +133,64 @@ class TokenBuilder:
             C = 1
         else:
             raise ValueError(f"image_shape must be (C,H,W) or (H,W), got {image_shape}")
-        
+
         # Auto-register if needed
         ref_size = self._ensure_resolution_registered(resolution)
-        
+
         # Validate crop fits in reference
         if H > ref_size or W > ref_size:
             raise ValueError(
                 f"Crop size ({H}×{W}) exceeds reference size ({ref_size}×{ref_size}) "
                 f"at resolution {resolution}m. Increase REFERENCE_SIZES[{resolution}]."
             )
-        
+
         # Get global offset for reference grid
         global_offset = self.lookup.get_or_register_modality(resolution, ref_size)
-        
+
         # Calculate extraction window (centered in reference grid)
         ref_center = ref_size // 2
         half_h = H // 2
         half_w = W // 2
-        
+
         # Extract indices from reference grid
         # For 240×240 from 512: [256-120:256+120] = [136:376]
         y_start = ref_center - half_h
         y_end = y_start + H  # Ensures exactly H elements
         x_start = ref_center - half_w
         x_end = x_start + W  # Ensures exactly W elements
-        
+
         y_coords = torch.arange(y_start, y_end, dtype=torch.float32)
         x_coords = torch.arange(x_start, x_end, dtype=torch.float32)
-        
+
         # Validate extracted window size
         assert len(y_coords) == H, f"y_coords length {len(y_coords)} != H {H}"
         assert len(x_coords) == W, f"x_coords length {len(x_coords)} != W {W}"
-        
+
         # Create grids and add global offset
         x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing="xy")
         x_grid = x_grid + global_offset
         y_grid = y_grid + global_offset
-        
+
         # Expand to [C, H, W, 1] format
         x_indices = einops.repeat(x_grid, "h w -> c h w 1", c=C)
         y_indices = einops.repeat(y_grid, "h w -> c h w 1", c=C)
-        
+
         return x_indices, y_indices
-    
+
     def get_query_coordinates(self, image_shape, resolution):
         """
         Generate query coordinate indices using reference grid.
-        
+
         All crops at the same resolution share the same query offset
         (from the reference grid registration).
-        
+
         Args:
             image_shape: (C, H, W) or (H, W) - image/crop dimensions
             resolution: float - GSD in meters/pixel
-        
+
         Returns:
             query_indices: [C, H, W, 1] - query offset for all pixels
-        
+
         Note:
             All pixels in a given resolution share the same query offset,
             regardless of crop size. This is a modality-level identifier.
@@ -203,19 +203,19 @@ class TokenBuilder:
             C = 1
         else:
             raise ValueError(f"image_shape must be (C,H,W) or (H,W), got {image_shape}")
-        
+
         # Auto-register if needed
         ref_size = self._ensure_resolution_registered(resolution)
-        
+
         global_offset = self.lookup.get_query_offset(resolution, ref_size)
-        
+
         # All pixels get the same query offset
         return torch.full((C, H, W, 1), global_offset, dtype=torch.float32)
-    
+
     # =========================================================================
     # HIGH-LEVEL TOKEN CONSTRUCTION
     # =========================================================================
-    
+
     def build_tokens(
         self,
         image,
@@ -227,10 +227,10 @@ class TokenBuilder:
     ):
         """
         Build complete token array for image data.
-        
+
         Token format: [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
                        col 0    1  2       3          4        5            6            7
-        
+
         Args:
             image: [C, H, W] - image data (reflectance/radiance values)
             label: [H, W] - per-pixel labels
@@ -238,10 +238,10 @@ class TokenBuilder:
             spectral_indices: [C] - spectral lookup indices for each band
             resolution_idx: int - resolution group index
             time_idx: int - temporal index (-1 for N/A)
-        
+
         Returns:
             tokens: [C*H*W, 8] - flattened token array
-        
+
         Example:
             >>> image = torch.randn(12, 240, 240)  # 12 bands
             >>> label = torch.randint(0, 15, (240, 240))
@@ -254,21 +254,21 @@ class TokenBuilder:
             >>> tokens.shape  # [12*240*240, 8] = [691200, 8]
         """
         C, H, W = image.shape
-        
+
         # Get position and query coordinates (from reference grid)
         x_indices, y_indices = self.get_position_coordinates((C, H, W), resolution)
         query_indices = self.get_query_coordinates((C, H, W), resolution)
-        
+
         # Expand spectral indices to [C*H*W]
         spectral_coords = spectral_indices.repeat_interleave(H * W)
-        
+
         # Expand label to [C, H, W]
         label_expanded = label.unsqueeze(0).expand(C, -1, -1)
-        
+
         # Create resolution and time columns
         resolution_col = torch.full((C, H, W, 1), resolution_idx, dtype=torch.float32)
         time_col = torch.full((C, H, W, 1), time_idx, dtype=torch.float32)
-        
+
         # Concatenate all features
         # [value, x, y, spectral, label, query, resolution, time]
         tokens = torch.cat([
@@ -281,10 +281,10 @@ class TokenBuilder:
             resolution_col,                                 # [C, H, W, 1] - col 6
             time_col,                                       # [C, H, W, 1] - col 7
         ], dim=-1)
-        
+
         # Flatten to [C*H*W, 8]
         return einops.rearrange(tokens, "c h w f -> (c h w) f")
-    
+
     def build_queries(
         self,
         label,
@@ -295,23 +295,23 @@ class TokenBuilder:
     ):
         """
         Build query token array.
-        
+
         Query tokens are used for reconstruction/prediction tasks. They have
         the same format as image tokens but with value=0 (to be predicted).
-        
+
         Token format: [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
                        col 0    1  2       3          4        5            6            7
-        
+
         Args:
             label: [H, W] - per-pixel labels
             resolution: float - GSD in meters/pixel
             first_spectral_idx: int - spectral index to use (typically first band)
             resolution_idx: int - resolution group index
             time_idx: int - temporal index (-1 for N/A)
-        
+
         Returns:
             queries: [H*W, 8] - query token array
-        
+
         Example:
             >>> label = torch.randint(0, 15, (240, 240))
             >>> queries = builder.build_queries(
@@ -322,11 +322,11 @@ class TokenBuilder:
             >>> queries.shape  # [240*240, 8] = [57600, 8]
         """
         H, W = label.shape
-        
+
         # Get position and query coordinates (from reference grid)
         x_indices, y_indices = self.get_position_coordinates((1, H, W), resolution)
         query_indices = self.get_query_coordinates((1, H, W), resolution)
-        
+
         # Build query tokens (value=0, single channel)
         queries = torch.cat([
             torch.zeros(1, H, W, 1),                                      # col 0 - value (to predict)
@@ -338,50 +338,230 @@ class TokenBuilder:
             torch.full((1, H, W, 1), resolution_idx, dtype=torch.float),  # col 6 - resolution
             torch.full((1, H, W, 1), time_idx, dtype=torch.float),        # col 7 - time
         ], dim=-1)
-        
+
         # Flatten to [H*W, 8]
         return einops.rearrange(queries, "c h w f -> (c h w) f")
-    
+
+
+    """
+    Extension to TokenBuilder for sparse (irregularly positioned) tokens.
+
+    ADD THE METHODS BELOW INTO THE EXISTING TokenBuilder CLASS in
+    `token_builder.py`. They follow the same conventions as `build_tokens` and
+    `build_queries`:
+
+        Token format: [value, x, y, spectral_idx, label, query_idx,
+                       resolution_idx, time_idx]
+
+    But for sparse inputs:
+        - One token per (point, channel) pair — for single-channel modalities
+          (LIDAR elevation), that's just one token per point.
+        - Positions are passed in pixel-equivalent coordinates (continuous,
+          not integer), already in the reference grid's coordinate frame.
+        - The reference-grid centering and global offset are applied here to
+          match the convention used by build_tokens for dense rasters.
+
+    Why pixel-equivalent positions rather than world coordinates? Because
+    build_tokens generates positions via meshgrid over [0, H) × [0, W), then
+    centers them in the reference grid. For sparse points to share the same
+    coordinate frame, they should be passed in the same [0, H) × [0, W)
+    pixel-equivalent space, NOT in absolute world coords (which would have
+    arbitrary magnitudes that the Fourier features can't handle).
+    """
+
+
+
+
+    # ============================================================================
+    # ADD INTO TokenBuilder CLASS
+    # ============================================================================
+
+    def build_sparse_tokens(
+        self,
+        values,                # [N] or [N, C] — point values (e.g., elevation)
+        positions,             # [N, 2] — (x_pix, y_pix) in patch-local pixel coords
+        labels,                # [N] — per-point labels
+        resolution,            # float — GSD context (0.2m for LIDAR aligned with VHR)
+        spectral_indices,      # [C] or scalar — spectral lookup index per channel
+        resolution_idx,        # int — resolution group index
+        patch_size_px,         # int — reference patch size in pixels (250 for FRACTAL)
+        time_idx=-1,
+    ):
+        """
+        Build tokens for sparse/irregular inputs (e.g., LIDAR points).
+
+        Args:
+            values: [N] for single-channel, or [N, C] for multi-channel sparse data.
+                    For LIDAR elevation: [N] tensor of z-values (normalized).
+            positions: [N, 2] — (x_pix, y_pix) coordinates in patch-local pixel space.
+                      Should be in [0, patch_size_px) range. The reference-grid
+                      centering offset is added here, NOT by the caller.
+            labels: [N] — per-point class labels (post-remap, in [0, num_classes)
+                    or IGNORE_INDEX).
+            resolution: float — GSD this modality is registered at. For LIDAR
+                        aligned with VHR, use 0.2.
+            spectral_indices: [C] or scalar — lookup indices for each channel.
+                              For LIDAR with one elevation channel: scalar (int)
+                              or [1].
+            resolution_idx: int — resolution group id from the lookup table.
+            patch_size_px: int — the nominal pixel size of the patch at this
+                           resolution (e.g., 250 for a 50m patch at 0.2m). Used to
+                           center positions in the reference grid the same way
+                           build_tokens does for dense rasters of shape (H, W).
+            time_idx: int — temporal index. -1 for atemporal data (LIDAR).
+
+        Returns:
+            tokens: [N*C, 8] (or [N, 8] for single-channel input) — same token
+                    format as build_tokens.
+        """
+        # ── Coerce shapes ────────────────────────────────────────────
+        if values.dim() == 1:
+            values = values.unsqueeze(-1)             # [N, 1]
+        N, C = values.shape
+
+        if isinstance(spectral_indices, int):
+            spectral_indices = torch.tensor([spectral_indices], dtype=torch.long)
+        elif spectral_indices.dim() == 0:
+            spectral_indices = spectral_indices.view(1)
+        assert spectral_indices.shape[0] == C, (
+            f"spectral_indices has {spectral_indices.shape[0]} channels, "
+            f"but values has C={C}"
+        )
+
+        # ── Auto-register the resolution (matches build_tokens behavior) ─
+        ref_size = self._ensure_resolution_registered(resolution)
+        if patch_size_px > ref_size:
+            raise ValueError(
+                f"patch_size_px ({patch_size_px}) exceeds reference grid "
+                f"({ref_size}) at resolution {resolution}m. "
+                f"Increase REFERENCE_SIZES[{resolution}]."
+            )
+
+        # ── Apply reference-grid centering (mirror of get_position_coordinates) ─
+        # In build_tokens, a dense raster of size (H, W) is centered in the
+        # reference grid: pixel (i, j) → reference position (i + (ref_size//2 -
+        # H//2), j + (ref_size//2 - W//2)) + global_offset. We do the same here.
+        global_offset = self.lookup.get_or_register_modality(resolution, ref_size)
+        ref_center = ref_size // 2
+        half = patch_size_px // 2
+        origin = ref_center - half                    # same offset build_tokens uses
+
+        x_pix = positions[:, 0].float() + origin + global_offset   # [N]
+        y_pix = positions[:, 1].float() + origin + global_offset   # [N]
+
+        # ── Query offset (same for all tokens at this resolution) ────
+        query_offset = self.lookup.get_query_offset(resolution, ref_size)
+
+        # ── Repeat per-point fields to [N*C] ─────────────────────────
+        # values: [N, C] → flatten to [N*C, 1]; channels vary fastest
+        val_flat       = einops.rearrange(values, "n c -> (n c) 1").float()
+        x_flat         = einops.repeat(x_pix,   "n -> (n c)", c=C).unsqueeze(-1)
+        y_flat         = einops.repeat(y_pix,   "n -> (n c)", c=C).unsqueeze(-1)
+        label_flat     = einops.repeat(labels.float(), "n -> (n c)", c=C).unsqueeze(-1)
+        spectral_flat  = einops.repeat(spectral_indices.float(), "c -> (n c)", n=N).unsqueeze(-1)
+        query_flat     = torch.full((N * C, 1), float(query_offset))
+        resolution_flat = torch.full((N * C, 1), float(resolution_idx))
+        time_flat      = torch.full((N * C, 1), float(time_idx))
+
+        tokens = torch.cat([
+            val_flat,        # col 0
+            x_flat,          # col 1
+            y_flat,          # col 2
+            spectral_flat,   # col 3
+            label_flat,      # col 4
+            query_flat,      # col 5
+            resolution_flat, # col 6
+            time_flat,       # col 7
+        ], dim=-1)
+        return tokens
+
+
+    def build_sparse_queries(
+        self,
+        positions,             # [N, 2] in patch-local pixel coords
+        labels,                # [N] per-point labels
+        resolution,
+        first_spectral_idx,
+        resolution_idx,
+        patch_size_px,
+        time_idx=-1,
+    ):
+        """
+        Build query tokens for sparse outputs (per-point segmentation).
+
+        Identical structure to build_queries() but for irregular positions.
+        Used when the target is per-point classification (FRACTAL LIDAR).
+        """
+        N = positions.shape[0]
+
+        ref_size = self._ensure_resolution_registered(resolution)
+        if patch_size_px > ref_size:
+            raise ValueError(
+                f"patch_size_px ({patch_size_px}) exceeds reference grid "
+                f"({ref_size}) at resolution {resolution}m."
+            )
+
+        global_offset = self.lookup.get_or_register_modality(resolution, ref_size)
+        query_offset  = self.lookup.get_query_offset(resolution, ref_size)
+        ref_center    = ref_size // 2
+        half          = patch_size_px // 2
+        origin        = ref_center - half
+
+        x_pix = positions[:, 0].float() + origin + global_offset   # [N]
+        y_pix = positions[:, 1].float() + origin + global_offset   # [N]
+
+        queries = torch.cat([
+            torch.zeros(N, 1),                                     # col 0: value (to predict)
+            x_pix.unsqueeze(-1),                                   # col 1
+            y_pix.unsqueeze(-1),                                   # col 2
+            torch.full((N, 1), float(first_spectral_idx)),         # col 3
+            labels.float().unsqueeze(-1),                          # col 4
+            torch.full((N, 1), float(query_offset)),               # col 5
+            torch.full((N, 1), float(resolution_idx)),             # col 6
+            torch.full((N, 1), float(time_idx)),                   # col 7
+        ], dim=-1)
+        return queries
+
     # =========================================================================
     # UTILITY METHODS
     # =========================================================================
-    
+
     @staticmethod
     def subsample_queries(queries, max_queries, ignore_index=255, prioritize_valid=True):
         """
         Subsample query tokens with optional prioritization of valid labels.
-        
+
         Args:
             queries: [N, 8] - query token array
             max_queries: int - maximum number of queries to return
             ignore_index: int - label value to consider invalid (default: 255)
             prioritize_valid: bool - if True, prioritize valid labels (default: True)
-        
+
         Returns:
             subsampled_queries: [max_queries, 8] - subsampled queries
-        
+
         Strategy:
             If prioritize_valid=True:
             1. Select all valid labels if count <= max_queries
             2. Otherwise, randomly sample max_queries valid labels
             3. Fill remaining slots with invalid labels if needed
-            
+
             If prioritize_valid=False:
             - Uniform random sampling
         """
         if queries.shape[0] <= max_queries:
             return queries
-        
+
         if not prioritize_valid:
             perm = torch.randperm(queries.shape[0])[:max_queries]
             return queries[perm]
-        
+
         # Prioritize valid labels
         query_labels = queries[:, 4]  # col 4 is label
         valid_mask = (query_labels != ignore_index)
         valid_indices = torch.where(valid_mask)[0]
         invalid_indices = torch.where(~valid_mask)[0]
-        
+
         if len(valid_indices) >= max_queries:
             # Enough valid labels - sample from them
             perm = torch.randperm(len(valid_indices))[:max_queries]
@@ -390,7 +570,7 @@ class TokenBuilder:
             # Not enough valid - take all valid + some invalid
             n_invalid_needed = max_queries - len(valid_indices)
             n_invalid_needed = min(n_invalid_needed, len(invalid_indices))
-            
+
             if n_invalid_needed > 0:
                 invalid_perm = torch.randperm(len(invalid_indices))[:n_invalid_needed]
                 selected = torch.cat([valid_indices, invalid_indices[invalid_perm]])
@@ -398,8 +578,5 @@ class TokenBuilder:
                 selected = selected[torch.randperm(len(selected))]
             else:
                 selected = valid_indices
-        
-        return queries[selected]
-    
 
-    
+        return queries[selected]
