@@ -396,6 +396,7 @@ trainer = Trainer(
     log_every_n_steps=10,
     callbacks=callbacks,
     default_root_dir=ckpt_dir,
+    gradient_clip_val=1.0
 )
 
 

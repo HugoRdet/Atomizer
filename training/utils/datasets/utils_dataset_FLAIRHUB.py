@@ -33,6 +33,14 @@ Cross-sensor transfer (the headline experiment):
     knows it's looking at a different sensor — just at the same spatial
     scale.
 
+D4 augmentation (training only):
+    Each __getitem__ samples ONE D4 transform (rotation 0/90/180/270° +
+    optional horizontal/vertical flips) and applies it consistently to
+    every modality and the label. Cross-modal spatial alignment is
+    preserved because all modalities share the same geographic patch
+    geometry. Augmentation is sampled deterministically from index +
+    worker_id (reproducible), and identity transform on val/test.
+
 Token format (8 cols, same across all modalities):
     [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
 """
@@ -68,6 +76,7 @@ except ImportError:
 
 from .token_grouping import *
 from .token_builder import TokenBuilder
+from .augmentations import D4Augmentation, D4Transform
 
 
 class FlairHubDataset(Dataset):
@@ -96,6 +105,8 @@ class FlairHubDataset(Dataset):
         use_s1:          Use SENTINEL1-ASC_TS + SENTINEL1-DESC_TS time series.
         multi_temporal:  Number of timesteps to sample evenly via linspace.
         max_queries:     Subsample queries per sample (memory).
+        use_augmentation: Enable D4 augmentation in training split. Defaults
+                         True; auto-disabled for val/test regardless.
     """
 
     # Resolutions (m/px). Single canonical values for resolution_idx lookup.
@@ -165,6 +176,7 @@ class FlairHubDataset(Dataset):
         use_s1: bool = True,
         multi_temporal: int = 6,
         max_queries: int = 100_000,
+        use_augmentation: bool = True,
     ):
         super().__init__()
         for lib, ok in [("rasterio", HAS_RASTERIO),
@@ -196,6 +208,21 @@ class FlairHubDataset(Dataset):
         self.multi_temporal = multi_temporal
 
         self.token_builder = TokenBuilder(look_up)
+
+        # ── D4 augmentation ─────────────────────────────────
+        # Only active in training split. One transform is sampled per
+        # __getitem__ and applied identically to all modalities + label.
+        # Val/test always get identity transform.
+        self.augmenter = D4Augmentation(
+            enabled=(use_augmentation and self.split == "train"),
+            p_flip_h=0.5,
+            p_flip_v=0.5,
+        )
+        if self.augmenter.enabled:
+            print(f"[FLAIR-HUB] D4 augmentation ENABLED (training split)")
+        else:
+            print(f"[FLAIR-HUB] D4 augmentation DISABLED "
+                  f"(split={self.split}, use_augmentation={use_augmentation})")
 
         # Token budgets from config
         self.nb_tokens                  = config_model["trainer"]["max_tokens"]
@@ -483,31 +510,40 @@ class FlairHubDataset(Dataset):
         row = self.patch_rows[index]
         patch_id = row["patch_id"]
 
+        # ── Sample D4 augmentation ONCE per item ───────────────
+        # Same transform passed to every modality below — guarantees
+        # cross-modal spatial alignment. Val/test returns identity.
+        aug = self.augmenter.sample(index=index)
+
         groups = {}
 
-        # ── Load label first (defines ground truth) ──────────
-        label = self._load_label(row)                          # [H, W] uint8
+        # ── Load and augment label first ───────────────────────
+        # Augmenting the label here means every downstream modality
+        # tokenizer that uses `label` (VHR, DEM, SPOT@VHR) already
+        # sees the augmented version — no need to re-augment.
+        label = self._load_label(row)                          # [H, W] uint8 (numpy)
         label = self._remap_label(label)
         label = torch.from_numpy(label.astype(np.int64))
+        label = self.augmenter.apply(label, aug)               # [H, W] augmented
 
         # ── 0.2m group: VHR + DEM (+ SPOT-resized if spot_as_vhr) ──
         hires_tokens_list = []
         hires_channels    = 0
 
         if self.use_vhr:
-            vhr_tokens = self._load_and_tokenize_vhr(row, label)
+            vhr_tokens = self._load_and_tokenize_vhr(row, label, aug=aug)
             hires_tokens_list.append(vhr_tokens)
             hires_channels += self.NUM_VHR_BANDS
 
         if self.use_spot and self.spot_as_vhr:
             # SPOT resized to 512×512 and tokenized as a VHR-resolution sensor.
             # Joins the 0.2m group; its tokens share latent placement with VHR/DEM.
-            spot_tokens, _ = self._load_and_tokenize_spot(row, label)
+            spot_tokens, _ = self._load_and_tokenize_spot(row, label, aug=aug)
             hires_tokens_list.append(spot_tokens)
             hires_channels += self.NUM_SPOT_BANDS
 
         if self.use_dem:
-            dem_tokens = self._load_and_tokenize_dem(row, label)
+            dem_tokens = self._load_and_tokenize_dem(row, label, aug=aug)
             hires_tokens_list.append(dem_tokens)
             hires_channels += self.NUM_DEM_BANDS
 
@@ -521,7 +557,7 @@ class FlairHubDataset(Dataset):
 
         # ── 1.6m group: SPOT (native, only when spot_as_vhr=False) ──
         if self.use_spot and not self.spot_as_vhr:
-            spot_tokens, _ = self._load_and_tokenize_spot(row, label)
+            spot_tokens, _ = self._load_and_tokenize_spot(row, label, aug=aug)
             groups[self.SPOT_RESOLUTION] = {
                 "tokens": spot_tokens,
                 "mask":   torch.zeros(spot_tokens.shape[0], dtype=torch.bool),
@@ -529,14 +565,18 @@ class FlairHubDataset(Dataset):
             }
 
         # ── 10m group: S2 + S1 ASC + S1 DESC time series ────
+        # All three get the SAME transform `aug`. Across timesteps within a
+        # single stack, the transform is also identical (applied to the
+        # whole [T, B, H, W] tensor). This keeps temporal coherence: a
+        # north-south road stays N-S across all timesteps after rotation.
         sat_tokens_list = []
         if self.use_s2:
-            s2_tokens = self._load_and_tokenize_s2_ts(row, patch_id)
+            s2_tokens = self._load_and_tokenize_s2_ts(row, patch_id, aug=aug)
             sat_tokens_list.append(s2_tokens)
 
         if self.use_s1:
-            s1a_tokens = self._load_and_tokenize_s1_ts(row, patch_id, mode="asc")
-            s1d_tokens = self._load_and_tokenize_s1_ts(row, patch_id, mode="desc")
+            s1a_tokens = self._load_and_tokenize_s1_ts(row, patch_id, mode="asc",  aug=aug)
+            s1d_tokens = self._load_and_tokenize_s1_ts(row, patch_id, mode="desc", aug=aug)
             sat_tokens_list.append(s1a_tokens)
             sat_tokens_list.append(s1d_tokens)
 
@@ -549,10 +589,12 @@ class FlairHubDataset(Dataset):
                 "shape":  (sat_total_bands, self.SAT_SIZE, self.SAT_SIZE),
             }
 
-        # ── Build queries from label at VHR resolution ──────
+        # ── Build queries from (already augmented) label at VHR resolution ──
         # Queries follow PASTIS convention: per-pixel at the highest available
         # spatial resolution. Subsample to max_tokens_reconstruction.
         # Pick the first spectral_idx from whatever 0.2m source is active.
+        # The label is ALREADY augmented above, so queries will be
+        # consistent with all the augmented modality tokens.
         if self.use_vhr:
             first_spectral = self.vhr_spectral_indices[0]
         elif self.use_spot and self.spot_as_vhr:
@@ -579,11 +621,15 @@ class FlairHubDataset(Dataset):
         # else: full per-pixel queries on val/test (decoder chunks internally)
         queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
 
-        # ── Image for visualization (VHR if available, else SPOT) ──
+        # ── Image for visualization (also augmented for consistency) ──
+        # If we returned the un-augmented image alongside augmented tokens,
+        # plotting predictions over the image would look misaligned.
         if self.use_vhr:
             image = self._load_vhr_image(row)
+            image = self.augmenter.apply(image, aug)
         elif self.use_spot:
             image, _ = self._load_spot_image(row)
+            image = self.augmenter.apply(image, aug)
         else:
             image = torch.zeros(1, self.VHR_SIZE, self.VHR_SIZE)
 
@@ -624,9 +670,17 @@ class FlairHubDataset(Dataset):
         img = torch.clamp(img, -10, 10)
         return torch.nan_to_num(img, nan=0.0, posinf=10.0, neginf=-10.0)
 
-    def _load_and_tokenize_vhr(self, row, label):
-        """Load + tokenize VHR. Returns [C*H*W, 8] tokens."""
+    def _load_and_tokenize_vhr(self, row, label, aug: D4Transform = None):
+        """
+        Load + tokenize VHR. Returns [C*H*W, 8] tokens.
+
+        Augmentation is applied AFTER normalization and BEFORE tokenization.
+        The `label` arg is expected to already be augmented (done at the top
+        of __getitem__).
+        """
         image = self._load_vhr_image(row)
+        if aug is not None:
+            image = self.augmenter.apply(image, aug)
         return self.token_builder.build_tokens(
             image=image,
             label=label,
@@ -649,6 +703,10 @@ class FlairHubDataset(Dataset):
                            full-resolution 512×512 label preserved.
                            Used for cross-sensor transfer where we want the
                            SPOT input to occupy the same token grid as VHR.
+
+        Note: this method returns the RAW (un-augmented) image and label.
+        Augmentation is applied by the caller (_load_and_tokenize_spot)
+        AFTER resizing so the transform operates on the final geometry.
         """
         path = self._resolve_path(row["SPOT_RGBI"])
         with rasterio.open(path) as src:
@@ -691,7 +749,7 @@ class FlairHubDataset(Dataset):
         ).squeeze(0).squeeze(0).long()
         return img, label_spot
 
-    def _load_and_tokenize_spot(self, row, label_full):
+    def _load_and_tokenize_spot(self, row, label_full, aug: D4Transform = None):
         """
         Tokenize SPOT. Resolution_idx depends on `spot_as_vhr`:
           False: SPOT_RESOLUTION (1.6m), spot_resolution_idx
@@ -701,21 +759,44 @@ class FlairHubDataset(Dataset):
                  Spectral indices stay SPOT-specific (different
                  bandwidth/wavelength than VHR), so the model still
                  sees a sensor mismatch via spectral metadata.
+
+        Augmentation: applied to both image and SPOT-resolution label AFTER
+        all resizing is complete. When spot_as_vhr=True the label arrives
+        already at VHR resolution and is replaced by `label_full` (which is
+        already augmented).
         """
         image, label_spot = self._load_spot_image(row)
 
+        # Apply augmentation to image at its final size (post-resize).
+        # The label needs careful handling:
+        #   - spot_as_vhr=True : label_spot here is the 512×512 label from
+        #     _load_spot_image; but `label_full` passed in is ALREADY the
+        #     augmented version at 512×512 — we use that for consistency.
+        #   - spot_as_vhr=False: label_spot is downsampled to 64×64 from a
+        #     RAW label (loaded inside _load_spot_image). We must augment
+        #     it here ourselves since it's at SPOT resolution.
+        if aug is not None:
+            image = self.augmenter.apply(image, aug)
+
         if self.spot_as_vhr:
+            # Use the already-augmented label passed in by __getitem__.
+            # `label_full` here is the 512×512 augmented label.
             tokens = self.token_builder.build_tokens(
-                image=image,                                   # [4, 512, 512]
-                label=label_spot,                              # [512, 512]
+                image=image,
+                label=label_full,
                 resolution=self.VHR_RESOLUTION,                # 0.2m
                 spectral_indices=self.spot_spectral_indices,   # SPOT bands
                 resolution_idx=self.vhr_resolution_idx,        # VHR's idx
                 time_idx=self.TIME_IDX_NA,
             )
-            return tokens, label_spot
+            return tokens, label_full
 
-        # Default: native SPOT.
+        # Native SPOT: label_spot is 64×64 from RAW label inside
+        # _load_spot_image. We must augment it ourselves to match the
+        # augmented image at the same resolution.
+        if aug is not None:
+            label_spot = self.augmenter.apply(label_spot, aug)
+
         tokens = self.token_builder.build_tokens(
             image=image,
             label=label_spot,
@@ -728,10 +809,14 @@ class FlairHubDataset(Dataset):
 
     # ── DEM ─────────────────────────────────────────────────
 
-    def _load_and_tokenize_dem(self, row, label):
+    def _load_and_tokenize_dem(self, row, label, aug: D4Transform = None):
         """
         Load DEM (DSM band 1, DTM band 2) as [2, H, W] float32, normalize,
         tokenize. DEM is at VHR resolution (0.2m, 512×512).
+
+        Augmentation applied AFTER normalization, before tokenization.
+        The label argument is expected to already be augmented (done at the
+        top of __getitem__).
         """
         path = self._resolve_path(row["DEM_ELEV"])
         with rasterio.open(path) as src:
@@ -744,6 +829,9 @@ class FlairHubDataset(Dataset):
         dem = self._normalize_dem(dem)
         dem = torch.clamp(dem, -10, 10)
         dem = torch.nan_to_num(dem, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        if aug is not None:
+            dem = self.augmenter.apply(dem, aug)
 
         return self.token_builder.build_tokens(
             image=dem,
@@ -773,10 +861,16 @@ class FlairHubDataset(Dataset):
 
     # ── Sentinel-2 ──────────────────────────────────────────
 
-    def _load_and_tokenize_s2_ts(self, row, patch_id):
+    def _load_and_tokenize_s2_ts(self, row, patch_id, aug: D4Transform = None):
         """
         Load S2 TS, sample multi_temporal timesteps via linspace, tokenize.
         Returns [num_bands * T * H * W, 8].
+
+        Augmentation: applied to the FULL [T, B, H, W] stack AFTER
+        normalization. The D4Augmentation handler operates on the last 2
+        axes (H, W), so T and B are preserved and every timestep receives
+        the same spatial transform. This keeps temporal coherence — a
+        north-south road stays N-S across all timesteps after rotation.
         """
         path = self._resolve_path(row["SENTINEL2_TS"])
         with rasterio.open(path) as src:
@@ -797,6 +891,10 @@ class FlairHubDataset(Dataset):
         stack = self._normalize_per_timestep(stack, "s2")
         stack = torch.clamp(stack, -10, 10)
 
+        # Same spatial transform applied to every timestep simultaneously
+        if aug is not None:
+            stack = self.augmenter.apply(stack, aug)           # [T_sel, B, H, W]
+
         return self._tokenize_temporal(
             stack=stack,
             spectral_indices=self.s2_spectral_indices,
@@ -805,8 +903,14 @@ class FlairHubDataset(Dataset):
 
     # ── Sentinel-1 ──────────────────────────────────────────
 
-    def _load_and_tokenize_s1_ts(self, row, patch_id, mode: str):
-        """Load S1 ASC or DESC TS, sample timesteps, tokenize."""
+    def _load_and_tokenize_s1_ts(self, row, patch_id, mode: str, aug: D4Transform = None):
+        """
+        Load S1 ASC or DESC TS, sample timesteps, tokenize.
+
+        Augmentation: applied to the FULL [T, B, H, W] stack. Same transform
+        as VHR / SPOT / DEM / S2 / label — guarantees that radar features
+        align with the optical and elevation features after rotation/flip.
+        """
         if mode == "asc":
             col, dates_key = "SENTINEL1-ASC_TS", "s1_asc"
         elif mode == "desc":
@@ -829,6 +933,10 @@ class FlairHubDataset(Dataset):
         stack = torch.nan_to_num(stack, nan=0.0, posinf=0.0, neginf=0.0)
         stack = self._normalize_per_timestep(stack, dates_key)
         stack = torch.clamp(stack, -10, 10)
+
+        # Same spatial transform applied to every timestep simultaneously
+        if aug is not None:
+            stack = self.augmenter.apply(stack, aug)           # [T_sel, B, H, W]
 
         return self._tokenize_temporal(
             stack=stack,

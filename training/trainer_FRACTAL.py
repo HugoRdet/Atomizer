@@ -157,7 +157,7 @@ class Model_Fractal(pl.LightningModule):
             ce_kwargs["ignore_index"] = int(self.ignore_index)
         if class_weights is not None:
             self.register_buffer("_class_weights", class_weights)
-            ce_kwargs["weight"] = self._class_weights
+            #ce_kwargs["weight"] = self._class_weights
         self.loss_fn = nn.CrossEntropyLoss(**ce_kwargs)
 
         # ── Metrics ──────────────────────────────────────────────

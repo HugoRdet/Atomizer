@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import gc
 from typing import Tuple, Optional
-
+import zlib  
 
 class GeographicPruning(nn.Module):
     """
@@ -83,7 +83,7 @@ class GeographicPruning(nn.Module):
         # Hash latent positions — round to 0.1m to be robust to float noise
         coords_flat = latent_coords[0].detach().float().cpu()
         coords_rounded = coords_flat.long()
-        pos_hash = hash(coords_rounded.numpy().tobytes()) % (10**8)
+        pos_hash = zlib.crc32(coords_rounded.numpy().tobytes()) % (10**8)
 
         return f"{N}_{L_spatial}_{grid_type}_{pos_hash}"
 
@@ -199,6 +199,9 @@ class GeographicPruning(nn.Module):
             cell_valid_mask = torch.zeros(L, max_cell_size, dtype=torch.bool, device=device)
             cell_distances = torch.zeros(L, max_cell_size, dtype=dtype, device=device)
 
+
+            
+
             for l in range(L):
                 in_cell_mask = (cell_membership == l)
                 in_cell_indices = torch.where(in_cell_mask)[0]
@@ -221,6 +224,9 @@ class GeographicPruning(nn.Module):
             self.register_buffer(f"cell_counts_{cache_key}", cell_counts)
 
             self._precomputed_keys.add(cache_key)
+
+
+            
 
             del pixel_coords, lat_coords, cell_membership, dist_to_nearest
             gc.collect()
@@ -360,6 +366,9 @@ class GeographicPruning(nn.Module):
         # =================================================================
         # Cached Voronoi path (original logic, for small N)
         # =================================================================
+
+        
+        
         cache_key = self._make_cache_key(N, L_spatial, hexagonal, latent_coords)
 
         if cache_key not in self._precomputed_keys:

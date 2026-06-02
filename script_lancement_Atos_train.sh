@@ -22,7 +22,7 @@ conda activate venv
 #python3 script_ablation_senflood.py --fraction 0.50 --ckpt_path ./checkpoints/ATOMIZERsenflood_baseline-val_loss-epoch=139-val_loss=0.0668.ckpt --xp_name DSQ
 #python3 script_ablation_senflood.py --fraction 0.25 --ckpt_path ./checkpoints/ATOMIZERsenflood_baseline-val_loss-epoch=139-val_loss=0.0668.ckpt --xp_name DSQqsd
 #python3 script_ablation_senflood.py --fraction 0.1 --ckpt_path ./checkpoints/ATOMIZERsenflood_baseline-val_loss-epoch=139-val_loss=0.0668.ckpt --xp_name bouhouhou
-python3 script_train_flair.py --xp_name flair_v1_spot_train --use_vhr true --use_spot false --use_dem true --use_s2 true --use_s1 true --subset_indices ./data/FLAIR-HUB/subset_indices.json --multi_temporal 6
+python3 script_train_flair.py --xp_name flair_v1_spot_train --use_vhr true --use_spot false --use_dem true --use_s2 true --use_s1 true --subset_indices ./data/FLAIR-HUB/subset_indices.json --multi_temporal 6 --ckpt_path ./checkpoints/flairhub/atomiser_flairhub_flair_v1_spot_train-last-epoch=17.ckpt --wandb_run_id  mpjn1xy3 
 #CUDA_VISIBLE_DEVICES=0 python3 script_train_fractal.py --xp_name fractal_smoke_test  --epochs 20 --batch_size 2 --num_workers 16
 #python3 script_train_flair.py --xp_name flair_v1_spot_train --use_vhr false --use_spot true --spot_as_vhr true --spot_norm_as_vhr false --use_dem true --use_s2 true --use_s1 true --subset_indices ./data/FLAIR-HUB/subset_indices.json --multi_temporal 6
 #python3 script_train_senflood.py --xp_name senflood_baseline --clipping
