@@ -344,6 +344,13 @@ class FractalDataset(Dataset):
         lidar_x = np.clip(lidar_x, 0.0, self.PATCH_SIZE_PX - 1e-3)
         lidar_y = np.clip(lidar_y, 0.0, self.PATCH_SIZE_PX - 1e-3)
 
+        # ── Echo info (return_number, number_of_returns) ───────────
+        # Both are standard LAS attributes; laspy exposes them as 1D arrays.
+        # Echo idx will be looked up later in build_sparse_tokens via the
+        # pre-registered echo table in Lookup_encoding.
+        return_number     = np.asarray(las.return_number,     dtype=np.int64)
+        number_of_returns = np.asarray(las.number_of_returns, dtype=np.int64)
+
         # ── Labels (BEFORE z-norm since z-norm uses ground mask) ───
         las_cls = np.asarray(las.classification, dtype=np.int64)
         las_cls = np.clip(las_cls, 0, REMAP_LUT.shape[0] - 1)
@@ -403,7 +410,9 @@ class FractalDataset(Dataset):
         # ── Subsample LIDAR if too many ────────────────────────────
         # AFTER augmentation, not before — every epoch sees a slightly
         # different subset AND a different augmentation, multiplying
-        # effective sample diversity.
+        # effective sample diversity. Echo arrays (return_number,
+        # number_of_returns) subsampled at the same indices to stay
+        # per-point aligned.
         if (self.max_lidar_points is not None
                 and n_points_raw > self.max_lidar_points):
             rng = np.random.default_rng(
@@ -416,6 +425,8 @@ class FractalDataset(Dataset):
             lidar_y = lidar_y[sel]
             z_norm  = z_norm[sel]
             labels  = labels[sel]
+            return_number     = return_number[sel]
+            number_of_returns = number_of_returns[sel]
 
         n_real_lidar = lidar_x.shape[0]
 
@@ -454,6 +465,9 @@ class FractalDataset(Dataset):
         )
 
         # ── Tokenize LIDAR (sparse) ─────────────────────────────────
+        # Echo info goes into column 7 (overriding time_idx, which is -1 for
+        # FRACTAL anyway). build_sparse_tokens looks up the echo index via
+        # self.look_up.get_echo_idx(r, t) and writes it per-point.
         lidar_tokens = self.token_builder.build_sparse_tokens(
             values=values_lidar,
             positions=positions_lidar,
@@ -463,6 +477,8 @@ class FractalDataset(Dataset):
             resolution_idx=self.resolution_idx,
             patch_size_px=self.PATCH_SIZE_PX,
             time_idx=self.TIME_IDX_NA,
+            return_number=return_number,
+            number_of_returns=number_of_returns,
         )
 
         # ── Pad LIDAR tokens ────────────────────────────────────────

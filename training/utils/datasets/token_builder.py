@@ -386,9 +386,28 @@ class TokenBuilder:
         resolution_idx,        # int — resolution group index
         patch_size_px,         # int — reference patch size in pixels (250 for FRACTAL)
         time_idx=-1,
+        return_number=None,        # NEW: [N] int LIDAR return numbers (1..number_of_returns)
+        number_of_returns=None,    # NEW: [N] int LIDAR total returns per pulse
     ):
         """
         Build tokens for sparse/irregular inputs (e.g., LIDAR points).
+
+        Echo encoding (NEW):
+            When both `return_number` and `number_of_returns` are provided,
+            each token's column 7 (normally `time_idx`) is replaced with the
+            echo index from `self.lookup.get_echo_idx(r, t)`. This index
+            references a pre-computed (a, b) continuous encoding stored in
+            the Lookup_encoding's echo table (built once via
+            `Lookup_encoding.build_echo_continuous_lut()`).
+
+            The downstream encoder is expected to detect LIDAR tokens via
+            their spectral_idx (col 3) and route col 7 to the echo
+            continuous-encoding LUT (followed by Fourier features) instead
+            of the time encoder for those tokens.
+
+            If either return_number or number_of_returns is None, behavior
+            is identical to the legacy version: col 7 is set to time_idx
+            for all tokens.
 
         Args:
             values: [N] for single-channel, or [N, C] for multi-channel sparse data.
@@ -409,6 +428,14 @@ class TokenBuilder:
                            center positions in the reference grid the same way
                            build_tokens does for dense rasters of shape (H, W).
             time_idx: int — temporal index. -1 for atemporal data (LIDAR).
+                     IGNORED if echo info is provided (col 7 is then filled
+                     per-point from the echo lookup).
+            return_number: [N] int array or tensor — LIDAR return number for
+                           each point (1-indexed; 1 <= r <= number_of_returns).
+                           Pass None to keep legacy time_idx behavior.
+            number_of_returns: [N] int array or tensor — total returns from
+                               the same pulse for each point. Pass None to
+                               keep legacy time_idx behavior.
 
         Returns:
             tokens: [N*C, 8] (or [N, 8] for single-channel input) — same token
@@ -452,6 +479,35 @@ class TokenBuilder:
         # ── Query offset (same for all tokens at this resolution) ────
         query_offset = self.lookup.get_query_offset(resolution, ref_size)
 
+        # ── Build the per-token "time / echo" column ─────────────────
+        # If echo info is provided, look up the echo_idx for each (r, t) pair
+        # via Lookup_encoding.get_echo_idx and use that as col 7. Otherwise,
+        # fall back to broadcasting the scalar time_idx across all tokens
+        # (legacy behavior for non-LIDAR sparse modalities).
+        echo_provided = (return_number is not None and number_of_returns is not None)
+        if echo_provided:
+            if isinstance(return_number, torch.Tensor):
+                r_arr = return_number.detach().cpu().long().tolist()
+            else:
+                r_arr = [int(v) for v in return_number]
+            if isinstance(number_of_returns, torch.Tensor):
+                t_arr = number_of_returns.detach().cpu().long().tolist()
+            else:
+                t_arr = [int(v) for v in number_of_returns]
+            assert len(r_arr) == N and len(t_arr) == N, (
+                f"return_number / number_of_returns length mismatch: "
+                f"got {len(r_arr)} and {len(t_arr)}, expected {N}"
+            )
+            # Per-point lookup is O(1) dict access; the Python loop runs once
+            # per __getitem__ (not per training step), so the cost is small
+            # relative to LAZ I/O. ~16k points → ~5ms.
+            echo_indices = [self.lookup.get_echo_idx(r, t)
+                            for r, t in zip(r_arr, t_arr)]
+            time_col_per_point = torch.tensor(echo_indices, dtype=torch.float32)  # [N]
+        else:
+            time_col_per_point = torch.full((N,), float(time_idx),
+                                             dtype=torch.float32)
+
         # ── Repeat per-point fields to [N*C] ─────────────────────────
         # values: [N, C] → flatten to [N*C, 1]; channels vary fastest
         val_flat       = einops.rearrange(values, "n c -> (n c) 1").float()
@@ -461,7 +517,8 @@ class TokenBuilder:
         spectral_flat  = einops.repeat(spectral_indices.float(), "c -> (n c)", n=N).unsqueeze(-1)
         query_flat     = torch.full((N * C, 1), float(query_offset))
         resolution_flat = torch.full((N * C, 1), float(resolution_idx))
-        time_flat      = torch.full((N * C, 1), float(time_idx))
+        time_flat      = einops.repeat(time_col_per_point,
+                                        "n -> (n c)", c=C).unsqueeze(-1)
 
         tokens = torch.cat([
             val_flat,        # col 0
@@ -471,7 +528,7 @@ class TokenBuilder:
             label_flat,      # col 4
             query_flat,      # col 5
             resolution_flat, # col 6
-            time_flat,       # col 7
+            time_flat,       # col 7  (echo_idx for LIDAR, time_idx otherwise)
         ], dim=-1)
         return tokens
 
@@ -491,6 +548,10 @@ class TokenBuilder:
 
         Identical structure to build_queries() but for irregular positions.
         Used when the target is per-point classification (FRACTAL LIDAR).
+
+        Note: queries don't carry echo info — that's an INPUT modality
+        feature, not a query feature. Col 7 of queries holds time_idx as
+        before (typically -1 for FRACTAL).
         """
         N = positions.shape[0]
 
