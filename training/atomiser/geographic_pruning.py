@@ -14,13 +14,37 @@ Note: the bias returned by this module is a binary attention mask
 (0 for valid positions, -inf for invalid). The `sigma` parameter is
 retained in the forward signature for API compatibility but is no
 longer used to weight in-cell positions.
+
+DDP NOTE (important):
+    Precomputed Voronoi tensors are stored via plain `setattr` on the
+    module rather than `register_buffer`. This is INTENTIONAL.
+
+    Each rank in DDP sees a different batch and therefore computes
+    different cell assignments and different max_cell_size values. If
+    these were registered as buffers, PyTorch's DDP would try to sync
+    them across ranks at every forward pass via _sync_module_buffers,
+    causing two problems:
+
+      1. Shape mismatch deadlock: rank 0 has [L, 1038], rank 1 has
+         [L, 1095], etc. broadcast_coalesced expects matching shapes
+         and hangs until the 30-minute NCCL timeout fires.
+
+      2. Even if shapes matched, the broadcast would overwrite each
+         rank's per-batch cell data with rank-0's data — which is
+         wrong (rank N needs its own cells for its own samples).
+
+    Plain attributes are NOT touched by DDP buffer sync, so each rank
+    keeps its own per-batch precomputed data. This is exactly what we
+    want.
 """
 
 import torch
 import torch.nn as nn
 import gc
 from typing import Tuple, Optional
-import zlib  
+import zlib
+import torch.distributed as dist
+
 
 class GeographicPruning(nn.Module):
     """
@@ -43,6 +67,8 @@ class GeographicPruning(nn.Module):
         - All gather indices clamped to [0, N-1]
         - Bias set to -inf for invalid positions, 0 for valid positions
         - Cache key includes latent position hash to prevent collisions
+        - Precomputed tensors stored as plain attributes (NOT buffers) so
+          DDP does not try to synchronize them across ranks.
     """
 
     MIN_CELL_SIZE = 1
@@ -77,10 +103,14 @@ class GeographicPruning(nn.Module):
         Prevents cache collisions when the same N/L/grid_type is used
         with different latent coordinates (e.g., callbacks vs training,
         or different grid configs).
+
+        Uses zlib.crc32 (not Python's built-in hash()) so the same input
+        produces the same key across DDP ranks. Python's hash() is salted
+        per-process via PYTHONHASHSEED → inconsistent keys across ranks.
         """
         grid_type = "hex" if hexagonal else "sq"
 
-        # Hash latent positions — round to 0.1m to be robust to float noise
+        # Hash latent positions — round to integer to be robust to float noise
         coords_flat = latent_coords[0].detach().float().cpu()
         coords_rounded = coords_flat.long()
         pos_hash = zlib.crc32(coords_rounded.numpy().tobytes()) % (10**8)
@@ -161,6 +191,9 @@ class GeographicPruning(nn.Module):
 
         Empty cells are safe: indices default to 0, valid mask is False,
         and downstream code masks them out with -inf bias.
+
+        The precomputed tensors are stored as PLAIN ATTRIBUTES (via setattr),
+        not buffers. See the DDP NOTE at the top of this file for why.
         """
         B, N, D = tokens.shape
         L = L_spatial
@@ -199,9 +232,6 @@ class GeographicPruning(nn.Module):
             cell_valid_mask = torch.zeros(L, max_cell_size, dtype=torch.bool, device=device)
             cell_distances = torch.zeros(L, max_cell_size, dtype=dtype, device=device)
 
-
-            
-
             for l in range(L):
                 in_cell_mask = (cell_membership == l)
                 in_cell_indices = torch.where(in_cell_mask)[0]
@@ -217,16 +247,17 @@ class GeographicPruning(nn.Module):
                 # Empty cells: indices=0, valid=False, distances=0
                 # Index 0 is a safe fallback — the token will be masked out
 
-            # Register buffers
-            self.register_buffer(f"cell_indices_{cache_key}", cell_indices_padded)
-            self.register_buffer(f"cell_valid_{cache_key}", cell_valid_mask)
-            self.register_buffer(f"cell_distances_{cache_key}", cell_distances)
-            self.register_buffer(f"cell_counts_{cache_key}", cell_counts)
+            # ── Store as plain attributes (NOT buffers) ───────────────
+            # See DDP NOTE at top of file. register_buffer would cause
+            # DDP to broadcast these across ranks at every forward pass,
+            # leading to either shape-mismatch deadlocks or corrupted
+            # per-rank data.
+            setattr(self, f"cell_indices_{cache_key}",   cell_indices_padded)
+            setattr(self, f"cell_valid_{cache_key}",     cell_valid_mask)
+            setattr(self, f"cell_distances_{cache_key}", cell_distances)
+            setattr(self, f"cell_counts_{cache_key}",    cell_counts)
 
             self._precomputed_keys.add(cache_key)
-
-
-            
 
             del pixel_coords, lat_coords, cell_membership, dist_to_nearest
             gc.collect()
@@ -367,14 +398,12 @@ class GeographicPruning(nn.Module):
         # Cached Voronoi path (original logic, for small N)
         # =================================================================
 
-        
-        
         cache_key = self._make_cache_key(N, L_spatial, hexagonal, latent_coords)
 
         if cache_key not in self._precomputed_keys:
             self._precompute_voronoi_cells(tokens, latent_coords, L_spatial, cache_key)
 
-        # Retrieve cached tensors
+        # Retrieve cached tensors (stored as plain attributes, not buffers)
         cell_indices = getattr(self, f"cell_indices_{cache_key}")
         cell_valid = getattr(self, f"cell_valid_{cache_key}")
         cell_distances = getattr(self, f"cell_distances_{cache_key}")
@@ -491,14 +520,19 @@ class GeographicPruning(nn.Module):
     # =========================================================================
 
     def clear_cache(self, cache_key: Optional[str] = None):
-        """Clear precomputed buffers."""
+        """
+        Clear precomputed attributes.
+
+        Works for both buffer-style storage (legacy) and plain attribute
+        storage (current) — delattr handles both transparently.
+        """
         keys_to_clear = [cache_key] if cache_key else list(self._precomputed_keys)
 
         for key in keys_to_clear:
             for prefix in ["cell_indices", "cell_valid", "cell_distances", "cell_counts"]:
-                buffer_name = f"{prefix}_{key}"
-                if hasattr(self, buffer_name):
-                    delattr(self, buffer_name)
+                attr_name = f"{prefix}_{key}"
+                if hasattr(self, attr_name):
+                    delattr(self, attr_name)
             self._precomputed_keys.discard(key)
 
         gc.collect()

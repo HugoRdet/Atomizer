@@ -22,10 +22,21 @@ Optional cross-task transfer:
     Loads FLAIR-HUB-trained encoder. strict_loading=False so the 19-class
     head doesn't fail to load (re-initialized for 7 classes).
 
+Auto-resume (NEW):
+    If --ckpt_path is NOT provided (and --test_only is not set), the script
+    looks for the most recent "last" checkpoint for this --xp_name and
+    resumes from it. This means rerunning the script with the same
+    --xp_name after a crash or walltime expiry will pick up where the
+    previous run stopped — useful for chaining 48h windows on the t4 QOS.
+    Pass --no_auto_resume to force a fresh start.
+
 Examples
 --------
-    # From scratch on FRACTAL
+    # From scratch on FRACTAL (will auto-resume if a prior run exists)
     python script_train_fractal.py --xp_name fractal_v1
+
+    # Force fresh start ignoring any existing checkpoints
+    python script_train_fractal.py --xp_name fractal_v1 --no_auto_resume
 
     # Pretrain transfer from FLAIR-HUB
     python script_train_fractal.py --xp_name fractal_v1_xfer \\
@@ -41,6 +52,8 @@ Examples
 # IMPORTS
 # =============================================================================
 import os
+import re
+import glob
 import argparse
 
 import torch
@@ -93,17 +106,8 @@ def register_all_resolutions(lookup_table):
 # bands. This way, the spectral_idx for FRACTAL VHR comes out identical to
 # FLAIR-HUB's aerial bands -> encoder weights transfer naturally if you
 # load a FLAIR-HUB checkpoint via --ckpt_path.
-#
-# Wavelengths/bandwidths from typical IGN ortho specs (matches FLAIR-HUB
-# aerial bands convention; adjust if your bands.yaml uses different values).
 
 def create_fractal_bands_info():
-    """
-    Build the bands_info dict that FractalDataset reads.
-
-    Returns:
-        dict containing 'bands_fractal_irgb_info' with NIR/R/G/B band specs.
-    """
     return {
         "bands_fractal_irgb_info": {
             "NIR": {"bandwidth": 100, "central_wavelength": 833, "idx": 0},
@@ -129,10 +133,9 @@ parser.add_argument("--config_model", type=str,
                     default="config_test-FRACTAL.yaml",
                     help="Atomizer config YAML. Use the same config family "
                          "as FLAIR-HUB for encoder-architecture reuse.")
-parser.add_argument("--dataset_name", type=str, default="u_regular",
-                    help="configs_dataset_<name>.yaml under data/Tiny_BigEarthNet/")
+parser.add_argument("--dataset_name", type=str, default="u_regular")
 parser.add_argument("--num_workers",  type=int, default=4)
-parser.add_argument("--epochs",       type=int, default=30)
+parser.add_argument("--epochs",       type=int, default=100)
 parser.add_argument("--batch_size",   type=int, default=None,
                     help="Override config's batchsize")
 
@@ -141,30 +144,31 @@ parser.add_argument("--root_path",          type=str, default="./data",
                     help="Parent dir containing FRACTAL/ and FRACTAL-IRGB/.")
 parser.add_argument("--max_lidar_points",   type=int, default=16_000,
                     help="Max LIDAR points per patch (subsampled if exceeded). "
-                         "Also the padding target for batching. Default 16k "
-                         "matches Myria3D's training convention.")
+                         "Also the padding target for batching.")
 parser.add_argument("--valid_patches_file", type=str, default=None,
                     help="Optional precomputed JSON listing valid patch IDs "
-                         "per split (filters out patches with <1000 points). "
-                         "If None, the dataset filters in-loop via __getitem__ "
-                         "recursion (less efficient but works).")
+                         "per split.")
 
 # Loss / training options
 parser.add_argument("--ignore_index", type=int, default=255,
                     help="Class to ignore. Default 255 matches FractalDataset's "
-                         "padding label. Set to None to score all positions.")
+                         "padding label.")
 parser.add_argument("--class_weighting", type=str, default="auto",
-                    choices=["auto", "none"],
-                    help="'auto' = inverse-freq clipped at 50 (default; "
-                         "severely imbalanced dataset). 'none' = unweighted CE.")
+                    choices=["auto", "none"])
 
 # Resume / test
 parser.add_argument("--ckpt_path",    type=str, default=None,
-                    help="Path to a checkpoint. Two use cases: "
-                         "(1) resume FRACTAL training from a previous run, or "
+                    help="Path to a checkpoint. Three use cases: "
+                         "(1) resume FRACTAL training from a specific run, "
                          "(2) initialize from a FLAIR-HUB checkpoint for "
-                         "cross-task transfer (strict_loading=False handles "
-                         "the 19->7 class head mismatch).")
+                         "cross-task transfer, "
+                         "(3) load weights for --test_only. "
+                         "If unset and --test_only is unset, the script "
+                         "auto-resumes from the latest 'last' checkpoint "
+                         "matching --xp_name (if one exists).")
+parser.add_argument("--no_auto_resume", action="store_true",
+                    help="Disable auto-resume from the latest 'last' "
+                         "checkpoint when --ckpt_path is unset.")
 parser.add_argument("--wandb_run_id", type=str, default=None)
 parser.add_argument("--test_only",    action="store_true")
 args = parser.parse_args()
@@ -177,30 +181,14 @@ config_model         = read_yaml(f"./training/configs/{args.config_model}")
 configs_dataset_path = f"./data/Tiny_BigEarthNet/configs_dataset_{args.dataset_name}.yaml"
 configs_dataset      = read_yaml(configs_dataset_path)
 
-# Bands: in-code factory for FRACTAL (NIR/R/G/B at 0.2m).
-# We also load FLAIR-HUB's bands_info for compatibility — if the encoder
-# was pretrained on FLAIR-HUB, having the same spectral indices registered
-# in the lookup table means the encoder's spectral embeddings transfer
-# directly.
 fractal_bands = create_fractal_bands_info()
 flair_bands   = create_flairhub_bands_info()
-# Merge: FLAIR-HUB bands first (more entries -> more table slots reserved
-# for compatibility), then FRACTAL VHR. Both should resolve to the same
-# spectral_idx for the NIR/R/G/B bands if wavelengths match.
 bands = {**flair_bands, **fractal_bands}
 
 lookup_table = Lookup_encoding(configs_dataset, bands, config_model)
 register_all_resolutions(lookup_table)
 
-# Register the LIDAR ELEV abstract channel. FractalDataset will look up
-# spectral_idx for key (-3, -3) -- this registers it.
-# (S1 VV/VH use -1/-2; ELEV uses -3 to avoid collision.)
 lookup_table.register_abstract_channel("ELEVATION")
-
-# Also register VV/VH/DSM/DTM for FLAIR-HUB checkpoint compatibility.
-# (If the FLAIR-HUB encoder was trained with these in its spectral table,
-# we need them in our lookup too so the encoder's spectral embeddings
-# don't collide.)
 lookup_table.register_abstract_channel("VV")
 lookup_table.register_abstract_channel("VH")
 lookup_table.register_abstract_channel("DSM")
@@ -215,6 +203,54 @@ else:
 
 # ── Override epochs in the config (cosine schedule reads from this) ──
 config_model["trainer"]["epochs"] = args.epochs
+
+
+# =============================================================================
+# CHECKPOINT DIR + AUTO-RESUME LOOKUP
+# =============================================================================
+ckpt_dir = "./checkpoints/fractal/"
+os.makedirs(ckpt_dir, exist_ok=True)
+
+
+def _find_latest_last_checkpoint(xp_name: str) -> str:
+    """
+    Find the most recent 'last' checkpoint for the given xp_name.
+
+    The 'last' callback writes files matching:
+        atomiser_fractal_<xp_name>-last-<epoch>.ckpt
+
+    Returns the path to the highest-epoch file, or None if none exist.
+    Sort is by epoch number parsed from the filename (deterministic),
+    NOT by mtime (which can be off on shared filesystems like Lustre).
+    """
+    pattern = os.path.join(
+        ckpt_dir, f"atomiser_fractal_{xp_name}-last-*.ckpt"
+    )
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+
+    def _epoch_from_name(path: str) -> int:
+        base = os.path.basename(path)
+        nums = re.findall(r"\d+", base)
+        return int(nums[-1]) if nums else -1
+
+    matches.sort(key=_epoch_from_name)
+    return matches[-1]
+
+
+# Decide whether to auto-resume.
+auto_resume_ckpt = None
+if (not args.test_only
+        and args.ckpt_path is None
+        and not args.no_auto_resume):
+    auto_resume_ckpt = _find_latest_last_checkpoint(args.xp_name)
+    if auto_resume_ckpt is not None:
+        print(f"\n[FRACTAL] Auto-resume: found checkpoint "
+              f"{auto_resume_ckpt}")
+    else:
+        print(f"\n[FRACTAL] Auto-resume: no prior checkpoint for "
+              f"xp_name='{args.xp_name}' — starting fresh")
 
 
 print(f"\n{'='*70}")
@@ -233,39 +269,49 @@ if args.ckpt_path is not None:
         print(f"  Mode:            TEST ONLY (ckpt: {args.ckpt_path})")
     else:
         print(f"  Init from ckpt:  {args.ckpt_path}")
-        print(f"                   (strict_loading=False; class head reinit if "
-              f"size mismatch)")
+elif auto_resume_ckpt is not None:
+    print(f"  Auto-resume:     {auto_resume_ckpt}")
 
 
 # =============================================================================
-# WANDB
+# WANDB (via Lightning's WandbLogger — no manual wandb.init)
 # =============================================================================
-wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    import wandb
+# Letting Lightning own the wandb lifecycle has two benefits:
+#   1. WandbLogger correctly handles rank detection AFTER DDP is set up,
+#      so only the actual rank-0 process initializes wandb (no ghost runs
+#      from too-early LOCAL_RANK checks at import time).
+#   2. Lightning passes hyperparameters in via the trainer once it starts.
+#
+# When auto-resuming, we want to continue the SAME wandb run if a previous
+# run id is available. Two sources:
+#   (a) --wandb_run_id explicitly passed
+#   (b) saved alongside the auto-resumed checkpoint (best-effort lookup)
+wandb_resume_id = args.wandb_run_id
+if wandb_resume_id is None and auto_resume_ckpt is not None:
+    run_id_path = f"training/wandb_runs/atomiser_fractal_{args.xp_name}.txt"
+    if os.path.exists(run_id_path):
+        with open(run_id_path) as f:
+            wandb_resume_id = f.read().strip()
+        print(f"[FRACTAL] Will resume wandb run id={wandb_resume_id} "
+              f"from {run_id_path}")
 
-    run_name = f"AtomizerFRACTAL_{args.xp_name}"
-    wandb_init_kwargs = dict(
-        name=run_name,
-        project="Atomizer-FRACTAL",
-        config={
-            **config_model,
-            "max_lidar_points": args.max_lidar_points,
-            "batch_size":       batch_size,
-            "epochs":           args.epochs,
-            "ignore_index":     args.ignore_index,
-            "class_weighting":  args.class_weighting,
-            "init_ckpt":        args.ckpt_path,
-        },
-    )
-    if args.wandb_run_id is not None:
-        wandb_init_kwargs["id"]     = args.wandb_run_id
-        wandb_init_kwargs["resume"] = "must"
-        print(f"  W&B:             resuming run {args.wandb_run_id}")
-    else:
-        print(f"  W&B:             new run {run_name}")
-    wandb.init(**wandb_init_kwargs)
-    wandb_logger = WandbLogger(project="Atomizer-FRACTAL")
+wandb_logger = WandbLogger(
+    project="Atomizer-FRACTAL",
+    name=f"AtomizerFRACTAL_{args.xp_name}",
+    save_dir=os.environ.get("WANDB_DIR", "./wandb"),
+    config={
+        **config_model,
+        "max_lidar_points": args.max_lidar_points,
+        "batch_size":       batch_size,
+        "epochs":           args.epochs,
+        "ignore_index":     args.ignore_index,
+        "class_weighting":  args.class_weighting,
+        "init_ckpt":        args.ckpt_path,
+        "auto_resume_ckpt": auto_resume_ckpt,
+    },
+    id=wandb_resume_id,
+    resume="must" if wandb_resume_id is not None else None,
+)
 
 
 # =============================================================================
@@ -273,7 +319,6 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # =============================================================================
 
 def build_dataset(mode: str):
-    """Build a FRACTAL dataset for the given split."""
     return FractalDataset(
         root_path=args.root_path,
         mode=mode,
@@ -286,7 +331,6 @@ def build_dataset(mode: str):
 
 
 def make_loader(dataset, shuffle: bool):
-    """DataLoader with manual DistributedSampler when DDP is initialized."""
     sampler = None
     if dist.is_available() and dist.is_initialized():
         sampler = DistributedSampler(dataset, shuffle=shuffle)
@@ -318,8 +362,6 @@ print(f"[FRACTAL] Sizes: "
 # =============================================================================
 
 class FractalDataModule(pl.LightningDataModule):
-    """Lightning wrapper around FRACTAL DataLoaders."""
-
     def setup(self, stage=None):
         pass
 
@@ -339,7 +381,6 @@ data_module = FractalDataModule()
 # =============================================================================
 # MODEL
 # =============================================================================
-# class_weights: "auto" or None depending on flag
 class_weights_arg = "auto" if args.class_weighting == "auto" else None
 
 model = Model_Fractal(
@@ -356,9 +397,6 @@ model = Model_Fractal(
 # =============================================================================
 # CALLBACKS + TRAINER
 # =============================================================================
-ckpt_dir = "./checkpoints/fractal/"
-os.makedirs(ckpt_dir, exist_ok=True)
-
 callbacks = [
     ModelCheckpoint(
         dirpath=ckpt_dir,
@@ -392,22 +430,25 @@ trainer = Trainer(
     log_every_n_steps=10,
     callbacks=callbacks,
     default_root_dir=ckpt_dir,
+    gradient_clip_val=1.0,
+    gradient_clip_algorithm="norm",
 )
 
 
 # =============================================================================
 # CHECKPOINT LOADING (init from FLAIR-HUB or resume FRACTAL)
 # =============================================================================
-# Two cases for --ckpt_path:
-#   1. Resume FRACTAL run: pass to trainer.fit(ckpt_path=...) — Lightning
-#      handles optimizer/scheduler/epoch restoration.
-#   2. Init from FLAIR-HUB checkpoint: load weights manually with
-#      strict=False to ignore the 19-class head, let Lightning start
-#      a fresh optimizer/scheduler.
+# Three paths for checkpoints:
 #
-# We auto-detect by checking the filename: if it contains "flairhub" or
-# "flair" we treat it as init-only; otherwise as resume. You can also
-# explicitly set behavior by passing the appropriate ckpt path style.
+#   1. Explicit --ckpt_path, name contains "flair":
+#        => Init mode: load weights only, strict=False, fresh optimizer.
+#
+#   2. Explicit --ckpt_path, name does NOT contain "flair":
+#        => Resume mode: pass to trainer.fit() for full state restore.
+#
+#   3. No --ckpt_path and not --test_only:
+#        => Auto-resume from latest "last" checkpoint if one exists.
+#           (Set --no_auto_resume to force a fresh start.)
 
 def _is_flairhub_checkpoint(path: str) -> bool:
     return any(tag in os.path.basename(path).lower()
@@ -415,6 +456,7 @@ def _is_flairhub_checkpoint(path: str) -> bool:
 
 
 resume_ckpt_path = None       # passed to trainer.fit() for full resume
+
 if args.ckpt_path is not None and not args.test_only:
     if _is_flairhub_checkpoint(args.ckpt_path):
         # Init mode: load weights only, fresh optimizer/scheduler.
@@ -430,6 +472,11 @@ if args.ckpt_path is not None and not args.test_only:
         # Resume mode: pass to trainer.fit().
         resume_ckpt_path = args.ckpt_path
         print(f"\n[FRACTAL] Resuming from {args.ckpt_path}")
+
+elif auto_resume_ckpt is not None and not args.test_only:
+    # No explicit --ckpt_path but auto-resume found a prior checkpoint.
+    resume_ckpt_path = auto_resume_ckpt
+    print(f"\n[FRACTAL] Auto-resuming from {resume_ckpt_path}")
 
 
 # =============================================================================
@@ -461,9 +508,15 @@ else:
 # =============================================================================
 # SAVE WANDB RUN ID
 # =============================================================================
-if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
+# Persist the run id so a subsequent auto-resume can attach the new
+# training segment to the same wandb run.
+if wandb_logger is not None and trainer.is_global_zero:
     import wandb
-    os.makedirs("training/wandb_runs", exist_ok=True)
-    with open(f"training/wandb_runs/atomiser_fractal_{args.xp_name}.txt", "w") as f:
-        f.write(wandb.run.id)
-    print(f"WANDB_RUN_ID: {wandb.run.id}")
+    run = getattr(wandb, "run", None)
+    if run is not None:
+        os.makedirs("training/wandb_runs", exist_ok=True)
+        with open(
+            f"training/wandb_runs/atomiser_fractal_{args.xp_name}.txt", "w"
+        ) as f:
+            f.write(run.id)
+        print(f"WANDB_RUN_ID: {run.id}")
