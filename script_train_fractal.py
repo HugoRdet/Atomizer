@@ -400,11 +400,11 @@ model = Model_Fractal(
 callbacks = [
     ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename=f"atomiser_fractal_{args.xp_name}-{{epoch:02d}}-"
+        filename=f"TMP_{args.xp_name}-{{epoch:02d}}-"
                  f"{{val_mIoU:.4f}}",
         monitor="val_mIoU",
         mode="max",
-        save_top_k=1,
+        save_top_k=25,
         verbose=True,
     ),
     ModelCheckpoint(
@@ -430,6 +430,7 @@ trainer = Trainer(
     log_every_n_steps=10,
     callbacks=callbacks,
     default_root_dir=ckpt_dir,
+    num_nodes=int(os.environ.get("SLURM_NNODES", 1)),
     gradient_clip_val=1.0,
     gradient_clip_algorithm="norm",
 )
