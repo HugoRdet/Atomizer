@@ -122,6 +122,7 @@ class Model_PureForest(pl.LightningModule):
         label_smoothing: float = 0.0,
     ):
         super().__init__()
+        self.strict_loading = False
         self.save_hyperparameters(ignore=["lookup_table", "transform", "class_weights"])
 
         self.config          = config
@@ -146,8 +147,6 @@ class Model_PureForest(pl.LightningModule):
         )
 
         # ── Class weights ─────────────────────────────────────────
-        #
-        class_weights=None
         if class_weights == "auto":
             cw = default_pureforest_class_weights()
             print(
@@ -167,8 +166,6 @@ class Model_PureForest(pl.LightningModule):
             self.register_buffer("class_weights", cw)
         else:
             self.class_weights = None
-
-
 
         # ── Optimizer config ──────────────────────────────────────
         trainer_cfg       = config["trainer"]
@@ -241,8 +238,8 @@ class Model_PureForest(pl.LightningModule):
         loss = F.cross_entropy(
             logits,
             target,
-            #weight=self.class_weights,
-            #label_smoothing=self.label_smoothing if is_train else 0.0,
+            weight=self.class_weights,
+            label_smoothing=self.label_smoothing if is_train else 0.0,
         )
 
         # Update metrics

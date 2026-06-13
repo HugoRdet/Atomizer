@@ -400,11 +400,11 @@ model = Model_Fractal(
 callbacks = [
     ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename=f"TMP_{args.xp_name}-{{epoch:02d}}-"
+        filename=f"precision32_{args.xp_name}-{{epoch:02d}}-"
                  f"{{val_mIoU:.4f}}",
         monitor="val_mIoU",
         mode="max",
-        save_top_k=25,
+        save_top_k=5,
         verbose=True,
     ),
     ModelCheckpoint(
@@ -424,7 +424,7 @@ trainer = Trainer(
     devices=-1,
     max_epochs=args.epochs,
     accelerator="gpu",
-    precision="bf16-mixed",
+    precision="32-true",
     logger=wandb_logger,
     accumulate_grad_batches=1,
     log_every_n_steps=10,

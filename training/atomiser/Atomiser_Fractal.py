@@ -2,81 +2,51 @@
 Atomiser_Fractal — Subclass for LIDAR + VHR semantic segmentation
 ==================================================================
 
-The only difference from Atomiser_Senflood is in the decoder's query
-construction. Atomiser_Senflood uses a single learned global query vector
-broadcast to all pixels:
+Differs from Atomiser_Senflood in two places:
 
-    Q[b, m] = global_query  (same for every pixel)
+1. Token processor: replaces the parent's TokenProcessor with
+   FractalTokenProcessor, which routes col 7 of each token through the
+   correct encoder — echo metadata for LIDAR tokens, time for everything
+   else. The parent treats col 7 as time_idx unconditionally, which
+   produces meaningless temporal embeddings for LIDAR tokens.
 
-This works when every query is fully characterized by its (x, y) position
-— the K/V side via rel_pe lets the model distinguish queries spatially.
+2. Decoder query construction: the parent uses a single learned global
+   query broadcast to all pixels:
 
-FRACTAL breaks this assumption: multiple LIDAR points share the same (x, y)
-but differ in z (tree canopy above ground, bridge deck above road, building
-eaves above sidewalk). With a position-only query, all such points get the
-same prediction.
+       Q[b, m] = global_query
 
-Atomiser_Fractal modifies Q to depend on the query's z value:
+   This works when every query is fully characterized by its (x, y)
+   position — rel_pe on the K/V side lets the model distinguish queries
+   spatially. FRACTAL breaks this assumption: multiple LIDAR points share
+   the same (x, y) but differ in z (canopy above ground, bridge deck above
+   road, eaves above sidewalk). With a position-only query they all get
+   the same prediction.
 
-    Q[b, m] = global_query + z_projection(reflectance_encoder(z[b, m]))
+   FRACTAL builds a per-pixel query that depends on z:
 
-The z value is stored in col 0 of each query token by FractalDataset, after
-ground-relative normalization (z minus local ground median, clipped to
-[-15, 30], scaled by 1/15 → roughly [-1, 2]).
+       Q[b, m] = global_query + z_projection(reflectance_encoder(z[b, m]))
 
-Everything else (encoder, refinement, error predictor, classifier, freeze
-helpers) is inherited unchanged. The new pieces in Atomiser_Fractal are:
-    1. z_query_projection: MLP mapping z_features → latent_dim
-    2. decoder_cross_attn: REPLACED with a QK-normalized variant (see below)
+   where z is stored in col 0 of each query token by FractalDataset
+   (ground-relative-clipped, scaled to roughly [-1, 2]).
 
 
 z_query_projection: MLP rather than single linear
 --------------------------------------------------
 The original implementation used a single nn.Linear for z_query_projection.
-Diagnostic analysis after early-run divergence showed this layer's bias
-inflated 2.89x (the largest growth of any parameter in the model, even
-larger than the decoder Q projection at 2.28x). A single linear cannot
-express enough nonlinear functions of z, so the model compensates by
-inflating weights to push z_features through magnitude scaling.
+We replace it with a small MLP (build_mlp factory): 2 layers, GELU + LayerNorm,
+hidden=128. This provides:
+  - Nonlinear capacity to map Fourier-encoded z features to a 768-dim offset
+  - LayerNorm in the middle for stable output magnitudes (the original
+    single Linear's bias inflated 2.89x during training, the largest growth
+    of any parameter in the model, because it had to encode both direction
+    and scale of the desired output without normalization to control magnitude)
 
-We replace it with the same MLP structure used by the parent class's
-decoder_mlp (build_mlp factory): 2 layers, GELU activation, LayerNorm.
-This provides genuine nonlinear capacity and stable output magnitudes,
-matching the architectural pattern already established in TokenProcessor.
+The final layer is zero-initialized so z_proj starts at zero. The model
+starts behaving like Senflood (Q ≈ global_query at init) and gradually
+learns to incorporate z as training progresses.
 
-The final layer is zero-initialized so the model starts behaving like
-Atomiser_Senflood (Q ≈ global_query at init) and gradually learns to
-incorporate z as training progresses.
-
-
-Decoder cross-attention QK-normalization
------------------------------------------
-After observing training divergence around epoch 12 in early FRACTAL runs,
-we ran a per-parameter diagnostic across checkpoints. The decoder
-cross-attention's Q projection inflated 2.28x in max_abs between epoch 9
-(healthy, val_mIoU=0.72) and epoch 14 (collapsed, val_mIoU=0.11). All other
-attention layers in the model — encoder cross-attention, encoder
-self-attention (4 blocks), classifier head — remained stable (<1.3x over
-the same window).
-
-The diagnosed failure mode is attention entropy collapse [ViT-22B, Gemma 2]:
-unbounded Q/K magnitudes saturate the softmax, gradients vanish through the
-saturated attention, and the model freezes in a degenerate predict-one-class
-state. The decoder is the load-bearing site because it has the largest
-attention matrix in the model (millions of pixel/point queries against the
-latent set).
-
-To prevent this, we replace the inherited `decoder_cross_attn` (a standard
-nn.MultiheadAttention) with `QKNormMultiheadAttention`, which applies
-RMSNorm to queries and keys per-head before computing attention scores.
-
-Encoder attention layers are NOT modified — the diagnostic showed they are
-stable, and over-normalizing them would unnecessarily restrict the encoder's
-representational flexibility.
-
-The MLP-based z_projection and QK-norm are complementary: the MLP reduces
-the pressure that causes attention magnitudes to inflate in the first place,
-while QK-norm provides defense-in-depth against any residual instability.
+Everything else (encoder, refinement, error predictor, classifier, freeze
+helpers) is inherited unchanged.
 """
 
 import torch
@@ -84,8 +54,8 @@ import torch.nn as nn
 from einops import repeat
 
 from .Atomiser_SENFLOOD import Atomiser_Senflood, EncoderOutput
-from .QK_norm_attention import QKNormMultiheadAttention
 from training.utils.token_building.processor import build_mlp
+from training.utils.token_building.fractal_token_processor import FractalTokenProcessor
 
 
 # Token column indices — must match TokenProcessor / TokenBuilder.
@@ -98,37 +68,67 @@ class Atomiser_Fractal(Atomiser_Senflood):
 
     Inherits all encoder/decoder/refinement logic from Atomiser_Senflood.
     Adds:
+        - input_processor: replaced with FractalTokenProcessor (echo routing)
         - z_query_projection (MLP): per-pixel z conditioning for queries
-        - decoder_cross_attn (QK-normalized): prevents attention collapse
     """
 
     def __init__(self, *, config, lookup_table):
         super().__init__(config=config, lookup_table=lookup_table)
 
-        # ── z-aware query projection (MLP) ────────────────────────────
-        # Builds an MLP matching the structure used by the parent's
-        # decoder_mlp: 2 layers, GELU + LayerNorm, hidden=tokenizer_hidden.
-        # This gives z_projection real nonlinear capacity instead of just
-        # a linear remap of Fourier features.
+        # ── Replace input_processor with FRACTAL-aware version ─────────
+        # The parent class instantiated a vanilla TokenProcessor. We replace
+        # it with FractalTokenProcessor which detects LIDAR tokens via
+        # spectral_idx and routes col 7 through an echo encoder instead of
+        # the time encoder.
+        #
+        # The replacement preserves all output dims (encoder/decoder MLP
+        # output dims are identical) so the parent's pre-computed
+        # self.input_dim, self.query_dim_recon, self.decoder_pe_dim etc.
+        # remain valid. Only the temporal feature *content* changes for
+        # LIDAR tokens.
+        #
+        # Sub-components that other parts of Atomiser_Senflood reference
+        # via self.input_processor.* (e.g., geometry, pos_encoder,
+        # reflectance_encoder) all still exist with the same names because
+        # FractalTokenProcessor inherits from TokenProcessor.
+        self.input_processor = FractalTokenProcessor(config, lookup_table)
+
+        # GeographicPruning was initialized with the OLD input_processor's
+        # geometry instance. Re-wire it to the new one so they stay in sync.
+        # (Both geometries are identical in behavior — they're built from
+        # the same config and lookup table — but keeping a single reference
+        # avoids confusion when the model is serialized.)
+        self.geo_pruning.geometry = self.input_processor.geometry
+
+        print(f"[Atomiser_Fractal] input_processor replaced with "
+              f"FractalTokenProcessor (echo-aware col-7 routing)")
+
+        # ── z-aware query projection (MLP) ─────────────────────────────
+        # The reflectance encoder produces a Fourier embedding of the
+        # query's z value. We project that into latent_dim through a small
+        # MLP and ADD it to the global query.
+        #
+        # An MLP (not a single Linear) is used so that:
+        #   - The LayerNorm in the middle stabilizes output magnitudes
+        #   - GELU provides nonlinear capacity over the Fourier features
+        # hidden_dim=128 is intentionally smaller than the encoder MLPs
+        # (768) because the input is a single scalar — there's no
+        # justification for the same capacity as 600-dim feature inputs.
         z_feature_dim    = self.input_processor.reflectance_encoder.out_dim
-        tokenizer_hidden = 128 #config["Atomiser"]["tokenizer_hidden_size"]
+        z_hidden         = 128
         tokenizer_layers = config["Atomiser"]["tokenizer_nb_layers"]
 
         self.z_query_projection = build_mlp(
             in_dim=z_feature_dim,
-            hidden_dim=tokenizer_hidden,
+            hidden_dim=z_hidden,
             out_dim=self.latent_dim,
             num_layers=tokenizer_layers,
         )
 
-        # Zero-init the FINAL layer so z_proj starts at zero. This way
+        # Zero-init the FINAL Linear layer so z_proj starts at zero.
         # per_pixel_q = global_query + z_proj ≈ global_query at init,
         # matching Senflood's behavior. The model gradually learns to
         # incorporate z as training progresses.
-        #
-        # We assume the final layer is the last nn.Linear in the
-        # Sequential. build_mlp's structure puts Linear last by design
-        # (see token_processor.build_mlp).
         last_linear = None
         for module in self.z_query_projection:
             if isinstance(module, nn.Linear):
@@ -139,29 +139,11 @@ class Atomiser_Fractal(Atomiser_Senflood):
 
         print(f"[Atomiser_Fractal] z-aware query projection: "
               f"reflectance_encoder({z_feature_dim}) → "
-              f"MLP({tokenizer_layers}L, h={tokenizer_hidden}) → "
+              f"MLP({tokenizer_layers}L, h={z_hidden}) → "
               f"latent_dim({self.latent_dim})  "
               f"[final layer zero-initialized]")
         print(f"[Atomiser_Fractal]   Q per pixel = global_query + "
               f"z_projection(reflectance_encoder(z))")
-
-        # ── Replace decoder cross-attention with QK-normalized variant ────
-        # The parent class (Atomiser_Senflood) instantiated a standard
-        # nn.MultiheadAttention for self.decoder_cross_attn. We replace it
-        # here with a QK-normalized version. Same constructor args, same
-        # forward signature — no other code changes needed.
-        self.decoder_cross_attn = QKNormMultiheadAttention(
-            embed_dim=self.latent_dim,
-            kdim=self.decoder_context_dim,
-            vdim=self.decoder_context_dim,
-            num_heads=self.cross_heads,
-            dropout=self.attn_dropout,
-            batch_first=True,
-        )
-
-        print(f"[Atomiser_Fractal] decoder_cross_attn: "
-              f"QK-normalized (RMSNorm per-head on Q and K) "
-              f"— prevents attention entropy collapse")
 
     # =========================================================================
     # Decoder override: z-aware query
@@ -173,19 +155,15 @@ class Atomiser_Fractal(Atomiser_Senflood):
                     return_topk=False):
         """
         FRACTAL-specific decoder. Identical to Atomiser_Senflood.reconstruct
-        except Q is derived per-pixel from (global_query + z_projection),
-        and the decoder cross-attention internally normalizes Q and K via
-        RMSNorm per-head.
+        except Q is derived per-pixel from (global_query + z_projection).
 
         Steps:
             1. Select k nearest latents per query pixel    (same as parent)
             2. Compute rel_pe                              (same as parent)
             3. context = cat([latent, rel_pe])             (same as parent)
             4. Bernoulli drop                              (same as parent)
-            5. Build per-pixel Q from global_query + MLP(z) (NEW: MLP-based)
-            6. Cross-attention with per-pixel Q            (NOTE: now uses
-               QKNormMultiheadAttention internally; call signature is
-               identical to nn.MultiheadAttention)
+            5. Build per-pixel Q from global_query + MLP(z) (NEW)
+            6. Cross-attention with per-pixel Q            (modified)
             7. Segmentation head                           (same as parent)
         """
         B, M, _ = query_tokens.shape
@@ -282,18 +260,13 @@ class Atomiser_Fractal(Atomiser_Senflood):
             z_features = z_features.squeeze(-2)                          # [B, M, feat_dim]
 
         # Project z features into latent_dim space via MLP, add to global query.
-        # This makes Q a per-pixel function of z while preserving the
-        # learned global query as the base. Final MLP layer is zero-initialized,
-        # so z_proj starts at zero and per_pixel_q ≈ global_query at init.
+        # Final MLP layer is zero-initialized so z_proj starts at zero and
+        # per_pixel_q ≈ global_query at init.
         z_proj = self.z_query_projection(z_features)                     # [B, M, latent_dim]
         global_q = self.global_query.expand(B, M, -1)                    # [B, M, latent_dim]
-        per_pixel_q = global_q + z_proj                                   # [B, M, latent_dim]
+        per_pixel_q = global_q + z_proj                                  # [B, M, latent_dim]
 
         # ── Cross-attention with per-pixel Q ──────────────────────────
-        # Note: self.decoder_cross_attn is now a QKNormMultiheadAttention
-        # (set in __init__). Same interface as nn.MultiheadAttention so the
-        # call below is identical — but Q and K are RMSNorm'd inside the
-        # attention before computing scores.
         BM = B * M
         kv_flat = context.reshape(BM, k_keep, -1)
         q_flat  = per_pixel_q.reshape(BM, 1, -1).contiguous()

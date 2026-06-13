@@ -1,453 +1,363 @@
-#!/usr/bin/env python3
 """
-Standalone FlairHub Reconstruction Visualizer
-==============================================
+PureForest Atomizer Trainer (single-task classification)
+==========================================================
 
-Loads a trained checkpoint, runs reconstruction on a few FlairHub samples,
-and saves per-modality GT / Predicted / Error figures to disk (+ optional W&B).
+13-class pure forest tree species classification.
+Input: RGB+NIR ortho (4 bands, 0.2 m/px) + LiDAR point cloud (optional).
 
-Completely decoupled from training — no callbacks, no DDP, no risk of
-blocking the trainer.
+Mirrors Model_ForestNet for the classification contract:
+    model(batch, training=..., task="classification") → [B, num_classes]
+    CE loss on [B] scalar targets from batch["label"]
 
-Usage
------
-    python visualize_flairhub_recon.py \
-        --ckpt_path  checkpoints/epoch=19-step=12000.ckpt \
-        --config_model  model_flairhub_recon.yaml \
-        --sample_indices 0 1 5 \
-        --output_dir  viz_recon/
+Differences from Model_ForestNet:
+  - 13 classes (PureForest) with severe imbalance →
+      inverse-frequency class weighting ON by default ("auto")
+  - Per-class top-1 accuracy logged at test time
+  - Cosine schedule with linear warmup (from FRACTAL trainer) rather than
+    plain CosineAnnealingLR — more robust with large datasets / multi-GPU
 
-    # With W&B logging:
-    python visualize_flairhub_recon.py \
-        --ckpt_path ... --config_model ... --log_wandb \
-        --wandb_run_id abc123   # attach to existing run (optional)
+Class frequencies are computed from the full PureForest-patches.csv
+(all splits combined, 135 569 scenes).
 """
 
-import argparse
-import os
-import sys
-
-import numpy as np
 import torch
-import matplotlib.pyplot as plt
-
-# ── Project imports ──────────────────────────────────────────────────────────
-from training.utils import read_yaml, Lookup_encoding
-from training.trainer_pretraining import Model_Pretrain
-from training.utils.datasets.utils_dataset_FLAIRHUB import (
-    FlairHubMultiTask,
-    DATASET_NAME,
-    RES_AERIAL, RES_SPOT, RES_S2, RES_S1,
-    N_BANDS_AERIAL, N_BANDS_SPOT, N_BANDS_S2, N_BANDS_S1,
-    SIZE_AERIAL, SIZE_SPOT, SIZE_S2, SIZE_S1,
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from transformers import get_cosine_schedule_with_warmup
+from torchmetrics.classification import (
+    MulticlassAccuracy,
+    MulticlassF1Score,
 )
-from training.utils.datasets.token_grouping import collate_multitask
 
 
-# =============================================================================
-# RECONSTRUCTION UTILITIES  (extracted from the old callback, standalone)
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# PureForest class metadata
+# ─────────────────────────────────────────────────────────────────────────────
 
-MODALITY_ORDER = ["aerial", "spot", "s2", "s1_asc", "s1_des"]
+PUREFOREST_CLASS_NAMES = [
+    "Deciduous oak",          # 0  — 35.4 %
+    "Evergreen oak",          # 1  — 16.5 %
+    "Beech",                  # 2  —  9.3 %
+    "Chestnut",               # 3  —  2.7 %
+    "Black locust",           # 4  —  1.7 %
+    "Maritime pine",          # 5  —  5.6 %
+    "Scotch pine",            # 6  — 13.5 %
+    "Black pine",             # 7  —  5.3 %
+    "Aleppo pine",            # 8  —  3.5 %
+    "Fir",                    # 9  —  0.6 %
+    "Spruce",                 # 10 —  3.0 %
+    "Larch",                  # 11 —  2.4 %
+    "Douglas",                # 12 —  0.4 %
+]
+NUM_CLASSES_PUREFOREST = 13
 
-MODALITY_RGB = {
-    "aerial": [0, 1, 2],       # R, G, B
-    "spot":   [0, 1, 2],       # R, G, B
-    "s2":     [2, 1, 0],       # B04(Red), B03(Green), B02(Blue)
-    "s1_asc": None,            # SAR → false-colour
-    "s1_des": None,
-}
+# Global class frequencies from PureForest-patches.csv (all 135 569 scenes).
+# Each entry is count / total.  Used for inverse-frequency class weighting.
+PUREFOREST_CLASS_FREQS = [
+    0.3545,   # 0  Deciduous oak       48 055
+    0.1649,   # 1  Evergreen oak       22 361
+    0.0934,   # 2  Beech               12 670
+    0.0272,   # 3  Chestnut             3 684
+    0.0170,   # 4  Black locust         2 303
+    0.0558,   # 5  Maritime pine        7 568
+    0.1347,   # 6  Scotch pine         18 265
+    0.0533,   # 7  Black pine           7 226
+    0.0346,   # 8  Aleppo pine          4 699
+    0.0062,   # 9  Fir                    840
+    0.0300,   # 10 Spruce               4 074
+    0.0243,   # 11 Larch                3 294
+    0.0039,   # 12 Douglas                530
+]
 
-MODALITY_DISPLAY = {
-    "aerial": "Aerial (0.2 m)",
-    "spot":   "SPOT (1.6 m)",
-    "s2":     "S2 (10 m)",
-    "s1_asc": "S1-Asc (10 m)",
-    "s1_des": "S1-Desc (10 m)",
-}
 
-
-def reconstruct_image(
-    queries: torch.Tensor,
-    values: torch.Tensor,
-    n_bands: int,
-    H: int,
-    W: int,
-    spectral_indices: torch.Tensor,
+def default_pureforest_class_weights(
+    freqs=PUREFOREST_CLASS_FREQS,
+    weight_clip: float = 20.0,
 ) -> torch.Tensor:
     """
-    Scatter token values back into a [C, H, W] image (NaN = unfilled).
+    Inverse-frequency weights, clipped to avoid destabilising extreme values
+    for the rarest classes (Douglas raw weight ≈ 256, Fir ≈ 161).
 
-    Token x/y coordinates are reference-grid indices (e.g., 507–516
-    for a 10×10 S2 crop centered in a 1024 reference grid).  We
-    convert them to local [0, H) × [0, W) pixel indices by
-    subtracting the per-axis minimum.
+    A clip of 20 keeps the signal on rare species meaningful while preventing
+    them from swamping the gradient signal from common species.
+    Tune weight_clip if you want more / less emphasis on rare classes.
     """
-    img = torch.full((n_bands, H, W), float("nan"))
-
-    if queries.shape[0] == 0:
-        return img
-
-    spec_to_band = {s.item(): i for i, s in enumerate(spectral_indices)}
-
-    x_raw = queries[:, 1].long()
-    y_raw = queries[:, 2].long()
-    spec = queries[:, 3].long()
-
-    # ── Convert reference-grid coords to local pixel indices ────────
-    x = x_raw - x_raw.min()
-    y = y_raw - y_raw.min()
-
-    bands = torch.tensor(
-        [spec_to_band.get(s.item(), -1) for s in spec], dtype=torch.long,
+    raw = torch.tensor(
+        [1.0 / max(f, 1e-9) for f in freqs], dtype=torch.float32
     )
-    valid = (
-        (bands >= 0) & (bands < n_bands)
-        & (x >= 0) & (x < W)
-        & (y >= 0) & (y < H)
-    )
-
-    n_total = queries.shape[0]
-    n_valid = valid.sum().item()
-    n_nan = n_total - n_valid
-    if n_nan > 0:
-        print(
-            f"    scatter: {n_valid}/{n_total} placed "
-            f"(x∈[{x.min()},{x.max()}] y∈[{y.min()},{y.max()}] "
-            f"target=[{n_bands},{H},{W}])"
-        )
-
-    img[bands[valid], y[valid], x[valid]] = values[valid].float()
-    return img
+    return raw.clamp(max=weight_clip)
 
 
-def to_rgb(img: torch.Tensor, mod: str) -> np.ndarray:
-    """[C, H, W] → [3, H, W] float32 numpy in [0, 1]."""
-    C = img.shape[0]
-    rgb_idx = MODALITY_RGB.get(mod)
+# ─────────────────────────────────────────────────────────────────────────────
+# Trainer
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if rgb_idx is not None and C >= 3:
-        rgb = torch.stack([img[rgb_idx[0]], img[rgb_idx[1]], img[rgb_idx[2]]])
-    elif C >= 2:
-        rgb = torch.stack([img[0], img[1], img[0]])  # SAR false-colour
-    else:
-        rgb = img[0:1].expand(3, -1, -1)
-
-    return percentile_stretch(rgb.numpy())
-
-
-def percentile_stretch(rgb: np.ndarray, lo_pct=2, hi_pct=98) -> np.ndarray:
-    """Per-channel percentile stretch to [0, 1], ignoring NaNs."""
-    out = rgb.copy()
-    for c in range(3):
-        ch = out[c]
-        valid = ~np.isnan(ch)
-        if valid.sum() < 10:
-            out[c] = 0.0
-            continue
-        lo = np.nanpercentile(ch, lo_pct)
-        hi = np.nanpercentile(ch, hi_pct)
-        if hi - lo > 1e-6:
-            out[c] = (ch - lo) / (hi - lo)
-        else:
-            out[c] = 0.0
-    return np.clip(np.nan_to_num(out, nan=0.0), 0, 1)
-
-
-# =============================================================================
-# SINGLE-SAMPLE PIPELINE
-# =============================================================================
-
-@torch.no_grad()
-def visualise_sample(
-    dataset: FlairHubMultiTask,
-    idx: int,
-    model: Model_Pretrain,
-    device: torch.device,
-) -> tuple:
+class Model_PureForest(pl.LightningModule):
     """
-    Run reconstruction on one sample.
+    PureForest tree species classification Lightning module.
 
-    Returns:
-        (modality_images dict, patch_id str)   or  (None, "")
+    Args:
+        config:           Atomizer config dict (YAML loaded).
+        wand:             Whether W&B logging is active.
+        name:             Experiment name string.
+        transform:        Unused; kept for API parity with other trainers.
+        lookup_table:     Lookup_encoding instance.
+        class_weights:    CE class weights.
+                            "auto"  (default) → inverse-frequency, clipped at 20
+                            None              → unweighted CE
+                            Tensor / list     → caller-provided weights [13]
+        label_smoothing:  CE label smoothing. Default 0.0 — kept off for
+                          fair comparison with the RandLA-Net baseline.
     """
-    sample = dataset.get_recon_viz_sample(idx)
 
-    # ── Pop viz extras before collating ──────────────────────────────────
-    modality_info = sample.pop("_viz_modality_info", {})
-    raw_image     = sample.pop("_viz_image", None)
-    patch_id      = sample.pop("_viz_patch_id", "")
-    n_real        = sample.pop("_viz_n_real", 0)
-
-    if not modality_info:
-        print(f"  [sample {idx}] no modality data — skipping")
-        return None, ""
-
-    # ── CPU copy of queries for image reconstruction ─────────────────────
-    queries_cpu = sample["tasks"]["reconstruction"]["queries"].clone()
-
-    # ── Collate into batch-of-1 → device ─────────────────────────────────
-    batch = collate_multitask([sample])
-    batch = _to_device(batch, device)
-
-    # ── Forward ──────────────────────────────────────────────────────────
-    result = model.forward_multitask(batch, training=False)
-
-    preds = result["reconstruction"].squeeze(0).squeeze(-1).cpu()
-    gt_values = queries_cpu[:, 4]
-
-    # ── Per-modality reconstruction ──────────────────────────────────────
-    modality_images = {}
-
-    for mod in MODALITY_ORDER:
-        if mod not in modality_info:
-            continue
-
-        info  = modality_info[mod]
-        start = info["offset"]
-        end   = start + info["count"]
-        n_bands, H, W = info["shape"]
-        spec_idx = info["spectral_indices"]
-
-        mod_queries = queries_cpu[start:end]
-        mod_preds   = preds[start:end]
-        mod_gt      = gt_values[start:end]
-
-        gt_img   = reconstruct_image(mod_queries, mod_gt,   n_bands, H, W, spec_idx)
-        pred_img = reconstruct_image(mod_queries, mod_preds, n_bands, H, W, spec_idx)
-
-        # Diagnostic — guard against empty images
-        gt_v = gt_img[~torch.isnan(gt_img)]
-        pred_v = pred_img[~torch.isnan(pred_img)]
-        nan_pct = torch.isnan(gt_img).float().mean().item() * 100
-
-        if gt_v.numel() == 0 or pred_v.numel() == 0:
-            print(
-                f"  {mod:8s} ({n_bands}×{H}×{W}, {info['count']} tok): "
-                f"EMPTY — no valid pixels after scatter  NaN%={nan_pct:.1f}"
-            )
-            continue
-
-        # Metrics
-        mse = ((mod_gt - mod_preds) ** 2).mean().item()
-        if mod_gt.shape[0] > 2:
-            corr = torch.corrcoef(torch.stack([mod_preds, mod_gt]))[0, 1].item()
-        else:
-            corr = float("nan")
-
-        modality_images[mod] = {
-            "gt": gt_img, "pred": pred_img,
-            "mse": mse, "corr": corr, "n_tokens": info["count"],
-        }
-
-        print(
-            f"  {mod:8s} ({n_bands}×{H}×{W}, {info['count']} tok): "
-            f"MSE={mse:.6f}  corr={corr:.4f}  "
-            f"GT=[{gt_v.min():.4f},{gt_v.max():.4f}]  "
-            f"Pred=[{pred_v.min():.4f},{pred_v.max():.4f}]  "
-            f"NaN%={nan_pct:.1f}"
-        )
-
-    return modality_images, patch_id
-
-
-# =============================================================================
-# FIGURE
-# =============================================================================
-
-def make_figure(modality_images: dict, sample_idx: int, patch_id: str, title_extra: str = ""):
-    """3-row (GT / Pred / Error) × N-modality figure."""
-    n_mods = len(modality_images)
-    if n_mods == 0:
-        return None
-
-    fig, axes = plt.subplots(3, n_mods, figsize=(4.5 * n_mods, 12), squeeze=False)
-
-    for col, (mod, data) in enumerate(modality_images.items()):
-        gt_rgb   = to_rgb(data["gt"], mod)
-        pred_rgb = to_rgb(data["pred"], mod)
-        error    = np.abs(pred_rgb - gt_rgb).mean(axis=0)
-
-        display = MODALITY_DISPLAY.get(mod, mod)
-        n_bands = data["gt"].shape[0]
-
-        axes[0, col].imshow(np.transpose(gt_rgb, (1, 2, 0)), interpolation="nearest")
-        axes[0, col].set_title(
-            f"GT: {display}\n{n_bands} bands, "
-            f"{data['gt'].shape[1]}×{data['gt'].shape[2]} px", fontsize=9,
-        )
-        axes[0, col].axis("off")
-
-        axes[1, col].imshow(np.transpose(pred_rgb, (1, 2, 0)), interpolation="nearest")
-        axes[1, col].set_title(
-            f"Pred  MSE={data['mse']:.5f}\n"
-            f"corr={data['corr']:.3f}  ({data['n_tokens']} tok)", fontsize=9,
-        )
-        axes[1, col].axis("off")
-
-        im = axes[2, col].imshow(error, cmap="hot", vmin=0, interpolation="nearest")
-        axes[2, col].set_title("Abs Error (RGB mean)", fontsize=9)
-        axes[2, col].axis("off")
-        fig.colorbar(im, ax=axes[2, col], fraction=0.046, pad=0.04)
-
-    suptitle = f"FlairHub Reconstruction — {patch_id}"
-    if title_extra:
-        suptitle += f" — {title_extra}"
-    fig.suptitle(suptitle, fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    return fig
-
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-def _to_device(batch, device):
-    """Recursively move tensors in a nested dict to device."""
-    out = {}
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = v.to(device)
-        elif isinstance(v, dict):
-            out[k] = _to_device(v, device)
-        else:
-            out[k] = v
-    return out
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Standalone FlairHub reconstruction visualization"
-    )
-    # ── Required ─────────────────────────────────────────────────────────
-    parser.add_argument("--ckpt_path",     type=str, required=True,
-                        help="Path to trained checkpoint (.ckpt)")
-    parser.add_argument("--config_model",  type=str, required=True,
-                        help="Model config yaml file (in training/configs/)")
-
-    # ── Dataset ──────────────────────────────────────────────────────────
-    parser.add_argument("--flairhub_path",    type=str,
-                        default="./data/FLAIR-HUB/extracted")
-    parser.add_argument("--flairhub_csv_dir", type=str,
-                        default="./data/FLAIR-HUB")
-    parser.add_argument("--mode",             type=str, default="validation",
-                        choices=["train", "validation"],
-                        help="Which split to visualise from")
-
-    # ── Samples ──────────────────────────────────────────────────────────
-    parser.add_argument("--sample_indices", type=int, nargs="+", default=[0, 1],
-                        help="Patch indices to visualise")
-
-    # ── Output ───────────────────────────────────────────────────────────
-    parser.add_argument("--output_dir", type=str, default="viz_recon",
-                        help="Directory to save figures")
-    parser.add_argument("--log_wandb",  action="store_true",
-                        help="Also log figures to W&B")
-    parser.add_argument("--wandb_run_id", type=str, default=None,
-                        help="Attach to existing W&B run (optional)")
-
-    # ── Device ───────────────────────────────────────────────────────────
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device (cuda / cpu)")
-
-    args = parser.parse_args()
-
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # ── Config + lookup ──────────────────────────────────────────────────
-    config_model   = read_yaml("./training/configs/" + args.config_model)
-    configs_dataset = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
-    bands_yaml      = "./data/bands_info/bands.yaml"
-    lookup_table    = Lookup_encoding(
-        read_yaml(configs_dataset), read_yaml(bands_yaml), config_model
-    )
-    dataset_config  = read_yaml(bands_yaml)
-
-    # ── Model ────────────────────────────────────────────────────────────
-    print(f"Loading checkpoint: {args.ckpt_path}")
-    model = Model_Pretrain.load_from_checkpoint(
-        args.ckpt_path,
-        config=config_model,
-        wand=False,
-        name="viz",
+    def __init__(
+        self,
+        config: dict,
+        wand: bool = False,
+        name: str = "pureforest",
         transform=None,
-        lookup_table=lookup_table,
-        map_location=device,
-    )
-    model = model.to(device)
-    model.eval()
-    print("Model loaded.\n")
+        lookup_table=None,
+        class_weights="auto",
+        label_smoothing: float = 0.0,
+    ):
+        super().__init__()
+        self.strict_loading = False
+        self.save_hyperparameters(ignore=["lookup_table", "transform", "class_weights"])
 
-    # ── Dataset ──────────────────────────────────────────────────────────
-    print(f"Loading FlairHub ({args.mode}) …")
-    dataset = FlairHubMultiTask(
-        mode=args.mode,
-        root_path=args.flairhub_path,
-        dataset_config=dataset_config,
-        config_model=config_model,
-        look_up=lookup_table,
-        tasks=["reconstruction"],
-        max_queries_recon=200_000,
-        csv_dir=args.flairhub_csv_dir,
-    )
-    print(f"Dataset: {len(dataset)} samples\n")
+        self.config          = config
+        self.name            = name
+        self.wand            = wand
+        self.num_classes     = NUM_CLASSES_PUREFOREST
+        self.class_names     = PUREFOREST_CLASS_NAMES
+        self.label_smoothing = label_smoothing
 
-    # ── W&B (optional) ───────────────────────────────────────────────────
-    wandb_run = None
-    if args.log_wandb:
-        import wandb
-        if args.wandb_run_id:
-            wandb_run = wandb.init(
-                project="Atomizer_Pretrain", id=args.wandb_run_id, resume="allow"
+        # ── Force num_classes in config ───────────────────────────
+        config = dict(config)
+        config_trainer = dict(config.get("trainer", {}))
+        config_trainer["num_classes"] = self.num_classes
+        config["trainer"] = config_trainer
+        self.config = config
+
+        # ── Build Atomizer model ──────────────────────────────────
+        from training.atomiser.Atomiser_SENFLOOD import Atomiser_Senflood
+        self.model = Atomiser_Senflood(
+            config=config,
+            lookup_table=lookup_table,
+        )
+
+        # ── Class weights ─────────────────────────────────────────
+        if class_weights == "auto":
+            cw = default_pureforest_class_weights()
+            print(
+                f"[PureForest-Trainer] Auto inverse-frequency weights "
+                f"(clip=20): {[round(w, 2) for w in cw.tolist()]}"
             )
+        elif class_weights is None:
+            cw = None
+            print("[PureForest-Trainer] No class weighting (unweighted CE).")
         else:
-            wandb_run = wandb.init(
-                project="Atomizer_Pretrain",
-                name=f"viz_recon_{os.path.basename(args.ckpt_path)}",
-                job_type="visualization",
+            cw = torch.tensor(class_weights, dtype=torch.float32) \
+                if not torch.is_tensor(class_weights) else class_weights
+            print(f"[PureForest-Trainer] Custom class weights: "
+                  f"{[round(w, 2) for w in cw.tolist()]}")
+
+        if cw is not None:
+            self.register_buffer("class_weights", cw)
+        else:
+            self.class_weights = None
+
+        # ── Optimizer config ──────────────────────────────────────
+        trainer_cfg       = config["trainer"]
+        self.lr           = float(trainer_cfg.get("lr", 1e-4))
+        self.weight_decay = float(trainer_cfg.get("weight_decay", 1e-2))
+
+        # ── Metrics ───────────────────────────────────────────────
+        def _make_metrics(prefix: str):
+            return nn.ModuleDict({
+                f"{prefix}_top1": MulticlassAccuracy(
+                    num_classes=self.num_classes, top_k=1, average="micro"),
+                f"{prefix}_top5": MulticlassAccuracy(
+                    num_classes=self.num_classes,
+                    top_k=min(5, self.num_classes), average="micro"),
+                f"{prefix}_macro_acc": MulticlassAccuracy(
+                    num_classes=self.num_classes, average="macro"),
+                f"{prefix}_macro_f1": MulticlassF1Score(
+                    num_classes=self.num_classes, average="macro"),
+            })
+
+        self.train_metrics = _make_metrics("train")
+        self.val_metrics   = _make_metrics("val")
+        self.test_metrics  = _make_metrics("test")
+
+        # Per-class top-1 accuracy at test time only
+        self.test_per_class_acc = MulticlassAccuracy(
+            num_classes=self.num_classes, average=None
+        )
+
+        print(
+            f"[PureForest-Trainer] {self.num_classes} classes, "
+            f"label_smoothing={self.label_smoothing}, "
+            f"lr={self.lr}, weight_decay={self.weight_decay}"
+        )
+
+    # =========================================================================
+    # FORWARD
+    # =========================================================================
+
+    def forward(self, batch, training: bool = True):
+        return self.model(batch, training=training, task="classification")
+
+    # =========================================================================
+    # SHARED STEP
+    # =========================================================================
+
+    def _shared_step(self, batch, stage: str):
+        is_train = stage == "train"
+
+        target = batch["label"].long()     # [B]
+        bs     = target.shape[0]
+
+        logits = self.forward(batch, training=is_train)   # [B, 13]
+
+        # Defensive checks
+        if logits.shape[-1] != self.num_classes:
+            raise RuntimeError(
+                f"[PureForest-Trainer] Logits last dim {logits.shape[-1]} != "
+                f"num_classes {self.num_classes}. "
+                f"Check config['trainer']['num_classes']."
+            )
+        if target.numel() > 0:
+            tmin, tmax = int(target.min()), int(target.max())
+            if tmin < 0 or tmax >= self.num_classes:
+                raise RuntimeError(
+                    f"[PureForest-Trainer] Targets out of range "
+                    f"[{tmin}, {tmax}], num_classes={self.num_classes}."
+                )
+
+        loss = F.cross_entropy(
+            logits,
+            target,
+            weight=self.class_weights,
+            label_smoothing=self.label_smoothing if is_train else 0.0,
+        )
+
+        # Update metrics
+        metrics = getattr(self, f"{stage}_metrics")
+        with torch.no_grad():
+            for metric in metrics.values():
+                metric.update(logits, target)
+            if stage == "test":
+                self.test_per_class_acc.update(logits, target)
+
+        self.log(
+            f"{stage}_loss", loss,
+            on_step=is_train, on_epoch=True,
+            prog_bar=True, sync_dist=True,
+            batch_size=bs,
+        )
+        # Print to stdout every 200 steps so SLURM log shows progress
+        if is_train and self.global_step % 200 == 0 and self.trainer.is_global_zero:
+            print(f"[step {self.global_step}] train_loss={loss.item():.4f}",
+                  flush=True)
+        return loss
+
+    # =========================================================================
+    # LIGHTNING HOOKS
+    # =========================================================================
+
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        return self._shared_step(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        return self._shared_step(batch, "test")
+
+    def _epoch_end(self, stage: str):
+        metrics = getattr(self, f"{stage}_metrics")
+        for name, metric in metrics.items():
+            val = metric.compute()
+            metric.reset()
+            self.log(name, val,
+                     on_epoch=True, prog_bar=("top1" in name),
+                     sync_dist=True)
+        # Print to stdout so progress is visible in SLURM log
+        if self.trainer.is_global_zero:
+            vals = {n: getattr(self, f"{stage}_metrics")[n].compute()
+                    if False else "(logged)" for n in metrics}
+            print(f"[{stage} epoch {self.current_epoch}] metrics logged",
+                  flush=True)
+
+    def on_train_epoch_end(self):
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self):
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self):
+        self._epoch_end("test")
+
+        # Per-class accuracy
+        per_class = self.test_per_class_acc.compute()   # [13]
+        self.test_per_class_acc.reset()
+        for i, class_name in enumerate(self.class_names):
+            self.log(
+                f"test_acc/{class_name}", per_class[i].item(),
+                on_epoch=True, sync_dist=True,
             )
 
-    # ── Run ──────────────────────────────────────────────────────────────
-    ckpt_name = os.path.splitext(os.path.basename(args.ckpt_path))[0]
+    # =========================================================================
+    # OPTIMIZER  — AdamW + cosine warmup (mirrors FRACTAL trainer)
+    # =========================================================================
 
-    for idx in args.sample_indices:
-        if idx >= len(dataset):
-            print(f"[SKIP] index {idx} >= dataset size {len(dataset)}")
-            continue
+    def _compute_total_steps(self) -> int:
+        override = self.config.get("trainer", {}).get("total_steps", None)
+        if override is not None:
+            print(f"[PureForest-Trainer] total_steps override: {override}")
+            return int(override)
 
-        print(f"── Sample {idx} ──────────────────────────────────────")
-        modality_images, patch_id = visualise_sample(dataset, idx, model, device)
+        try:
+            est = int(self.trainer.estimated_stepping_batches)
+        except Exception:
+            est = -1
 
-        if modality_images is None:
-            continue
+        if est <= 0:
+            fallback = max(1, self.trainer.max_epochs) * 1000
+            print(
+                f"[PureForest-Trainer] WARN: cannot estimate total_steps, "
+                f"falling back to {fallback}."
+            )
+            return fallback
 
-        fig = make_figure(modality_images, idx, patch_id, title_extra=ckpt_name)
-        if fig is None:
-            continue
+        print(f"[PureForest-Trainer] total_steps estimate: {est}")
+        return est
 
-        # Save to disk
-        fname = f"recon_{ckpt_name}_sample{idx}.png"
-        fpath = os.path.join(args.output_dir, fname)
-        fig.savefig(fpath, dpi=150, bbox_inches="tight")
-        print(f"  → saved: {fpath}")
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
 
-        # W&B
-        if wandb_run is not None:
-            import wandb
-            wandb.log({f"flairhub_recon/sample_{idx}": wandb.Image(fig)})
+        total_steps  = self._compute_total_steps()
+        warmup_steps = self.config.get("optimizer", {}).get(
+            "warmup_steps", max(1, int(0.05 * total_steps))
+        )
 
-        plt.close(fig)
+        print(
+            f"[PureForest-Trainer] LR schedule: "
+            f"total_steps={total_steps}, warmup={warmup_steps}, "
+            f"peak_lr={self.lr}"
+        )
 
-    print("\nDone.")
-
-    if wandb_run is not None:
-        wandb_run.finish()
-
-
-if __name__ == "__main__":
-    main()
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
