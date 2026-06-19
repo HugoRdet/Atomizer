@@ -14,28 +14,40 @@ from .token_builder import TokenBuilder
 class Sen1Floods11Dataset(Dataset):
     """
     Sen1Floods11 Dataset — grouped token format (8 columns).
-    
+
     S2 (13 optical bands) + S1 (2 SAR bands), all at 10m, 512×512.
     Both modalities share the same resolution → single group.
-    
+
     Token format:
         [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
          col 0  1  2       3          4        5            6            7
-    
+
+    Band selection
+    --------------
+    Use `bands` in trainer config to select which bands to keep AND which
+    to treat as padding tokens (dropped from attention).
+
+    Config format:
+        trainer:
+          bands:
+            keep:  [B02, B03, B04, B08, VV, VH]   # bands to keep; omit = all
+            drop:  [VV, VH]                        # bands to mask as padding
+
+    Rules:
+      - `keep` filters which bands are loaded (like the old single_channel).
+        Omit or set to null to keep all bands.
+      - `drop` marks bands as padding AFTER loading — their tokens stay in
+        the batch (latent grid unchanged) but are masked out in attention.
+        Must be a subset of `keep` (or all bands if keep is null).
+      - Both lists use yaml band names: B01–B12, VV, VH.
+      - Old `single_channel` int/list config still works for backwards compat.
+
     Modes:
         - segmentation (default): queries = 1 per pixel, col 4 = class label
         - reconstruction:         queries = 1 per pixel-band, col 4 = reflectance
-    
-    Single-channel mode:
-        When `single_channel` is set in trainer config, only the specified band
-        index (0-based into the merged S2+S1 stack) is used. Useful for debugging
-        reconstruction and isolating per-band issues.
-        Set to -1 or omit to use all bands (default).
 
     Augmentations (training only):
-        D4 group: 4 rotations (0, 90, 180, 270°) × 2 flips = 8 transforms.
-        Applied consistently to both image [C, H, W] and label [H, W]
-        before token building, so token coordinates remain valid.
+        D4 group: 4 rotations × 2 flips = 8 transforms.
     """
 
     OPTICAL_RESOLUTION = 10.0
@@ -44,6 +56,13 @@ class Sen1Floods11Dataset(Dataset):
     NUM_CLASSES = 2
     IGNORE_INDEX = 255
     TIME_IDX_NA = -1
+
+    # Canonical band order matching idx in bands_senflood config
+    ALL_BAND_NAMES = [
+        "B01", "B02", "B03", "B04", "B05", "B06", "B07",
+        "B08", "B08A", "B09", "B10", "B11", "B12",
+        "VV", "VH",
+    ]
 
     def __init__(
         self,
@@ -63,7 +82,6 @@ class Sen1Floods11Dataset(Dataset):
         self.look_up = look_up
         self.config_model = config_model
 
-        # Initialize TokenBuilder
         self.token_builder = TokenBuilder(look_up)
 
         # Config parameters
@@ -71,27 +89,27 @@ class Sen1Floods11Dataset(Dataset):
         self.max_tokens_reconstruction = config_model["trainer"]["max_tokens_reconstruction"]
         self.reconstruction = config_model["trainer"].get("mode", "segmentation") == "reconstruction"
 
-        # ── Single-channel mode ─────────────────────────────
-        sc = config_model["trainer"].get("single_channel", -1)
-        if isinstance(sc, list):
-            self.selected_channels = sorted(sc)
-        elif isinstance(sc, int) and sc >= 0:
-            self.selected_channels = [sc]
-        else:
-            self.selected_channels = None  # all bands
+        # ── Band selection ──────────────────────────────────────────────────
+        # New: bands.keep / bands.drop by name
+        # Old: single_channel int/list (backwards compat)
+        bands_cfg = config_model["trainer"].get("bands", {}) or {}
+        keep_names = bands_cfg.get("keep", None)   # list of band names or None
+        drop_names = bands_cfg.get("drop", None)   # list of band names or None
 
-        if self.selected_channels is not None:
-            total = self.NUM_S2_BANDS + self.NUM_S1_BANDS
-            for ch in self.selected_channels:
-                assert 0 <= ch < total, (
-                    f"single_channel index {ch} out of range [0, {total})"
-                )
-            print(f"[Sen1Floods11] SINGLE-CHANNEL MODE: using band indices {self.selected_channels}")
+        # Backwards compat: single_channel int or list of ints
+        if keep_names is None:
+            sc = config_model["trainer"].get("single_channel", -1)
+            if isinstance(sc, list):
+                keep_names = [self.ALL_BAND_NAMES[i] for i in sorted(sc)]
+            elif isinstance(sc, int) and sc >= 0:
+                keep_names = [self.ALL_BAND_NAMES[sc]]
 
-        if self.reconstruction:
-            print(f"[Sen1Floods11] Mode: RECONSTRUCTION (queries = image tokens, col 4 = reflectance)")
-        else:
-            print(f"[Sen1Floods11] Mode: SEGMENTATION (queries = pixels, col 4 = class label)")
+        # Resolve keep → integer channel indices (position in the 15-band stack)
+        self.selected_channels = self._resolve_band_names(keep_names)  # None = all
+        # Resolve drop → band names to suppress at attention time
+        self.drop_band_names = set(drop_names) if drop_names else set()
+
+        self._print_band_selection()
 
         # Split mapping
         self.split_mapping = {
@@ -100,42 +118,102 @@ class Sen1Floods11Dataset(Dataset):
             "test": "test",
         }
 
-        # Paths
         self.data_root = os.path.join(root_path, "data", "flood_events", "HandLabeled")
         self.split_file = os.path.join(
             root_path, "splits", "flood_handlabeled",
             f"flood_{self.split_mapping[mode]}_data.csv",
         )
 
-        # Load & filter file lists
         self.s1_image_list, self.s2_image_list, self.label_list = self._load_file_lists()
         self._filter_invalid_samples()
 
-        # Band metadata
+        # Band metadata (all 15 bands first, then filter)
         self.bands_info = dataset_config["bands_senflood"]
         self.bandwidths, self.wavelengths, self.band_names = self._parse_bands_info()
         self.spectral_indices = self._build_spectral_indices()
 
-        # Apply single-channel filtering to band metadata
+        # Apply channel selection to band metadata
         if self.selected_channels is not None:
-            self.bandwidths = self.bandwidths[self.selected_channels]
-            self.wavelengths = self.wavelengths[self.selected_channels]
-            self.band_names = [self.band_names[i] for i in self.selected_channels]
+            self.bandwidths       = self.bandwidths[self.selected_channels]
+            self.wavelengths      = self.wavelengths[self.selected_channels]
+            self.band_names       = [self.band_names[i] for i in self.selected_channels]
             self.spectral_indices = self.spectral_indices[self.selected_channels]
-            print(f"[Sen1Floods11] After channel selection: {len(self.bandwidths)} bands → "
-                  f"{[self.band_names[i] if i < len(self.band_names) else '?' for i in range(len(self.band_names))]}")
 
-        # Resolution index
+        # Build spectral_idx → drop flag for __getitem__
+        # This maps each spectral_idx that is in drop_band_names to True.
+        self.dropped_spectral_indices = self._resolve_drop_indices()
+
         self.resolution_idx = self.look_up.get_resolution_idx(self.OPTICAL_RESOLUTION)
-
-        # Normalization
         self.norm_stats = self._load_or_compute_normalization()
 
+        if self.reconstruction:
+            print(f"[Sen1Floods11] Mode: RECONSTRUCTION")
+        else:
+            print(f"[Sen1Floods11] Mode: SEGMENTATION")
         print(f"[Sen1Floods11] Loaded {len(self.bandwidths)} bands")
-        print(f"[Sen1Floods11] Resolution idx: {self.resolution_idx} "
-              f"(GSD={self.OPTICAL_RESOLUTION} m/px, all bands)")
-        print(f"[Sen1Floods11] Time idx: -1 (no temporal info, zeroed by encoder)")
-        print(f"[Sen1Floods11] D4 augmentations: {'ON (train only)' if self.split == 'train' else 'OFF'}")
+        print(f"[Sen1Floods11] Resolution idx: {self.resolution_idx}")
+        print(f"[Sen1Floods11] D4 augmentations: {'ON' if self.split == 'train' else 'OFF'}")
+
+    # =========================================================================
+    # BAND SELECTION HELPERS
+    # =========================================================================
+
+    def _resolve_band_names(self, names):
+        """
+        Convert a list of band names to integer channel indices into the
+        15-band stack [S2×13, S1×2].  Returns None if names is None (= all).
+        """
+        if names is None:
+            return None
+        invalid = set(names) - set(self.ALL_BAND_NAMES)
+        if invalid:
+            raise ValueError(
+                f"Unknown band names: {invalid}. "
+                f"Valid names: {self.ALL_BAND_NAMES}"
+            )
+        return [self.ALL_BAND_NAMES.index(n) for n in names]
+
+    def _resolve_drop_indices(self):
+        """
+        Build the set of spectral_idx values for bands in self.drop_band_names.
+        These are the values written into token col 3 by the TokenBuilder,
+        looked up via look_up.table_wave[(bandwidth, wavelength)].
+        """
+        if not self.drop_band_names:
+            return set()
+
+        # Validate: dropped bands must be in the kept set
+        kept = set(self.band_names)
+        unknown = self.drop_band_names - set(self.ALL_BAND_NAMES)
+        if unknown:
+            raise ValueError(f"bands.drop contains unknown names: {unknown}")
+        not_kept = self.drop_band_names - kept
+        if not_kept:
+            raise ValueError(
+                f"bands.drop {not_kept} are not in bands.keep {kept}. "
+                f"You can only drop bands that were kept."
+            )
+
+        dropped = set()
+        for name in self.drop_band_names:
+            data = self.bands_info[name]
+            key = (int(data["bandwidth"]), int(data["central_wavelength"]))
+            if key in self.look_up.table_wave:
+                dropped.add(self.look_up.table_wave[key])
+            else:
+                raise KeyError(
+                    f"Band '{name}' key={key} not found in lookup table."
+                )
+        return dropped
+
+    def _print_band_selection(self):
+        if self.selected_channels is None:
+            kept_str = "ALL"
+        else:
+            kept_str = str([self.ALL_BAND_NAMES[i] for i in self.selected_channels])
+        drop_str = str(sorted(self.drop_band_names)) if self.drop_band_names else "none"
+        print(f"[Sen1Floods11] Bands kept    : {kept_str}")
+        print(f"[Sen1Floods11] Bands dropped : {drop_str} (padding tokens, grid unchanged)")
 
     # =========================================================================
     # D4 AUGMENTATION
@@ -143,58 +221,57 @@ class Sen1Floods11Dataset(Dataset):
 
     @staticmethod
     def _d4_augment(image: torch.Tensor, label: torch.Tensor):
-        """
-        Apply a random D4 transform to image [C, H, W] and label [H, W].
-
-        D4 = dihedral group of order 8:
-            4 rotations (0, 90, 180, 270°) × optional horizontal flip
-            = 8 equally likely transforms.
-
-        image and label are transformed identically so spatial
-        correspondence is preserved. Token coordinates remain valid
-        because they are derived from image shape after augmentation.
-        """
-        # Random horizontal flip (p=0.5)
         if torch.rand(1).item() < 0.5:
-            image = torch.flip(image, dims=[2])   # [C, H, W] → flip W
-            label = torch.flip(label, dims=[1])   # [H, W]    → flip W
-
-        # Random rotation: 0, 90, 180, or 270 degrees
+            image = torch.flip(image, dims=[2])
+            label = torch.flip(label, dims=[1])
         k = torch.randint(0, 4, (1,)).item()
         if k > 0:
-            image = torch.rot90(image, k, dims=[1, 2])  # rotate H×W plane
-            label = torch.rot90(label, k, dims=[0, 1])  # rotate H×W plane
-
+            image = torch.rot90(image, k, dims=[1, 2])
+            label = torch.rot90(label, k, dims=[0, 1])
         return image, label
 
     @staticmethod
     def _random_crop(image: torch.Tensor, label: torch.Tensor, size: int = 256):
-        """
-        Random spatial crop of image [C, H, W] and label [H, W] to size×size.
-
-        Applied after D4 augmentation (augment full 512, then crop) for
-        maximum spatial diversity. The TokenBuilder handles crops smaller
-        than the 512 reference grid correctly — the crop extracts a
-        different coordinate window depending on top/left offsets.
-        """
         C, H, W = image.shape
-        assert H >= size and W >= size, (
-            f"Crop size {size} exceeds image size ({H}×{W})"
-        )
+        assert H >= size and W >= size
         top  = torch.randint(0, H - size + 1, (1,)).item()
         left = torch.randint(0, W - size + 1, (1,)).item()
-        image = image[:, top:top + size, left:left + size]
-        label = label[top:top + size, left:left + size]
-        return image, label
+        return image[:, top:top + size, left:left + size], label[top:top + size, left:left + size]
 
     # =========================================================================
-    # CHANNEL SELECTION HELPER
+    # CHANNEL SELECTION
     # =========================================================================
 
     def _select_channels(self, image):
         if self.selected_channels is None:
             return image
         return image[self.selected_channels]
+
+    def _apply_drop_mask(self, tokens: torch.Tensor, mask: torch.Tensor):
+        """
+        For any token whose spectral_idx (col 3) is in dropped_spectral_indices:
+          - zero col 0 (reflectance) — belt-and-suspenders
+          - set mask entry to 1.0   — the real guard: -inf in attention
+
+        tokens : [N, 8]
+        mask   : [N]     0=real, 1=padding
+        Returns cloned (tokens, mask) — originals untouched.
+        """
+        if not self.dropped_spectral_indices:
+            return tokens, mask
+
+        tokens = tokens.clone()
+        mask   = mask.clone().float()
+
+        spec_idx = tokens[:, 3]
+        drop = torch.zeros(tokens.shape[0], dtype=torch.bool)
+        for sid in self.dropped_spectral_indices:
+            drop |= (spec_idx == sid)
+
+        tokens[drop, 0] = 0.0   # zero reflectance
+        mask[drop]      = 1.0   # mark as padding
+
+        return tokens, mask
 
     # =========================================================================
     # DATASET INTERFACE
@@ -220,14 +297,14 @@ class Sen1Floods11Dataset(Dataset):
 
         image_s2 = torch.from_numpy(image_s2)
         image_s1 = torch.from_numpy(image_s1)
-        label = torch.from_numpy(label)
+        label    = torch.from_numpy(label)
 
         # ── Normalize ───────────────────────────────────────
         image_s2, image_s1 = self.normalize_image(image_s2, image_s1)
 
         # ── Merge & select channels ─────────────────────────
         image_full = torch.cat([image_s2, image_s1], dim=0)  # [15, H, W]
-        image = self._select_channels(image_full)              # [C', H, W]
+        image      = self._select_channels(image_full)        # [C', H, W]
 
         # ── D4 augmentation (training only) ─────────────────
         if self.split == "train":
@@ -237,15 +314,18 @@ class Sen1Floods11Dataset(Dataset):
         resolution = self.OPTICAL_RESOLUTION
         image_tokens, seg_queries = self._build_tokens(image, label, resolution)
 
+        # ── Apply drop mask (padding for dropped bands) ─────
+        attention_mask = torch.zeros(image_tokens.shape[0])
+        image_tokens, attention_mask = self._apply_drop_mask(image_tokens, attention_mask)
+
         # ── Build queries (mode-dependent) ──────────────────
         if self.reconstruction:
             queries = image_tokens.clone()
-            queries[:, 4] = queries[:, 0].clone()  # reflectance → label col
-            perm = torch.randperm(queries.shape[0])[:self.max_tokens_reconstruction]
+            queries[:, 4] = queries[:, 0].clone()
+            perm    = torch.randperm(queries.shape[0])[:self.max_tokens_reconstruction]
             queries = queries[perm]
         else:
             if self.split == "train":
-                # Training: subsample for memory/speed
                 queries = self.token_builder.subsample_queries(
                     seg_queries,
                     max_queries=self.max_tokens_reconstruction,
@@ -253,12 +333,8 @@ class Sen1Floods11Dataset(Dataset):
                     prioritize_valid=True,
                 )
             else:
-                # Val/test: all pixels for accurate evaluation
-                # reconstruct() handles chunking internally (chunk_size=10_000)
                 queries = seg_queries
 
-        # ── Masks ───────────────────────────────────────────
-        attention_mask = torch.zeros(image_tokens.shape[0])
         queries_mask = torch.zeros(queries.shape[0])
 
         # ── Return ──────────────────────────────────────────
@@ -266,14 +342,14 @@ class Sen1Floods11Dataset(Dataset):
             "groups": {
                 resolution: {
                     "tokens": image_tokens,
-                    "mask": attention_mask,
-                    "shape": tuple(image.shape),
+                    "mask":   attention_mask,
+                    "shape":  tuple(image.shape),
                 },
             },
-            "queries": queries,
-            "queries_mask": queries_mask,
+            "queries":           queries,
+            "queries_mask":      queries_mask,
             "target_resolution": resolution,
-            "image": image,
+            "image":             image,
         }
 
         if not self.reconstruction:
@@ -294,7 +370,6 @@ class Sen1Floods11Dataset(Dataset):
             resolution_idx=self.resolution_idx,
             time_idx=self.TIME_IDX_NA,
         )
-
         first_spectral_idx = self.spectral_indices[0]
         queries = self.token_builder.build_queries(
             label=label,
@@ -303,7 +378,6 @@ class Sen1Floods11Dataset(Dataset):
             resolution_idx=self.resolution_idx,
             time_idx=self.TIME_IDX_NA,
         )
-
         return image_tokens, queries
 
     # =========================================================================
@@ -311,9 +385,6 @@ class Sen1Floods11Dataset(Dataset):
     # =========================================================================
 
     def get_viz_sample(self, index: int) -> dict:
-        """
-        Viz sample — mode-aware. No augmentation applied (deterministic).
-        """
         with rasterio.open(self.s2_image_list[index]) as src:
             image_s2 = src.read().astype(np.float32)
         with rasterio.open(self.s1_image_list[index]) as src:
@@ -327,62 +398,48 @@ class Sen1Floods11Dataset(Dataset):
 
         image_s2 = torch.from_numpy(image_s2)
         image_s1 = torch.from_numpy(image_s1)
-        label = torch.from_numpy(label)
-
+        label    = torch.from_numpy(label)
         image_s2, image_s1 = self.normalize_image(image_s2, image_s1)
 
         image_full = torch.cat([image_s2, image_s1], dim=0)
-        image = self._select_channels(image_full)
-        C, H, W = image.shape
-
-        # No augmentation in viz — always deterministic
+        image      = self._select_channels(image_full)
+        C, H, W    = image.shape
 
         if self.reconstruction:
             dummy_label = torch.full((H, W), self.IGNORE_INDEX, dtype=torch.long)
             tokens = self.token_builder.build_tokens(
-                image=image,
-                label=dummy_label,
+                image=image, label=dummy_label,
                 resolution=self.OPTICAL_RESOLUTION,
                 spectral_indices=self.spectral_indices,
                 resolution_idx=self.resolution_idx,
                 time_idx=self.TIME_IDX_NA,
             )
             tokens[:, 4] = tokens[:, 0].clone()
-
-            queries = tokens.clone()
-            queries_mask = torch.zeros(tokens.shape[0], dtype=torch.bool)
             attention_mask = torch.zeros(tokens.shape[0])
+            tokens, attention_mask = self._apply_drop_mask(tokens, attention_mask)
+            queries      = tokens.clone()
+            queries_mask = torch.zeros(tokens.shape[0], dtype=torch.bool)
 
             return {
-                "groups": {
-                    self.OPTICAL_RESOLUTION: {
-                        "tokens": tokens,
-                        "mask": attention_mask,
-                        "shape": (C, H, W),
-                    },
-                },
-                "queries": queries,
-                "queries_mask": queries_mask,
+                "groups": {self.OPTICAL_RESOLUTION: {
+                    "tokens": tokens, "mask": attention_mask, "shape": (C, H, W),
+                }},
+                "queries": queries, "queries_mask": queries_mask,
                 "target_resolution": self.OPTICAL_RESOLUTION,
-                "image": image,
-                "image_shape": (C, H, W),
-                "n_real": tokens.shape[0],
+                "image": image, "image_shape": (C, H, W),
+                "n_real": (attention_mask == 0).sum().item(),
             }
         else:
             image_tokens, queries = self._build_tokens(image, label, self.OPTICAL_RESOLUTION)
-            queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
             attention_mask = torch.zeros(image_tokens.shape[0])
+            image_tokens, attention_mask = self._apply_drop_mask(image_tokens, attention_mask)
+            queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
 
             return {
-                "groups": {
-                    self.OPTICAL_RESOLUTION: {
-                        "tokens": image_tokens,
-                        "mask": attention_mask,
-                        "shape": (C, H, W),
-                    },
-                },
-                "queries": queries,
-                "queries_mask": queries_mask,
+                "groups": {self.OPTICAL_RESOLUTION: {
+                    "tokens": image_tokens, "mask": attention_mask, "shape": (C, H, W),
+                }},
+                "queries": queries, "queries_mask": queries_mask,
                 "label": label,
                 "target_resolution": self.OPTICAL_RESOLUTION,
                 "image": image,
@@ -395,26 +452,22 @@ class Sen1Floods11Dataset(Dataset):
     def _load_file_lists(self):
         s1_images, s2_images, labels = [], [], []
         print(f"[Sen1Floods11] Loading split file: {self.split_file}")
-
         with open(self.split_file, "r") as f:
             reader = csv.reader(f)
             for row in reader:
                 if len(row) < 2:
                     continue
-                s1_filename = row[0].replace("S1Hand/", "")
+                s1_filename    = row[0].replace("S1Hand/", "")
                 label_filename = row[1].replace("LabelHand/", "")
-                s2_filename = s1_filename.replace("_S1Hand", "_S2Hand")
-
-                s1_images.append(os.path.join(self.data_root, "S1Hand", s1_filename))
-                s2_images.append(os.path.join(self.data_root, "S2Hand", s2_filename))
-                labels.append(os.path.join(self.data_root, "LabelHand", label_filename))
-
+                s2_filename    = s1_filename.replace("_S1Hand", "_S2Hand")
+                s1_images.append(os.path.join(self.data_root, "S1Hand",    s1_filename))
+                s2_images.append(os.path.join(self.data_root, "S2Hand",    s2_filename))
+                labels.append(   os.path.join(self.data_root, "LabelHand", label_filename))
         return s1_images, s2_images, labels
 
     def _filter_invalid_samples(self):
         valid_s1, valid_s2, valid_labels = [], [], []
         skipped = 0
-
         print(f"[Sen1Floods11] Filtering invalid samples...")
         for i in tqdm(range(len(self.label_list)), desc="Checking labels"):
             try:
@@ -430,11 +483,10 @@ class Sen1Floods11Dataset(Dataset):
             except Exception as e:
                 print(f"[Warning] Could not read {self.label_list[i]}: {e}")
                 skipped += 1
-
         print(f"[Sen1Floods11] Skipped {skipped} invalid samples")
         self.s1_image_list = valid_s1
         self.s2_image_list = valid_s2
-        self.label_list = valid_labels
+        self.label_list    = valid_labels
 
     # =========================================================================
     # NORMALIZATION
@@ -442,24 +494,20 @@ class Sen1Floods11Dataset(Dataset):
 
     def _load_or_compute_normalization(self):
         norm_file = os.path.join(self.root_path, "normalization_stats.pt")
-
         if os.path.exists(norm_file):
             print(f"[Sen1Floods11] Loading normalization stats from {norm_file}")
             stats = torch.load(norm_file, weights_only=True)
             self._print_norm_stats(stats)
             return stats
-
         if self.split != "train":
             print(f"[Sen1Floods11] WARNING: No normalization file at {norm_file}")
             return {
                 "s2_mean": torch.zeros(13), "s2_std": torch.ones(13),
                 "s1_mean": torch.zeros(2),  "s1_std": torch.ones(2),
             }
-
         print(f"[Sen1Floods11] Computing normalization from {len(self.s1_image_list)} samples...")
         stats = self._compute_normalization_stats()
         torch.save(stats, norm_file)
-        print(f"[Sen1Floods11] Saved normalization stats to {norm_file}")
         self._print_norm_stats(stats)
         return stats
 
@@ -467,9 +515,9 @@ class Sen1Floods11Dataset(Dataset):
         s2_sum = torch.zeros(13, dtype=torch.float64)
         s2_sq  = torch.zeros(13, dtype=torch.float64)
         s2_n   = torch.zeros(13, dtype=torch.float64)
-        s1_sum = torch.zeros(2, dtype=torch.float64)
-        s1_sq  = torch.zeros(2, dtype=torch.float64)
-        s1_n   = torch.zeros(2, dtype=torch.float64)
+        s1_sum = torch.zeros(2,  dtype=torch.float64)
+        s1_sq  = torch.zeros(2,  dtype=torch.float64)
+        s1_n   = torch.zeros(2,  dtype=torch.float64)
 
         for idx in tqdm(range(len(self.s2_image_list)), desc="Computing normalization"):
             try:
@@ -485,7 +533,6 @@ class Sen1Floods11Dataset(Dataset):
                         s2_n[c]   += len(valid)
             except Exception:
                 continue
-
             try:
                 with rasterio.open(self.s1_image_list[idx]) as src:
                     s1 = src.read().astype(np.float64)
@@ -504,11 +551,7 @@ class Sen1Floods11Dataset(Dataset):
         s2_std  = ((s2_sq / s2_n.clamp(min=1) - s2_mean.double() ** 2).sqrt()).float()
         s1_mean = (s1_sum / s1_n.clamp(min=1)).float()
         s1_std  = ((s1_sq / s1_n.clamp(min=1) - s1_mean.double() ** 2).sqrt()).float()
-
-        return {
-            "s2_mean": s2_mean, "s2_std": s2_std,
-            "s1_mean": s1_mean, "s1_std": s1_std,
-        }
+        return {"s2_mean": s2_mean, "s2_std": s2_std, "s1_mean": s1_mean, "s1_std": s1_std}
 
     def _print_norm_stats(self, stats):
         print(f"[Sen1Floods11] S2 mean: {stats['s2_mean'].numpy()}")
@@ -517,7 +560,6 @@ class Sen1Floods11Dataset(Dataset):
         print(f"[Sen1Floods11] S1 std:  {stats['s1_std'].numpy()}")
 
     def normalize_image(self, s2, s1):
-        """Normalize S2 and S1 separately using precomputed stats."""
         s2_mean = self.norm_stats["s2_mean"].view(13, 1, 1)
         s2_std  = self.norm_stats["s2_std"].view(13, 1, 1)
         s1_mean = self.norm_stats["s1_mean"].view(2, 1, 1)
@@ -540,15 +582,9 @@ class Sen1Floods11Dataset(Dataset):
                 })
         all_bands.sort(key=lambda b: b["idx"])
 
-        bw = torch.tensor([b["bandwidth"] for b in all_bands], dtype=torch.float32)
-        wl = torch.tensor([b["central_wavelength"] for b in all_bands], dtype=torch.float32)
+        bw    = torch.tensor([b["bandwidth"]          for b in all_bands], dtype=torch.float32)
+        wl    = torch.tensor([b["central_wavelength"] for b in all_bands], dtype=torch.float32)
         names = [b["name"] for b in all_bands]
-
-        print(f"[Sen1Floods11] Band order:")
-        for b in all_bands:
-            tag = " (SAR)" if b["bandwidth"] < 0 or b["central_wavelength"] < 0 else ""
-            print(f"  idx={b['idx']:2d}: {b['name']:4s} → bw={b['bandwidth']:4d}, wl={b['central_wavelength']:4d}{tag}")
-
         return bw, wl, names
 
     def _build_spectral_indices(self):
