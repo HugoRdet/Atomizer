@@ -5,12 +5,13 @@ Perceiver Segmentation Model — Multi-Task / Multi-Temporal
 Wraps PerceiverIO for dense pixel-wise segmentation, with native
 support for multi-temporal inputs.
 
-Input:  [B, C, H, W]              single-frame
+Input:  [B, C, H, W]             single-frame
      or [B, T, C, H, W]           multi-temporal
         + doy: [B, T] long        day-of-year per frame (multi-temporal)
                                   or None (single-frame uses learned vec)
 
-Output: [B, num_classes, H, W]    logits
+Output: [B, num_classes, H, W]    logits (single-frame)
+     or [B, T, num_classes, H, W] logits (multi-temporal)
 
 Pipeline:
     Multi-frame (T >= 1):
@@ -20,25 +21,20 @@ Pipeline:
         3. Per-token time encoding from doy, broadcast to all H*W
            pixels of frame t. If doy is None, use a learned vector.
         4. Concat [reflectance, pos, time] -> input tokens.
-        5. Build queries on the H*W spatial grid only:
-              query_pos    = Fourier(spatial)
-              query_time   = learned vector  (always — queries are
-                                              time-agnostic by design)
-              query_input  = [pos, time] -> Linear -> [H*W, query_dim]
+        5. Build queries: exact 1:1 match with input tokens
+           query_input = tokens -> Linear -> [T*H*W, query_dim]
         6. PerceiverIO.encode(tokens).decode(queries)
-           -> [B, H*W, num_classes]
-        7. Reshape -> [B, num_classes, H, W]
+           -> [B, T*H*W, num_classes]
+        7. Reshape -> [B, num_classes, H, W] or [B, T, num_classes, H, W]
 
-Time-agnostic queries: cross-attention naturally aggregates over the
-T*H*W input tokens, picking up time-relevant info per spatial location
-without committing the query to a specific frame. Matches Atomizer-IO's
-philosophy.
+Dense Token Queries: By utilizing the exact input features (reflectance +
+spatial pos + time) as queries, the decoder acts as a structural
+skip-connection. This forces the latent cross-attention to anchor
+directly to the raw input space, which is highly effective for dense
+reconstruction and resolving autoencoder blurriness.
 
 Single learned time vector: shared across all tasks. Used for
-(a) single-frame tasks (no real time), and
-(b) the query side of every task (time-agnostic).
-The model can route specific features through this vector if it needs
-to identify single-frame vs multi-frame contexts.
+single-frame tasks (no real time).
 """
 
 import torch
@@ -56,8 +52,8 @@ class PerceiverSeg(nn.Module):
     Args:
         in_channels: Number of input bands per frame (e.g., 15 for the
                      canonical 13 S2 + 2 SAR layout).
-        num_classes: Number of segmentation classes.
-        img_size: Spatial size (H = W). Used for query construction.
+        num_classes: Number of segmentation classes (or output channels).
+        img_size: Spatial size (H = W).
         num_latents, latent_dim, depth, etc.: standard Perceiver-IO config.
         num_freq_bands, max_freq: Fourier-encoder config (shared by
                                   position and time).
@@ -98,17 +94,17 @@ class PerceiverSeg(nn.Module):
         time_dim = self.time_encoder.get_output_dim()
 
         # ── Learned "no time" vector ─────────────────────
-        # Used for single-frame inputs (no real DOY) and for queries
-        # (which are time-agnostic by design). Shared across all tasks.
+        # Used for single-frame inputs (no real DOY).
         self.no_time_vector = nn.Parameter(torch.zeros(time_dim))
         nn.init.normal_(self.no_time_vector, std=0.02)
 
         # ── Token / query dims ───────────────────────────
         # Token = [reflectance(C), pos, time]
         input_dim = in_channels + pos_dim + time_dim
-        # Query = projection of [pos, time] (time = learned vector always)
+
+        # Query = projection of the exact same features [reflectance, pos, time]
         query_dim = latent_dim
-        self.query_proj = nn.Linear(pos_dim + time_dim, query_dim)
+        self.query_proj = nn.Linear(input_dim, query_dim)
 
         # ── Core Perceiver-IO ────────────────────────────
         self.perceiver = PerceiverIO(
@@ -152,7 +148,8 @@ class PerceiverSeg(nn.Module):
                 or None                    fall back to learned vector
 
         Returns:
-            logits: [B, num_classes, H, W]
+            logits: [B, num_classes, H, W]       (if input was 4D)
+                 or [B, T, num_classes, H, W]    (if input was 5D)
         """
         # ── Normalize input rank ─────────────────────────
         if image.dim() == 4:
@@ -201,15 +198,16 @@ class PerceiverSeg(nn.Module):
 
         tokens = torch.cat([pixels, pos_for_tokens, time_for_tokens], dim=-1)
 
-        # ── Build queries: [B, H*W, query_dim], time-agnostic ──
-        query_time = self.no_time_vector.to(image.dtype) \
-            .view(1, 1, -1) \
-            .expand(B, H * W, -1)
-        query_pos = repeat(pos, 'n d -> b n d', b=B)
-        queries = self.query_proj(torch.cat([query_pos, query_time], dim=-1))
+        # ── Build queries: Exact same as tokens ──
+        queries = self.query_proj(tokens)
 
         # ── Perceiver-IO ─────────────────────────────────
         logits = self.perceiver(tokens, queries=queries)
-        # [B, H*W, num_classes]
+        # Output shape: [B, T*H*W, num_classes]
 
-        return rearrange(logits, 'b (h w) c -> b c h w', h=H, w=W)
+        # ── Reshape ──────────────────────────────────────
+        if T > 1:
+            return rearrange(logits, 'b (t h w) c -> b t c h w', t=T, h=H, w=W)
+        else:
+            # Drop 't' from the einops pattern entirely since T=1
+            return rearrange(logits, 'b (h w) c -> b c h w', h=H, w=W)

@@ -2,24 +2,19 @@
 PASTIS Crop Segmentation Trainer
 ==================================
 
-PyTorch Lightning module for training Atomizer (± LTAE) on PASTIS-HD
-for multi-temporal crop type segmentation.
+PyTorch Lightning module for training Atomizer (± LTAE ± decoder skip) on
+PASTIS-HD for multi-temporal crop type segmentation.
 
-Supports both:
-    - Atomiser_Senflood           (no temporal reasoning, T=1 style)
-    - AtomiserLTAE                (per-timestamp encoding + LTAE aggregation)
-Selected via config["Atomiser"]["use_ltae"].
+Encoder selection (priority order):
+    1. config["Atomiser"]["use_decoder_skip"] == True
+         -> Atomiser_Senflood_Skip   (decoder pixel-skip cascade)
+    2. config["Atomiser"]["use_ltae"] == True
+         -> AtomiserLTAE             (per-timestamp encoding + LTAE)
+    3. otherwise
+         -> Atomiser_Senflood        (no temporal reasoning; the 0.38 baseline)
 
 Metric convention:
     mIoU is averaged over crop classes 1..18 (excluding background class 0).
-    This matches PASTIS benchmark papers and is what UNet's 0.44 refers to.
-
-Batch format (flexible — unwrapped before forward):
-    groups[res]["tokens"]: [B, N, 8]
-    queries:               [B, M, 8]   — from batch["queries"] OR
-                                         batch["tasks"]["pastis_segmentation"]["queries"]
-    queries_mask:          [B, M]
-    label:                 [B, H, W]
 
 Token format (8 columns):
     [value, x, y, spectral_idx, label, query_flag, resolution_idx, time_idx]
@@ -34,6 +29,8 @@ from transformers import get_cosine_schedule_with_warmup
 
 from training.atomiser import Atomiser_Senflood
 from training.atomiser.atomiser_ltae_wrapper import AtomiserLTAE
+# >>> SKIP: decoder pixel-skip variant (adjust path if the class lives elsewhere)
+from training.atomiser.Atomiser_senflood_skip import Atomiser_Senflood_Skip
 from training.atomiser.error_supervision import (
     compute_latent_errors,
     compute_error_predictor_loss,
@@ -44,14 +41,8 @@ TASK_NAME = "pastis_segmentation"
 
 
 class PASTISTrainer(pl.LightningModule):
-    """
-    PyTorch Lightning trainer for PASTIS crop segmentation.
+    """PyTorch Lightning trainer for PASTIS crop segmentation."""
 
-    The encoder (Atomiser or AtomiserLTAE) handles encode + decode
-    internally; this trainer just wraps loss/metrics/logging.
-    """
-
-    # PASTIS crop-type names (19 active classes, 0-18)
     CROP_NAMES = [
         "background",
         "meadow",
@@ -87,8 +78,7 @@ class PASTISTrainer(pl.LightningModule):
         self.ignore_index = 255
 
         # =====================================================================
-        # METRICS — per-class, mIoU computed over classes 1-18 only
-        # (excluding background class 0, matching PASTIS benchmark papers)
+        # METRICS — per-class, mIoU over classes 1-18 (exclude background)
         # =====================================================================
         for split in ("train", "val", "test"):
             setattr(self, f"metric_IoU_{split}", torchmetrics.JaccardIndex(
@@ -101,11 +91,20 @@ class PASTISTrainer(pl.LightningModule):
             ))
 
         # =====================================================================
-        # MODEL — LTAE toggle via config["Atomiser"]["use_ltae"]
+        # MODEL — encoder selection
+        #   use_decoder_skip  > use_ltae > base Atomiser_Senflood
         # =====================================================================
-        self.use_ltae = config["Atomiser"].get("use_ltae", True)
-        if self.use_ltae:
-            print("[PASTIS] Using AtomiserLTAE (per-timestamp encoding + LTAE)")
+        self.use_decoder_skip = config["Atomiser"].get("use_decoder_skip", False)
+        self.use_ltae         = config["Atomiser"].get("use_ltae", True)
+
+        if self.use_decoder_skip:
+            print("[PASTIS] Using Atomiser_Senflood_Skip "
+                  "(decoder pixel-skip cascade)")
+            self.encoder = Atomiser_Senflood_Skip(
+                config=self.config, lookup_table=self.lookup_table)
+        elif self.use_ltae:
+            print("[PASTIS] Using AtomiserLTAE "
+                  "(per-timestamp encoding + LTAE)")
             self.encoder = AtomiserLTAE(
                 config=self.config, lookup_table=self.lookup_table)
         else:
@@ -145,7 +144,9 @@ class PASTISTrainer(pl.LightningModule):
                 and self.current_epoch >= self.error_warmup)
 
     def _ensure_flat_batch(self, batch):
-        """Lift queries/queries_mask from batch['tasks'] to the top level."""
+        """Lift queries/queries_mask from batch['tasks'] to the top level.
+        Preserves all other top-level keys (incl. query_token_idx /
+        query_token_valid for the skip) via the shallow dict() copy."""
         if "queries" in batch and batch["queries"] is not None:
             return batch
         if "tasks" in batch and isinstance(batch["tasks"], dict) and len(batch["tasks"]) > 0:
@@ -180,7 +181,6 @@ class PASTISTrainer(pl.LightningModule):
             y_hat = result
             result = {}
 
-        # Queries (labels are in column 4)
         batch = self._ensure_flat_batch(batch)
         queries = batch["queries"]
         labels  = queries[:, :, 4].long()
@@ -191,7 +191,6 @@ class PASTISTrainer(pl.LightningModule):
 
         total_loss = class_loss
 
-        # Error supervision
         if supervise_error and isinstance(result, dict):
             predicted_errors = result.get("predicted_errors")
             topk_indices     = result.get("topk_indices")
@@ -223,7 +222,7 @@ class PASTISTrainer(pl.LightningModule):
         return total_loss, class_loss, preds, labels
 
     # =========================================================================
-    # TRAINING / VALIDATION / TEST STEPS
+    # TRAIN / VAL / TEST STEPS
     # =========================================================================
 
     def training_step(self, batch, batch_idx):
@@ -310,7 +309,6 @@ class PASTISTrainer(pl.LightningModule):
         self.log("test_accuracy", self._compute_crop_acc(test_acc),
                  on_epoch=True, logger=True)
 
-        # Per-class
         for i, name in enumerate(self.CROP_NAMES):
             if i < len(test_iou):
                 self.log(f"test_IoU_{name}", test_iou[i],
@@ -319,7 +317,6 @@ class PASTISTrainer(pl.LightningModule):
                 self.log(f"test_acc_{name}", test_acc[i],
                          on_epoch=True, logger=True)
 
-        # Console summary
         print(f"\n{'='*60}")
         print(f"TEST RESULTS (crop mIoU = mean over classes 1-18)")
         print(f"{'='*60}")
@@ -354,17 +351,6 @@ class PASTISTrainer(pl.LightningModule):
     # =========================================================================
 
     def _compute_total_steps(self) -> int:
-        """
-        Compute total optimizer steps. Prefers dataset length over
-        Lightning's estimated_stepping_batches (which is unreliable with
-        DDP + use_distributed_sampler=False + manual DistributedSampler).
-
-        Priority:
-          1. Config override trainer.total_steps
-          2. Dataset-based computation
-          3. num_training_batches fallback
-          4. estimated_stepping_batches last resort
-        """
         override = self.config.get("trainer", {}).get("total_steps", None)
         if override is not None:
             print(f"[PASTIS] total_steps override from config: {override}")
@@ -374,7 +360,6 @@ class PASTISTrainer(pl.LightningModule):
         accum       = max(1, int(self.trainer.accumulate_grad_batches))
         num_devices = max(1, self.trainer.num_devices * self.trainer.num_nodes)
 
-        # Fallback for grad_accum if callback hasn't applied yet
         if accum == 1:
             cfg_trainer = self.config.get("trainer", {})
             config_accum = int(
@@ -393,7 +378,6 @@ class PASTISTrainer(pl.LightningModule):
             )
         )
 
-        # Try dataset length first
         dataset_len = None
         try:
             dm = self.trainer.datamodule
@@ -427,7 +411,6 @@ class PASTISTrainer(pl.LightningModule):
             print(f"[PASTIS]   total_steps (Lightning): {lightning_est}")
             return total_steps
 
-        # Fallback: num_training_batches
         try:
             ntb = int(self.trainer.num_training_batches)
             if ntb > 0:
@@ -439,7 +422,6 @@ class PASTISTrainer(pl.LightningModule):
         except Exception:
             pass
 
-        # Last resort
         fallback = int(self.trainer.estimated_stepping_batches)
         print(f"[PASTIS] [WARNING] Using estimated_stepping_batches={fallback}")
         return fallback

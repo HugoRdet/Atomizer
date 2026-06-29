@@ -31,7 +31,7 @@ import torch.nn as nn
 from einops import repeat
 
 from .attention import Attention, PreNorm, FeedForward
-
+from torch.profiler import record_function
 
 # =============================================================================
 # CACHE HELPER (for weight tying)
@@ -158,12 +158,15 @@ class PerceiverEncoder(nn.Module):
         x = repeat(self.latents, 'n d -> b n d', b=B)
 
         for cross_attn, cross_ff, self_attns in self.encoder_layers:
-            x = cross_attn(x, context=data, mask=mask) + x
-            x = cross_ff(x) + x
+            with record_function("Encoder Cross Attention"):
+                x = cross_attn(x, context=data, mask=mask) + x
+                x = cross_ff(x) + x
 
-            for self_attn, self_ff in self_attns:
-                x = self_attn(x) + x
-                x = self_ff(x) + x
+            with record_function("Self Attention"):
+
+                for self_attn, self_ff in self_attns:
+                    x = self_attn(x) + x
+                    x = self_ff(x) + x
 
         return x
 
@@ -232,10 +235,11 @@ class PerceiverDecoder(nn.Module):
         Returns:
             logits: [B, M, output_dim]
         """
-        out = self.decoder_cross_attn(queries, context=latents)
-        if self.decoder_ff is not None:
-            out = out + self.decoder_ff(out)
-        return self.to_logits(out)
+        with record_function("Decoder"):
+            out = self.decoder_cross_attn(queries, context=latents)
+            if self.decoder_ff is not None:
+                out = out + self.decoder_ff(out)
+            return self.to_logits(out)
 
 
 # =============================================================================

@@ -1,28 +1,28 @@
 """
-PASTIS-HD Dataset — Multi-temporal, multi-resolution segmentation
+PASTIS-HD Dataset — Multi-temporal, multi-resolution segmentation (SKIP variant)
 
-Modalities:
-    - S2:   10 bands @ 10m, multi-temporal
-    - S1A:  2 bands (VV, VH) @ 10m, multi-temporal
-    - SPOT: 3 bands (R, G, B) @ 1m, single frame (optional)
+Adds a per-query gather index `query_token_idx` / `query_token_valid` so a
+decoder skip cross-attention can read each query-pixel's OWN atoms directly.
+On PASTIS a pixel's atoms span BANDS x TIMESTEPS for BOTH sensors (not just
+bands as on Sen1Floods11).
 
-Token format (8 cols):
-    [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
+Everything tagged  # >>> SKIP  is new relative to the base PastisHDDataset.
 
-Temporal sampling:
-    Evenly spaced frames via torch.linspace — matches PANGAEA reference implementation.
+POOL LAYOUT (verified against TokenBuilder.build_tokens flatten + the cats):
+    sat_tokens = cat([ S2_f0(c h w), ..., S2_f(Ts2-1),  S1_f0(c h w), ..., S1_f(Ts1-1) ])
+  - within a frame: channel-major (c h w)->row  => pixel p={p + c*HW} per sub-block
+  - frames FRAME-MAJOR; S2 block precedes S1 block.
+  pixel p atoms:
+    S2: { t*C2*HW + c*HW + p : t<Ts2, c<C2 }
+    S1: (Ts2*C2*HW) + { t*C1*HW + c*HW + p : t<Ts1, c<C1 }
 
-Returns:
-{
-    "groups": {
-        10.0: {"tokens": [N_sat, 8], "mask": [N_sat], "shape": (H, W)},
-        1.0:  {"tokens": [N_spot, 8], "mask": [N_spot], "shape": (H_hr, W_hr)},  # optional
-    },
-    "tasks": { "pastis_segmentation": { "queries": [M, 8], "queries_mask": [M] } },
-    "label":             [H, W],
-    "target_resolution": 10.0,
-    "image":             [13, H, W],
-}
+  The index is RELATIVE TO sat_tokens (the 10m SAT group) ONLY. It does NOT
+  include the optional SPOT (1m) group. The skip must gather from groups[10.0].
+
+NOTE on splits: PASTIS subsamples queries on EVERY split (unlike Sen1Floods11
+which only subsamples on train). We therefore capture kept_indices via
+return_indices=True on ALL splits, so the gather index always matches the
+(reordered) queries.
 """
 
 import os
@@ -61,10 +61,8 @@ except ImportError:
 
 class PastisHDDataset(Dataset):
     """
-    PASTIS-HD Dataset — Multi-temporal, multi-resolution segmentation.
-
+    PASTIS-HD Dataset — Multi-temporal, multi-resolution segmentation, SKIP variant.
     Flat temporal tokens only (one token per pixel × band × frame).
-    Temporal profile mode has been removed.
     """
 
     SAT_RESOLUTION  = 10.0
@@ -160,13 +158,70 @@ class PastisHDDataset(Dataset):
 
         self.norm_stats = self._load_or_compute_normalization()
 
-        print(f"[PASTIS-HD] {len(self.patch_ids)} patches, split='{self.split}'")
-        print(f"[PASTIS-HD] S2: {self.NUM_S2_BANDS} bands @ {self.SAT_RESOLUTION}m")
-        print(f"[PASTIS-HD] S1: {'enabled' if self.use_s1 else 'DISABLED'} "
+        print(f"[PASTIS-HD-SKIP] {len(self.patch_ids)} patches, split='{self.split}'")
+        print(f"[PASTIS-HD-SKIP] S2: {self.NUM_S2_BANDS} bands @ {self.SAT_RESOLUTION}m")
+        print(f"[PASTIS-HD-SKIP] S1: {'enabled' if self.use_s1 else 'DISABLED'} "
               f"({self.NUM_S1_BANDS} bands)")
-        print(f"[PASTIS-HD] SPOT: {'available' if self.has_spot else 'NOT found/disabled'}")
-        print(f"[PASTIS-HD] Temporal: {self.multi_temporal} frames "
+        print(f"[PASTIS-HD-SKIP] SPOT: {'available' if self.has_spot else 'NOT found/disabled'}")
+        if self.has_spot:
+            print(f"[PASTIS-HD-SKIP] WARNING: SPOT group present. The skip gather index "
+                  f"covers the 10m SAT group ONLY; ensure the model's _pixel_skip "
+                  f"gathers from groups[{self.SAT_RESOLUTION}], not a merged pool.")
+        print(f"[PASTIS-HD-SKIP] Temporal: {self.multi_temporal} frames "
               f"(evenly spaced — matches PANGAEA)")
+
+    # =========================================================================
+    # >>> SKIP: per-query gather index into own band×time atoms
+    # =========================================================================
+
+    @staticmethod
+    def _build_full_pixel_index(Ts2, C2, Ts1, C1, H, W):
+        """
+        Closed-form gather index for ALL pixels, pixel order p = h*W + w.
+
+        Ts2/Ts1 are the ACTUAL frame counts of the S2/S1 token blocks (derived
+        from the built tensors, so S1!=S2 frame counts are handled correctly).
+        C1=0 disables the S1 block.
+
+        Returns [H*W, Ts2*C2 + Ts1*C1] long. Verified numerically against
+        build_tokens' einops flatten + the dataset's frame/sensor cats.
+        """
+        HW = H * W
+        p = torch.arange(HW)                                          # [HW]
+        blocks = []
+
+        # S2 sub-block: t*C2*HW + c*HW + p
+        t2 = torch.arange(Ts2).view(Ts2, 1, 1)
+        c2 = torch.arange(C2).view(1, C2, 1)
+        s2 = (t2 * C2 * HW + c2 * HW).reshape(-1, 1) + p.view(1, -1)  # [Ts2*C2, HW]
+        blocks.append(s2)
+
+        # S1 sub-block (offset by full S2 block): off + t*C1*HW + c*HW + p
+        if C1 > 0 and Ts1 > 0:
+            off = Ts2 * C2 * HW
+            t1 = torch.arange(Ts1).view(Ts1, 1, 1)
+            c1 = torch.arange(C1).view(1, C1, 1)
+            s1 = (off + t1 * C1 * HW + c1 * HW).reshape(-1, 1) + p.view(1, -1)  # [Ts1*C1, HW]
+            blocks.append(s1)
+
+        return torch.cat(blocks, dim=0).t().contiguous()             # [HW, Ts2*C2 + Ts1*C1]
+
+    def _build_query_token_index(self, Ts2, C2, Ts1, C1, H, W, kept_indices=None):
+        """
+        Per-query gather index into the pixel's own atoms (bands x timesteps).
+
+        kept_indices: [N_q] long or None. Row positions (into the full pixel
+        grid) kept by subsample_queries, in the SAME order as returned queries.
+        None -> full grid in pixel order.
+
+        Returns:
+            idx   : [N_q, Ts2*C2 + Ts1*C1] long  -- rows into sat_tokens
+            valid : [N_q] bool                    -- all True (closed form)
+        """
+        full = self._build_full_pixel_index(Ts2, C2, Ts1, C1, H, W)  # [H*W, A]
+        idx = full if kept_indices is None else full[kept_indices]
+        valid = torch.ones(idx.shape[0], dtype=torch.bool)
+        return idx, valid
 
     # =========================================================================
     # DATASET INTERFACE
@@ -232,13 +287,16 @@ class PastisHDDataset(Dataset):
         s2_tokens = self._build_temporal_tokens(
             s2_data, label, s2_time_indices,
             self.s2_spectral_indices, self.sat_resolution_idx)
+        Ts2 = s2_data.shape[0]                       # >>> SKIP: actual S2 frame count
 
         if self.use_s1:
             s1_tokens = self._build_temporal_tokens(
                 s1_data, label, s1_time_indices,
                 self.s1_spectral_indices, self.sat_resolution_idx)
+            Ts1 = s1_data.shape[0]                   # >>> SKIP: actual S1 frame count
             sat_tokens = torch.cat([s2_tokens, s1_tokens], dim=0)
         else:
+            Ts1 = 0
             sat_tokens = s2_tokens
 
         sat_mask = torch.zeros(sat_tokens.shape[0], dtype=torch.bool)
@@ -281,10 +339,19 @@ class PastisHDDataset(Dataset):
             resolution_idx=self.sat_resolution_idx,
             time_idx=s2_time_indices[0],
         )
-        queries = self.token_builder.subsample_queries(
+        # >>> SKIP: capture kept_indices on EVERY split (PASTIS subsamples all splits)
+        queries, kept_indices = self.token_builder.subsample_queries(
             queries, max_queries=self.max_queries,
-            ignore_index=self.IGNORE_INDEX, prioritize_valid=True)
+            ignore_index=self.IGNORE_INDEX, prioritize_valid=True,
+            return_indices=True,
+        )
         queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
+
+        # >>> SKIP: per-query gather index into the pixel's band×time atoms.
+        C1 = self.NUM_S1_BANDS if self.use_s1 else 0
+        query_token_idx, query_token_valid = self._build_query_token_index(
+            Ts2, self.NUM_S2_BANDS, Ts1, C1, H, W, kept_indices=kept_indices,
+        )
 
         image = torch.cat([s2_data[0], s1_data[0]], dim=0) if self.use_s1 else s2_data[0]
 
@@ -294,6 +361,9 @@ class PastisHDDataset(Dataset):
             "label":  label,
             "target_resolution": self.SAT_RESOLUTION,
             "image":  image,
+            # >>> SKIP
+            "query_token_idx":   query_token_idx,    # [N_q, Ts2*C2 + Ts1*C1]
+            "query_token_valid": query_token_valid,  # [N_q] bool
         }
 
     # =========================================================================
@@ -340,14 +410,10 @@ class PastisHDDataset(Dataset):
     # =========================================================================
 
     def _sample_temporal(self, data, dates, n_samples):
-        """
-        Select n_samples evenly spaced frames from temporal sequence.
-        Uses torch.linspace — matches PANGAEA reference implementation exactly.
-        """
+        """Evenly spaced frames via torch.linspace — matches PANGAEA."""
         T = data.shape[0]
         if T <= n_samples:
             return data, dates, torch.arange(T)
-
         indices = torch.linspace(0, T - 1, n_samples, dtype=torch.long)
         return data[indices], [dates[i.item()] for i in indices], indices
 
@@ -390,13 +456,16 @@ class PastisHDDataset(Dataset):
         s2_tokens = self._build_temporal_tokens(
             s2_data, label, s2_time_indices,
             self.s2_spectral_indices, self.sat_resolution_idx)
+        Ts2 = s2_data.shape[0]
 
         if self.use_s1:
             s1_tokens = self._build_temporal_tokens(
                 s1_data, label, s1_time_indices,
                 self.s1_spectral_indices, self.sat_resolution_idx)
+            Ts1 = s1_data.shape[0]
             sat_tokens = torch.cat([s2_tokens, s1_tokens], dim=0)
         else:
+            Ts1 = 0
             sat_tokens = s2_tokens
 
         sat_mask = torch.zeros(sat_tokens.shape[0], dtype=torch.bool)
@@ -428,7 +497,12 @@ class PastisHDDataset(Dataset):
             first_spectral_idx=self.s2_spectral_indices[0],
             resolution_idx=self.sat_resolution_idx,
             time_idx=s2_time_indices[0])
+        # >>> SKIP: viz uses full seg_queries in pixel order (no subsample) -> kept=None
         queries_mask = torch.zeros(queries.shape[0], dtype=torch.bool)
+        C1 = self.NUM_S1_BANDS if self.use_s1 else 0
+        query_token_idx, query_token_valid = self._build_query_token_index(
+            Ts2, self.NUM_S2_BANDS, Ts1, C1, H, W, kept_indices=None)
+
         image = torch.cat([s2_data[0], s1_data[0]], dim=0) if self.use_s1 else s2_data[0]
 
         return {
@@ -439,6 +513,9 @@ class PastisHDDataset(Dataset):
             "image":  image,
             "image_shape": (H, W),
             "n_queries": queries.shape[0],
+            # >>> SKIP
+            "query_token_idx":   query_token_idx,
+            "query_token_valid": query_token_valid,
         }
 
     # =========================================================================

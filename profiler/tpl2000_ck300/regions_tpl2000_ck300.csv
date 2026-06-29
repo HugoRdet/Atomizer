@@ -1,0 +1,14 @@
+region,gflops,cuda_ms,leaf_ops
+Decoder Cross Attention,389.31922944,171.53676499999932,99
+Self Attention,223.071810476,63.15268200000009,1193
+Decoder Logits,218.75490816,25.93979600000009,44
+Decoder skip,203.549719684,173.49624199999806,582
+Encoder Cross Attention:,110.22986304,41.283444,55
+Encoder Process data,50.815512002,25.018528000000007,197
+Decoder pre processing,0.004199684,16.04134399999946,389
+Latents init,0.0,0.0,0
+geo pruning,0.0,0.0,0
+Compute grid config,0.0,0.0,0
+Decoder Cross attention,0.0,97.94310399999924,23
+encode,0.0,21.10429700000002,1
+Cross Attention - Encoder,0.0,20.915146,8

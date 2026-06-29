@@ -22,21 +22,30 @@ TOKEN_TIME_IDX       = 7
 TOKEN_DIM            = 8
 
 
-def build_mlp(in_dim: int, hidden_dim: int, out_dim: int, num_layers: int) -> nn.Sequential:
+def build_mlp(in_dim: int, hidden_dim: int, out_dim: int, num_layers: int,
+              norm_output: bool = True) -> nn.Sequential:
     """
-    MLP with GELU activations and post-LayerNorm on hidden layers.
+    MLP with GELU activations and post-LayerNorm on hidden layers, plus an
+    optional LayerNorm on the OUTPUT.
 
     num_layers=1 → single linear (no activation)
     num_layers=2 → Linear → GELU → LN → Linear
     num_layers=N → adds (N-2) hidden blocks between first and last linear
+
+    norm_output=True appends a LayerNorm(out_dim) after the final Linear.
     """
     if num_layers == 1:
-        return nn.Sequential(nn.Linear(in_dim, out_dim))
+        layers = [nn.Linear(in_dim, out_dim)]
+        if norm_output:
+            layers.append(nn.LayerNorm(out_dim))
+        return nn.Sequential(*layers)
 
     layers = [nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim)]
     for _ in range(num_layers - 2):
         layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim)])
     layers.append(nn.Linear(hidden_dim, out_dim))
+    if norm_output:
+        layers.append(nn.LayerNorm(out_dim))
 
     return nn.Sequential(*layers)
 

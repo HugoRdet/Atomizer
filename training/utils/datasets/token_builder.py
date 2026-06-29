@@ -588,56 +588,53 @@ class TokenBuilder:
     # =========================================================================
 
     @staticmethod
-    def subsample_queries(queries, max_queries, ignore_index=255, prioritize_valid=True):
-        """
-        Subsample query tokens with optional prioritization of valid labels.
+    def subsample_queries(queries, max_queries, ignore_index=255,
+                              prioritize_valid=True, return_indices=False):
+            """
+            Subsample query tokens with optional prioritization of valid labels.
 
-        Args:
-            queries: [N, 8] - query token array
-            max_queries: int - maximum number of queries to return
-            ignore_index: int - label value to consider invalid (default: 255)
-            prioritize_valid: bool - if True, prioritize valid labels (default: True)
+            Args:
+                queries: [N, 8] - query token array
+                max_queries: int - maximum number of queries to return
+                ignore_index: int - label value to consider invalid (default: 255)
+                prioritize_valid: bool - if True, prioritize valid labels
+                return_indices: bool - if True, also return the kept row indices
+                                into the original `queries` tensor. Default False
+                                preserves the original (queries-only) return.
 
-        Returns:
-            subsampled_queries: [max_queries, 8] - subsampled queries
+            Returns:
+                subsampled_queries: [max_queries, 8]
+                (and, if return_indices: kept_indices [max_queries] long)
+            """
+            if queries.shape[0] <= max_queries:
+                if return_indices:
+                    return queries, torch.arange(queries.shape[0])
+                return queries
 
-        Strategy:
-            If prioritize_valid=True:
-            1. Select all valid labels if count <= max_queries
-            2. Otherwise, randomly sample max_queries valid labels
-            3. Fill remaining slots with invalid labels if needed
+            if not prioritize_valid:
+                perm = torch.randperm(queries.shape[0])[:max_queries]
+                if return_indices:
+                    return queries[perm], perm
+                return queries[perm]
 
-            If prioritize_valid=False:
-            - Uniform random sampling
-        """
-        if queries.shape[0] <= max_queries:
-            return queries
+            query_labels = queries[:, 4]
+            valid_mask = (query_labels != ignore_index)
+            valid_indices = torch.where(valid_mask)[0]
+            invalid_indices = torch.where(~valid_mask)[0]
 
-        if not prioritize_valid:
-            perm = torch.randperm(queries.shape[0])[:max_queries]
-            return queries[perm]
-
-        # Prioritize valid labels
-        query_labels = queries[:, 4]  # col 4 is label
-        valid_mask = (query_labels != ignore_index)
-        valid_indices = torch.where(valid_mask)[0]
-        invalid_indices = torch.where(~valid_mask)[0]
-
-        if len(valid_indices) >= max_queries:
-            # Enough valid labels - sample from them
-            perm = torch.randperm(len(valid_indices))[:max_queries]
-            selected = valid_indices[perm]
-        else:
-            # Not enough valid - take all valid + some invalid
-            n_invalid_needed = max_queries - len(valid_indices)
-            n_invalid_needed = min(n_invalid_needed, len(invalid_indices))
-
-            if n_invalid_needed > 0:
-                invalid_perm = torch.randperm(len(invalid_indices))[:n_invalid_needed]
-                selected = torch.cat([valid_indices, invalid_indices[invalid_perm]])
-                # Shuffle combined set
-                selected = selected[torch.randperm(len(selected))]
+            if len(valid_indices) >= max_queries:
+                perm = torch.randperm(len(valid_indices))[:max_queries]
+                selected = valid_indices[perm]
             else:
-                selected = valid_indices
+                n_invalid_needed = max_queries - len(valid_indices)
+                n_invalid_needed = min(n_invalid_needed, len(invalid_indices))
+                if n_invalid_needed > 0:
+                    invalid_perm = torch.randperm(len(invalid_indices))[:n_invalid_needed]
+                    selected = torch.cat([valid_indices, invalid_indices[invalid_perm]])
+                    selected = selected[torch.randperm(len(selected))]
+                else:
+                    selected = valid_indices
 
-        return queries[selected]
+            if return_indices:
+                return queries[selected], selected
+            return queries[selected]

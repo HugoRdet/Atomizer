@@ -76,7 +76,7 @@ class DistributedShapeBasedBatchSampler(Sampler):
             image_shape = dataset.Sampler_building(idx, mode=self.mode)
             shape_key = image_shape
             self.shape_to_indices.setdefault(shape_key, []).append(idx)
-        
+
         self.batches = []
         for indices in tqdm(self.shape_to_indices.values(), desc="Batch creation"):
             random.shuffle(indices)
@@ -84,10 +84,10 @@ class DistributedShapeBasedBatchSampler(Sampler):
                 batch = indices[i:i+self.batch_size]
                 if len(batch) == self.batch_size:
                     self.batches.append(batch)
-        
+
         if self.shuffle:
             random.shuffle(self.batches)
-        
+
         total_batches = len(self.batches)
         remainder = total_batches % self.world_size
         if remainder != 0:
@@ -114,11 +114,11 @@ class DistributedShapeBasedBatchSampler(Sampler):
 class UnifiedDataModule(pl.LightningDataModule):
     """
     Unified DataModule that works with multiple dataset types.
-    
+
     Dataset types:
     - 'h5':      HDF5-based (Tiny_BigEarthNet, FLAIR_MAE) — h5 worker init
     - 'simple':  In-memory (MNISTSparseCanvas) — no special init
-    - 'grouped': Grouped token format (Sen1Floods11, HLSBurnScars, MADOS) — 
+    - 'grouped': Grouped token format (Sen1Floods11, HLSBurnScars, MADOS) —
                  custom collate_fn for nested dict output
 
     Batch sizes (from config_model["trainer"]):
@@ -127,12 +127,12 @@ class UnifiedDataModule(pl.LightningDataModule):
     - test_batch_size:  test batch size (default: same as val)
     - When slide=True in config, val/test batch_size is forced to 1.
     """
-    
+
     H5_DATASET_CLASSES = {'Tiny_BigEarthNet', 'FLAIR_MAE', 'FLAIR_2'}
     SIMPLE_DATASET_CLASSES = {'MNISTSparseCanvas'}
-    GROUPED_DATASET_CLASSES = {'Sen1Floods11Dataset', 
-                                'HLSBurnScarsDataset', 
-                                'MADOSDataset', 
+    GROUPED_DATASET_CLASSES = {'Sen1Floods11Dataset',
+                                'HLSBurnScarsDataset',
+                                'MADOSDataset',
                                 'Sen1Floods11MultiResDataset',
                                 'PastisHDDataset',
                                 'MMEarthMAEDataset',
@@ -143,9 +143,10 @@ class UnifiedDataModule(pl.LightningDataModule):
                                 'MMEarthSegESA',
                                 'ForestNetDataset',
                                 "pv4ger",
-                                "BurnScarsDataset"
+                                "BurnScarsDataset",
+                                'Sen1Floods11SkipDataset'
                                 }
-    
+
     def __init__(
         self,
         path=None,
@@ -160,6 +161,7 @@ class UnifiedDataModule(pl.LightningDataModule):
         config_model=None,
         look_up=None,
         dataset_class=None,
+        collate_fn=None,
         # MNISTSparseCanvas specific params
         canvas_size=64,
         min_digit_size=59,
@@ -169,7 +171,7 @@ class UnifiedDataModule(pl.LightningDataModule):
         fixed_position=False,
     ):
         super().__init__()
-        
+
         # Common params
         self.num_workers = num_workers
         self.trans_modalities = trans_modalities
@@ -179,7 +181,8 @@ class UnifiedDataModule(pl.LightningDataModule):
         self.config_model = config_model
         self.look_up = look_up
         self.dataset_class = dataset_class
-        
+        self._collate_fn_override = collate_fn
+
         # Determine dataset type early (needed for path setup)
         self._dataset_type = self._get_dataset_type()
 
@@ -195,7 +198,7 @@ class UnifiedDataModule(pl.LightningDataModule):
             # Sliding window requires batch_size=1 for val/test
             self.batch_size_val = 1
             self.batch_size_test = 1
-        
+
         # Path setup depends on dataset type
         self.path = path
         if path is not None:
@@ -209,7 +212,7 @@ class UnifiedDataModule(pl.LightningDataModule):
                 self.train_file = path + "_train.h5"
                 self.val_file = path + "_val.h5"
                 self.test_file = path + "_test.h5"
-        
+
         # MNISTSparseCanvas specific params
         self.canvas_size = canvas_size
         self.min_digit_size = min_digit_size
@@ -217,14 +220,14 @@ class UnifiedDataModule(pl.LightningDataModule):
         self.num_samples_train = num_samples_train
         self.num_samples_val = num_samples_val
         self.fixed_position = fixed_position
-        
+
     def _get_dataset_type(self) -> str:
         """Determine the type of dataset for configuration purposes."""
         if self.dataset_class is None:
             return 'unknown'
-        
+
         class_name = self.dataset_class.__name__
-        
+
         if class_name in self.H5_DATASET_CLASSES:
             return 'h5'
         elif class_name in self.SIMPLE_DATASET_CLASSES:
@@ -233,25 +236,27 @@ class UnifiedDataModule(pl.LightningDataModule):
             return 'grouped'
         else:
             return 'h5'  # default for backward compat
-    
+
     def _get_worker_init_fn(self):
         """Get the appropriate worker init function based on dataset type."""
         if self._dataset_type == 'h5':
             return _init_worker_h5
         else:
             return _init_worker_simple
-    
+
     def _get_collate_fn(self):
         """Get the appropriate collate function based on dataset type."""
+        if self._collate_fn_override is not None:
+            return self._collate_fn_override
         if self._dataset_type == 'grouped':
             return collate_grouped
         else:
-            return None  # PyTorch default
-    
+            return None
+
     # =========================================================================
     # DATASET CREATION
     # =========================================================================
-    
+
     def _create_h5_dataset(self, file_path: str, mode: str):
         """Create an HDF5-based dataset."""
         return self.dataset_class(
@@ -263,7 +268,7 @@ class UnifiedDataModule(pl.LightningDataModule):
             config_model=self.config_model,
             look_up=self.look_up
         )
-    
+
     def _create_grouped_dataset(self, mode: str):
         """Create a grouped token format dataset."""
         return self.dataset_class(
@@ -275,11 +280,11 @@ class UnifiedDataModule(pl.LightningDataModule):
             config_model=self.config_model,
             look_up=self.look_up,
         )
-    
+
     def _create_mnist_dataset(self, mode: str):
         """Create an MNISTSparseCanvas dataset."""
         num_samples = self.num_samples_train if mode == "train" else self.num_samples_val
-        
+
         return self.dataset_class(
             canvas_size=self.canvas_size,
             min_digit_size=self.min_digit_size,
@@ -291,11 +296,11 @@ class UnifiedDataModule(pl.LightningDataModule):
             num_samples=num_samples,
             fixed_position=self.fixed_position,
         )
-    
+
     # =========================================================================
     # SETUP
     # =========================================================================
-    
+
     def setup(self, stage=None):
         """Setup datasets based on dataset type."""
         if self._dataset_type == 'h5':
@@ -306,15 +311,15 @@ class UnifiedDataModule(pl.LightningDataModule):
             self._setup_grouped_datasets()
         else:
             raise ValueError(f"Unknown dataset type: {self._dataset_type}")
-    
+
     def _setup_h5_datasets(self):
         """Setup HDF5-based datasets."""
         self.train_dataset = self._create_h5_dataset(self.train_file, "train")
         self.val_dataset = self._create_h5_dataset(self.val_file, "validation")
-        
+
         if self.modality is not None:
             self.val_dataset.modality_mode = self.modality
-        
+
         self.test_dataset = self.dataset_class(
             self.test_file,
             transform=self.trans_modalities,
@@ -325,38 +330,38 @@ class UnifiedDataModule(pl.LightningDataModule):
             config_model=self.config_model,
             look_up=self.look_up
         )
-        
+
         if self.modality is not None:
             self.test_dataset.modality_mode = self.modality
-    
+
     def _setup_grouped_datasets(self):
         """Setup grouped token format datasets."""
         self.train_dataset = self._create_grouped_dataset("train")
         self.val_dataset = self._create_grouped_dataset("validation")
         self.test_dataset = self._create_grouped_dataset("test")
-    
+
     def _setup_simple_datasets(self):
         """Setup simple in-memory datasets."""
         self.train_dataset = self._create_mnist_dataset("train")
         self.val_dataset = self._create_mnist_dataset("validation")
         self.test_dataset = self._create_mnist_dataset("test")
-    
+
     # =========================================================================
     # DATALOADERS
     # =========================================================================
-    
+
     def _make_dataloader(self, dataset, batch_size, shuffle=False, prefetch_factor=2):
         """Create a DataLoader with the right collate/worker config."""
         worker_init_fn = self._get_worker_init_fn()
         collate_fn = self._get_collate_fn()
-        
+
         num_workers = self.num_workers
         if self._dataset_type == 'simple' and num_workers > 4:
             num_workers = 4
 
         # pin_memory doesn't work well with nested dicts in sliding window
         pin_memory = not (self.use_sliding and batch_size == 1)
-        
+
         return DataLoader(
             dataset,
             num_workers=num_workers,
@@ -368,14 +373,14 @@ class UnifiedDataModule(pl.LightningDataModule):
             prefetch_factor=prefetch_factor,
             persistent_workers=True if num_workers > 0 else False,
         )
-    
+
     def train_dataloader(self):
         if self.modality is None:
             self.modality = "train"
-        
+
         rank = dist.get_rank() if dist.is_initialized() else 0
         print(f"Train DataLoader created on rank: {rank}, batch_size={self.batch_size_train}")
-        
+
         pf = 8 if self._dataset_type == 'h5' else 2
         return self._make_dataloader(
             self.train_dataset,
@@ -387,11 +392,11 @@ class UnifiedDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         if self.modality is None:
             self.modality = "validation"
-        
+
         rank = dist.get_rank() if dist.is_initialized() else 0
         print(f"Validation DataLoader created on rank: {rank}, batch_size={self.batch_size_val}"
               f"{' (sliding window)' if self.use_sliding else ''}")
-        
+
         pf = 8 if self._dataset_type == 'h5' else 2
         return self._make_dataloader(
             self.val_dataset,
@@ -403,11 +408,11 @@ class UnifiedDataModule(pl.LightningDataModule):
     def test_dataloader(self):
         if self.modality is None:
             self.modality = "test"
-        
+
         rank = dist.get_rank() if dist.is_initialized() else 0
         print(f"Test DataLoader created on rank: {rank}, batch_size={self.batch_size_test}"
               f"{' (sliding window)' if self.use_sliding else ''}")
-        
+
         pf = 4 if self._dataset_type == 'h5' else 2
         return self._make_dataloader(
             self.test_dataset,

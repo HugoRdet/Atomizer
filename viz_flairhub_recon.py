@@ -1,363 +1,286 @@
 """
-PureForest Atomizer Trainer (single-task classification)
-==========================================================
+Sen1Floods11 — Modality Drop Inference Script
+==============================================
 
-13-class pure forest tree species classification.
-Input: RGB+NIR ortho (4 bands, 0.2 m/px) + LiDAR point cloud (optional).
+Load a trained Atomizer checkpoint and evaluate on the test split under
+different band configurations, without retraining.
 
-Mirrors Model_ForestNet for the classification contract:
-    model(batch, training=..., task="classification") → [B, num_classes]
-    CE loss on [B] scalar targets from batch["label"]
+How it works
+------------
+For each ablation config the script:
+  1. Instantiates Sen1Floods11Dataset with bands.keep / bands.drop set.
+  2. Builds a DataModule and runs trainer.test().
+  3. Prints a summary table of mIoU per config.
 
-Differences from Model_ForestNet:
-  - 13 classes (PureForest) with severe imbalance →
-      inverse-frequency class weighting ON by default ("auto")
-  - Per-class top-1 accuracy logged at test time
-  - Cosine schedule with linear warmup (from FRACTAL trainer) rather than
-    plain CosineAnnealingLR — more robust with large datasets / multi-GPU
+The model checkpoint is loaded once and reused for all ablations.
+The latent grid stays identical across ablations because dropped bands
+are replaced by masked padding tokens (same N tokens, same Voronoi cells).
 
-Class frequencies are computed from the full PureForest-patches.csv
-(all splits combined, 135 569 scenes).
+Usage
+-----
+    python script_test_senflood_modality_drop.py \
+        --ckpt ./checkpoints/my_run.ckpt \
+        --xp_name modality_drop_eval
+
+    # Custom ablation list (yaml band names):
+    python script_test_senflood_modality_drop.py \
+        --ckpt ./checkpoints/my_run.ckpt \
+        --xp_name modality_drop_eval \
+        --ablations "all" "s2_only" "s1_only" "rgb_only"
+
+Available built-in ablation names
+----------------------------------
+    all        — all 15 bands (baseline, no drop)
+    s2_only    — keep all S2 (B01–B12), drop VV VH
+    s1_only    — keep all bands, drop B01–B12  (SAR only)
+    rgb_only   — keep all bands, drop everything except B02 B03 B04
+    no_swir    — keep all bands, drop B10 B11 B12
+    no_re      — keep all bands, drop red-edge (B05 B06 B07 B08A)
+
+    Or define your own inline:
+        --ablations "keep=B02,B03,B04,VV,VH drop=VV,VH"
+    Format: "keep=<comma-list> drop=<comma-list>"
+    Either key can be omitted (keep omitted = all bands).
 """
 
+import os
+import argparse
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pytorch_lightning as pl
-from transformers import get_cosine_schedule_with_warmup
-from torchmetrics.classification import (
-    MulticlassAccuracy,
-    MulticlassF1Score,
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.loggers import WandbLogger
+
+seed_everything(42, workers=True)
+
+from training.utils import read_yaml, Lookup_encoding
+from training.trainer_SENFLOOD import Model_SenFlood
+from training.utils.datasets.utils_dataset_SENFLOOD import Sen1Floods11Dataset
+from training.utils.datasets.dataloaders import UnifiedDataModule
+from training.utils.datasets.token_grouping import collate_grouped
+
+# =============================================================================
+# BUILT-IN ABLATION CONFIGS
+# name → (keep: list|None, drop: list|None)
+# =============================================================================
+
+ALL_S2 = ["B01","B02","B03","B04","B05","B06","B07","B08","B08A","B09","B10","B11","B12"]
+ALL_S1 = ["VV","VH"]
+ALL_BANDS = ALL_S2 + ALL_S1
+
+BUILTIN_ABLATIONS = {
+    "all":      (None,      None),
+    "s2_only":  (None,      ALL_S1),
+    "s1_only":  (None,      ALL_S2),
+    "rgb_only": (None,      [b for b in ALL_BANDS if b not in ["B02","B03","B04"]]),
+    "no_swir":  (None,      ["B10","B11","B12"]),
+    "no_re":    (None,      ["B05","B06","B07","B08A"]),
+}
+
+
+def parse_ablation(name: str):
+    """
+    Parse an ablation spec. Either a builtin name or inline format:
+        "keep=B02,B03,B04 drop=VV,VH"
+    Returns (keep: list|None, drop: list|None).
+    """
+    if name in BUILTIN_ABLATIONS:
+        return BUILTIN_ABLATIONS[name]
+
+    keep, drop = None, None
+    for part in name.strip().split():
+        if part.startswith("keep="):
+            keep = [b.strip() for b in part[5:].split(",") if b.strip()]
+        elif part.startswith("drop="):
+            drop = [b.strip() for b in part[5:].split(",") if b.strip()]
+    return keep, drop
+
+
+# =============================================================================
+# ARGS
+# =============================================================================
+
+parser = argparse.ArgumentParser(description="Sen1Floods11 modality drop evaluation")
+parser.add_argument("--ckpt",      type=str, required=True,  help="Path to .ckpt file")
+parser.add_argument("--xp_name",   type=str, required=True,  help="Experiment name")
+parser.add_argument("--data_dir",  type=str, default="./data/SENFLOOD")
+parser.add_argument("--config",    type=str, default="./training/configs/config_test-SENFLOOD.yaml")
+parser.add_argument("--bands_yaml",type=str, default="./data/bands_info/bands.yaml")
+parser.add_argument("--dataset_config", type=str,
+                    default="./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml")
+parser.add_argument("--num_workers", type=int, default=4)
+parser.add_argument("--ablations", type=str, nargs="+",
+                    default=["all", "s2_only", "s1_only"],
+                    help="Ablation names or inline 'keep=... drop=...' specs")
+parser.add_argument("--wandb",     action="store_true", help="Log results to wandb")
+args = parser.parse_args()
+
+
+# =============================================================================
+# SETUP
+# =============================================================================
+
+config_model   = read_yaml(args.config)
+lookup_table   = Lookup_encoding(
+    read_yaml(args.dataset_config),
+    read_yaml(args.bands_yaml),
+    config_model,
 )
+dataset_config = read_yaml(args.bands_yaml)
+
+print(f"\n{'='*60}")
+print(f"  Sen1Floods11 Modality Drop Evaluation")
+print(f"  Checkpoint: {args.ckpt}")
+print(f"  Ablations:  {args.ablations}")
+print(f"{'='*60}\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PureForest class metadata
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# LOAD MODEL ONCE
+# =============================================================================
 
-PUREFOREST_CLASS_NAMES = [
-    "Deciduous oak",          # 0  — 35.4 %
-    "Evergreen oak",          # 1  — 16.5 %
-    "Beech",                  # 2  —  9.3 %
-    "Chestnut",               # 3  —  2.7 %
-    "Black locust",           # 4  —  1.7 %
-    "Maritime pine",          # 5  —  5.6 %
-    "Scotch pine",            # 6  — 13.5 %
-    "Black pine",             # 7  —  5.3 %
-    "Aleppo pine",            # 8  —  3.5 %
-    "Fir",                    # 9  —  0.6 %
-    "Spruce",                 # 10 —  3.0 %
-    "Larch",                  # 11 —  2.4 %
-    "Douglas",                # 12 —  0.4 %
-]
-NUM_CLASSES_PUREFOREST = 13
-
-# Global class frequencies from PureForest-patches.csv (all 135 569 scenes).
-# Each entry is count / total.  Used for inverse-frequency class weighting.
-PUREFOREST_CLASS_FREQS = [
-    0.3545,   # 0  Deciduous oak       48 055
-    0.1649,   # 1  Evergreen oak       22 361
-    0.0934,   # 2  Beech               12 670
-    0.0272,   # 3  Chestnut             3 684
-    0.0170,   # 4  Black locust         2 303
-    0.0558,   # 5  Maritime pine        7 568
-    0.1347,   # 6  Scotch pine         18 265
-    0.0533,   # 7  Black pine           7 226
-    0.0346,   # 8  Aleppo pine          4 699
-    0.0062,   # 9  Fir                    840
-    0.0300,   # 10 Spruce               4 074
-    0.0243,   # 11 Larch                3 294
-    0.0039,   # 12 Douglas                530
-]
+print("[Eval] Loading checkpoint...")
+model = Model_SenFlood.load_from_checkpoint(
+    args.ckpt,
+    strict=False,
+    config=config_model,
+    wand=False,
+    name=args.xp_name,
+    transform=None,
+    lookup_table=lookup_table,
+)
+model.eval()
+print("[Eval] Checkpoint loaded.\n")
 
 
-def default_pureforest_class_weights(
-    freqs=PUREFOREST_CLASS_FREQS,
-    weight_clip: float = 20.0,
-) -> torch.Tensor:
-    """
-    Inverse-frequency weights, clipped to avoid destabilising extreme values
-    for the rarest classes (Douglas raw weight ≈ 256, Fir ≈ 161).
+# =============================================================================
+# WANDB (optional)
+# =============================================================================
 
-    A clip of 20 keeps the signal on rare species meaningful while preventing
-    them from swamping the gradient signal from common species.
-    Tune weight_clip if you want more / less emphasis on rare classes.
-    """
-    raw = torch.tensor(
-        [1.0 / max(f, 1e-9) for f in freqs], dtype=torch.float32
+wandb_logger = None
+if args.wandb and os.environ.get("LOCAL_RANK", "0") == "0":
+    import wandb
+    wandb.init(
+        name=f"{args.xp_name}_modality_drop",
+        project="SenFlood",
+        config={"ckpt": args.ckpt, "ablations": args.ablations},
     )
-    return raw.clamp(max=weight_clip)
+    wandb_logger = WandbLogger(project="SenFlood")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Trainer
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# RUN ABLATIONS
+# =============================================================================
 
-class Model_PureForest(pl.LightningModule):
-    """
-    PureForest tree species classification Lightning module.
+results = []   # list of (name, metrics_dict)
 
-    Args:
-        config:           Atomizer config dict (YAML loaded).
-        wand:             Whether W&B logging is active.
-        name:             Experiment name string.
-        transform:        Unused; kept for API parity with other trainers.
-        lookup_table:     Lookup_encoding instance.
-        class_weights:    CE class weights.
-                            "auto"  (default) → inverse-frequency, clipped at 20
-                            None              → unweighted CE
-                            Tensor / list     → caller-provided weights [13]
-        label_smoothing:  CE label smoothing. Default 0.0 — kept off for
-                          fair comparison with the RandLA-Net baseline.
-    """
+for ablation_name in args.ablations:
 
-    def __init__(
-        self,
-        config: dict,
-        wand: bool = False,
-        name: str = "pureforest",
-        transform=None,
-        lookup_table=None,
-        class_weights="auto",
-        label_smoothing: float = 0.0,
-    ):
-        super().__init__()
-        self.strict_loading = False
-        self.save_hyperparameters(ignore=["lookup_table", "transform", "class_weights"])
+    keep, drop = parse_ablation(ablation_name)
 
-        self.config          = config
-        self.name            = name
-        self.wand            = wand
-        self.num_classes     = NUM_CLASSES_PUREFOREST
-        self.class_names     = PUREFOREST_CLASS_NAMES
-        self.label_smoothing = label_smoothing
+    keep_str = ",".join(keep) if keep else "ALL"
+    drop_str = ",".join(drop) if drop else "none"
+    print(f"\n{'─'*60}")
+    print(f"  Ablation : {ablation_name}")
+    print(f"  Keep     : {keep_str}")
+    print(f"  Drop     : {drop_str}")
+    print(f"{'─'*60}")
 
-        # ── Force num_classes in config ───────────────────────────
-        config = dict(config)
-        config_trainer = dict(config.get("trainer", {}))
-        config_trainer["num_classes"] = self.num_classes
-        config["trainer"] = config_trainer
-        self.config = config
+    # ── Inject band config into model config ─────────────────────────────
+    # Sen1Floods11Dataset reads bands.keep / bands.drop from config_model.
+    # We patch it per-ablation; the model weights are untouched.
+    config_model["trainer"]["bands"] = {
+        "keep": keep,
+        "drop": drop,
+    }
 
-        # ── Build Atomizer model ──────────────────────────────────
-        from training.atomiser.Atomiser_SENFLOOD import Atomiser_Senflood
-        self.model = Atomiser_Senflood(
-            config=config,
-            lookup_table=lookup_table,
-        )
+    # ── Build test datamodule ─────────────────────────────────────────────
+    data_module = UnifiedDataModule(
+        path=args.data_dir,
+        batch_size=1,          # full 512×512 tiles, keep memory safe
+        num_workers=args.num_workers,
+        trans_modalities=None,
+        trans_tokens=None,
+        model=config_model["encoder"],
+        dataset_config=dataset_config,
+        config_model=config_model,
+        look_up=lookup_table,
+        dataset_class=Sen1Floods11Dataset,
+    )
 
-        # ── Class weights ─────────────────────────────────────────
-        if class_weights == "auto":
-            cw = default_pureforest_class_weights()
-            print(
-                f"[PureForest-Trainer] Auto inverse-frequency weights "
-                f"(clip=20): {[round(w, 2) for w in cw.tolist()]}"
-            )
-        elif class_weights is None:
-            cw = None
-            print("[PureForest-Trainer] No class weighting (unweighted CE).")
-        else:
-            cw = torch.tensor(class_weights, dtype=torch.float32) \
-                if not torch.is_tensor(class_weights) else class_weights
-            print(f"[PureForest-Trainer] Custom class weights: "
-                  f"{[round(w, 2) for w in cw.tolist()]}")
+    # ── Trainer (test only, no fitting) ──────────────────────────────────
+    trainer = Trainer(
+        devices=-1,
+        accelerator="gpu",
+        precision="bf16-mixed",
+        logger=wandb_logger,
+        enable_progress_bar=True,
+        enable_model_summary=False,
+    )
 
-        if cw is not None:
-            self.register_buffer("class_weights", cw)
-        else:
-            self.class_weights = None
+    # trainer.test returns a list of dicts, one per dataloader
+    test_results = trainer.test(model, datamodule=data_module, verbose=True)
+    metrics = test_results[0] if test_results else {}
 
-        # ── Optimizer config ──────────────────────────────────────
-        trainer_cfg       = config["trainer"]
-        self.lr           = float(trainer_cfg.get("lr", 1e-4))
-        self.weight_decay = float(trainer_cfg.get("weight_decay", 1e-2))
+    results.append((ablation_name, keep_str, drop_str, metrics))
 
-        # ── Metrics ───────────────────────────────────────────────
-        def _make_metrics(prefix: str):
-            return nn.ModuleDict({
-                f"{prefix}_top1": MulticlassAccuracy(
-                    num_classes=self.num_classes, top_k=1, average="micro"),
-                f"{prefix}_top5": MulticlassAccuracy(
-                    num_classes=self.num_classes,
-                    top_k=min(5, self.num_classes), average="micro"),
-                f"{prefix}_macro_acc": MulticlassAccuracy(
-                    num_classes=self.num_classes, average="macro"),
-                f"{prefix}_macro_f1": MulticlassF1Score(
-                    num_classes=self.num_classes, average="macro"),
-            })
+    if args.wandb and wandb_logger:
+        import wandb
+        wandb.log({
+            f"{ablation_name}/{k}": v
+            for k, v in metrics.items()
+        })
 
-        self.train_metrics = _make_metrics("train")
-        self.val_metrics   = _make_metrics("val")
-        self.test_metrics  = _make_metrics("test")
 
-        # Per-class top-1 accuracy at test time only
-        self.test_per_class_acc = MulticlassAccuracy(
-            num_classes=self.num_classes, average=None
-        )
+# =============================================================================
+# SUMMARY TABLE
+# =============================================================================
 
-        print(
-            f"[PureForest-Trainer] {self.num_classes} classes, "
-            f"label_smoothing={self.label_smoothing}, "
-            f"lr={self.lr}, weight_decay={self.weight_decay}"
-        )
+print(f"\n\n{'='*70}")
+print(f"  MODALITY DROP SUMMARY — {args.xp_name}")
+print(f"  Checkpoint: {args.ckpt}")
+print(f"{'='*70}")
 
-    # =========================================================================
-    # FORWARD
-    # =========================================================================
+# Collect all metric keys that appeared
+all_keys = []
+for _, _, _, m in results:
+    for k in m:
+        if k not in all_keys:
+            all_keys.append(k)
 
-    def forward(self, batch, training: bool = True):
-        return self.model(batch, training=training, task="classification")
+# Print header
+col_w = 22
+print(f"\n{'Ablation':<18} {'Keep':<30} {'Drop':<30}", end="")
+for k in all_keys:
+    print(f"  {k:<14}", end="")
+print()
+print("─" * (18 + 30 + 30 + len(all_keys) * 16))
 
-    # =========================================================================
-    # SHARED STEP
-    # =========================================================================
+# Print rows
+for name, keep_str, drop_str, metrics in results:
+    print(f"{name:<18} {keep_str:<30} {drop_str:<30}", end="")
+    for k in all_keys:
+        v = metrics.get(k, float("nan"))
+        print(f"  {v:<14.4f}", end="")
+    print()
 
-    def _shared_step(self, batch, stage: str):
-        is_train = stage == "train"
+print(f"{'='*70}\n")
 
-        target = batch["label"].long()     # [B]
-        bs     = target.shape[0]
+# Save to txt
+out_path = f"./results_{args.xp_name}_modality_drop.txt"
+with open(out_path, "w") as f:
+    f.write(f"Checkpoint: {args.ckpt}\n\n")
+    f.write(f"{'Ablation':<18} {'Keep':<30} {'Drop':<30}")
+    for k in all_keys:
+        f.write(f"  {k:<14}")
+    f.write("\n" + "─" * (18 + 30 + 30 + len(all_keys) * 16) + "\n")
+    for name, keep_str, drop_str, metrics in results:
+        f.write(f"{name:<18} {keep_str:<30} {drop_str:<30}")
+        for k in all_keys:
+            v = metrics.get(k, float("nan"))
+            f.write(f"  {v:<14.4f}")
+        f.write("\n")
 
-        logits = self.forward(batch, training=is_train)   # [B, 13]
+print(f"[Eval] Results saved to {out_path}")
 
-        # Defensive checks
-        if logits.shape[-1] != self.num_classes:
-            raise RuntimeError(
-                f"[PureForest-Trainer] Logits last dim {logits.shape[-1]} != "
-                f"num_classes {self.num_classes}. "
-                f"Check config['trainer']['num_classes']."
-            )
-        if target.numel() > 0:
-            tmin, tmax = int(target.min()), int(target.max())
-            if tmin < 0 or tmax >= self.num_classes:
-                raise RuntimeError(
-                    f"[PureForest-Trainer] Targets out of range "
-                    f"[{tmin}, {tmax}], num_classes={self.num_classes}."
-                )
-
-        loss = F.cross_entropy(
-            logits,
-            target,
-            weight=self.class_weights,
-            label_smoothing=self.label_smoothing if is_train else 0.0,
-        )
-
-        # Update metrics
-        metrics = getattr(self, f"{stage}_metrics")
-        with torch.no_grad():
-            for metric in metrics.values():
-                metric.update(logits, target)
-            if stage == "test":
-                self.test_per_class_acc.update(logits, target)
-
-        self.log(
-            f"{stage}_loss", loss,
-            on_step=is_train, on_epoch=True,
-            prog_bar=True, sync_dist=True,
-            batch_size=bs,
-        )
-        # Print to stdout every 200 steps so SLURM log shows progress
-        if is_train and self.global_step % 200 == 0 and self.trainer.is_global_zero:
-            print(f"[step {self.global_step}] train_loss={loss.item():.4f}",
-                  flush=True)
-        return loss
-
-    # =========================================================================
-    # LIGHTNING HOOKS
-    # =========================================================================
-
-    def training_step(self, batch, batch_idx):
-        return self._shared_step(batch, "train")
-
-    def validation_step(self, batch, batch_idx):
-        return self._shared_step(batch, "val")
-
-    def test_step(self, batch, batch_idx):
-        return self._shared_step(batch, "test")
-
-    def _epoch_end(self, stage: str):
-        metrics = getattr(self, f"{stage}_metrics")
-        for name, metric in metrics.items():
-            val = metric.compute()
-            metric.reset()
-            self.log(name, val,
-                     on_epoch=True, prog_bar=("top1" in name),
-                     sync_dist=True)
-        # Print to stdout so progress is visible in SLURM log
-        if self.trainer.is_global_zero:
-            vals = {n: getattr(self, f"{stage}_metrics")[n].compute()
-                    if False else "(logged)" for n in metrics}
-            print(f"[{stage} epoch {self.current_epoch}] metrics logged",
-                  flush=True)
-
-    def on_train_epoch_end(self):
-        self._epoch_end("train")
-
-    def on_validation_epoch_end(self):
-        self._epoch_end("val")
-
-    def on_test_epoch_end(self):
-        self._epoch_end("test")
-
-        # Per-class accuracy
-        per_class = self.test_per_class_acc.compute()   # [13]
-        self.test_per_class_acc.reset()
-        for i, class_name in enumerate(self.class_names):
-            self.log(
-                f"test_acc/{class_name}", per_class[i].item(),
-                on_epoch=True, sync_dist=True,
-            )
-
-    # =========================================================================
-    # OPTIMIZER  — AdamW + cosine warmup (mirrors FRACTAL trainer)
-    # =========================================================================
-
-    def _compute_total_steps(self) -> int:
-        override = self.config.get("trainer", {}).get("total_steps", None)
-        if override is not None:
-            print(f"[PureForest-Trainer] total_steps override: {override}")
-            return int(override)
-
-        try:
-            est = int(self.trainer.estimated_stepping_batches)
-        except Exception:
-            est = -1
-
-        if est <= 0:
-            fallback = max(1, self.trainer.max_epochs) * 1000
-            print(
-                f"[PureForest-Trainer] WARN: cannot estimate total_steps, "
-                f"falling back to {fallback}."
-            )
-            return fallback
-
-        print(f"[PureForest-Trainer] total_steps estimate: {est}")
-        return est
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-        )
-
-        total_steps  = self._compute_total_steps()
-        warmup_steps = self.config.get("optimizer", {}).get(
-            "warmup_steps", max(1, int(0.05 * total_steps))
-        )
-
-        print(
-            f"[PureForest-Trainer] LR schedule: "
-            f"total_steps={total_steps}, warmup={warmup_steps}, "
-            f"peak_lr={self.lr}"
-        )
-
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
-        }
+if args.wandb and wandb_logger:
+    import wandb
+    wandb.finish()

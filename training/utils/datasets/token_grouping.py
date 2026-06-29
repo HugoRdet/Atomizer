@@ -164,23 +164,44 @@ def _pad_tokens(tensors, pad_value=0.0):
     max_len = max(t.shape[0] for t in tensors)
     D = tensors[0].shape[1]
     B = len(tensors)
-
     padded = torch.full((B, max_len, D), pad_value, dtype=tensors[0].dtype)
     for i, t in enumerate(tensors):
         padded[i, :t.shape[0]] = t
-
     return padded
+
 
 def _pad_masks(masks, pad_value=True):
     """Pad a list of [N_i] bool tensors to [B, N_max]. Padded = True."""
     max_len = max(m.shape[0] for m in masks)
     B = len(masks)
-
     padded = torch.full((B, max_len), pad_value, dtype=torch.bool)
     for i, m in enumerate(masks):
         padded[i, :m.shape[0]] = m
-
     return padded
+
+
+def _pad_index_2d(idx_list, pad_value=0):
+    """
+    Pad a list of [M_i, A_i] long tensors to [B, M_max, A_max].
+    Padded entries get pad_value (0 -> harmless row 0; masked via valid).
+    """
+    M_max = max(t.shape[0] for t in idx_list)
+    A_max = max(t.shape[1] for t in idx_list)
+    B = len(idx_list)
+    out = torch.full((B, M_max, A_max), pad_value, dtype=idx_list[0].dtype)
+    for i, t in enumerate(idx_list):
+        out[i, :t.shape[0], :t.shape[1]] = t
+    return out
+
+
+def _pad_valid_1d(valid_list, pad_value=False):
+    """Pad a list of [M_i] bool tensors to [B, M_max]. Padded = False (skip)."""
+    M_max = max(v.shape[0] for v in valid_list)
+    B = len(valid_list)
+    out = torch.full((B, M_max), pad_value, dtype=torch.bool)
+    for i, v in enumerate(valid_list):
+        out[i, :v.shape[0]] = v
+    return out
 
 # =============================================================================
 # MULTI-TASK COLLATE (DYNAMIC VERSION)
@@ -188,26 +209,20 @@ def _pad_masks(masks, pad_value=True):
 
 def collate_multitask(samples: list) -> dict:
     """
-    Collate multi-task samples into a batch.
-    Dynamic version: Safe to use because Round-Robin sampling + static modalities
-    guarantees identical batch structures across all DDP ranks.
-
-    Passes through dataset_name from the first sample (homogeneous batches
-    guaranteed by round-robin sampling).
+    SKIP-aware multitask collate. Pads groups + per-task queries, AND carries
+    query_token_idx / query_token_valid padded in lockstep with the queries.
+    No batch offset on indices: per-sample pools live in separate batch rows.
     """
     B = len(samples)
 
-    # 1. Collate groups dynamically
+    # 1. Groups (unchanged)
     all_resolutions = set()
     for s in samples:
         all_resolutions.update(s["groups"].keys())
 
     groups = {}
     for res in sorted(all_resolutions):
-        tokens_list = []
-        masks_list = []
-        shape = None
-
+        tokens_list, masks_list, shape = [], [], None
         for s in samples:
             if res in s["groups"]:
                 tokens_list.append(s["groups"][res]["tokens"])
@@ -215,20 +230,17 @@ def collate_multitask(samples: list) -> dict:
                 if shape is None:
                     shape = s["groups"][res]["shape"]
             else:
-                # Sample doesn't have this resolution — empty placeholder, will be fully masked
                 tokens_list.append(torch.zeros(0, 8))
                 masks_list.append(torch.zeros(0, dtype=torch.bool))
-
         if shape is None:
             shape = (1, 1)
-
         groups[res] = {
             "tokens": _pad_tokens(tokens_list),
-            "mask": _pad_masks(masks_list),
-            "shape": shape,
+            "mask":   _pad_masks(masks_list),
+            "shape":  shape,
         }
 
-    # 2. Collate tasks dynamically
+    # 2. Tasks (queries) — unchanged padding to M_max
     all_task_names = set()
     for s in samples:
         all_task_names.update(s.get("tasks", {}).keys())
@@ -236,10 +248,9 @@ def collate_multitask(samples: list) -> dict:
     tasks = {}
     for task_name in sorted(all_task_names):
         queries_list = [s["tasks"][task_name]["queries"] for s in samples]
-        masks_list = [s["tasks"][task_name]["queries_mask"] for s in samples]
-
+        masks_list   = [s["tasks"][task_name]["queries_mask"] for s in samples]
         tasks[task_name] = {
-            "queries": _pad_tokens(queries_list),
+            "queries":      _pad_tokens(queries_list),
             "queries_mask": _pad_masks(masks_list),
         }
 
@@ -247,17 +258,23 @@ def collate_multitask(samples: list) -> dict:
 
     result = {
         "groups": groups,
-        "tasks": tasks,
+        "tasks":  tasks,
         "target_resolution": target_resolution,
     }
 
-    # Pass through dataset_name (homogeneous batch from round-robin)
+    # 3. >>> SKIP: carry query_token_idx / query_token_valid, padded in lockstep
+    #    with the queries (same M_max). Padded query rows -> valid=False so the
+    #    model ignores them; their index value is 0 (never read once masked).
+    if "query_token_idx" in samples[0]:
+        qti_list = [s["query_token_idx"]   for s in samples]   # [M_i, A_i] long
+        qtv_list = [s["query_token_valid"] for s in samples]   # [M_i] bool
+        result["query_token_idx"]   = _pad_index_2d(qti_list, pad_value=0)
+        result["query_token_valid"] = _pad_valid_1d(qtv_list, pad_value=False)
+
     if "dataset_name" in samples[0]:
         result["dataset_name"] = samples[0]["dataset_name"]
 
     return result
-
-
 # =============================================================================
 # SINGLE-TASK COLLATE (GROUPED)
 # =============================================================================
@@ -528,7 +545,7 @@ def compute_grid_config(
 
     # Number of latents from token budget
     num_latents = max(1, total_tokens // tokens_per_latent)
-    
+
 
     # Cap: never more latents than spatial positions allow.
     # Temporal tokens share spatial locations, so the latent grid
