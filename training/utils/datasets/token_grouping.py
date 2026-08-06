@@ -22,7 +22,20 @@ Token format:
     [value, x, y, spectral_idx, label, query_idx, resolution_idx, time_idx]
      col 0  1  2       3          4        5            6            7
 
-All tokens are flat — no temporal dimension. Temporal info is in column 7.
+All tokens are flat -- no temporal dimension. Temporal info is in column 7.
+
+DALES ADDITIONS (see collate_grouped):
+    "token_latent_assignment": [B, N_max] long -- per-token nearest-latent
+        index, precomputed offline (see precompute_dales_latent_assignment.py)
+        and selected for whichever D4 variant DalesDataset sampled for each
+        sample. Padded in lockstep with groups[res]["tokens"] (same N_max),
+        padding value 0 (harmless -- padded positions are already masked in
+        groups[res]["mask"], and GeographicPruningDales gathers that input
+        mask too, so a padded token landing in latent 0's cell never
+        actually contributes).
+    "patch_id": List[str], length B -- passed through as-is (not stacked
+        into a tensor), used as the GeographicPruningDales FALLBACK cache
+        key when token_latent_assignment isn't available.
 """
 
 import math
@@ -90,7 +103,7 @@ class RoundRobinDistributedBatchSampler(Sampler):
         self.max_batches = max(self.batches_per_dataset)
 
         # Total batches yielded per epoch (per rank):
-        # max_batches rounds × num_datasets batches per round
+        # max_batches rounds x num_datasets batches per round
         self.total_batches = self.max_batches * self.num_datasets
 
     def _build_indices(self, d_len, num_needed, offset, generator):
@@ -203,6 +216,19 @@ def _pad_valid_1d(valid_list, pad_value=False):
         out[i, :v.shape[0]] = v
     return out
 
+
+def _pad_assignment_1d(assign_list, pad_value=0):
+    """Pad a list of [N_i] long tensors to [B, N_max]. Padded value is
+    harmless (see module docstring) -- those positions are already masked
+    in groups[res]['mask'].
+    """
+    N_max = max(a.shape[0] for a in assign_list)
+    B = len(assign_list)
+    out = torch.full((B, N_max), pad_value, dtype=torch.long)
+    for i, a in enumerate(assign_list):
+        out[i, :a.shape[0]] = a
+    return out
+
 # =============================================================================
 # MULTI-TASK COLLATE (DYNAMIC VERSION)
 # =============================================================================
@@ -297,6 +323,15 @@ def collate_grouped(batch: list) -> dict:
 
     Passes through dataset_name from the first sample (homogeneous batches
     guaranteed by round-robin sampling).
+
+    DALES additions (see module docstring):
+        "token_latent_assignment": [B, N_max] long, padded in lockstep with
+            groups[res]["tokens"] (assumes a SINGLE resolution group, true
+            for DALES's LIDAR-only setup — if a sample ever has multiple
+            resolution groups this only covers the token dimension shared
+            by the assignment's own N, which must match the LIDAR group's
+            N specifically).
+        "patch_id": List[str], passed through unstacked.
     """
     B = len(batch)
 
@@ -391,6 +426,25 @@ def collate_grouped(batch: list) -> dict:
     # Pass through dataset_name (homogeneous batch from round-robin)
     if "dataset_name" in batch[0]:
         result["dataset_name"] = batch[0]["dataset_name"]
+
+    # ── DALES: token_latent_assignment (padded in lockstep with tokens) ──
+    if "token_latent_assignment" in batch[0]:
+        assign_list = [s["token_latent_assignment"] for s in batch]
+        result["token_latent_assignment"] = _pad_assignment_1d(
+            assign_list, pad_value=0
+        )
+
+    # ── DALES: patch_id (fallback cache key, passed through unstacked) ───
+    if "patch_id" in batch[0]:
+        result["patch_id"] = [s["patch_id"] for s in batch]
+
+    # ── Decoder-skip cascade: query_token_idx / query_token_valid, padded
+    # in lockstep with queries (same M_max) ───────────────────────────
+    if "query_token_idx" in batch[0]:
+        qti_list = [s["query_token_idx"]   for s in batch]   # [M_i, A_i] long
+        qtv_list = [s["query_token_valid"] for s in batch]   # [M_i] bool
+        result["query_token_idx"]   = _pad_index_2d(qti_list, pad_value=0)
+        result["query_token_valid"] = _pad_valid_1d(qtv_list, pad_value=False)
 
     return result
 
@@ -508,7 +562,7 @@ def compute_grid_config(
     preserving the image's aspect ratio.
 
     For temporal modalities (e.g. S1/S2 time series), total_tokens can
-    vastly exceed the spatial extent (H×W) because each timestamp ×
+    vastly exceed the spatial extent (H×W) because each timestamp x
     band generates separate tokens at the same spatial positions.
     The latent grid is capped so it never exceeds the spatial pixel
     count, preventing empty Voronoi cells and downstream NaN.

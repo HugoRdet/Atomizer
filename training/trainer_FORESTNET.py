@@ -42,6 +42,7 @@ class Model_ForestNet(pl.LightningModule):
         label_smoothing: float = 0.0,
     ):
         super().__init__()
+        self.strict_loading = False
         self.save_hyperparameters(ignore=["lookup_table", "transform", "class_weights"])
 
         self.config = config

@@ -9,6 +9,18 @@ Single-temporal classification training on geo-bench m-forestnet (12 classes).
     and run test on the provided checkpoint with a single GPU. Useful for
     re-evaluating saved checkpoints without retraining.
 
+--resume_from mode (NEW):
+    Pass --resume_from <path/to/checkpoint.ckpt> to resume TRAINING from
+    that checkpoint (full trainer state: model, optimizer, LR scheduler,
+    epoch/step counters, callback state e.g. EarlyStopping/ModelCheckpoint's
+    best-score tracking), via Trainer.fit(ckpt_path=...). If the file
+    doesn't exist yet, use --resume_wait_seconds to poll for it instead of
+    failing immediately (useful for chained SLURM jobs where the next job
+    in the chain can start before the previous job's checkpoint write --
+    and any filesystem sync delay, common on Lustre -- has landed on disk).
+    Mutually exclusive with --test_only (one skips training, the other
+    continues it -- pick one).
+
 Required:
     - bands_forestnet section in ./data/bands_info/bands.yaml
       with 6 bands: B02 Blue, B03 Green, B04 Red, B05 NIR, B06 SWIR1, B07 SWIR2
@@ -16,6 +28,7 @@ Required:
 """
 
 import os
+import time
 import argparse
 
 import torch
@@ -45,17 +58,69 @@ UnifiedDataModule.GROUPED_DATASET_CLASSES = (
 
 
 # =============================================================================
+# RESUME HELPER (mirrors train_biomassters.py's wait_for_checkpoint)
+# =============================================================================
+
+def wait_for_checkpoint(path: str, wait_seconds: int, poll_interval: int = 15) -> str:
+    """
+    Polls for `path` to exist, up to `wait_seconds` total, checking every
+    `poll_interval` seconds. Useful for chained SLURM jobs where the next
+    job in the chain can start before the previous job's checkpoint write
+    has actually landed on disk.
+
+    wait_seconds=0 means "check once, don't wait" -- fails fast if the
+    file isn't there.
+
+    Raises FileNotFoundError if the checkpoint never appears within the
+    timeout, rather than silently falling back to training from scratch --
+    resuming should be an explicit, verified action.
+    """
+    if os.path.exists(path):
+        return path
+
+    if wait_seconds <= 0:
+        raise FileNotFoundError(
+            f"Checkpoint not found: {path} "
+            f"(use --resume_wait_seconds > 0 to poll for it instead of failing immediately)"
+        )
+
+    print(f"[Train] Checkpoint not found yet: {path}")
+    print(f"[Train] Waiting up to {wait_seconds}s (polling every {poll_interval}s)...")
+    waited = 0
+    while waited < wait_seconds:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        if os.path.exists(path):
+            print(f"[Train] Checkpoint appeared after {waited}s: {path}")
+            return path
+        print(f"[Train]   ...still waiting ({waited}/{wait_seconds}s)")
+
+    raise FileNotFoundError(
+        f"Checkpoint still not found after waiting {wait_seconds}s: {path}"
+    )
+
+
+# =============================================================================
 # ARGS
 # =============================================================================
 
 parser = argparse.ArgumentParser(description="Atomiser ForestNet training")
 parser.add_argument("--xp_name",      type=str, required=True)
-parser.add_argument("--config_model", type=str, required=True,
-                    help="Model config yaml (e.g. atomiser_forestnet.yaml)")
 parser.add_argument("--dataset_name", type=str, default="forestnet")
 parser.add_argument("--clipping",     action="store_true")
 parser.add_argument("--use_class_weights", action="store_true")
 parser.add_argument("--label_smoothing",   type=float, default=0.0)
+parser.add_argument("--train_fraction", type=float, default=None,
+                    choices=[0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00],
+                    help="Limited-label train partition fraction (e.g. 0.10 for "
+                         "the 10%% partition). Loads "
+                         "'{fraction:.2f}x_train_partition.json' for the TRAIN "
+                         "split only -- validation/test always use "
+                         "default_partition.json regardless. Default (None) "
+                         "uses the full default_partition.json train split. "
+                         "NOTE: I haven't verified UnifiedDataModule forwards "
+                         "arbitrary extra kwargs to dataset_class construction "
+                         "-- see the comment at the DATA MODULE section below.")
 
 # Test-only mode
 parser.add_argument("--test_only", type=str, default=None,
@@ -63,10 +128,31 @@ parser.add_argument("--test_only", type=str, default=None,
                          "and runs test directly on this checkpoint. "
                          "Uses a single GPU (no DDP).")
 
+# Resume-training mode (NEW)
+parser.add_argument("--resume_from", type=str, default=None,
+                    help="Path to a checkpoint to resume TRAINING from (full "
+                         "trainer state via Trainer.fit(ckpt_path=...)). If "
+                         "the file doesn't exist yet, use --resume_wait_seconds "
+                         "to poll for it instead of failing immediately. "
+                         "Mutually exclusive with --test_only.")
+parser.add_argument("--resume_wait_seconds", type=int, default=0,
+                    help="How long to poll for --resume_from (or --test_only, "
+                         "reused for both) to appear before giving up "
+                         "(0 = check once, fail immediately if missing).")
+parser.add_argument("--resume_poll_interval", type=int, default=15,
+                    help="Seconds between polls while waiting for the checkpoint.")
+
 args = parser.parse_args()
 
+if args.test_only is not None and args.resume_from is not None:
+    raise ValueError(
+        "--test_only and --resume_from are mutually exclusive: --test_only "
+        "skips training entirely (loads weights, runs test), --resume_from "
+        "continues training from a checkpoint. Pick one."
+    )
+
 xp_name           = args.xp_name
-config_model      = read_yaml("./training/configs/" + args.config_model)
+config_model = read_yaml("./training/configs/config_test-FORESTNET.yaml")
 configs_dataset   = f"./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 bands_yaml        = "./data/bands_info/bands.yaml"
 
@@ -77,6 +163,9 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"[Train] Gradient clipping: {'ON (val=1.0)' if args.clipping else 'OFF'}")
         print(f"[Train] Class weights:     {'ON' if args.use_class_weights else 'OFF'}")
         print(f"[Train] Label smoothing:   {args.label_smoothing}")
+        if args.resume_from:
+            print(f"[Train] Resume requested:  {args.resume_from} "
+                  f"(wait up to {args.resume_wait_seconds}s if not found yet)")
 
 
 # =============================================================================
@@ -91,11 +180,12 @@ lookup_table = Lookup_encoding(
 
 
 # =============================================================================
-# WANDB
+# WANDB (skipped in test-only mode, same as BioMassters' convention --
+# resuming training still logs, since training is still happening)
 # =============================================================================
 
 wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0":
+if os.environ.get("LOCAL_RANK", "0") == "0" and args.test_only is None:
     import wandb
     wandb.init(
         name=config_model["encoder"] + "_" + xp_name,
@@ -116,6 +206,20 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 if os.environ.get("LOCAL_RANK", "0") == "0":
     print(f"[DEBUG] dataset_class.__name__ = '{ForestNetDataset.__name__}'")
     print(f"[DEBUG] match: {ForestNetDataset.__name__ in UnifiedDataModule.GROUPED_DATASET_CLASSES}")
+
+# Limited-label train fraction: UnifiedDataModule._create_grouped_dataset
+# hardcodes the exact kwargs forwarded to dataset_class(...) -- no
+# passthrough for arbitrary extra args like train_fraction (confirmed:
+# passing dataset_kwargs= raised TypeError, UnifiedDataModule doesn't
+# accept it). config_model IS forwarded unchanged though, so
+# ForestNetDataset reads train_fraction from
+# config_model["dataset"]["train_fraction"] instead -- set it here,
+# BEFORE constructing UnifiedDataModule.
+if args.train_fraction is not None:
+    config_model.setdefault("dataset", {})["train_fraction"] = args.train_fraction
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        print(f"[Train] Limited-label train partition: {args.train_fraction:.2f}x "
+              f"(set via config_model['dataset']['train_fraction'])")
 
 data_module = UnifiedDataModule(
     path="./data/geo-bench-1.0/classification_v1.0/m-forestnet",
@@ -221,7 +325,17 @@ if args.test_only is None:
         gradient_clip_val=1.0 if args.clipping else None,
     )
 
-    trainer.fit(model, datamodule=data_module)
+    # Resolve --resume_from (with polling) BEFORE fit, so a chained-job
+    # wait doesn't happen after the (potentially slow) data module / class
+    # weights setup above has already run.
+    fit_ckpt_path = None
+    if args.resume_from is not None:
+        fit_ckpt_path = wait_for_checkpoint(
+            args.resume_from, args.resume_wait_seconds, args.resume_poll_interval)
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(f"[Train] RESUMING from: {fit_ckpt_path}")
+
+    trainer.fit(model, datamodule=data_module, ckpt_path=fit_ckpt_path)
 
     # Capture best checkpoint path BEFORE destroying the process group.
     best_ckpt = checkpoint_val.best_model_path
@@ -245,11 +359,8 @@ if args.test_only is None:
 
 else:
     # Test-only mode — skip DDP setup entirely.
-    if not os.path.exists(args.test_only):
-        raise FileNotFoundError(
-            f"--test_only checkpoint not found: {args.test_only}"
-        )
-    best_ckpt = args.test_only
+    best_ckpt = wait_for_checkpoint(
+        args.test_only, args.resume_wait_seconds, args.resume_poll_interval)
     print(f"\n[test-only mode] Skipping training, testing checkpoint:")
     print(f"  {best_ckpt}\n")
 

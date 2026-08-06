@@ -3,7 +3,9 @@ Atomiser Model (SKIP variant) — Multi-Resolution Encoder/Decoder
 ================================================================
 
 Identical to Atomiser_Senflood EXCEPT for a decoder PIXEL-SKIP CASCADE,
-gated behind config["Atomiser"]["use_decoder_skip"].
+gated behind config["Atomiser"]["use_decoder_skip"], plus an inference-only
+ADAPTIVE probe-and-broadcast decode gated behind
+config["Atomiser"]["use_adaptive_decode"].
 
 Cascade (when enabled):
     learned pixel_query
@@ -17,13 +19,17 @@ share the same pixel, so displacement is zero and the positional block in
 process_data_for_encoder collapses to a constant. Tokens are distinguished
 purely by spectral / reflectance / resolution / time.
 
-All additions are tagged  # >>> SKIP  for easy diffing against the original.
+All skip additions are tagged  # >>> SKIP  and adaptive ones  # >>> ADAPTIVE.
 
 Config additions:
   Atomiser:
     use_decoder_skip: true
-    decoder_skip_drop_p: 0.5   # aggressive train-only random drop on the
-                               # pixel's own band-tokens (can go down to 1)
+    decoder_skip_drop_p: 0.5     # train-only physical drop FRACTION on the
+                                 # pixel's own band-tokens
+    use_adaptive_decode: true    # inference-only (B=1) probe-and-broadcast
+    adaptive_probe_k:    10
+    adaptive_seed:       42
+    skip_resolution:     10.0    # SAT pool the gather index targets
 """
 
 import random
@@ -36,6 +42,7 @@ from dataclasses import dataclass
 from einops import repeat
 from typing import Optional, Tuple, List, Dict
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torch.profiler import record_function
 
 from training.utils.token_building.processor import TokenProcessor
 from training.utils.datasets.token_grouping import compute_grid_config
@@ -53,7 +60,8 @@ from .RPE import (
 )
 
 from .geographic_pruning import GeographicPruning
-from .error_supervision import compute_latent_errors, compute_error_predictor_loss
+# >>> ADAPTIVE: zone-probe for probe-and-broadcast decode
+from .zone_probe import ZoneProbe
 
 
 # =============================================================================
@@ -169,102 +177,6 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
             print("[Atomiser] Gradient checkpointing: ENABLED")
 
         # =====================================================================
-        # 7. ERROR PREDICTOR
-        # =====================================================================
-        self.use_error_predictor = config["Atomiser"].get("use_error_predictor", False)
-        if self.use_error_predictor:
-            self.lambda_error = float(config["Atomiser"].get("lambda_error", 0.1))
-            print(f"[Atomiser] Error predictor ENABLED (lambda={self.lambda_error})")
-        else:
-            print(f"[Atomiser] Error predictor DISABLED")
-
-        # =====================================================================
-        # 7c. TARGETED DEPTH-2
-        # Second cross-attention + self-attention pass on top-k high-error
-        # latents only. Uses shared encoder weights (zero new parameters).
-        # Much cheaper than full depth=2: only 2.5% of latents re-encoded.
-        # =====================================================================
-        self.use_targeted_depth2 = config["Atomiser"].get(
-            "use_targeted_depth2", False)
-        if self.use_targeted_depth2:
-            td2 = config["Atomiser"].get("targeted_depth2", {})
-            self.td2_k          = int(td2.get("k", 50))
-            self.td2_cross_k    = int(td2.get("cross_k", 2000))  # full geo pool
-            self.td2_self_attn  = int(td2.get("self_attn", 2))
-            print(f"[Atomiser] Targeted depth-2 ENABLED: "
-                  f"k={self.td2_k}, cross_k={self.td2_cross_k}, "
-                  f"self_attn={self.td2_self_attn}")
-        else:
-            print(f"[Atomiser] Targeted depth-2 DISABLED")
-
-        # =====================================================================
-        # 7b. REFINEMENT
-        # =====================================================================
-        self.use_refinement = config["Atomiser"].get("use_refinement", False)
-        if self.use_refinement:
-            ref_cfg = config["Atomiser"].get("refinement", {})
-            self.k_refine            = int(ref_cfg.get("k_refine", 50))
-            self.refine_grid_size    = int(ref_cfg.get("grid_size", 2))   # 2→2×2=4 latents
-            self.refine_tpl          = int(ref_cfg.get("tokens_per_latent", 500))
-            self.refine_cross_k      = int(ref_cfg.get("cross_k", 500))
-            self.refine_self_local   = int(ref_cfg.get("self_attn_local", 2))
-            self.refine_self_global  = int(ref_cfg.get("self_attn_global", 2))
-            # grid offset: half the typical latent spacing fraction
-            self.refine_offset_factor = float(ref_cfg.get("offset_factor", 0.25))
-            print(f"[Atomiser] Refinement ENABLED: k={self.k_refine}, "
-                  f"grid={self.refine_grid_size}×{self.refine_grid_size}, "
-                  f"tpl={self.refine_tpl}, cross_k={self.refine_cross_k}")
-
-            refine_cs = float(ref_cfg.get(
-                "self_attn_compression_scale",
-                1250.0,
-            ))
-            rope_base = config["RoPE"].get("base", 100.0)
-
-            self.refine_self_attn = PreNormRoPE(
-                self.latent_dim,
-                SelfAttentionRoPE(
-                    dim=self.latent_dim,
-                    heads=self.latent_heads,
-                    dim_head=self.latent_dim_head,
-                    dropout=self.attn_dropout,
-                    use_rope=True,
-                    rope_base=rope_base,
-                    rope_compression_scale=refine_cs,
-                    rope_learnable_scale=self.rope_learnable_scale,
-                )
-            )
-            self.refine_self_ff = PreNorm(
-                self.latent_dim,
-                FeedForward(self.latent_dim, dropout=self.ff_dropout),
-            )
-            print(f"[Atomiser] Refinement local SA compression scale: {refine_cs:.1f}m")
-
-            cross_rope_cs = self.config["RoPE"].get("cross_compression_scale", 50.0)
-            self.refine_cross_attn = PreNorm(
-                self.latent_dim,
-                LocalCrossAttentionRoPE(
-                    dim_query=self.latent_dim,
-                    dim_context=self.input_dim,
-                    dim_out=self.latent_dim,
-                    heads=self.cross_heads,
-                    dim_head=self.cross_dim_head,
-                    dropout=self.attn_dropout,
-                    use_rope=self.encoder_use_rpe,
-                    rope_base=rope_base,
-                    rope_compression_scale=cross_rope_cs,
-                    rope_learnable_scale=self.rope_learnable_scale,
-                )
-            )
-            self.refine_cross_ff = PreNorm(
-                self.latent_dim,
-                FeedForward(self.latent_dim, dropout=self.ff_dropout),
-            )
-            print(f"[Atomiser] Refinement dedicated cross-attention ENABLED")
-        else:
-            print(f"[Atomiser] Refinement DISABLED")
-
-        # =====================================================================
         # 8. INITIALIZE COMPONENTS
         # =====================================================================
         self._init_latents()
@@ -298,9 +210,6 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
         self.mask_token = nn.Parameter(torch.randn(self.latent_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02, a=-2., b=2.)
 
-        self.refinement_latent_content = nn.Parameter(torch.randn(self.latent_dim))
-        nn.init.trunc_normal_(self.refinement_latent_content, std=0.02, a=-2., b=2.)
-
         if self.num_global_latents > 0:
             self.global_latents = nn.Parameter(
                 torch.randn(self.num_global_latents, self.latent_dim))
@@ -312,6 +221,30 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
         self.geo_pruning = GeographicPruning(
             geometry=self.input_processor.geometry,
         )
+        # >>> ADAPTIVE: zone-probe for probe-and-broadcast decode (inference)
+        self.zone_probe = ZoneProbe(geometry=self.input_processor.geometry)
+        acfg = self.config["Atomiser"]
+        self.use_adaptive_decode = acfg.get("use_adaptive_decode", False)
+        self.adaptive_probe_k    = int(acfg.get("adaptive_probe_k", 10))
+        self.adaptive_seed       = int(acfg.get("adaptive_seed", 42))
+        if self.use_adaptive_decode:
+            print(f"[Atomiser] Adaptive decode: ENABLED "
+                  f"(probe_k={self.adaptive_probe_k}, seed={self.adaptive_seed})")
+        else:
+            print("[Atomiser] Adaptive decode: DISABLED")
+        # >>> END ADAPTIVE
+
+        # >>> QUADTREE: image-plane hierarchical decode (inference, B=1)
+        self.use_quadtree_decode = acfg.get("use_quadtree_decode", False)
+        self.quadtree_start_cell = int(acfg.get("quadtree_start_cell", 16))
+        self.quadtree_min_cell   = int(acfg.get("quadtree_min_cell", 1))
+        if self.use_quadtree_decode:
+            print(f"[Atomiser] Quadtree decode: ENABLED "
+                  f"(start_cell={self.quadtree_start_cell}, "
+                  f"min_cell={self.quadtree_min_cell})")
+        else:
+            print("[Atomiser] Quadtree decode: DISABLED")
+        # >>> END QUADTREE
 
     def _init_encoder_layers(self):
         self_rope_compression_scale  = self.config["RoPE"].get("self_compression_scale", 50.0)
@@ -410,15 +343,6 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
             nn.GELU(),
             nn.Linear(hidden_dim, self.num_classes),
         )
-
-        # ── Error predictor ───────────────────────────────────────────
-        if self.use_error_predictor:
-            self.error_predictor = nn.Sequential(
-                nn.Linear(self.latent_dim, self.latent_dim // 4),
-                nn.GELU(),
-                nn.Linear(self.latent_dim // 4, 1),
-                nn.Softplus(),
-            )
 
         # >>> SKIP ─────────────────────────────────────────────────────
         # Decoder pixel-skip cascade: a learned query first attends to the
@@ -603,8 +527,10 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
 
     def _cross_attention_step(self, latents, sampled_tokens, sampled_masks,
                               coords, cross_attn, cross_ff, L_spatial):
-        processed_tokens = self.input_processor.process_data_for_encoder(
-            sampled_tokens, sampled_masks, latent_positions=coords)
+
+        with record_function("Encoder Process data"):
+            processed_tokens = self.input_processor.process_data_for_encoder(
+                sampled_tokens, sampled_masks, latent_positions=coords)
         delta_x, delta_y, gsd = self._compute_deltas(sampled_tokens, coords)
 
         spatial = latents[:, :L_spatial]
@@ -614,13 +540,14 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
             sampled_masks = sampled_masks.clone()
             sampled_masks[:, :, 0] = sampled_masks[:, :, 0] & ~all_masked.squeeze(-1)
 
-        attn_out = cross_attn(
-            spatial, context=processed_tokens, mask=~sampled_masks,
-            delta_x=delta_x, delta_y=delta_y, gsd=gsd)
-        attn_out = torch.nan_to_num(attn_out, nan=0.0)
+        with record_function("Encoder Cross Attention:"):
+            attn_out = cross_attn(
+                spatial, context=processed_tokens, mask=~sampled_masks,
+                delta_x=delta_x, delta_y=delta_y, gsd=gsd)
+            attn_out = torch.nan_to_num(attn_out, nan=0.0)
 
-        spatial = attn_out + spatial
-        spatial = cross_ff(spatial) + spatial
+            spatial = attn_out + spatial
+            spatial = cross_ff(spatial) + spatial
         return torch.cat([spatial, latents[:, L_spatial:]], dim=1)
 
     def _self_attention_step_multiresolution(self, latents_per_res, coords_per_res,
@@ -659,21 +586,24 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
         device = first_group["tokens"].device
         resolutions = sorted(groups.keys())
 
-        latents_per_res, coords_per_res = self.init_latents_per_resolution(
-            B, grid_configs, device)
-        global_latents = self.get_global_latents(B)
+        with record_function("Latents init "):
+            latents_per_res, coords_per_res = self.init_latents_per_resolution(
+                B, grid_configs, device)
+            global_latents = self.get_global_latents(B)
 
         geo_cache = {}
-        for res in resolutions:
-            tokens    = groups[res]["tokens"]
-            mask      = groups[res]["mask"]
-            gc        = dict(grid_configs[res])
-            coords    = coords_per_res[res]
-            L_spatial = gc["L_spatial"]
 
-            geo_tokens, geo_masks = self._apply_pruning(
-                tokens, mask, coords, gc, L_spatial)
-            geo_cache[res] = (geo_tokens, geo_masks, gc, cross_k)
+        with record_function("geo pruning"):
+            for res in resolutions:
+                tokens    = groups[res]["tokens"]
+                mask      = groups[res]["mask"]
+                gc        = dict(grid_configs[res])
+                coords    = coords_per_res[res]
+                L_spatial = gc["L_spatial"]
+
+                geo_tokens, geo_masks = self._apply_pruning(
+                    tokens, mask, coords, gc, L_spatial)
+                geo_cache[res] = (geo_tokens, geo_masks, gc, cross_k)
 
         mae_active = mask_ratio > 0.0
         vis_latents = {}; vis_coords = {}
@@ -705,51 +635,53 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
             cross_attn, cross_ff, self_attns = self.encoder_layers[layer_idx]
 
             for res in resolutions:
-                if mae_active:
-                    st, sm = self._sample_tokens(
-                        vis_geo_tokens[res], vis_geo_masks[res], vis_cross_k[res])
-                    if self.gradient_checkpointing and self.training:
-                        vis_latents[res] = torch_checkpoint(
-                            self._cross_attention_step,
-                            vis_latents[res], st, sm,
-                            vis_coords[res], cross_attn, cross_ff,
-                            vis_latents[res].shape[1],
-                            use_reentrant=False)
+                with record_function("Cross Attention - Encoder"):
+                    if mae_active:
+                        st, sm = self._sample_tokens(
+                            vis_geo_tokens[res], vis_geo_masks[res], vis_cross_k[res])
+                        if self.gradient_checkpointing and self.training:
+                            vis_latents[res] = torch_checkpoint(
+                                self._cross_attention_step,
+                                vis_latents[res], st, sm,
+                                vis_coords[res], cross_attn, cross_ff,
+                                vis_latents[res].shape[1],
+                                use_reentrant=False)
+                        else:
+                            vis_latents[res] = self._cross_attention_step(
+                                vis_latents[res], st, sm,
+                                vis_coords[res], cross_attn, cross_ff,
+                                L_spatial=vis_latents[res].shape[1])
                     else:
-                        vis_latents[res] = self._cross_attention_step(
-                            vis_latents[res], st, sm,
-                            vis_coords[res], cross_attn, cross_ff,
-                            L_spatial=vis_latents[res].shape[1])
-                else:
-                    gt, gm, gc, ck = geo_cache[res]
-                    L_spatial = gc["L_spatial"]
-                    st, sm = self._sample_tokens(gt, gm, ck)
-                    if self.gradient_checkpointing and self.training:
-                        latents_per_res[res] = torch_checkpoint(
-                            self._cross_attention_step,
-                            latents_per_res[res], st, sm,
-                            coords_per_res[res], cross_attn, cross_ff,
-                            L_spatial, use_reentrant=False)
-                    else:
-                        latents_per_res[res] = self._cross_attention_step(
-                            latents_per_res[res], st, sm,
-                            coords_per_res[res], cross_attn, cross_ff, L_spatial)
+                        gt, gm, gc, ck = geo_cache[res]
+                        L_spatial = gc["L_spatial"]
+                        st, sm = self._sample_tokens(gt, gm, ck)
+                        if self.gradient_checkpointing and self.training:
+                            latents_per_res[res] = torch_checkpoint(
+                                self._cross_attention_step,
+                                latents_per_res[res], st, sm,
+                                coords_per_res[res], cross_attn, cross_ff,
+                                L_spatial, use_reentrant=False)
+                        else:
+                            latents_per_res[res] = self._cross_attention_step(
+                                latents_per_res[res], st, sm,
+                                coords_per_res[res], cross_attn, cross_ff, L_spatial)
 
-            if mae_active:
-                full_lpr = {}; full_cpr = {}; L_vis_pr = {}
-                for res in resolutions:
-                    full_lpr[res] = torch.cat([vis_latents[res], msk_latents[res]], dim=1)
-                    full_cpr[res] = torch.cat([vis_coords[res], msk_coords[res]], dim=1)
-                    L_vis_pr[res] = vis_latents[res].shape[1]
-                full_lpr, global_latents = self._self_attention_step_multiresolution(
-                    full_lpr, full_cpr, global_latents, self_attns)
-                for res in resolutions:
-                    lv = L_vis_pr[res]
-                    vis_latents[res] = full_lpr[res][:, :lv]
-                    msk_latents[res] = full_lpr[res][:, lv:]
-            else:
-                latents_per_res, global_latents = self._self_attention_step_multiresolution(
-                    latents_per_res, coords_per_res, global_latents, self_attns)
+            with record_function("Self Attention"):
+                if mae_active:
+                    full_lpr = {}; full_cpr = {}; L_vis_pr = {}
+                    for res in resolutions:
+                        full_lpr[res] = torch.cat([vis_latents[res], msk_latents[res]], dim=1)
+                        full_cpr[res] = torch.cat([vis_coords[res], msk_coords[res]], dim=1)
+                        L_vis_pr[res] = vis_latents[res].shape[1]
+                    full_lpr, global_latents = self._self_attention_step_multiresolution(
+                        full_lpr, full_cpr, global_latents, self_attns)
+                    for res in resolutions:
+                        lv = L_vis_pr[res]
+                        vis_latents[res] = full_lpr[res][:, :lv]
+                        msk_latents[res] = full_lpr[res][:, lv:]
+                else:
+                    latents_per_res, global_latents = self._self_attention_step_multiresolution(
+                        latents_per_res, coords_per_res, global_latents, self_attns)
 
             if return_trajectory:
                 trajectory.append(coords_per_res.copy())
@@ -777,61 +709,68 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
                     pool_tokens, pool_mask, training):
         """
         Build the enriched per-pixel query by attending over each query-pixel's
-        own encoded band-tokens.
+        own atoms. TRAIN: physically keep C_keep = ceil((1-drop_p)*A) atoms per
+        pixel (fresh each step). VAL/TEST: use all A atoms.
 
         Args:
-            query_tokens      : [B, M, 8]   decoder queries (one per pixel)
-            query_token_idx   : [B, M, C]   rows into pool_tokens for each query's
-                                            own band-tokens (C = bands_per_pixel)
-            query_token_valid : [B, M]      bool, True = real query (not padding)
-            pool_tokens       : [B, N, 8]   FULL un-subsampled token pool
+            query_tokens      : [B, M, 8]
+            query_token_idx   : [B, M, A]   rows into pool_tokens (A atoms/pixel)
+            query_token_valid : [B, M]      bool, True = real query
+            pool_tokens       : [B, N, 8]
             pool_mask         : [B, N]      True/1 = padded OR band-dropped token
             training          : bool
-
         Returns:
             enriched_query : [B, M, latent_dim]
         """
-        B, M, C = query_token_idx.shape
-        device = pool_tokens.device
-
-        # ── 1. Gather each pixel's own C band-tokens + their pool mask ─
-        flat_idx = query_token_idx.reshape(B, M * C)
-        gathered = torch.gather(
-            pool_tokens, 1,
-            flat_idx.unsqueeze(-1).expand(-1, -1, pool_tokens.shape[-1])
-        ).reshape(B, M, C, pool_tokens.shape[-1])                      # [B, M, C, 8]
+        B, M, A = query_token_idx.shape
+        device  = pool_tokens.device
+        Dtok    = pool_tokens.shape[-1]
 
         pool_mask_b = pool_mask.bool() if pool_mask.dtype != torch.bool else pool_mask
+
+        # ── 0. TRAIN-ONLY physical subsample of columns (per pixel, fresh) ────
+        # decoder_skip_drop_p is a DROP FRACTION. keep_frac = 1 - drop_p.
+        drop_p = getattr(self, "decoder_skip_drop_p", 0.0)
+        if training and drop_p > 0.0:
+            keep_frac = 1.0 - drop_p
+            C_keep = max(1, int(torch.ceil(torch.tensor(keep_frac * A)).item()))
+            # uniform without-replacement column sample: argsort of random keys
+            rand = torch.rand(B, M, A, device=device)
+            sel  = rand.argsort(dim=-1)[..., :C_keep]                 # [B, M, C_keep]
+            qti  = torch.gather(query_token_idx, 2, sel)              # [B, M, C_keep]
+            C    = C_keep
+        else:
+            qti = query_token_idx                                     # [B, M, A]
+            C   = A
+
+        # ── 1. Gather each pixel's C atoms + their pool mask ──────────────────
+        flat_idx = qti.reshape(B, M * C)
+        gathered = torch.gather(
+            pool_tokens, 1,
+            flat_idx.unsqueeze(-1).expand(-1, -1, Dtok)
+        ).reshape(B, M, C, Dtok)                                      # [B, M, C, 8]
+
         gathered_mask = torch.gather(
             pool_mask_b, 1, flat_idx
-        ).reshape(B, M, C)                                             # [B, M, C] True=masked
+        ).reshape(B, M, C)                                            # [B, M, C] True=masked
 
-        # ── 2. Encode band-tokens (no RPE: zero displacement -> constant
-        #        positional block; pass pixel's own coords) ────────────
-        query_coords = self.input_processor.geometry.get_token_centers(query_tokens)  # [B,M,2]
+        # ── 2. Encode band-tokens (no RPE: zero displacement) ─────────────────
+        query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
         encoded = self.input_processor.process_data_for_encoder(
             gathered, gathered_mask, latent_positions=query_coords
         )                                                             # [B, M, C, input_dim]
 
-        # ── 3. key_padding_mask (True = DON'T attend) ─────────────────
-        key_pad = gathered_mask.clone()                              # band-drop / pool-pad
+        # ── 3. key_padding_mask (True = DON'T attend) ─────────────────────────
+        key_pad   = gathered_mask.clone()
         invalid_q = ~query_token_valid.bool()                        # [B, M]
-        key_pad = key_pad | invalid_q.unsqueeze(-1)
+        key_pad   = key_pad | invalid_q.unsqueeze(-1)
 
-        # Aggressive random drop, TRAIN ONLY (can go down to 1 token).
-        if training and self.decoder_skip_drop_p > 0:
-            real = ~key_pad
-            drop_roll = torch.bernoulli(
-                torch.full((B, M, C), self.decoder_skip_drop_p, device=device)
-            ).bool()
-            key_pad = key_pad | (drop_roll & real)
-
-        # ── 4. Force-keep guard: every pixel keeps >=1 REAL token ─────
-        real_token = ~(gathered_mask | invalid_q.unsqueeze(-1))      # eligible (not band-drop/pad)
-        none_kept = (~key_pad).sum(dim=-1) == 0                       # [B, M]
+        # ── 4. Force-keep guard: every pixel keeps >=1 REAL token ─────────────
+        real_token = ~(gathered_mask | invalid_q.unsqueeze(-1))
+        none_kept  = (~key_pad).sum(dim=-1) == 0                      # [B, M]
         if none_kept.any():
-            has_real   = real_token.any(dim=-1)                      # [B, M]
-            first_real = torch.argmax(real_token.float(), dim=-1)    # [B, M]
+            has_real   = real_token.any(dim=-1)
+            first_real = torch.argmax(real_token.float(), dim=-1)
             fix = none_kept & has_real
             if fix.any():
                 bi, mi = torch.where(fix)
@@ -839,20 +778,20 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
             still = none_kept & ~has_real
             if still.any():
                 bi, mi = torch.where(still)
-                key_pad[bi, mi, 0] = False  # fully padded query; output discarded
+                key_pad[bi, mi, 0] = False  # fully padded/empty pixel; output discarded
 
-        # ── 5. Pixel cross-attention ──────────────────────────────────
-        BM = B * M
-        kv  = encoded.reshape(BM, C, -1)                             # [B*M, C, input_dim]
-        q   = self.pixel_query.expand(BM, 1, -1).contiguous()        # [B*M, 1, latent_dim]
-        q   = self.pixel_q_norm(q)                                   # >>> QNORM
-        kpm = key_pad.reshape(BM, C)                                 # [B*M, C]
+        # ── 5. Pixel cross-attention over C tokens ────────────────────────────
+        BM  = B * M
+        kv  = encoded.reshape(BM, C, -1)
+        q   = self.pixel_query.expand(BM, 1, -1).contiguous()
+        q   = self.pixel_q_norm(q)
+        kpm = key_pad.reshape(BM, C)
 
         enriched, _ = self.pixel_cross_attn(
             query=q, key=kv, value=kv,
             key_padding_mask=kpm, need_weights=False,
-        )                                                            # [B*M, 1, latent_dim]
-        enriched = enriched.squeeze(1).reshape(B, M, -1)             # [B, M, latent_dim]
+        )
+        enriched = enriched.squeeze(1).reshape(B, M, -1)
         return enriched
 
     # =========================================================================
@@ -873,325 +812,347 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
         B, M, _ = query_tokens.shape
         k = self.decoder_k_spatial
 
-        query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
+        with record_function("Decoder pre processing"):
 
-        all_latents = torch.cat(
-            [latents_per_res[r] for r in sorted(latents_per_res.keys(), key=str)], dim=1)
-        all_coords = torch.cat(
-            [coords_per_res[r] for r in sorted(coords_per_res.keys(), key=str)], dim=1)
 
-        dists_sq = (query_coords.unsqueeze(2) - all_coords.unsqueeze(1)).pow(2).sum(-1)
+            query_coords = self.input_processor.geometry.get_token_centers(query_tokens)
 
-        k_fetch = min(k, all_coords.shape[1])
-        k_keep  = k_fetch
+            all_latents = torch.cat(
+                [latents_per_res[r] for r in sorted(latents_per_res.keys(), key=str)], dim=1)
+            all_coords = torch.cat(
+                [coords_per_res[r] for r in sorted(coords_per_res.keys(), key=str)], dim=1)
 
-        _, topk_indices = torch.topk(dists_sq, k=k_fetch, dim=-1, largest=False)
+            dists_sq = (query_coords.unsqueeze(2) - all_coords.unsqueeze(1)).pow(2).sum(-1)
 
-        D = all_latents.shape[-1]
-        flat_idx = topk_indices.reshape(B, M * k_keep)
+            k_fetch = min(k, all_coords.shape[1])
+            k_keep  = k_fetch
 
-        selected_latents = torch.gather(
-            all_latents, 1,
-            flat_idx.unsqueeze(-1).expand(-1, -1, D)
-        ).reshape(B, M, k_keep, D)
+            _, topk_indices = torch.topk(dists_sq, k=k_fetch, dim=-1, largest=False)
 
-        selected_coords = torch.gather(
-            all_coords, 1,
-            flat_idx.unsqueeze(-1).expand(-1, -1, 2)
-        ).reshape(B, M, k_keep, 2)
+            D = all_latents.shape[-1]
+            flat_idx = topk_indices.reshape(B, M * k_keep)
 
-        delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
-        delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
+            selected_latents = torch.gather(
+                all_latents, 1,
+                flat_idx.unsqueeze(-1).expand(-1, -1, D)
+            ).reshape(B, M, k_keep, D)
 
-        B_d, M_d, K_d = delta_x.shape
-        if self.input_processor.use_constant_gsd:
-            cs = self.input_processor.compression_alpha * self.input_processor._constant_gsd
-        else:
-            query_gsd = self.input_processor.geometry.get_token_gsd(query_tokens)
-            cs = self.input_processor.compression_alpha * query_gsd
+            selected_coords = torch.gather(
+                all_coords, 1,
+                flat_idx.unsqueeze(-1).expand(-1, -1, 2)
+            ).reshape(B, M, k_keep, 2)
 
-        dx_flat = delta_x.reshape(B_d, M_d * K_d)
-        dy_flat = delta_y.reshape(B_d, M_d * K_d)
-        rel_pe  = self.input_processor.pos_encoder(dx_flat, dy_flat, compression_scale=cs)
-        rel_pe  = rel_pe.reshape(B_d, M_d, K_d, -1)
+            delta_x = selected_coords[..., 0] - query_coords[..., 0].unsqueeze(-1)
+            delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
 
-        context = torch.cat([selected_latents, rel_pe], dim=-1)
-
-        if training and self.decoder_drop_p > 0:
-            keep_probs = torch.full(
-                (B, M, k_keep), 1.0 - self.decoder_drop_p,
-                device=context.device)
-            keep_mask = torch.bernoulli(keep_probs).bool()
-
-            none_kept = ~keep_mask.any(dim=-1, keepdim=True)
-            if none_kept.any():
-                keep_mask = keep_mask.clone()
-                keep_mask[..., 0] = keep_mask[..., 0] | none_kept.squeeze(-1)
-        else:
-            keep_mask = torch.ones(B, M, k_keep, dtype=torch.bool,
-                                    device=context.device)
-
-        BM = B * M
-        kv_flat     = context.reshape(BM, k_keep, -1)
-        kv_flat     = self.dec_ctx_norm(kv_flat)
-
-        # >>> SKIP: build the per-pixel enriched query if the cascade is on.
-        # Otherwise fall back to the shared global_query (original behavior).
-
-        if self.use_decoder_skip and query_token_idx is not None:
-            enriched = self._pixel_skip(
-                query_tokens, query_token_idx, query_token_valid,
-                pool_tokens, pool_mask, training)                    # [B, M, latent_dim]
-            q_flat = enriched.reshape(BM, 1, -1).contiguous()        # [B*M, 1, latent_dim]
-        else:
-            q_flat = self.global_query.expand(BM, 1, -1).contiguous()
-        # >>> QNORM: pre-norm the decoder query (enriched OR global_query)
-        # before the cross-attention. No residual is added on the
-        # input-derived enriched query (Perceiver-IO decoder note).
-        q_flat = self.dec_q_norm(q_flat)
-        # >>> END QNORM
-        # >>> END SKIP
-
-        key_pad_flat = (~keep_mask).reshape(BM, k_keep)
-
-        attn_out, _ = self.decoder_cross_attn(
-            query=q_flat, key=kv_flat, value=kv_flat,
-            key_padding_mask=key_pad_flat,
-            need_weights=False,
-        )
-        attn_out = attn_out.squeeze(1).reshape(B, M, -1)
-
-        if return_features:
-            return attn_out
-
-        logits = self.reconstruction_head(attn_out)
-
-        if return_topk:
-            topk_dists_sq_kept = torch.gather(dists_sq, 2, topk_indices)
-            return logits, topk_indices, topk_dists_sq_kept
-
-        return logits
-
-    # =========================================================================
-    # Refinement
-    # =========================================================================
-
-    def _spawn_refinement_grid(
-        self,
-        topk_coords:   torch.Tensor,
-        latent_spacing: float,
-    ) -> torch.Tensor:
-        B, k, _ = topk_coords.shape
-        g        = self.refine_grid_size
-        offset   = latent_spacing * self.refine_offset_factor
-        device   = topk_coords.device
-
-        steps = torch.linspace(-offset * (g - 1) / 2,
-                                offset * (g - 1) / 2, g, device=device)
-        gy, gx = torch.meshgrid(steps, steps, indexing="ij")
-        offsets = torch.stack([gx.flatten(), gy.flatten()], dim=-1)
-
-        refine_coords = (topk_coords.unsqueeze(2)
-                         + offsets.unsqueeze(0).unsqueeze(0))
-        return refine_coords.reshape(B, k * g * g, 2)
-
-    def _estimate_latent_spacing(self, coords: torch.Tensor) -> float:
-        c = coords[0, :min(50, coords.shape[1])]
-        with torch.no_grad():
-            d = torch.cdist(c.unsqueeze(0), c.unsqueeze(0)).squeeze(0)
-            d.fill_diagonal_(float("inf"))
-            spacing = d.min(dim=-1).values.median().item()
-        return spacing
-
-    def refine(
-        self,
-        latents_per_res: dict,
-        coords_per_res:  dict,
-        groups:          dict,
-        predicted_errors: torch.Tensor,
-        geo_cache:       dict,
-        training:        bool,
-    ) -> tuple:
-        B      = predicted_errors.shape[0]
-        device = predicted_errors.device
-
-        resolutions  = sorted(latents_per_res.keys(), key=str)
-        all_latents  = torch.cat([latents_per_res[r] for r in resolutions], dim=1)
-        all_coords   = torch.cat([coords_per_res[r]  for r in resolutions], dim=1)
-        L            = all_latents.shape[1]
-
-        res = resolutions[0]
-        geo_tokens_all, geo_masks_all, gc, _ = geo_cache[res]
-        L_geo = geo_tokens_all.shape[1]
-
-        errors_for_topk = predicted_errors[:, :L_geo]
-        k               = min(self.k_refine, L_geo)
-        topk_idx        = torch.topk(errors_for_topk, k, dim=-1).indices
-
-        all_coords_original = all_coords[:, :L_geo]
-        topk_coords = torch.gather(
-            all_coords_original, 1,
-            topk_idx.unsqueeze(-1).expand(-1, -1, 2))
-        spacing       = self._estimate_latent_spacing(all_coords)
-        refine_coords = self._spawn_refinement_grid(topk_coords, spacing)
-        n_refine = refine_coords.shape[1]
-
-        refine_latents = repeat(
-            self.refinement_latent_content,
-            "d -> b n d", b=B, n=n_refine)
-
-        g2 = self.refine_grid_size ** 2
-        topk_idx_exp = (topk_idx
-                        .unsqueeze(-1).unsqueeze(-1)
-                        .expand(-1, -1, geo_tokens_all.shape[2], 8))
-        topk_geo_tokens = torch.gather(
-            geo_tokens_all, 1, topk_idx_exp)
-        topk_geo_masks = torch.gather(
-            geo_masks_all, 1,
-            topk_idx.unsqueeze(-1).expand(
-                -1, -1, geo_masks_all.shape[2]))
-
-        refine_geo_tokens = topk_geo_tokens.unsqueeze(2).expand(
-            -1, -1, g2, -1, -1).reshape(B, n_refine,
-                                         topk_geo_tokens.shape[2], 8)
-        refine_geo_masks  = topk_geo_masks.unsqueeze(2).expand(
-            -1, -1, g2, -1).reshape(B, n_refine,
-                                     topk_geo_masks.shape[2])
-
-        st, sm = self._sample_tokens(
-            refine_geo_tokens, refine_geo_masks,
-            cross_k=self.refine_cross_k)
-
-        refine_latents = self._cross_attention_step(
-            refine_latents, st, sm,
-            refine_coords, self.refine_cross_attn, self.refine_cross_ff,
-            L_spatial=n_refine,
-        )
-
-        px = refine_coords[..., 0]
-        py = refine_coords[..., 1]
-        for _ in range(self.refine_self_local):
-            refine_latents = (self.refine_self_attn(
-                refine_latents, pos_x=px, pos_y=py,
-                num_spatial=n_refine) + refine_latents)
-            refine_latents = self.refine_self_ff(refine_latents) + refine_latents
-
-        _, _, self_attns = self.encoder_layers[0]
-        merged_latents = torch.cat([all_latents, refine_latents], dim=1)
-        merged_coords  = torch.cat([all_coords,  refine_coords],  dim=1)
-
-        for sa_idx in range(self.refine_self_global):
-            self_attn, self_ff = self_attns[sa_idx % len(self_attns)]
-            if self.use_rpe:
-                px = merged_coords[..., 0]
-                py = merged_coords[..., 1]
-                merged_latents = (self_attn(
-                    merged_latents, pos_x=px, pos_y=py,
-                    num_spatial=merged_latents.shape[1]) + merged_latents)
+            B_d, M_d, K_d = delta_x.shape
+            if self.input_processor.use_constant_gsd:
+                cs = self.input_processor.compression_alpha * self.input_processor._constant_gsd
             else:
-                merged_latents = self_attn(merged_latents) + merged_latents
-            merged_latents = self_ff(merged_latents) + merged_latents
+                query_gsd = self.input_processor.geometry.get_token_gsd(query_tokens)
+                cs = self.input_processor.compression_alpha * query_gsd
 
-        latents_per_res_updated = {}
-        coords_per_res_updated  = {}
+            dx_flat = delta_x.reshape(B_d, M_d * K_d)
+            dy_flat = delta_y.reshape(B_d, M_d * K_d)
+            rel_pe  = self.input_processor.pos_encoder(dx_flat, dy_flat, compression_scale=cs)
+            rel_pe  = rel_pe.reshape(B_d, M_d, K_d, -1)
 
-        offset = 0
-        for r in resolutions:
-            n = latents_per_res[r].shape[1]
-            latents_per_res_updated[r] = merged_latents[:, offset:offset + n]
-            coords_per_res_updated[r]  = merged_coords[:, offset:offset + n]
-            offset += n
+            context = torch.cat([selected_latents, rel_pe], dim=-1)
 
-        latents_per_res_updated["refinement"] = merged_latents[:, offset:]
-        coords_per_res_updated["refinement"]  = merged_coords[:, offset:]
+        with record_function("Decoder Cross attention"):
 
-        return latents_per_res_updated, coords_per_res_updated
+            if training and self.decoder_drop_p > 0:
+                keep_probs = torch.full(
+                    (B, M, k_keep), 1.0 - self.decoder_drop_p,
+                    device=context.device)
+                keep_mask = torch.bernoulli(keep_probs).bool()
+
+                none_kept = ~keep_mask.any(dim=-1, keepdim=True)
+                if none_kept.any():
+                    keep_mask = keep_mask.clone()
+                    keep_mask[..., 0] = keep_mask[..., 0] | none_kept.squeeze(-1)
+            else:
+                keep_mask = torch.ones(B, M, k_keep, dtype=torch.bool,
+                                        device=context.device)
+
+            BM = B * M
+            kv_flat     = context.reshape(BM, k_keep, -1)
+            kv_flat     = self.dec_ctx_norm(kv_flat)
+
+            # >>> SKIP: build the per-pixel enriched query if the cascade is on.
+            # Otherwise fall back to the shared global_query (original behavior).
+            with record_function("Decoder skip"):
+                if self.use_decoder_skip and query_token_idx is not None:
+                    enriched = self._pixel_skip(
+                        query_tokens, query_token_idx, query_token_valid,
+                        pool_tokens, pool_mask, training)                    # [B, M, latent_dim]
+                    q_flat = enriched.reshape(BM, 1, -1).contiguous()        # [B*M, 1, latent_dim]
+                else:
+                    q_flat = self.global_query.expand(BM, 1, -1).contiguous()
+                # >>> QNORM: pre-norm the decoder query (enriched OR global_query)
+                # before the cross-attention. No residual is added on the
+                # input-derived enriched query (Perceiver-IO decoder note).
+                q_flat = self.dec_q_norm(q_flat)
+                # >>> END QNORM
+                # >>> END SKIP
+
+            key_pad_flat = (~keep_mask).reshape(BM, k_keep)
+
+            with record_function("Decoder Cross Attention"):
+
+                attn_out, _ = self.decoder_cross_attn(
+                    query=q_flat, key=kv_flat, value=kv_flat,
+                    key_padding_mask=key_pad_flat,
+                    need_weights=False,
+                )
+                attn_out = attn_out.squeeze(1).reshape(B, M, -1)
+
+                if return_features:
+                    return attn_out
+
+                with record_function("Decoder Logits"):
+                    logits = self.reconstruction_head(attn_out)
+
+                if return_topk:
+                    topk_dists_sq_kept = torch.gather(dists_sq, 2, topk_indices)
+                    return logits, topk_indices, topk_dists_sq_kept
+
+                return logits
 
     # =========================================================================
-    # Targeted Depth-2
+    # >>> ADAPTIVE: probe-and-broadcast deployed decode (inference, B=1)
     # =========================================================================
 
-    def _targeted_depth2(
-        self,
-        latents_per_res:  dict,
-        coords_per_res:   dict,
-        predicted_errors: torch.Tensor,
-        geo_cache:        dict,
-        global_latents:   Optional[torch.Tensor],
-    ) -> dict:
-        resolutions = sorted(latents_per_res.keys(), key=str)
-        res         = resolutions[0]
+    @torch.no_grad()
+    def _decode_subset(self, latents_per_res, coords_per_res, query_tokens,
+                       subset_idx, batch):
+        """Full-path decode of an arbitrary pixel subset (B=1). Gathers query
+        tokens + skip inputs at subset_idx; the token pool stays whole.
+        skip_res is the SAT (10m) pool, consistent with the gather index."""
+        qsub = query_tokens[:, subset_idx]
+        qti = batch.get("query_token_idx", None)
+        qtv = batch.get("query_token_valid", None)
+        qti_sub = qti[:, subset_idx] if qti is not None else None
+        qtv_sub = qtv[:, subset_idx] if qtv is not None else None
 
-        all_latents = torch.cat(
-            [latents_per_res[r] for r in resolutions
-             if r != "refinement"], dim=1)
-        all_coords  = torch.cat(
-            [coords_per_res[r]  for r in resolutions
-             if r != "refinement"], dim=1)
-        B, L, D = all_latents.shape
+        skip_pool_tokens = skip_pool_mask = None
+        if self.use_decoder_skip and qti is not None:
+            skip_res = self.config["Atomiser"].get("skip_resolution", 10.0)
+            if skip_res not in batch["groups"]:
+                skip_res = min(batch["groups"].keys())
+            skip_pool_tokens = batch["groups"][skip_res]["tokens"]
+            skip_pool_mask   = batch["groups"][skip_res]["mask"]
 
-        geo_tokens_all, geo_masks_all, gc, _ = geo_cache[res]
-        L_geo = geo_tokens_all.shape[1]
-
-        errors_for_topk = predicted_errors[:, :L_geo]
-        k = min(self.td2_k, L_geo)
-        topk_idx = torch.topk(errors_for_topk, k, dim=-1).indices
-
-        topk_latents = torch.gather(
-            all_latents, 1,
-            topk_idx.unsqueeze(-1).expand(-1, -1, D))
-        topk_coords  = torch.gather(
-            all_coords, 1,
-            topk_idx.unsqueeze(-1).expand(-1, -1, 2))
-
-        geo_k = geo_tokens_all.shape[2]
-        topk_geo_tokens = torch.gather(
-            geo_tokens_all, 1,
-            topk_idx.unsqueeze(-1).unsqueeze(-1)
-                    .expand(-1, -1, geo_k, 8))
-        topk_geo_masks  = torch.gather(
-            geo_masks_all, 1,
-            topk_idx.unsqueeze(-1).expand(-1, -1, geo_k))
-
-        cross_attn, cross_ff, _ = self.encoder_layers[0]
-        st, sm = self._sample_tokens(
-            topk_geo_tokens, topk_geo_masks,
-            cross_k=self.td2_cross_k)
-
-        topk_latents_updated = self._cross_attention_step(
-            topk_latents, st, sm,
-            topk_coords, cross_attn, cross_ff,
-            L_spatial=k,
+        qmask_sub = batch["queries_mask"][:, subset_idx]
+        logits = self.reconstruct(
+            latents_per_res, coords_per_res, qsub, qmask_sub,
+            target_resolution=batch.get("target_resolution", None),
+            training=False, return_features=False, return_topk=False,
+            query_token_idx=qti_sub, query_token_valid=qtv_sub,
+            pool_tokens=skip_pool_tokens, pool_mask=skip_pool_mask,
         )
+        return logits[0]                                                 # [S, C]
 
-        all_latents = all_latents.clone()
-        all_latents.scatter_(
-            1,
-            topk_idx.unsqueeze(-1).expand(-1, -1, D),
-            topk_latents_updated,
-        )
+    @torch.no_grad()
+    def _reconstruct_adaptive(self, latents_per_res, coords_per_res, batch):
+        """Probe-and-broadcast decode (B=1). Decodes only probe pixels + hard
+        zones; easy zones broadcast their agreed probe class. Vectorized
+        easy/hard determination (masked min==max over the probe axis)."""
+        query_tokens = batch["queries"]
+        assert query_tokens.shape[0] == 1, "_reconstruct_adaptive supports B=1 only"
+        device = query_tokens.device
+        M = query_tokens.shape[1]; C = self.num_classes
 
-        updated_per_res = {}
-        updated_coords  = {}
-        offset = 0
-        for r in resolutions:
-            if r == "refinement":
-                continue
-            n = latents_per_res[r].shape[1]
-            updated_per_res[r] = all_latents[:, offset:offset + n]
-            updated_coords[r]  = all_coords[:,  offset:offset + n]
-            offset += n
+        # ── zone assignment via ZoneProbe (geometry-only, like geo_pruning) ──
+        with record_function("zone probe"):
+            all_coords = torch.cat(
+                [coords_per_res[r] for r in sorted(coords_per_res.keys(), key=str)],
+                dim=1)                                                   # [B, L, 2]
+            zone_id, probe_idx, probe_cnt = self.zone_probe(
+                query_tokens, all_coords,
+                probe_k=self.adaptive_probe_k, seed=self.adaptive_seed)
+        zone_id   = zone_id[0]                                          # [M]
+        probe_idx = probe_idx[0]                                        # [L, k]
+        probe_cnt = probe_cnt[0]                                        # [L]
+        L = probe_idx.shape[0]
 
-        if "refinement" in latents_per_res:
-            updated_per_res["refinement"] = latents_per_res["refinement"]
-            updated_coords["refinement"]  = coords_per_res["refinement"]
+        # ── 1. probe decode (all zones' probe pixels in one call) ────────────
+        with record_function("adaptive probe decode"):
+            valid_probe_mask = probe_idx >= 0                          # [L, k]
+            flat_probe = probe_idx[valid_probe_mask]                   # [P]
+            if flat_probe.numel() > 0:
+                probe_logits = self._decode_subset(
+                    latents_per_res, coords_per_res, query_tokens, flat_probe, batch)
+                probe_pred = probe_logits.argmax(-1)                   # [P]
+            else:
+                probe_pred = torch.empty(0, dtype=torch.long, device=device)
+            probe_class_grid = torch.full((L, self.adaptive_probe_k), -1,
+                                          dtype=torch.long, device=device)
+            probe_class_grid[valid_probe_mask] = probe_pred           # [L, k]
 
-        _, _, self_attns = self.encoder_layers[0]
-        updated_per_res, global_latents = \
-            self._self_attention_step_multiresolution(
-                updated_per_res, updated_coords, global_latents, self_attns)
+        # ── 2. VECTORIZED easy/hard via masked min==max over the probe axis ──
+        # "all valid probes equal" <=> min(valid) == max(valid).
+        # Sentinels sit strictly outside [0, C): +big for min, -1 for max, so
+        # invalid slots never win either reduction; a real class 0 is never
+        # confused with padding (we mask by `valid`, not by value).
+        valid     = valid_probe_mask                                  # [L, k]
+        has_valid = valid.any(dim=1)                                  # [L]
+        big       = C + 1
+        g_for_min = torch.where(valid, probe_class_grid,
+                                torch.full_like(probe_class_grid, big))
+        g_for_max = torch.where(valid, probe_class_grid,
+                                torch.full_like(probe_class_grid, -1))
+        row_min   = g_for_min.min(dim=1).values                       # [L]
+        row_max   = g_for_max.max(dim=1).values                       # [L]
+        agree     = row_min == row_max
+        easy_zone = has_valid & agree
+        hard_zone = has_valid & (~agree)
+        broadcast_class = torch.where(
+            easy_zone, row_min, torch.zeros_like(row_min))            # [L]
 
-        return updated_per_res
+        # ── 3. hard-zone pixel decode ────────────────────────────────────────
+        with record_function("adaptive hard decode"):
+            hard_pixel = hard_zone[zone_id]                           # [M]
+            hard_idx   = hard_pixel.nonzero(as_tuple=True)[0]
+            out_pred   = broadcast_class[zone_id]                     # [M]
+            hard_logits = None
+            if hard_idx.numel() > 0:
+                hard_logits = self._decode_subset(
+                    latents_per_res, coords_per_res, query_tokens, hard_idx, batch)
+                out_pred = out_pred.clone()
+                out_pred[hard_idx] = hard_logits.argmax(-1)
+
+        # ── 4. synthesize logits so argmax == out_pred; keep real for hard ──
+        out_dtype = (hard_logits.dtype if hard_logits is not None
+                     else (probe_logits.dtype if flat_probe.numel() > 0
+                           else torch.float32))
+        logits = torch.zeros(M, C, device=device, dtype=out_dtype)
+        logits.scatter_(1, out_pred.unsqueeze(1), 10.0)
+        if hard_idx.numel() > 0:
+            logits[hard_idx] = hard_logits
+
+        # expose last hard fraction for cost reporting (non-FLOP)
+        self._last_hard_pixel_frac = hard_pixel.float().mean().item()
+        self._last_hard_zone_frac  = hard_zone.float().mean().item()
+        return logits.unsqueeze(0)                                     # [1, M, C]
+
+    @torch.no_grad()
+    def _reconstruct_quadtree(self, latents_per_res, coords_per_res, batch):
+        """
+        Image-plane quadtree decode (inference, B=1). Cells start at
+        quadtree_start_cell px and subdivide on probe DISAGREEMENT; they
+        terminate on unanimity (broadcast the agreed class) OR at
+        quadtree_min_cell px (force-decode, protecting boundary mIoU).
+
+        Probe = cell center + 4 corners (5 fixed pixels). A coordinate cache
+        (flat query index -> class) reuses shared corners across levels, and
+        each level issues ONE batched _decode_subset call over the unique
+        uncached probes, so GPU launches ~ number of levels (not cells).
+
+        Assumes queries form a dense H*W grid in ROW-MAJOR order, so
+        query_index = y * W + x  (verified for Sen1Floods11).
+        """
+        query_tokens = batch["queries"]
+        assert query_tokens.shape[0] == 1, "_reconstruct_quadtree supports B=1 only"
+        device = query_tokens.device
+        M = query_tokens.shape[1]
+        C = self.num_classes
+
+        # ── infer H, W (prefer label geometry; else assume square) ──────────
+        if "label" in batch and batch["label"] is not None:
+            lab = batch["label"]
+            H, W = lab.shape[-2], lab.shape[-1]
+        else:
+            s = int(round(M ** 0.5))
+            assert s * s == M, f"Cannot infer H,W from M={M}; pass label geometry."
+            H = W = s
+        assert H * W == M, f"quadtree assumes dense grid: H*W={H*W} != M={M}"
+
+        start_cell = int(self.quadtree_start_cell)
+        min_cell   = int(self.quadtree_min_cell)
+
+        # ── output buffer + coordinate cache (flat query idx -> class) ──────
+        out_pred    = torch.full((M,), -1, dtype=torch.long, device=device)
+        cache_class = torch.full((M,), -1, dtype=torch.long, device=device)  # -1 = not decoded
+
+        def qidx(ys, xs):
+            return ys * W + xs
+
+        # ── initial active cells (y0, x0, size) at start_cell ───────────────
+        ny, nx = H // start_cell, W // start_cell
+        cy = torch.arange(ny, device=device).repeat_interleave(nx)
+        cx = torch.arange(nx, device=device).repeat(ny)
+        cell_y0 = cy * start_cell
+        cell_x0 = cx * start_cell
+        cell_sz = torch.full_like(cell_y0, start_cell)
+
+        with record_function("Quadtree decode"):
+            while cell_y0.numel() > 0:
+                s = cell_sz
+                y0, x0 = cell_y0, cell_x0
+                yc, xc = y0 + s // 2, x0 + s // 2
+
+                # 5 probe coords per cell: center + 4 corners
+                py = torch.stack([yc, y0, y0, y0 + s - 1, y0 + s - 1], dim=1)   # [K,5]
+                px = torch.stack([xc, x0, x0 + s - 1, x0, x0 + s - 1], dim=1)   # [K,5]
+                probe_q = qidx(py, px)                                          # [K,5]
+
+                # dedup uncached probe indices, decode in ONE batched call
+                flat_probe = probe_q.reshape(-1)
+                uncached = cache_class[flat_probe] < 0
+                need = torch.unique(flat_probe[uncached])
+                if need.numel() > 0:
+                    with record_function("Quadtree probe decode"):
+                        logits = self._decode_subset(
+                            latents_per_res, coords_per_res,
+                            query_tokens, need, batch)               # [len(need), C]
+                    cache_class[need] = logits.argmax(-1)
+
+                # gather the 5 probe classes per cell -> agreement
+                probe_cls = cache_class[probe_q]                     # [K,5]
+                agree = (probe_cls == probe_cls[:, :1]).all(dim=1)   # [K]
+                cls0  = probe_cls[:, 0]                              # [K]
+                is_min = s <= min_cell
+
+                # terminal cells: broadcast agreed/forced class over the block.
+                # All terminal cells at this level share the SAME size `ss`, so we
+                # build one ss x ss offset grid and broadcast it across all cells,
+                # then scatter in a single op (no Python per-cell loop).
+                term = agree | is_min
+                if term.any():
+                    ti  = term.nonzero(as_tuple=True)[0]        # [T]
+                    ss  = int(s[ti[0]].item())                  # shared cell size
+                    ty0 = y0[ti]                                # [T]
+                    tx0 = x0[ti]                                # [T]
+                    tcl = cls0[ti]                              # [T]
+                    off = torch.arange(ss, device=device)
+                    oy, ox = torch.meshgrid(off, off, indexing="ij")
+                    oy = oy.reshape(-1); ox = ox.reshape(-1)    # [ss*ss] each
+                    ys = ty0[:, None] + oy[None, :]             # [T, ss*ss]
+                    xs = tx0[:, None] + ox[None, :]             # [T, ss*ss]
+                    flat = qidx(ys, xs).reshape(-1)             # [T*ss*ss]
+                    vals = tcl[:, None].expand(-1, ss * ss).reshape(-1)
+                    out_pred[flat] = vals
+
+                # subdivide the rest into 4 children
+                sub = ~term
+                if sub.any():
+                    si = sub.nonzero(as_tuple=True)[0]
+                    hy0 = y0[si]; hx0 = x0[si]; hs = s[si] // 2
+                    cell_y0 = torch.cat([hy0, hy0, hy0 + hs, hy0 + hs])
+                    cell_x0 = torch.cat([hx0, hx0 + hs, hx0, hx0 + hs])
+                    cell_sz = torch.cat([hs, hs, hs, hs])
+                else:
+                    cell_y0 = cell_y0[:0]; cell_x0 = cell_x0[:0]; cell_sz = cell_sz[:0]
+
+        # ── synthesize logits so argmax == out_pred (parity w/ adaptive) ────
+        logits = torch.zeros(M, C, device=device)
+        logits.scatter_(1, out_pred.clamp(min=0).unsqueeze(1), 10.0)
+
+        # diagnostics (non-FLOP)
+        self._last_quadtree_decoded = int((cache_class >= 0).sum().item())
+        self._last_quadtree_frac    = self._last_quadtree_decoded / M
+        return logits.unsqueeze(0)                                   # [1, M, C]
 
     def classify(self, latents_per_res):
         all_latents = torch.cat(
@@ -1213,12 +1174,15 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
         target_resolution = batch.get("target_resolution", None)
 
         # >>> SKIP: read cascade inputs + the intact full token pool.
-        query_token_idx   = batch.get("query_token_idx", None)    # [B, M, C]
+        query_token_idx   = batch.get("query_token_idx", None)    # [B, M, A]
         query_token_valid = batch.get("query_token_valid", None)  # [B, M]
         skip_pool_tokens = None
         skip_pool_mask   = None
         if self.use_decoder_skip and query_token_idx is not None:
-            skip_res = sorted(groups.keys())[0]   # single-res Sen1Floods11
+            # Explicit SAT pool (the gather index targets 10m), never SPOT.
+            skip_res = self.config["Atomiser"].get("skip_resolution", 10.0)
+            if skip_res not in groups:
+                skip_res = min(groups.keys())
             skip_pool_tokens = groups[skip_res]["tokens"]   # [B, N, 8] intact
             skip_pool_mask   = groups[skip_res]["mask"]     # [B, N]
         # >>> END SKIP
@@ -1232,23 +1196,26 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
         resolutions   = sorted(groups.keys())
         geo_k_budget  = batch_cross_k * 2
 
-        grid_configs = {
-            res: compute_grid_config(
-                resolution=res,
-                shape=groups[res]["shape"],
-                tokens_per_latent=tpl,
-                total_tokens=groups[res]["tokens"].shape[1],
-                sigma_factor=self.sigma_factor,
-                max_k=geo_k_budget,
-            )
-            for res in resolutions
-        }
+        with record_function("Compute grid config"):
+            grid_configs = {
+                res: compute_grid_config(
+                    resolution=res,
+                    shape=groups[res]["shape"],
+                    tokens_per_latent=tpl,
+                    total_tokens=groups[res]["tokens"].shape[1],
+                    sigma_factor=self.sigma_factor,
+                    max_k=geo_k_budget,
+                )
+                for res in resolutions
+            }
 
         need_trajectory = return_trajectory or task == "visualization"
-        encoder_output = self.encode(
-            groups=groups, grid_configs=grid_configs,
-            training=training, return_trajectory=need_trajectory,
-            mask_ratio=mask_ratio, cross_k=batch_cross_k)
+
+        with record_function("encode"):
+            encoder_output = self.encode(
+                groups=groups, grid_configs=grid_configs,
+                training=training, return_trajectory=need_trajectory,
+                mask_ratio=mask_ratio, cross_k=batch_cross_k)
 
         latents_per_res = encoder_output.latents_per_res
         coords_per_res  = encoder_output.coords_per_res
@@ -1264,39 +1231,38 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
 
         if task in ("reconstruction", "visualization"):
             predicted_errors = None
-            all_latents_for_err = torch.cat(
-                [latents_per_res[r] for r in sorted(latents_per_res.keys(), key=str)], dim=1)
-            if self.use_error_predictor:
-                predicted_errors = self.error_predictor(
-                    all_latents_for_err.detach()
-                ).squeeze(-1)
 
-            if (self.use_refinement
-                    and predicted_errors is not None
-                    and encoder_output.geo_cache is not None):
-                latents_per_res, coords_per_res = self.refine(
-                    latents_per_res=latents_per_res,
-                    coords_per_res=coords_per_res,
-                    groups=groups,
-                    predicted_errors=predicted_errors,
-                    geo_cache=encoder_output.geo_cache,
-                    training=training,
-                )
+            # >>> QUADTREE: image-plane hierarchical decode (inference, B=1)
+            if getattr(self, "use_quadtree_decode", False) and not training:
+                with record_function("Quadtree decode branch"):
+                    output = self._reconstruct_quadtree(
+                        latents_per_res, coords_per_res, batch)
+                if task == "visualization" or return_predicted_errors:
+                    return {'predictions': output,
+                            'latents_per_res': latents_per_res,
+                            'coords_per_res': coords_per_res,
+                            'trajectory': trajectory,
+                            'predicted_errors': predicted_errors}
+                return output
+            # >>> END QUADTREE
 
-            if (self.use_targeted_depth2
-                    and predicted_errors is not None
-                    and encoder_output.geo_cache is not None):
-                latents_per_res = self._targeted_depth2(
-                    latents_per_res=latents_per_res,
-                    coords_per_res=coords_per_res,
-                    predicted_errors=predicted_errors,
-                    geo_cache=encoder_output.geo_cache,
-                    global_latents=encoder_output.global_latents,
-                )
+            # >>> ADAPTIVE: probe-and-broadcast deployed decode (inference, B=1)
+            if getattr(self, "use_adaptive_decode", False) and not training:
+                with record_function("Adaptive decode"):
+                    output = self._reconstruct_adaptive(
+                        latents_per_res, coords_per_res, batch)
+                if task == "visualization" or return_predicted_errors:
+                    return {'predictions': output,
+                            'latents_per_res': latents_per_res,
+                            'coords_per_res': coords_per_res,
+                            'trajectory': trajectory,
+                            'predicted_errors': predicted_errors}
+                return output
+            # >>> END ADAPTIVE
 
             chunk_size = 10_000
             N = queries.shape[1]
-            need_topk = return_for_error and self.use_error_predictor
+            need_topk = False  # error-predictor path removed
 
             if N > chunk_size:
                 preds_list      = []
@@ -1406,19 +1372,11 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
         self._set_requires_grad(self.input_processor, True)
 
     def freeze_decoder(self):
-        self._set_requires_grad(self.dec_q_norm,False)
+        self._set_requires_grad(self.dec_q_norm, False)
         self._set_requires_grad(self.dec_ctx_norm, False)
         self._set_requires_grad(self.decoder_cross_attn, False)
         self._set_requires_grad(self.reconstruction_head, False)
 
-        if self.use_error_predictor:
-            self._set_requires_grad(self.error_predictor, False)
-        if self.use_refinement:
-            self.refinement_latent_content.requires_grad = False
-            self._set_requires_grad(self.refine_cross_attn, False)
-            self._set_requires_grad(self.refine_cross_ff, False)
-            self._set_requires_grad(self.refine_self_attn, False)
-            self._set_requires_grad(self.refine_self_ff, False)
         # >>> SKIP
         if self.use_decoder_skip:
             self._set_requires_grad(self.pixel_cross_attn, False)
@@ -1428,17 +1386,9 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
 
     def unfreeze_decoder(self):
         self._set_requires_grad(self.decoder_cross_attn, True)
-        self._set_requires_grad(self.dec_q_norm,True)
+        self._set_requires_grad(self.dec_q_norm, True)
         self._set_requires_grad(self.reconstruction_head, True)
         self._set_requires_grad(self.dec_ctx_norm, True)
-        if self.use_error_predictor:
-            self._set_requires_grad(self.error_predictor, True)
-        if self.use_refinement:
-            self.refinement_latent_content.requires_grad = True
-            self._set_requires_grad(self.refine_cross_attn, True)
-            self._set_requires_grad(self.refine_cross_ff, True)
-            self._set_requires_grad(self.refine_self_attn, True)
-            self._set_requires_grad(self.refine_self_ff, True)
         # >>> SKIP
         if self.use_decoder_skip:
             self._set_requires_grad(self.pixel_cross_attn, True)

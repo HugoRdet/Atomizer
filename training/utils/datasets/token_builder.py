@@ -388,11 +388,18 @@ class TokenBuilder:
         time_idx=-1,
         return_number=None,        # NEW: [N] int LIDAR return numbers (1..number_of_returns)
         number_of_returns=None,    # NEW: [N] int LIDAR total returns per pulse
+        intensity_override=None,  # NEW: [N] per-point raw/normalized value. When
+                                   # provided, col 6 carries THIS value (broadcast
+                                   # across channels) instead of the constant
+                                   # resolution_idx. Intended for LIDAR intensity —
+                                   # resolution is constant/uninformative for LIDAR,
+                                   # so this repurposes that column rather than
+                                   # adding a second token channel.
     ):
         """
         Build tokens for sparse/irregular inputs (e.g., LIDAR points).
 
-        Echo encoding (NEW):
+        Echo encoding:
             When both `return_number` and `number_of_returns` are provided,
             each token's column 7 (normally `time_idx`) is replaced with the
             echo index from `self.lookup.get_echo_idx(r, t)`. This index
@@ -408,6 +415,23 @@ class TokenBuilder:
             If either return_number or number_of_returns is None, behavior
             is identical to the legacy version: col 7 is set to time_idx
             for all tokens.
+
+        Intensity override (NEW):
+            When `intensity_override` is provided, column 6 (normally
+            `resolution_idx`) carries this per-point continuous value
+            instead of the constant resolution index. Resolution is
+            constant/uninformative for LIDAR (fixed GSD), so this
+            repurposes that column to carry the second per-point LIDAR
+            value (intensity) without doubling token count via a second
+            channel. If None, column 6 is filled with resolution_idx as
+            before (legacy/default behavior — used by every existing
+            caller, e.g. FRACTAL).
+
+            The downstream TokenProcessor must be a variant that knows to
+            route column 6 for these tokens through an intensity encoder
+            instead of the categorical resolution embedding (e.g.
+            DalesTokenProcessor), otherwise column 6 will be silently
+            misinterpreted as an out-of-range resolution index.
 
         Args:
             values: [N] for single-channel, or [N, C] for multi-channel sparse data.
@@ -436,6 +460,11 @@ class TokenBuilder:
             number_of_returns: [N] int array or tensor — total returns from
                                the same pulse for each point. Pass None to
                                keep legacy time_idx behavior.
+            intensity_override: [N] tensor or None — per-point continuous
+                                value (e.g. normalized LIDAR intensity) to
+                                place in column 6 INSTEAD of resolution_idx.
+                                Pass None to keep legacy resolution_idx
+                                behavior in column 6.
 
         Returns:
             tokens: [N*C, 8] (or [N, 8] for single-channel input) — same token
@@ -516,7 +545,23 @@ class TokenBuilder:
         label_flat     = einops.repeat(labels.float(), "n -> (n c)", c=C).unsqueeze(-1)
         spectral_flat  = einops.repeat(spectral_indices.float(), "c -> (n c)", n=N).unsqueeze(-1)
         query_flat     = torch.full((N * C, 1), float(query_offset))
-        resolution_flat = torch.full((N * C, 1), float(resolution_idx))
+
+        # ── Build the per-token "resolution / intensity" column ──────
+        # If intensity_override is provided, col 6 carries the per-point
+        # continuous value (broadcast across channels) instead of the
+        # constant resolution_idx. Otherwise, legacy behavior (constant
+        # resolution_idx for every token) is preserved exactly.
+        if intensity_override is not None:
+            assert intensity_override.shape[0] == N, (
+                f"intensity_override has {intensity_override.shape[0]} "
+                f"entries, expected N={N}"
+            )
+            resolution_flat = einops.repeat(
+                intensity_override.float(), "n -> (n c)", c=C
+            ).unsqueeze(-1)
+        else:
+            resolution_flat = torch.full((N * C, 1), float(resolution_idx))
+
         time_flat      = einops.repeat(time_col_per_point,
                                         "n -> (n c)", c=C).unsqueeze(-1)
 
@@ -527,7 +572,8 @@ class TokenBuilder:
             spectral_flat,   # col 3
             label_flat,      # col 4
             query_flat,      # col 5
-            resolution_flat, # col 6
+            resolution_flat, # col 6  (intensity_override for LIDAR if given,
+                             #          resolution_idx otherwise)
             time_flat,       # col 7  (echo_idx for LIDAR, time_idx otherwise)
         ], dim=-1)
         return tokens
@@ -551,7 +597,9 @@ class TokenBuilder:
 
         Note: queries don't carry echo info — that's an INPUT modality
         feature, not a query feature. Col 7 of queries holds time_idx as
-        before (typically -1 for FRACTAL).
+        before (typically -1 for FRACTAL). Queries also always hold the
+        constant resolution_idx in col 6 (no intensity_override support
+        here — intensity is an INPUT token feature, not a query feature).
         """
         N = positions.shape[0]
 

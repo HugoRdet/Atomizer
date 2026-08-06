@@ -1,7 +1,6 @@
 """
 HLS BurnScars Perceiver-IO Single-Task Training Script
 =========================================================
-
 Trains the Perceiver-IO baseline on HLS BurnScars — binary burn-scar
 segmentation, single-frame, full-image (no random cropping).
 
@@ -31,10 +30,9 @@ Examples:
     python script_train_burnscars_perceiver.py --xp_name perceiver_burnscars \
         --test_only ./checkpoints/burnscars_perceiver/bl_perceiver_burnscars-best.ckpt
 """
-
 import argparse
 import os
-
+import csv
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning import Trainer, seed_everything
@@ -55,11 +53,9 @@ from training.utils.datasets_baselines.utils_dataset_burnscars_baselines import 
 from training.perceiverIO.perceiver_seg import PerceiverSeg
 from training.trainer_baselines import BaselineTrainer
 
-
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
 NUM_CLASSES  = BurnScarsBaselineDataset.NUM_CLASSES        # 2
 IGNORE_INDEX = BurnScarsBaselineDataset.IGNORE_INDEX       # 255
 NUM_CHANNELS = BurnScarsBaselineDataset.NUM_CHANNELS       # 6
@@ -72,17 +68,14 @@ NATIVE_SIZE = 512
 # =============================================================================
 # COLLATE
 # =============================================================================
-
 def burnscars_collate(batch):
     """Stack per-modality images, stack targets, keep metadata as list."""
     images = {}
     sensor_keys = list(batch[0]["image"].keys())
     for key in sensor_keys:
         images[key] = torch.stack([s["image"][key] for s in batch])
-
     targets = torch.stack([s["target"] for s in batch])
     metadata = [s["metadata"] for s in batch]
-
     return {
         "image": images,
         "target": targets,
@@ -93,7 +86,6 @@ def burnscars_collate(batch):
 # =============================================================================
 # ARGS
 # =============================================================================
-
 parser = argparse.ArgumentParser(description="HLS BurnScars Perceiver-IO Baseline")
 parser.add_argument("--xp_name",   type=str, required=True)
 parser.add_argument("--data_dir",  type=str, default="./data/hls_burn_scars")
@@ -103,12 +95,12 @@ parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a .ckpt file. Skip training, test directly.")
 
 # Training
-parser.add_argument("--batch_size",   type=int, default=2)
+parser.add_argument("--batch_size",   type=int, default=1)
 parser.add_argument("--lr",           type=float, default=1e-4)
 parser.add_argument("--weight_decay", type=float, default=1e-2)
 parser.add_argument("--epochs",       type=int, default=80)
 parser.add_argument("--num_workers",  type=int, default=4)
-parser.add_argument("--patience",     type=int, default=20)
+parser.add_argument("--patience",     type=int, default=100)
 parser.add_argument("--grad_accum",   type=int, default=1)
 
 # Spatial — BurnScars native is 512x512, used throughout (no random crop).
@@ -118,26 +110,24 @@ parser.add_argument("--img_size", type=int, default=NATIVE_SIZE,
 # Perceiver-IO config (matches the PASTIS/MADOS runs for parameter parity)
 parser.add_argument("--num_latents",        type=int, default=512)
 parser.add_argument("--latent_dim",         type=int, default=768)
-parser.add_argument("--depth",              type=int, default=6)
-parser.add_argument("--cross_heads",        type=int, default=1)
+parser.add_argument("--depth",              type=int, default=1)
+parser.add_argument("--cross_heads",        type=int, default=8)
 parser.add_argument("--latent_heads",       type=int, default=8)
 parser.add_argument("--cross_dim_head",     type=int, default=64)
 parser.add_argument("--latent_dim_head",    type=int, default=64)
-parser.add_argument("--self_per_cross_attn", type=int, default=1)
+parser.add_argument("--self_per_cross_attn", type=int, default=2)
 parser.add_argument("--no_weight_tie",      action="store_true",
                     help="Disable weight-tying across encoder blocks.")
 parser.add_argument("--num_freq_bands",     type=int, default=6)
 parser.add_argument("--max_freq",           type=float, default=10.0)
 parser.add_argument("--attn_dropout",       type=float, default=0.0)
 parser.add_argument("--ff_dropout",         type=float, default=0.0)
-
 args = parser.parse_args()
 
 
 # =============================================================================
 # DATASETS
 # =============================================================================
-
 # crop_size=None -> full image (no random crop, no center crop).
 train_ds = BurnScarsBaselineDataset(
     root_path=args.data_dir, mode="train",
@@ -152,11 +142,9 @@ test_ds = BurnScarsBaselineDataset(
     crop_size=None, augment=False,
 )
 
-
 # =============================================================================
 # SUMMARY
 # =============================================================================
-
 print(f"\n{'='*60}")
 print(f"  HLS BurnScars Perceiver-IO Baseline")
 print(f"  Channels:     {NUM_CHANNELS} (HLS optical)")
@@ -173,16 +161,13 @@ print(f"  LR:           {args.lr}")
 print(f"  Grad accum:   {args.grad_accum}")
 print(f"  GPUs:         {torch.cuda.device_count()}")
 print(f"{'='*60}\n")
-
 print(f"  Train: {len(train_ds)} samples")
 print(f"  Val:   {len(val_ds)} samples")
 print(f"  Test:  {len(test_ds)} samples")
 
-
 # =============================================================================
 # DATALOADERS
 # =============================================================================
-
 loader_kwargs = dict(
     num_workers=args.num_workers,
     collate_fn=burnscars_collate,
@@ -190,7 +175,6 @@ loader_kwargs = dict(
     persistent_workers=args.num_workers > 0,
     prefetch_factor=4 if args.num_workers > 0 else None,
 )
-
 train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                           shuffle=True, drop_last=True, **loader_kwargs)
 val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
@@ -198,11 +182,9 @@ val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
 test_loader  = DataLoader(test_ds,  batch_size=args.batch_size,
                           shuffle=False, **loader_kwargs)
 
-
 # =============================================================================
 # MODEL
 # =============================================================================
-
 model = PerceiverSeg(
     in_channels=NUM_CHANNELS,
     num_classes=NUM_CLASSES,
@@ -223,10 +205,10 @@ model = PerceiverSeg(
 )
 
 
+
 # =============================================================================
 # TRAINER MODULE
 # =============================================================================
-
 trainer_module = BaselineTrainer(
     model=model,
     modality=MODALITY_KEY,
@@ -238,11 +220,9 @@ trainer_module = BaselineTrainer(
     ignore_index=IGNORE_INDEX,
 )
 
-
 # =============================================================================
 # WANDB
 # =============================================================================
-
 wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     try:
@@ -257,11 +237,9 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     except Exception:
         print("  WandB not available, logging to console only.")
 
-
 # =============================================================================
 # TRAIN (skipped in --test_only mode)
 # =============================================================================
-
 ckpt_dir = "./checkpoints/burnscars_perceiver/"
 os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -290,7 +268,6 @@ if args.test_only is None:
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
-
     trainer = Trainer(
         strategy=DDPStrategy(find_unused_parameters=False),
         devices=-1,
@@ -310,7 +287,6 @@ if args.test_only is None:
     print(f"{'='*60}\n")
 
     trainer.fit(trainer_module, train_loader, val_loader)
-
     best_ckpt = trainer.checkpoint_callback.best_model_path
 
     import torch.distributed as dist
@@ -318,13 +294,10 @@ if args.test_only is None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
-
     if not is_rank_zero:
         if wandb_logger:
-            import wandb
             wandb.finish()
         raise SystemExit(0)
-
 else:
     if not os.path.exists(args.test_only):
         raise FileNotFoundError(
@@ -333,11 +306,9 @@ else:
     best_ckpt = args.test_only
     print(f"\n[test-only mode] Skipping training, testing: {best_ckpt}\n")
 
-
 # =============================================================================
 # SINGLE-GPU TEST
 # =============================================================================
-
 print(f"\n{'='*60}")
 print(f"  Testing checkpoint: {best_ckpt}")
 print(f"{'='*60}\n")
@@ -351,6 +322,168 @@ test_trainer = Trainer(
 )
 test_trainer.test(trainer_module, test_loader, ckpt_path=best_ckpt)
 
+# =============================================================================
+# GFLOPS MEASUREMENT (torch.profiler, after scoring)
+# =============================================================================
+def _to_device(b, dev):
+    if isinstance(b, torch.Tensor):
+        return b.to(dev)
+    if isinstance(b, dict):
+        return {k: _to_device(v, dev) for k, v in b.items()}
+    if isinstance(b, (list, tuple)):
+        return type(b)(_to_device(v, dev) for v in b)
+    return b
+
+
+gflops = float("nan")
+PROFILE_DIR = "./profiler"
+tag = f"{args.xp_name}_test"
+out_dir = os.path.join(PROFILE_DIR, tag)
+os.makedirs(out_dir, exist_ok=True)
+print(f"\n[Profile] Saving profiler artifacts to {out_dir}/")
+
+try:
+    from torch.profiler import profile, ProfilerActivity
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # To avoid the PyTorch Lightning wrapper overhead, we pull the base model
+    # directly and pass the image tensor into it.
+    profiler_model = trainer_module.model.to(device)
+    profiler_model.eval()
+
+    n_profile = 30
+    n_warmup  = 1
+    batches = []
+    for i, b in enumerate(test_loader):
+        batches.append(_to_device(b, device))
+        if len(batches) >= n_profile + n_warmup:
+            break
+
+    if not batches:
+        print("[Profile] No test batches available; skipping profiling.")
+    else:
+        with torch.no_grad():
+            # Warmup
+            for b in batches[:n_warmup]:
+                _ = profiler_model(b["image"][MODALITY_KEY])
+            if device == "cuda":
+                torch.cuda.synchronize()
+
+            flops_list = []
+            prof_last = None
+            for b in batches[n_warmup:]:
+                img_tensor = b["image"][MODALITY_KEY]
+                with profile(activities=[ProfilerActivity.CPU,
+                                         ProfilerActivity.CUDA],
+                             with_flops=True,
+                             record_shapes=True,
+                             profile_memory=True) as prof:
+                    _ = profiler_model(img_tensor)
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                total = sum(evt.flops for evt in prof.key_averages()
+                            if getattr(evt, "flops", None))
+                flops_list.append(total)
+                prof_last = prof
+
+            if flops_list:
+                mean_flops = sum(flops_list) / len(flops_list)
+                gflops = mean_flops / 1e9
+                print(f"[Profile] GFLOPs/forward (mean of {len(flops_list)} "
+                      f"passes): {gflops:.3f}  "
+                      f"[lower bound; profiler-counted ops only]")
+
+            if prof_last is not None:
+                ka = prof_last.key_averages()
+
+                # Chrome trace
+                try:
+                    trace_path = os.path.join(out_dir, f"trace_{tag}.json")
+                    prof_last.export_chrome_trace(trace_path)
+                except Exception as ee:
+                    pass
+
+                # Region Summary Logic
+                try:
+                    # Specific custom regions requested
+                    REGION_LABELS = {
+                        "Self Attention",
+                        "Encoder Cross Attention",
+                        "Decoder"
+                    }
+                    evlist = prof_last.events()
+
+                    def _start(e):
+                        for a in ("time_range",):
+                            tr = getattr(e, a, None)
+                            if tr is not None:
+                                return tr.start, tr.end
+                        s = getattr(e, "cpu_interval", None)
+                        if s is not None:
+                            return s.start, s.end
+                        return None
+
+                    label_iv = []
+                    for e in evlist:
+                        nm = getattr(e, "name", getattr(e, "key", ""))
+                        if nm in REGION_LABELS:
+                            iv = _start(e)
+                            if iv:
+                                label_iv.append((nm, iv[0], iv[1]))
+
+                    region_flops = {n: 0 for n in REGION_LABELS}
+                    region_cuda  = {n: 0.0 for n in REGION_LABELS}
+                    region_count = {n: 0 for n in REGION_LABELS}
+
+                    for e in evlist:
+                        fl = getattr(e, "flops", None) or 0
+                        cu = getattr(e, "cuda_time_total", 0) or 0
+                        if fl == 0 and cu == 0:
+                            continue
+                        iv = _start(e)
+                        if not iv:
+                            continue
+                        s, en = iv
+                        best = None
+                        best_span = None
+                        for (nm, ls, le) in label_iv:
+                            if ls <= s and en <= le:
+                                span = le - ls
+                                if best_span is None or span < best_span:
+                                    best, best_span = nm, span
+                        if best is not None:
+                            region_flops[best] += fl
+                            region_cuda[best]  += cu
+                            region_count[best] += 1
+
+                    region_path = os.path.join(out_dir, f"regions_{tag}.csv")
+                    with open(region_path, "w", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(["region", "gflops", "cuda_ms", "leaf_ops"])
+                        for nm in sorted(REGION_LABELS,
+                                         key=lambda n: region_flops[n],
+                                         reverse=True):
+                            w.writerow([nm, region_flops[nm]/1e9,
+                                        region_cuda[nm]/1e3, region_count[nm]])
+
+                    print("\n[Profile] Per-region breakdown (GFLOPs | CUDA ms | leaf ops):")
+                    any_nonzero = False
+                    for nm in sorted(REGION_LABELS, key=lambda n: region_flops[n], reverse=True):
+                        gf = region_flops[nm]/1e9
+                        cu = region_cuda[nm]/1e3
+                        if region_flops[nm] > 0 or region_cuda[nm] > 0:
+                            any_nonzero = True
+                        print(f"[Profile]   {nm:<26} {gf:>9.1f} | {cu:>7.2f} ms | {region_count[nm]:>4d}")
+                    if not any_nonzero:
+                        print("[Profile]   (no FLOPs attributed — verify record_function placement)")
+                except Exception as ee:
+                    print(f"[Profile] region summary failed: {ee}")
+except Exception as e:
+    import traceback
+    print(f"[Profile] GFLOPs measurement failed: {e}")
+    gflops = float("nan")
+
+print(f"\nRESULT xp={args.xp_name} test_gflops={gflops:.6f}")
+
 if wandb_logger:
-    import wandb
     wandb.finish()

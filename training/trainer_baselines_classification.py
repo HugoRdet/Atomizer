@@ -15,7 +15,9 @@ Expected batch format (from collate):
     }
 
 Model contract:
-    forward(image: [B, C, H, W]) -> logits: [B, num_classes]
+    Standard models:  forward(image: [B, C, H, W]) -> logits: [B, num_classes]
+    RAMEN-style:       forward(image: dict[modality] -> [B, C, H, W]) -> logits: [B, num_classes]
+                       (model sets `expects_full_image_dict = True` — see _get_image)
 """
 
 import torch
@@ -31,8 +33,17 @@ from torchmetrics.classification import (
 class ClassificationBaselineTrainer(pl.LightningModule):
     """
     Args:
-        model:        nn.Module with forward(image) -> logits [B, num_classes]
-        modality:     dataset image dict key (e.g. "landsat")
+        model:        nn.Module with forward(image) -> logits [B, num_classes].
+                      Standard models take a single [B,C,H,W] tensor (selected
+                      via `modality`). Multi-modal models (e.g. RAMEN) that
+                      need the entire modality dict should set a class
+                      attribute `expects_full_image_dict = True` — see
+                      _get_image below. `modality` is then unused for input
+                      extraction (only shown in logs), but is still required
+                      as a constructor arg.
+        modality:     dataset image dict key (e.g. "fused"). Ignored for
+                      input extraction when model.expects_full_image_dict
+                      is True.
         num_classes:  number of classes
         lr:           initial learning rate
         weight_decay: AdamW weight decay
@@ -84,6 +95,27 @@ class ClassificationBaselineTrainer(pl.LightningModule):
         self.test_metrics  = _make_metrics("test")
 
     # ─────────────────────────────────────────────────────────────────────
+    # Input extraction
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _get_image(self, batch):
+        """
+        Extract the model input from a batch.
+
+        Models that need the entire modality dict (e.g. a RAMEN-style
+        classifier, which looks up a separate spectral projector per
+        modality internally) set a class attribute
+        `expects_full_image_dict = True`. Checked with getattr rather
+        than isinstance so that wrappers around such a model (e.g. a
+        modality-drop wrapper) are also recognized correctly as long as
+        they carry the same attribute. Every other model expects a
+        single modality's tensor, selected via self.modality.
+        """
+        if getattr(self.model, "expects_full_image_dict", False):
+            return batch["image"]  # dict[modality] -> Tensor, passed through as-is
+        return batch["image"][self.modality]  # [B, C, H, W]
+
+    # ─────────────────────────────────────────────────────────────────────
     # FORWARD
     # ─────────────────────────────────────────────────────────────────────
 
@@ -95,7 +127,7 @@ class ClassificationBaselineTrainer(pl.LightningModule):
     # ─────────────────────────────────────────────────────────────────────
 
     def _shared_step(self, batch, stage: str):
-        image  = batch["image"][self.modality]    # [B, C, H, W]
+        image  = self._get_image(batch)
         target = batch["target"]                   # [B] long
         bs = target.shape[0]
 

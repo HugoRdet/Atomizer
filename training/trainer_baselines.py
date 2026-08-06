@@ -3,7 +3,7 @@ Baseline Segmentation Trainer
 ==============================
 
 PyTorch Lightning trainer for fixed-format baseline models (UNet, ViT,
-TemporalUNet / U-TAE) on segmentation tasks.
+TemporalUNet / U-TAE, RAMEN) on segmentation tasks.
 
 Batch format:
     {
@@ -16,10 +16,15 @@ Batch format:
 Architecture:
     Non-temporal: model(image) → logits [B, num_classes, H, W]
     Temporal:     model(image, doy=dates) → logits [B, num_classes, H, W]
+    RAMEN:        model(image_dict) → logits [B, num_classes, H, W]
+                  (image_dict = batch["image"] passed through as-is,
+                   since RAMENUPerNet looks up a separate spectral
+                   projector per modality internally)
 
 Supports:
     - Single-modality training (one sensor key)
     - Temporal models (U-TAE) with day-of-year positional encoding
+    - Multi-modal models (RAMEN) that consume the full modality dict
     - Cross-sensor evaluation
     - Per-class IoU logging
     - Cosine LR schedule with warmup
@@ -30,6 +35,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 import torchmetrics
 from transformers import get_cosine_schedule_with_warmup
+from training.sliding_window import sliding_window_inference  # adjust import path
 
 
 IGNORE_INDEX = 255
@@ -62,6 +68,7 @@ TASK_CLASS_NAMES = {
     "multiearth": {
         0: "Forest",         1: "Deforested",
     },
+    "burnscars": {0: "No burn", 1: "Burn scar"},
 }
 
 
@@ -69,9 +76,11 @@ class BaselineTrainer(pl.LightningModule):
     """
     Single-task segmentation trainer for baseline models.
 
-    Handles both standard models (UNet, ViT) and temporal models
-    (TemporalUNet / U-TAE) transparently. Temporal models receive
-    day-of-year positional encoding from batch["dates"].
+    Handles standard models (UNet, ViT), temporal models (TemporalUNet /
+    U-TAE), and multi-modal models (RAMEN) transparently. Temporal models
+    receive day-of-year positional encoding from batch["dates"]. RAMEN
+    receives the entire batch["image"] dict rather than a single
+    modality's tensor.
 
     Parameters
     ----------
@@ -79,8 +88,11 @@ class BaselineTrainer(pl.LightningModule):
         Segmentation model.
         Non-temporal: [B, C, H, W] → [B, num_classes, H, W]
         Temporal:     [B, T, C, H, W], doy=[B, T] → [B, num_classes, H, W]
+        RAMEN:        dict[modality] -> Tensor → [B, num_classes, H, W]
     modality : str
         Key in batch["image"] to use as input (e.g., "s2", "hyspex").
+        Ignored when model is a RAMENUPerNet — pass any placeholder
+        (e.g. "optical+sar") since it's only used in the startup print.
     temporal : bool
         If True, pass dates to model and expect [B, T, C, H, W] input.
     task : str
@@ -93,6 +105,22 @@ class BaselineTrainer(pl.LightningModule):
         Number of segmentation classes.
     ignore_index : int
         Label value to ignore in loss and metrics.
+    window_size : int, optional
+        For models that can't afford a full-resolution forward pass
+        (currently: RAMEN, whose pixel-level tokenization makes full
+        self-attention over a large image intractable), the spatial size
+        the model was built/trained for. At val/test time, if the input
+        is larger than window_size, sliding_window_inference tiles the
+        input into overlapping windows of this size and stitches the
+        logits back together. Ignored for all other models, and ignored
+        during training (training already sees pre-cropped windows of
+        this size directly from the dataset/collate, so no tiling is
+        needed there).
+    window_stride : int, optional
+        Step between windows for sliding-window inference. Must be
+        <= window_size; stride < window_size gives overlap (averaged in
+        the output), stride == window_size gives non-overlapping tiling.
+        Required if window_size is set.
     """
 
     def __init__(
@@ -105,6 +133,8 @@ class BaselineTrainer(pl.LightningModule):
         weight_decay: float = 0.01,
         num_classes: int = 20,
         ignore_index: int = IGNORE_INDEX,
+        window_size: int = None,
+        window_stride: int = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -117,6 +147,8 @@ class BaselineTrainer(pl.LightningModule):
         self.weight_decay = weight_decay
         self.num_classes = num_classes
         self.ignore_index = ignore_index
+        self.window_size = window_size
+        self.window_stride = window_stride if window_stride is not None else window_size
 
         self.class_names = TASK_CLASS_NAMES.get(task, {})
 
@@ -159,11 +191,34 @@ class BaselineTrainer(pl.LightningModule):
         return self.model(x)
 
     # ─────────────────────────────────────────────────────────────────
+    # Input extraction
+    # ─────────────────────────────────────────────────────────────────
+
+    def _get_image(self, batch):
+        """
+        Extract the model input from a batch.
+
+        Models that need the entire modality dict (e.g. RAMENUPerNet,
+        which looks up a separate spectral projector per modality
+        internally) set a class attribute `expects_full_image_dict = True`.
+        This is checked with getattr rather than isinstance so that
+        wrappers around such a model (e.g. a modality-drop wrapper used
+        for ablation studies) are also recognized correctly, as long as
+        they carry the same attribute — no need for this trainer to
+        import or know about every wrapper class.
+        Every other model expects a single modality's tensor, selected
+        via self.modality.
+        """
+        if getattr(self.model, "expects_full_image_dict", False):
+            return batch["image"]  # dict[modality] -> Tensor, passed through as-is
+        return batch["image"][self.modality]  # [B, C, H, W] or [B, T, C, H, W]
+
+    # ─────────────────────────────────────────────────────────────────
     # Shared step
     # ─────────────────────────────────────────────────────────────────
 
     def _shared_step(self, batch, split: str):
-        image = batch["image"][self.modality]  # [B, C, H, W] or [B, T, C, H, W]
+        image = self._get_image(batch)
         target = batch["target"]                # [B, H, W]
 
         # Get dates for temporal models
@@ -176,7 +231,23 @@ class BaselineTrainer(pl.LightningModule):
                 doy = dates  # [B, T]
 
         # Forward
-        if self.temporal and doy is not None:
+        use_sliding_window = (
+            self.window_size is not None
+            and split != "train"
+            and not self.temporal
+        )
+        if use_sliding_window:
+            # Training already sees pre-cropped windows of this exact
+            # size (see dataset/collate crop_size), so tiling is only
+            # needed for full-resolution val/test images.
+            logits = sliding_window_inference(
+                self.model,
+                image,
+                window_size=self.window_size,
+                stride=self.window_stride,
+                num_classes=self.num_classes,
+            )
+        elif self.temporal and doy is not None:
             logits = self.model(image, doy=doy)
         else:
             logits = self.model(image)

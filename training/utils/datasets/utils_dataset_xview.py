@@ -100,7 +100,7 @@ class XView2Dataset(Dataset):
         super().__init__()
         assert mode in self.SPLIT_MAPPING, f"Unknown split: {mode}"
 
-        self.root_path     = root_path
+        self.root_path     = "./data/xview"
         self.split         = mode
         self.look_up       = look_up
         self.config_model  = config_model
@@ -331,6 +331,60 @@ class XView2Dataset(Dataset):
         return _take((H - crop_size) // 2, (W - crop_size) // 2)
 
     # ─────────────────────────────────────────────────────────────────────
+    # >>> SKIP: per-query gather index into own band x time atoms
+    # Mirrors BioMasstersSkipDataset's _build_full_pixel_index /
+    # _build_query_token_index, simplified to a single spectral block: xView2
+    # has one modality (RGB) rather than BioMassters' S2+S1 split, so there's
+    # no second "off" block to concatenate -- just T*C atoms per pixel.
+    #
+    # Token layout produced above in __getitem__/get_viz_sample:
+    #   image_tokens = cat([ frame_0(c h w), frame_1(c h w) ])
+    # i.e. frame-major, and within a frame TokenBuilder.build_tokens orders
+    # tokens channel-major (pixel p -> row p + c*HW), the SAME convention
+    # BioMasstersSkipDataset's docstring documents for its S2/S1 blocks
+    # (shared TokenBuilder, so the ordering convention is identical here).
+    # For pixel p, band c, frame t: index = t*C*HW + c*HW + p.
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_full_pixel_index(T, C, H, W):
+        """
+        For every pixel p in [0, H*W), returns the indices into the flat
+        `image_tokens` array of every (band, time) atom at that pixel --
+        i.e. everything the SKIP decoder needs to gather to reconstruct
+        pixel p directly from its own input atoms.
+
+        Returns: LongTensor [H*W, T*C]
+        """
+        HW = H * W
+        p = torch.arange(HW)
+        t = torch.arange(T).view(T, 1, 1)
+        c = torch.arange(C).view(1, C, 1)
+        idx = (t * C * HW + c * HW).reshape(-1, 1) + p.view(1, -1)  # [T*C, HW]
+        return idx.t().contiguous()  # [HW, T*C]
+
+    def _build_query_token_index(self, T, C, H, W, kept_indices=None):
+        """
+        kept_indices=None means queries were NOT subsampled (val/test: all
+        H*W pixels), so the full per-pixel index is used as-is. Otherwise
+        kept_indices are row indices into the pre-subsample, row-major
+        [0, H*W) pixel ordering returned by subsample_queries(...,
+        return_indices=True) -- same ordering _build_full_pixel_index is
+        built over, so full[kept_indices] lines up 1:1 with the surviving
+        queries.
+
+        `valid` is unconditionally True: every index here always points to
+        a real position in image_tokens (this dataset never pads/replicates
+        frames the way BioMassters' variable-length time series does), so
+        there's nothing for a per-atom validity flag to encode here -- kept
+        only for interface parity with BioMasstersSkipDataset's SKIP fields.
+        """
+        full = self._build_full_pixel_index(T, C, H, W)
+        idx = full if kept_indices is None else full[kept_indices]
+        valid = torch.ones(idx.shape[0], dtype=torch.bool)
+        return idx, valid
+
+    # ─────────────────────────────────────────────────────────────────────
     # DATASET INTERFACE
     # ─────────────────────────────────────────────────────────────────────
 
@@ -423,6 +477,11 @@ class XView2Dataset(Dataset):
         # pruning step is designed to use.
 
         # ── Subsample queries (training only) ──
+        # kept_indices tracks which of the seg_queries' H*W rows survived
+        # subsampling -- needed below to build query_token_idx so the SKIP
+        # gather index stays aligned with the (possibly subsampled) queries.
+        # None means "not subsampled" (reconstruction mode, or val/test).
+        kept_indices = None
         if self.reconstruction:
             queries = image_tokens.clone()
             queries[:, 4] = queries[:, 0].clone()
@@ -430,11 +489,12 @@ class XView2Dataset(Dataset):
             queries = queries[perm]
         else:
             if self.split == "train":
-                queries = self.token_builder.subsample_queries(
+                queries, kept_indices = self.token_builder.subsample_queries(
                     seg_queries,
                     max_queries=self.max_tokens_reconstruction,
                     ignore_index=IGNORE_INDEX,
                     prioritize_valid=True,
+                    return_indices=True,
                 )
             else:
                 # Val/test: all pixels for accurate evaluation
@@ -460,6 +520,17 @@ class XView2Dataset(Dataset):
 
         if not self.reconstruction:
             result["label"] = target
+            # SKIP decoder pixel-gather index. NOT built for reconstruction
+            # mode: there, each "query" IS one atom (one band/time/pixel,
+            # copied straight from image_tokens), not a per-pixel query
+            # needing all of that pixel's atoms gathered together -- the
+            # concept doesn't map onto that branch, so it's intentionally
+            # skipped rather than built with wrong semantics.
+            query_token_idx, query_token_valid = self._build_query_token_index(
+                T, C, H, W, kept_indices=kept_indices,
+            )
+            result["query_token_idx"]   = query_token_idx
+            result["query_token_valid"] = query_token_valid
 
         return result
 
@@ -518,6 +589,12 @@ class XView2Dataset(Dataset):
         attention_mask = torch.zeros(image_tokens.shape[0])
         queries_mask   = torch.zeros(queries.shape[0], dtype=torch.bool)
 
+        # No subsampling here (viz uses all H*W pixels), so kept_indices=None
+        # -> the full, unsubsampled per-pixel gather index.
+        query_token_idx, query_token_valid = self._build_query_token_index(
+            T, C, H, W, kept_indices=None,
+        )
+
         return {
             "groups": {
                 self.OPTICAL_RESOLUTION: {
@@ -531,6 +608,8 @@ class XView2Dataset(Dataset):
             "label":             target,
             "target_resolution": self.OPTICAL_RESOLUTION,
             "image":             img,
+            "query_token_idx":   query_token_idx,
+            "query_token_valid": query_token_valid,
         }
 
     # ─────────────────────────────────────────────────────────────────────

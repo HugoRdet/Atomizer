@@ -124,13 +124,13 @@ parser.add_argument("--img_size", type=int, default=DEFAULT_CROP,
 
 # Perceiver-IO config (matches the rest of the row for parameter parity)
 parser.add_argument("--num_latents",        type=int, default=512)
-parser.add_argument("--latent_dim",         type=int, default=768)
-parser.add_argument("--depth",              type=int, default=6)
+parser.add_argument("--latent_dim",         type=int, default=389)
+parser.add_argument("--depth",              type=int, default=1)
 parser.add_argument("--cross_heads",        type=int, default=1)
 parser.add_argument("--latent_heads",       type=int, default=8)
 parser.add_argument("--cross_dim_head",     type=int, default=64)
 parser.add_argument("--latent_dim_head",    type=int, default=64)
-parser.add_argument("--self_per_cross_attn", type=int, default=1)
+parser.add_argument("--self_per_cross_attn", type=int, default=6)
 parser.add_argument("--no_weight_tie",      action="store_true",
                     help="Disable weight-tying across encoder blocks.")
 parser.add_argument("--num_freq_bands",     type=int, default=16)

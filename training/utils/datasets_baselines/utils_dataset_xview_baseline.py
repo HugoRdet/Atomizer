@@ -78,7 +78,7 @@ class XView2BaselineDataset(Dataset):
 
     def __init__(
         self,
-        root_path: str = "./data/xView2",
+        root_path: str = "./data/xview",
         mode: str = "train",
         crop_size: int = 512,
         augment: bool = True,

@@ -11,6 +11,13 @@ top-1/top-5 accuracy, macro-F1).
 Supported models:
   - resnet : ResNet (avgpool + fc head). Variant via --resnet_variant.
   - vit    : ViT (CLS token + linear head).
+  - ramen  : RAMENClassifier — multi-modal spectral tokenization + CLS
+             token classification head. ForestNet has a single modality
+             (Landsat optical, no SAR), so unlike the EuroSAT-SAR script's
+             adapter (which splits a fused tensor into optical + sar),
+             RAMENInputAdapter here just renames image["landsat"] into
+             RAMEN's {"optical": ...} input dict — see RAMENInputAdapter
+             below.
 
 Bands: 6 Landsat (Blue, Green, Red, NIR, SWIR1, SWIR2) at 15 m/px.
 Input size: center-cropped 320×320 from native 332×332 (divisible by 16
@@ -26,6 +33,11 @@ Examples:
     python script_train_forestnet_baselines.py --xp_name vit \
         --model vit \
         --batch_size 16 --lr 1e-4 --epochs 80
+
+    # RAMEN
+    python script_train_forestnet_baselines.py --xp_name ramen \
+        --model ramen \
+        --batch_size 32 --lr 1e-4 --epochs 80
 """
 
 import os
@@ -33,6 +45,7 @@ import argparse
 from collections import Counter
 
 import torch
+import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
@@ -51,6 +64,7 @@ from training.utils.datasets_baselines.utils_dataset_forestnet_baselines import 
 )
 from training.VIT.model_vit_upernet import ViTClassifier
 from training.ResNet.model_resnet_upernet import build_resnet_classifier
+from training.RAMEN.ramen_classifier import build_ramen_classifier  # adjust import path
 from training.trainer_baselines_classification import (
     ClassificationBaselineTrainer,
 )
@@ -63,6 +77,59 @@ from training.trainer_baselines_classification import (
 NUM_CLASSES  = ForestNetBaselineDataset.NUM_CLASSES   # 12
 NUM_CHANNELS = ForestNetBaselineDataset.NUM_CHANNELS  # 6
 MODALITY_KEY = "landsat"
+
+
+# =============================================================================
+# RAMEN band metadata
+# =============================================================================
+# Central wavelengths (nm) for the 6 Landsat-style bands used by ForestNet,
+# in the same order the docstring/dataset describes them: Blue, Green, Red,
+# NIR, SWIR1, SWIR2. These are the standard Landsat 8 OLI band centers.
+# NOTE: unlike the EuroSAT-SAR script, ForestNetBaselineDataset doesn't
+# expose a NAME_TO_S2CODE-style mapping to derive these from, so they are
+# hardcoded here — adjust if the underlying imagery uses different band
+# passes (e.g. Landsat 7 ETM+ instead of Landsat 8 OLI).
+FORESTNET_BAND_NAMES = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
+
+RAMEN_BAND_WAVELENGTHS_NM = {
+    "Blue":  482.0,
+    "Green": 561.5,
+    "Red":   654.5,
+    "NIR":   865.0,
+    "SWIR1": 1608.5,
+    "SWIR2": 2200.5,
+}
+
+RAMEN_INPUT_BANDS = {
+    "optical": FORESTNET_BAND_NAMES,
+}
+RAMEN_WAVELENGTHS = {
+    "optical": RAMEN_BAND_WAVELENGTHS_NM,
+}
+
+
+# =============================================================================
+# RAMEN INPUT ADAPTER
+# =============================================================================
+
+class RAMENInputAdapter(nn.Module):
+    """
+    Wraps the dataset's single-sensor image["landsat"] : [B,6,H,W] tensor
+    into RAMEN's expected {"optical": [B,6,H,W]} dict.
+
+    ForestNet has no SAR modality, so — in contrast to the EuroSAT-SAR
+    script's adapter, which splits a fused tensor into {"optical","sar"} —
+    this is a straight rename/passthrough, not a split.
+    """
+    expects_full_image_dict = True
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: dict, **kwargs):
+        image = x[MODALITY_KEY]  # [B, 6, H, W]
+        return self.model({"optical": image}, **kwargs)
 
 
 # =============================================================================
@@ -108,9 +175,23 @@ def build_model(model_name: str, in_channels: int, num_classes: int, args):
             patch_size=args.vit_patch_size,
             dropout=args.dropout,
         )
+    elif model_name == "ramen":
+        base = build_ramen_classifier(
+            input_bands=RAMEN_INPUT_BANDS,
+            wavelengths=RAMEN_WAVELENGTHS,
+            num_classes=num_classes,
+            input_size=args.img_size,  # must equal --crop_size (see sanity check)
+            embed_dim=args.ramen_embed_dim,
+            depth=args.ramen_depth,
+            num_heads=args.ramen_num_heads,
+            input_res=args.ramen_input_res,
+            res=args.ramen_res,
+            dropout=args.dropout,
+        )
+        return RAMENInputAdapter(base)
     else:
         raise ValueError(
-            f"Unknown model: {model_name}. Available: 'resnet', 'vit'"
+            f"Unknown model: {model_name}. Available: 'resnet', 'vit', 'ramen'"
         )
 
 
@@ -135,7 +216,7 @@ def compute_class_weights(dataset, num_classes):
 parser = argparse.ArgumentParser(description="ForestNet Baseline Training")
 parser.add_argument("--xp_name",   type=str, required=True)
 parser.add_argument("--model",     type=str, default="resnet",
-                    choices=["resnet", "vit"])
+                    choices=["resnet", "vit", "ramen"])
 parser.add_argument("--data_dir",  type=str,
                     default="./data/geo-bench-1.0/classification_v1.0/m-forestnet")
 
@@ -156,7 +237,7 @@ parser.add_argument("--use_class_weights", action="store_true",
 parser.add_argument("--crop_size", type=int, default=320,
                     help="Center-crop size (native 332).")
 parser.add_argument("--img_size",  type=int, default=320,
-                    help="ViT positional embedding size; must equal --crop_size.")
+                    help="ViT/RAMEN positional embedding size; must equal --crop_size.")
 
 # ViT
 parser.add_argument("--vit_embed_dim",     type=int, default=384)
@@ -169,6 +250,19 @@ parser.add_argument("--resnet_variant", type=str, default="resnet50",
                     choices=["resnet_super_small", "resnet_small",
                              "resnet50", "resnet101", "resnet152"])
 
+# RAMEN
+parser.add_argument("--ramen_embed_dim", type=int, default=384,
+                    help="Matches --vit_embed_dim's default for a fair "
+                         "parameter-count comparison; independent knob.")
+parser.add_argument("--ramen_depth",     type=int, default=12)
+parser.add_argument("--ramen_num_heads", type=int, default=6)
+parser.add_argument("--ramen_input_res", type=float, default=15.0,
+                    help="Native GSD (m/px) of ForestNet Landsat imagery.")
+parser.add_argument("--ramen_res",       type=float, default=60.0,
+                    help="Working resolution (m/px). Default equals "
+                         "--ramen_input_res (no resampling, full native "
+                         "detail). Increase to trade detail for speed.")
+
 args = parser.parse_args()
 
 
@@ -176,9 +270,9 @@ args = parser.parse_args()
 # SANITY CHECK
 # =============================================================================
 
-if args.model == "vit" and args.crop_size != args.img_size:
+if args.model in ("vit", "ramen") and args.crop_size != args.img_size:
     raise ValueError(
-        f"For ViT: --crop_size ({args.crop_size}) must equal "
+        f"For ViT/RAMEN: --crop_size ({args.crop_size}) must equal "
         f"--img_size ({args.img_size}). Default: both 320."
     )
 
@@ -192,6 +286,11 @@ print(f"  ForestNet Baseline Classification")
 print(f"  Model:       {args.model}")
 if args.model == "resnet":
     print(f"  Variant:     {args.resnet_variant}")
+if args.model == "ramen":
+    print(f"  Embed dim:   {args.ramen_embed_dim}, depth={args.ramen_depth}, "
+          f"heads={args.ramen_num_heads}")
+    print(f"  Resolution:  input_res={args.ramen_input_res}, res={args.ramen_res} "
+          f"({'no resampling' if args.ramen_input_res == args.ramen_res else 'resampled'})")
 print(f"  Channels:    {NUM_CHANNELS} (Landsat optical)")
 print(f"  Classes:     {NUM_CLASSES}")
 print(f"  Crop:        {args.crop_size}×{args.crop_size}")
@@ -264,6 +363,9 @@ if args.use_class_weights:
 
 trainer_module = ClassificationBaselineTrainer(
     model=model,
+    # RAMENInputAdapter consumes the full image dict (see
+    # ClassificationBaselineTrainer._get_image); `modality` is unused in
+    # that case, only shown in logs/hparams.
     modality=MODALITY_KEY,
     num_classes=NUM_CLASSES,
     lr=args.lr,
@@ -324,8 +426,21 @@ callbacks = [
 # TRAINER
 # =============================================================================
 
+# RAMEN's RadarProjector (reused verbatim from RAMEN/ramen_encoder.py)
+# registers polarization parameters that are never used in the forward
+# graph when no "sar" modality is passed in (as here, ForestNet is
+# optical-only) — DDP's default unused-parameter check rejects that.
+# Only RAMEN needs find_unused_parameters=True; other models don't pay
+# the (small) runtime cost of DDP's extra graph traversal. Mirrors the
+# same guard in the EuroSAT-SAR script; drop it if your build_ramen_classifier
+# only registers modality-specific parameters.
+strategy = (
+    DDPStrategy(find_unused_parameters=True) if args.model == "ramen"
+    else DDPStrategy(find_unused_parameters=False)
+)
+
 trainer = Trainer(
-    strategy=DDPStrategy(find_unused_parameters=False),
+    strategy=strategy,
     devices=-1,
     max_epochs=args.epochs,
     accelerator="gpu",

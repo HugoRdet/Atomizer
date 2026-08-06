@@ -8,6 +8,10 @@ Changes vs previous version:
   - geographic pruning bias capture cleaned up (was silently discarded anyway)
   - global_latents kept: participates in self-attention for global context,
     intentionally not wired into decoder
+  - classifier pooling is now config-switchable: "mean" (parameter-free,
+    can't collapse onto a subset of latents — used as an overfitting
+    countermeasure) or "attention" (the original LatentAttentionPooling).
+    Defaults to "mean". See MeanLatentPooling / _init_classifier.
 
 Config:
   latent_grid:
@@ -17,6 +21,8 @@ Config:
       - [3000, 1000]
     val_sampling:
       - [3000, 1000]
+  Atomiser:
+    pooling_type: mean   # "mean" (default) or "attention"
 """
 
 import random
@@ -67,6 +73,24 @@ def cache_fn(f):
         cache[key] = result
         return result
     return cached_fn
+
+
+class MeanLatentPooling(nn.Module):
+    """
+    Parameter-free classifier pooling: mean over the latent (token) axis.
+
+    Alternative to LatentAttentionPooling. A learned attention pool is a
+    soft-argmax that's free to sharpen onto a handful of latents during
+    training (a high-variance readout prone to memorizing whichever
+    latents happen to correlate with train labels). Mean pooling has no
+    parameters and structurally cannot collapse onto a subset — every
+    latent contributes equally — which trades away the ability to
+    selectively emphasize a few highly-informative latents in exchange
+    for a readout that's harder to overfit with.
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, D] -> [B, D]
+        return x.mean(dim=1)
 
 
 # =============================================================================
@@ -457,12 +481,39 @@ class Atomiser_Senflood(pl.LightningModule):
             )
 
     def _init_classifier(self):
+        """
+        Build the final classification head.
+
+        Pooling is config-switchable via config["Atomiser"]["pooling_type"]:
+          - "mean"      (default): parameter-free mean over all latents.
+                        Cannot collapse onto a subset of latents, so it's
+                        used here as a countermeasure against the pooling
+                        head overfitting (attention pooling sharpening
+                        onto a handful of latents that happen to correlate
+                        with train labels).
+          - "attention": the original LatentAttentionPooling — a learned
+                        query attends over the latents. Kept available for
+                        A/B comparison against mean pooling.
+        """
         if self.config["Atomiser"].get("final_classifier_head", True):
-            self.to_logits = nn.Sequential(
-                LatentAttentionPooling(
+            pooling_type = self.config["Atomiser"].get("pooling_type", "mean")
+
+            if pooling_type == "mean":
+                pooling = MeanLatentPooling()
+            elif pooling_type == "attention":
+                pooling = LatentAttentionPooling(
                     self.latent_dim, heads=self.latent_heads,
                     dim_head=self.latent_dim_head, dropout=self.attn_dropout,
-                ),
+                )
+            else:
+                raise ValueError(
+                    f"Unknown pooling_type '{pooling_type}'. "
+                    f"Expected 'mean' or 'attention'."
+                )
+            print(f"[Atomiser] Classifier pooling: {pooling_type}")
+
+            self.to_logits = nn.Sequential(
+                pooling,
                 nn.LayerNorm(self.latent_dim),
                 nn.Linear(self.latent_dim, self.num_classes),
             )

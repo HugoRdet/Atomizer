@@ -25,6 +25,26 @@ Specific to baselines:
     - No token grouping
     - Optional random crop to 256×256 during training (full 512 at val/test)
     - Channels are merged in fixed order: 13 S2 bands first, then 2 S1 bands
+
+Band-dropout augmentation (train only):
+    Zeroes whole modalities or random individual bands during training, so
+    baselines get SOME training-time exposure to missing-band inputs —
+    matching the semantics of the test-time modality-drop ablation
+    (script_test_senflood_baseline_modality_drop.py's ChannelDropWrapper,
+    which zeros already-normalized channels). Applied AFTER normalization
+    for the same reason: zeroing raw pixel values before normalization
+    would leave a nonzero value post-z-score ((0-mean)/std != 0), which
+    is a different signal than what the model actually sees at ablation
+    eval time (a literal zero). Sampled per-sample, independently of the
+    fixed eval ablations (whole-S1-drop, whole-S2-drop, or a random
+    per-band subset) — NOT limited to replaying the exact eval-time
+    combinations, since always training on only those exact combinations
+    would be a soft form of eval-set leakage into training. See
+    Atomiser vs. baseline fairness note in the training script: this
+    augmentation is baseline-only, compensating for these architectures'
+    lack of a native way to represent "this band is absent" (unlike
+    Atomiser's padding tokens) — not neutral, and should be reported as
+    such in any writeup.
 """
 
 import csv
@@ -47,6 +67,21 @@ class Sen1Floods11BaselineDataset(Dataset):
         crop_size:    Random crop size for training (None = no crop, full 512).
                       Validation/test always use full 512.
         augment:      D4 augmentation (rotations + flip) — train only.
+        band_dropout: Whole-modality/per-band zeroing augmentation — train
+                      only (see module docstring). Independent of `augment`
+                      so it can be toggled separately if needed.
+        p_dropout_applied: Probability that band dropout happens at all for
+                      a given training sample. The rest of the time, the
+                      sample is unmodified (all bands present) — keeps the
+                      "no dropout" regime well-represented so standard
+                      full-band performance doesn't degrade.
+        p_whole_modality: Given that dropout is applied, probability it's a
+                      whole-modality drop (all S1 or all S2, mirroring the
+                      "S2 only"/"S1 only" eval ablations) rather than a
+                      random per-band subset.
+        p_band_drop:  Given a per-band (not whole-modality) drop, the
+                      independent Bernoulli probability each of the 15
+                      bands is individually zeroed.
 
     Returns dict per sample:
         {
@@ -75,6 +110,10 @@ class Sen1Floods11BaselineDataset(Dataset):
         mode: str = "train",
         crop_size: int = 256,
         augment: bool = True,
+        band_dropout: bool = True,
+        p_dropout_applied: float = 0.5,
+        p_whole_modality: float = 0.5,
+        p_band_drop: float = 0.15,
     ):
         super().__init__()
         assert mode in self.SPLIT_MAPPING, f"Unknown split: {mode}"
@@ -83,6 +122,10 @@ class Sen1Floods11BaselineDataset(Dataset):
         self.split = mode
         self.crop_size = crop_size if mode == "train" else None
         self.augment = augment and (mode == "train")
+        self.band_dropout = band_dropout and (mode == "train")
+        self.p_dropout_applied = p_dropout_applied
+        self.p_whole_modality = p_whole_modality
+        self.p_band_drop = p_band_drop
 
         # Paths
         self.data_root = os.path.join(root_path, "data", "flood_events", "HandLabeled")
@@ -106,6 +149,13 @@ class Sen1Floods11BaselineDataset(Dataset):
         else:
             print(f"[Sen1Floods11-BL] full image (512×512)")
         print(f"[Sen1Floods11-BL] D4 augment: {'ON' if self.augment else 'OFF'}")
+        if self.band_dropout:
+            print(f"[Sen1Floods11-BL] Band dropout: ON "
+                  f"(p_applied={self.p_dropout_applied}, "
+                  f"p_whole_modality={self.p_whole_modality}, "
+                  f"p_band_drop={self.p_band_drop})")
+        else:
+            print(f"[Sen1Floods11-BL] Band dropout: OFF")
 
     # ─────────────────────────────────────────────────────────────────────
     # DATASET INTERFACE
@@ -138,6 +188,13 @@ class Sen1Floods11BaselineDataset(Dataset):
         # ── Merge channels: [13 S2 + 2 S1] = [15, H, W] ─────
         image = torch.cat([image_s2, image_s1], dim=0)
 
+        # ── Band-dropout augmentation (training only, AFTER normalize) ──
+        if self.band_dropout:
+            image = self._band_dropout_augment(
+                image, self.p_dropout_applied, self.p_whole_modality,
+                self.p_band_drop, self.NUM_S2_BANDS, self.NUM_S1_BANDS,
+            )
+
         # ── D4 augmentation (training only) ─────────────────
         if self.augment:
             image, label = self._d4_augment(image, label)
@@ -161,6 +218,46 @@ class Sen1Floods11BaselineDataset(Dataset):
     # ─────────────────────────────────────────────────────────────────────
     # AUGMENTATION
     # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _band_dropout_augment(
+        image: torch.Tensor,
+        p_dropout_applied: float,
+        p_whole_modality: float,
+        p_band_drop: float,
+        num_s2_bands: int,
+        num_s1_bands: int,
+    ) -> torch.Tensor:
+        """
+        Zero out whole modalities or random individual bands, applied to
+        the already-normalized, already-merged [15, H, W] tensor.
+
+        With probability (1 - p_dropout_applied): no-op, sample keeps all
+        bands (keeps the full-band regime well-represented in training).
+
+        Otherwise, with probability p_whole_modality: zero either all S2
+        or all S1 bands (mirrors the "S2 only" / "S1 only" eval
+        ablations). With probability (1 - p_whole_modality): zero each of
+        the 15 bands independently with probability p_band_drop (covers
+        the RGB-only / no-SWIR / no-red-edge style subset ablations
+        without hardcoding to those exact combinations).
+        """
+        if torch.rand(1).item() >= p_dropout_applied:
+            return image
+
+        image = image.clone()
+
+        if torch.rand(1).item() < p_whole_modality:
+            if torch.rand(1).item() < 0.5:
+                image[num_s2_bands:] = 0.0                    # drop S1
+            else:
+                image[:num_s2_bands] = 0.0                    # drop S2
+        else:
+            total_bands = num_s2_bands + num_s1_bands
+            band_mask = torch.rand(total_bands) < p_band_drop
+            image[band_mask] = 0.0
+
+        return image
 
     @staticmethod
     def _d4_augment(image: torch.Tensor, label: torch.Tensor):

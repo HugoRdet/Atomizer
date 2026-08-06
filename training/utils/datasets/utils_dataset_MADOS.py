@@ -22,7 +22,19 @@ class MADOSDataset(Dataset):
 
     All bands are loaded at native resolution, normalized, then upscaled
     to 10m (240×240) via nearest-neighbor. Single resolution group at 10m.
-    No augmentation (fair benchmarking).
+
+    D4 augmentation (random flip + 90° rotation) is applied on the train
+    split only, after the focus crop and before token building. Val/test
+    (sliding window) remain unaugmented for fair benchmarking.
+
+    SKIP: emits a per-query gather index `query_token_idx` of shape
+    [N_q, bands_per_pixel] (and `query_token_valid`), where each row holds
+    the row indices (into this sample's `image_tokens` pool) of that
+    query-pixel's own band-tokens. This lets a decoder skip cross-attention
+    and read each pixel's own raw tokens directly (Atomiser_Senflood_Skip).
+    Join key is (x, y) = cols 1,2, shared by a pixel's band-tokens and its
+    query. Indices are RELATIVE TO THIS SAMPLE's image_tokens pool — the
+    collate function must offset them if it concatenates samples.
 
     Uses reference grid indexing: all crops (including edge crops from
     sliding window) extract coordinates from a shared 512×512 reference grid,
@@ -112,6 +124,7 @@ class MADOSDataset(Dataset):
         for b in self.all_bands_sorted:
             print(f"  idx={b['idx']:2d}: {b['band_key']:4s} (native {b['resolution']}m) → "
                   f"wl={b['wavelength']}nm, bw={b['bandwidth']}nm")
+        print(f"[MADOS] D4 augmentations: {'ON' if self.split == 'train' else 'OFF'}")
         if self.split != "train" and self.use_sliding:
             print(f"[MADOS] Val/test: sliding window, crop={self.FOCUS_CROP_SIZE}, "
                   f"stride={self.SLIDING_STRIDE}")
@@ -170,6 +183,76 @@ class MADOSDataset(Dataset):
         return torch.tensor(indices, dtype=torch.long)
 
     # =========================================================================
+    # D4 AUGMENTATION
+    # =========================================================================
+
+    @staticmethod
+    def _d4_augment(image: torch.Tensor, label: torch.Tensor):
+        """Random horizontal flip + random 90° rotation (train split only)."""
+        if torch.rand(1).item() < 0.5:
+            image = torch.flip(image, dims=[2])
+            label = torch.flip(label, dims=[1])
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            image = torch.rot90(image, k, dims=[1, 2])
+            label = torch.rot90(label, k, dims=[0, 1])
+        return image, label
+
+    # =========================================================================
+    # SKIP: per-query gather index into own band-tokens
+    # =========================================================================
+
+    def _build_full_pixel_index(self, C, H, W):
+        """
+        Closed-form gather index for ALL pixels, in pixel order p = h*W + w.
+
+        TokenBuilder.build_tokens flattens as `(c h w) -> row`, i.e. channel-
+        major: pixel p's band-tokens live at rows {p + c*H*W : c in 0..C-1},
+        strided by H*W (NOT contiguous). Same TokenBuilder as Sen1Floods11Skip,
+        so the ordering carries over unchanged.
+
+        Returns [H*W, C] long.
+        """
+        HW = H * W
+        p = torch.arange(HW)                                   # [HW]
+        c = torch.arange(C)                                    # [C]
+        return p.unsqueeze(1) + c.unsqueeze(0) * HW            # [HW, C]
+
+    def _build_query_token_index(self, C, H, W, kept_indices=None):
+        """
+        Vectorized per-query gather index into own band-tokens.
+
+        idx[i] = the C row indices (into this sample's image_tokens) of the
+        band-tokens for query i's pixel.
+
+        Args:
+            C, H, W      : image dims used to build the token pool
+            kept_indices : [N_q] long or None.
+                           None  -> queries are the full pixel grid in order
+                                    (sliding crops: queries == seg_queries).
+                           tensor-> the row positions (into the full pixel
+                                    grid) that subsample_queries kept, in the
+                                    SAME order as the returned queries
+                                    (train / non-sliding eval). Obtained via
+                                    subsample_queries(..., return_indices=True).
+
+        Returns:
+            idx   : [N_q, C] long  -- rows into image_tokens
+            valid : [N_q] bool     -- all True (closed form always resolves)
+
+        NOTE: indices are RELATIVE TO THIS SAMPLE's image_tokens pool. The
+        collate function must offset them if it concatenates samples; no
+        offset needed if it pads to [B, N, 8] and the model gathers per-sample.
+        """
+        full = self._build_full_pixel_index(C, H, W)          # [H*W, C]
+        if kept_indices is None:
+            idx = full
+        else:
+            idx = full[kept_indices]                          # [N_q, C]
+        valid = torch.ones(idx.shape[0], dtype=torch.bool)
+        return idx, valid
+
+    # =========================================================================
     # DATASET INTERFACE
     # =========================================================================
 
@@ -196,11 +279,11 @@ class MADOSDataset(Dataset):
             return self._getitem_train(image, label_full)
 
     # =========================================================================
-    # TRAIN: focus crop → single sample
+    # TRAIN: focus crop → D4 augment → token building
     # =========================================================================
 
     def _getitem_train(self, image, label_full):
-        """Focus crop + token building (no augmentation)."""
+        """Focus crop + D4 augmentation (train split only) + token building."""
 
         crop_coords = self._get_focus_crop(label_full)
 
@@ -210,6 +293,9 @@ class MADOSDataset(Dataset):
             image = image[:, y0:y0+crop_h, x0:x0+crop_w]
         else:
             label = label_full
+
+        if self.split == "train":
+            image, label = self._d4_augment(image, label)
 
         # Build single token group — everything at 10m
         C, H, W = image.shape
@@ -229,13 +315,22 @@ class MADOSDataset(Dataset):
 
         # Build and subsample queries using TokenBuilder
         queries = self._build_queries(label, self.TARGET_RESOLUTION)
-        queries = self.token_builder.subsample_queries(
+        # SKIP: capture which queries were kept so the gather index can be
+        #       selected to match (subsample shuffles/truncates order).
+        queries, kept_indices = self.token_builder.subsample_queries(
             queries,
             max_queries=self.max_tokens_reconstruction,
             ignore_index=self.IGNORE_INDEX,
             prioritize_valid=True,
+            return_indices=True,
         )
         queries_mask = torch.zeros(queries.shape[0])
+
+        # SKIP: vectorized per-query gather index (closed form) into this
+        # sample's own image_tokens pool.
+        query_token_idx, query_token_valid = self._build_query_token_index(
+            C, H, W, kept_indices=kept_indices
+        )
 
         return {
             "groups": groups,
@@ -244,16 +339,18 @@ class MADOSDataset(Dataset):
             "label": label,
             "target_resolution": self.TARGET_RESOLUTION,
             "image": image,
+            "query_token_idx": query_token_idx,
+            "query_token_valid": query_token_valid,
         }
 
     # =========================================================================
-    # VAL/TEST: sliding window
+    # VAL/TEST: sliding window (no augmentation)
     # =========================================================================
 
     def _getitem_sliding(self, image, label_full):
         """
-        Sliding window over full tile.
-        
+        Sliding window over full tile. No augmentation (fair benchmarking).
+
         Edge crops may be smaller than FOCUS_CROP_SIZE, but all extract
         coordinates from the same 512×512 reference grid, ensuring
         consistent coordinate space.
@@ -292,7 +389,7 @@ class MADOSDataset(Dataset):
     def _build_single_crop(self, image, label_full, y0, x0, crop_h, crop_w):
         """
         Build tokens for one sliding window crop.
-        
+
         TokenBuilder's reference grid system handles edge crops automatically:
         - 240×240 crop extracts window [136:376, 136:376] from 512×512 reference
         - 160×240 edge crop extracts [176:336, 136:376] from same reference
@@ -302,7 +399,7 @@ class MADOSDataset(Dataset):
         image_crop = image[:, y0:y0+crop_h, x0:x0+crop_w]
 
         C, H, W = image_crop.shape
-        
+
         # TokenBuilder handles coordinate extraction from reference grid
         image_tokens = self._build_tokens_for_group(
             image_crop, label_crop, self.TARGET_RESOLUTION,
@@ -321,10 +418,18 @@ class MADOSDataset(Dataset):
         queries = self._build_queries(label_crop, self.TARGET_RESOLUTION)
         queries_mask = torch.zeros(queries.shape[0])
 
+        # SKIP: sliding crops use the full pixel grid in order (no
+        # subsampling), so kept_indices=None.
+        query_token_idx, query_token_valid = self._build_query_token_index(
+            C, H, W, kept_indices=None
+        )
+
         return {
             "groups": groups,
             "queries": queries,
             "queries_mask": queries_mask,
+            "query_token_idx": query_token_idx,
+            "query_token_valid": query_token_valid,
         }
 
     # =========================================================================
@@ -425,7 +530,7 @@ class MADOSDataset(Dataset):
                                 spectral_indices, resolution_idx):
         """
         Build [N, 8] tokens using TokenBuilder with reference grid indexing.
-        
+
         All crops (including edge crops) extract coordinates from the
         512×512 reference grid, ensuring consistent coordinate space.
         """
@@ -441,7 +546,7 @@ class MADOSDataset(Dataset):
     def _build_queries(self, label, resolution):
         """Build query tokens using TokenBuilder with reference grid indexing."""
         first_spectral_idx = self.all_spectral_indices[0]
-        
+
         return self.token_builder.build_queries(
             label=label,
             resolution=resolution,

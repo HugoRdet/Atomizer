@@ -1,23 +1,20 @@
 """
-Lookup_encoding with ECHO lookup table added.
+Lookup_encoding with ECHO lookup table + BioMassters abstract channels added.
 
 This file is intended to REPLACE the existing Lookup_encoding module.
-The only changes vs the previous version are:
+Changes vs the previous (echo-table) version:
 
-  - New constant LEARNED_ECHO_IDX = 0
-  - New constant MAX_ECHOS = 10 (max returns per pulse to pre-register)
-  - New attributes: self.table_echo, self.num_echo_indices
-  - New methods:
-      * init_echo_lookup_table()        — pre-registers (r, t) up to MAX_ECHOS
-      * get_echo_idx(r, t)              — read-only lookup
-      * register_echo(r, t)             — idempotent registration
-      * get_or_register_echo(r, t)      — auto-register on miss
-      * get_echo_continuous(idx)        — return (a, b) for a given index
-      * build_echo_continuous_lut()     — build [num_echo_indices, 2] tensor
-  - print_summary() updated to include echo stats
+  - New ABSTRACT_CHANNELS entries: CLP, VV_ASC, VH_ASC, VV_DESC, VH_DESC
+    (BioMassters-specific pseudo-spectral channels: cloud probability and
+    the 4 distinct SAR polarization/orbit-direction combinations). Codes
+    -40..-44 were chosen to NOT collide with any existing entry (current
+    range in use before this change: -1..-3, -10..-15, -20..-22, -100..-102).
+  - New helper function create_biomassters_bands_info(), matching the
+    existing create_pastis_bands_info() / create_sen1floods11_bands_info()
+    pattern.
 
-Everything else (position / spectral / query / resolution / time / abstract
-channels) is unchanged from the previous version.
+Everything else (position / spectral / query / resolution / time / echo /
+abstract channel mechanics) is unchanged from the previous version.
 """
 
 import torch
@@ -67,7 +64,7 @@ MAX_ECHOS = 10
 
 
 # =============================================================================
-# ABSTRACT CHANNEL DEFINITIONS (unchanged)
+# ABSTRACT CHANNEL DEFINITIONS
 # =============================================================================
 ABSTRACT_CHANNELS = {
     "VV":    {"bandwidth": -1, "central_wavelength": -1},
@@ -86,6 +83,18 @@ ABSTRACT_CHANNELS = {
     "ABSTRACT_1": {"bandwidth": -100, "central_wavelength": -100},
     "ABSTRACT_2": {"bandwidth": -101, "central_wavelength": -101},
     "ABSTRACT_3": {"bandwidth": -102, "central_wavelength": -102},
+    # --- BioMassters-specific (NEW) ---
+    # CLP: Sentinel-2 cloud probability layer, not a physical reflectance band.
+    # VV_ASC/VH_ASC/VV_DESC/VH_DESC: BioMassters' Sentinel-1 tiles carry 4
+    # distinct polarization/orbit-direction channels per month, unlike
+    # PASTIS/Sen1Floods11's generic VV/VH (which don't distinguish orbit
+    # direction) -- these get their OWN codes so the model can tell them
+    # apart rather than aliasing onto the existing VV(-1)/VH(-2) entries.
+    "CLP":     {"bandwidth": -40, "central_wavelength": -40},
+    "VV_ASC":  {"bandwidth": -41, "central_wavelength": -41},
+    "VH_ASC":  {"bandwidth": -42, "central_wavelength": -42},
+    "VV_DESC": {"bandwidth": -43, "central_wavelength": -43},
+    "VH_DESC": {"bandwidth": -44, "central_wavelength": -44},
 }
 
 
@@ -331,7 +340,7 @@ class Lookup_encoding(pl.LightningModule):
         return indices
 
     # =========================================================================
-    # ECHO LOOKUP (NEW)
+    # ECHO LOOKUP
     # =========================================================================
 
     def init_echo_lookup_table(self):
@@ -532,7 +541,7 @@ class Lookup_encoding(pl.LightningModule):
 
 
 # =============================================================================
-# HELPER FUNCTIONS (unchanged from previous version)
+# HELPER FUNCTIONS
 # =============================================================================
 
 def create_sen1floods11_bands_info() -> dict:
@@ -661,6 +670,55 @@ def create_flairhub_bands_info() -> dict:
                 "bandwidth":         ABSTRACT_CHANNELS["VH"]["bandwidth"],
                 "central_wavelength": ABSTRACT_CHANNELS["VH"]["central_wavelength"],
                 "idx": 1,
+            },
+        },
+    }
+    return bands_info
+
+
+def create_biomassters_bands_info() -> dict:
+    """
+    Bands info for BioMassters: 10 Sentinel-2 physical bands (CLP excluded --
+    matches PANGAEA's band set for this task) and 4 Sentinel-1 channels
+    (VV/VH x ascending/descending orbit, each a DISTINCT pseudo-spectral
+    entry -- unlike PASTIS/Sen1Floods11's generic VV/VH, BioMassters needs
+    the model to tell orbit direction apart).
+
+    Wavelengths for the 10 physical S2 bands match Atomizer-IO's S2_BANDS /
+    create_pastis_bands_info's convention. The 4 SAR channels use the codes
+    registered in ABSTRACT_CHANNELS (-41..-44). ABSTRACT_CHANNELS["CLP"]
+    (-40) remains defined above but is unused here -- harmless if left in
+    place, in case a future run wants it back.
+    """
+    bands_info = {
+        "bands_sen2_info": {
+            "B02": {"bandwidth": 65,  "central_wavelength": 490},
+            "B03": {"bandwidth": 35,  "central_wavelength": 560},
+            "B04": {"bandwidth": 30,  "central_wavelength": 665},
+            "B05": {"bandwidth": 15,  "central_wavelength": 705},
+            "B06": {"bandwidth": 15,  "central_wavelength": 740},
+            "B07": {"bandwidth": 20,  "central_wavelength": 783},
+            "B08": {"bandwidth": 115, "central_wavelength": 842},
+            "B8A": {"bandwidth": 20,  "central_wavelength": 865},
+            "B11": {"bandwidth": 90,  "central_wavelength": 1610},
+            "B12": {"bandwidth": 180, "central_wavelength": 2190},
+        },
+        "bands_sen1_info": {
+            "VV_ASC": {
+                "bandwidth":         ABSTRACT_CHANNELS["VV_ASC"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VV_ASC"]["central_wavelength"],
+            },
+            "VH_ASC": {
+                "bandwidth":         ABSTRACT_CHANNELS["VH_ASC"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VH_ASC"]["central_wavelength"],
+            },
+            "VV_DESC": {
+                "bandwidth":         ABSTRACT_CHANNELS["VV_DESC"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VV_DESC"]["central_wavelength"],
+            },
+            "VH_DESC": {
+                "bandwidth":         ABSTRACT_CHANNELS["VH_DESC"]["bandwidth"],
+                "central_wavelength": ABSTRACT_CHANNELS["VH_DESC"]["central_wavelength"],
             },
         },
     }

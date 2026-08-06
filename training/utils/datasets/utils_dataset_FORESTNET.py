@@ -13,6 +13,28 @@ Source files (geo-bench-1.0/classification_v1.0/m-forestnet/):
     label_map.json          — {class_idx_str: [sample_name, ...]}
     {sample_name}.hdf5      — 6 bands, [332, 332] uint8 each
 
+    LIMITED-LABEL PARTITIONS (NEW): {fraction}x_train_partition.json for
+    fraction in {0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00} -- PANGAEA-style
+    limited-label experiments (same convention as BioMassters' 10%/50%/100%
+    label comparisons). Only the TRAIN split's sample list is swapped when
+    config_model["dataset"]["train_fraction"] is set (read from config, NOT
+    a constructor kwarg -- UnifiedDataModule doesn't forward arbitrary extra
+    kwargs to dataset_class(...), but it does forward config_model
+    unchanged, so that's the reliable channel here); validation/test ALWAYS
+    come from default_partition.json's "valid"/"test" keys regardless of
+    train_fraction -- subsampling eval would make results across fractions
+    non-comparable, and isn't what these files are for.
+
+    FORMAT ASSUMPTION: I haven't seen the actual contents of a
+    "{fraction}x_train_partition.json" file, so this loader handles BOTH
+    plausible schemas defensively:
+      - a plain JSON list of sample names, or
+      - a dict with a "train" key holding that list (matching
+        default_partition.json's schema, just with only "train" present).
+    If neither applies, it raises a clear error rather than silently
+    misinterpreting the file -- verify against your actual file if you hit
+    that error.
+
 HDF5 keys are date-suffixed (e.g. "02 - Blue_2014-01-01"). We match keys
 by prefix at load time so the date suffix is handled transparently.
 
@@ -75,6 +97,11 @@ class ForestNetDataset(Dataset):
         "test":       "test",
     }
 
+    # Available limited-label fractions -- matches the files you listed.
+    # Kept here mainly for a friendly error message if an unavailable
+    # fraction is requested.
+    AVAILABLE_TRAIN_FRACTIONS = [0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.00]
+
     def __init__(
         self,
         root_path: str = "./data/geo-bench-1.0/classification_v1.0/m-forestnet",
@@ -98,19 +125,39 @@ class ForestNetDataset(Dataset):
         self.config_model  = config_model
         self.dataset_config = dataset_config
 
+        # Limited-label train fraction (NEW): read from config_model rather
+        # than a constructor kwarg. UnifiedDataModule (training/utils/
+        # datasets/dataloaders.py's _create_grouped_dataset) hardcodes the
+        # exact set of kwargs forwarded to dataset_class(...) -- no
+        # passthrough for arbitrary extra args -- but it DOES forward
+        # config_model unchanged, so that's the reliable channel. Set
+        # config_model["dataset"]["train_fraction"] before constructing
+        # UnifiedDataModule (see train_forestnet.py).
+        train_fraction = (config_model or {}).get("dataset", {}).get("train_fraction", None)
+        self.train_fraction = train_fraction
+
         self.token_builder = TokenBuilder(look_up)
         self.nb_tokens = config_model["trainer"]["max_tokens"]
 
         # ── Load JSON metadata ──────────────────────────────
         with open(os.path.join(root_path, "default_partition.json")) as f:
-            partition = json.load(f)
+            default_partition = json.load(f)
         with open(os.path.join(root_path, "label_map.json")) as f:
             label_map = json.load(f)
         with open(os.path.join(root_path, "band_stats.json")) as f:
             self.band_stats = json.load(f)
 
+        # ── Sample list: limited-label partition ONLY for train, ──────
+        # val/test always come from default_partition.json regardless of
+        # train_fraction (see module docstring for why).
         split_key = self.SPLIT_MAPPING[mode]
-        self.sample_names = list(partition[split_key])
+        if mode == "train" and train_fraction is not None and train_fraction != 1.0:
+            self.sample_names = self._load_train_fraction_partition(train_fraction)
+            print(f"[ForestNet] Using {train_fraction:.2f}x limited-label train "
+                  f"partition: {len(self.sample_names)} samples "
+                  f"(full train would be {len(default_partition['train'])})")
+        else:
+            self.sample_names = list(default_partition[split_key])
 
         # ── sample_name → class_idx lookup ──────────────────
         self.name_to_label = {}
@@ -158,6 +205,39 @@ class ForestNetDataset(Dataset):
         for n in self.sample_names:
             cls_counts[self.name_to_label[n]] += 1
         print(f"[ForestNet] class counts: {cls_counts.tolist()}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # LIMITED-LABEL PARTITION LOADING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _load_train_fraction_partition(self, fraction: float):
+        """
+        Loads sample names from "{fraction:.2f}x_train_partition.json".
+        Handles both a plain list and a {"train": [...]} dict, since the
+        exact schema of these files wasn't confirmed (see module docstring).
+        """
+        fname = f"{fraction:.2f}x_train_partition.json"
+        path = os.path.join(self.root_path, fname)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"[ForestNet] No partition file at {path}. Available "
+                f"fractions: {self.AVAILABLE_TRAIN_FRACTIONS}"
+            )
+
+        with open(path) as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            return list(data)
+        elif isinstance(data, dict) and "train" in data:
+            return list(data["train"])
+        else:
+            raise ValueError(
+                f"[ForestNet] {path} has an unrecognized format -- expected "
+                f"a plain list of sample names or a dict with a 'train' key, "
+                f"got a dict with keys {list(data.keys()) if isinstance(data, dict) else type(data)}. "
+                f"Update _load_train_fraction_partition to match the actual schema."
+            )
 
     # ─────────────────────────────────────────────────────────────────────
     # AUGMENTATION

@@ -18,6 +18,12 @@ Same dataset protocol as the Sen1Floods11 baseline:
     - Same normalization (per-band z-score, normalization_stats.pt)
     - Same NaN cleanup, ignore_index=255
     - D4 augmentation in training
+    - Band-dropout augmentation in training (see --band_dropout below) —
+      gives this baseline training-time exposure to missing modalities/
+      bands, matching Atomiser's own token-dropout augmentation and the
+      other Sen1Floods11 baseline scripts. Gated to training only by the
+      dataset itself (mode=="train"), so val/test are unaffected
+      regardless of these flags.
 
 Differs from the baseline script: full 512x512 used throughout (no random
 crop), matching the BurnScars Perceiver run. Token count = 512^2 = 262,144.
@@ -107,9 +113,9 @@ parser.add_argument("--test_only", type=str, default=None,
 parser.add_argument("--batch_size",   type=int, default=1)
 parser.add_argument("--lr",           type=float, default=1e-4)
 parser.add_argument("--weight_decay", type=float, default=1e-2)
-parser.add_argument("--epochs",       type=int, default=100)
+parser.add_argument("--epochs",       type=int, default=150)
 parser.add_argument("--num_workers",  type=int, default=8)
-parser.add_argument("--patience",     type=int, default=20)
+parser.add_argument("--patience",     type=int, default=150)
 parser.add_argument("--grad_accum",   type=int, default=1)
 
 # Spatial — Sen1Floods11 native is 512x512, used throughout (no crop).
@@ -120,17 +126,41 @@ parser.add_argument("--img_size", type=int, default=NATIVE_SIZE,
 parser.add_argument("--num_latents",        type=int, default=512)
 parser.add_argument("--latent_dim",         type=int, default=768)
 parser.add_argument("--depth",              type=int, default=1)
-parser.add_argument("--cross_heads",        type=int, default=16)
+parser.add_argument("--cross_heads",        type=int, default=8)
 parser.add_argument("--latent_heads",       type=int, default=8)
 parser.add_argument("--cross_dim_head",     type=int, default=64)
 parser.add_argument("--latent_dim_head",    type=int, default=64)
-parser.add_argument("--self_per_cross_attn", type=int, default=6)
+parser.add_argument("--self_per_cross_attn", type=int, default=2)
 parser.add_argument("--no_weight_tie",      action="store_true",
                     help="Disable weight-tying across encoder blocks.")
 parser.add_argument("--num_freq_bands",     type=int, default=16)
 parser.add_argument("--max_freq",           type=float, default=16.0)
 parser.add_argument("--attn_dropout",       type=float, default=0.0)
 parser.add_argument("--ff_dropout",         type=float, default=0.0)
+
+# Band-dropout augmentation (train only) — gives this baseline training-time
+# exposure to missing modalities/bands, matching the other Sen1Floods11
+# baseline scripts and Atomiser's own token-dropout augmentation. See
+# Sen1Floods11BaselineDataset's docstring for exact semantics.
+parser.add_argument("--band_dropout", action="store_true", default=True,
+                    help="Enable band-dropout augmentation during training "
+                         "(default: on). Set the probabilities below to the "
+                         "SAME values used for the other baselines/Atomiser "
+                         "for a fair comparison.")
+parser.add_argument("--no_band_dropout", dest="band_dropout", action="store_false",
+                    help="Disable band-dropout augmentation (e.g. for an "
+                         "ablation isolating its effect).")
+parser.add_argument("--p_dropout_applied", type=float, default=0.5,
+                    help="Probability a given training sample gets ANY "
+                         "band dropout applied (the rest keep all bands).")
+parser.add_argument("--p_whole_modality", type=float, default=0.5,
+                    help="Given dropout is applied, probability it's a "
+                         "whole-modality drop (all S1 or all S2) rather "
+                         "than a random per-band subset.")
+parser.add_argument("--p_band_drop", type=float, default=0.15,
+                    help="Given a per-band (not whole-modality) drop, the "
+                         "independent probability each of the 15 bands is "
+                         "individually zeroed.")
 
 args = parser.parse_args()
 
@@ -143,10 +173,17 @@ args = parser.parse_args()
 train_ds = Sen1Floods11BaselineDataset(
     root_path=args.data_dir, mode="train",
     crop_size=None, augment=True,
+    band_dropout=args.band_dropout,
+    p_dropout_applied=args.p_dropout_applied,
+    p_whole_modality=args.p_whole_modality,
+    p_band_drop=args.p_band_drop,
 )
 val_ds = Sen1Floods11BaselineDataset(
     root_path=args.data_dir, mode="validation",
     crop_size=None, augment=False,
+    # band_dropout intentionally not passed: the dataset gates it to
+    # mode=="train" internally regardless of the constructor default,
+    # so val/test are never augmented either way.
 )
 test_ds = Sen1Floods11BaselineDataset(
     root_path=args.data_dir, mode="test",
@@ -173,6 +210,7 @@ print(f"  Batch size:   {args.batch_size}")
 print(f"  LR:           {args.lr}")
 print(f"  Grad accum:   {args.grad_accum}")
 print(f"  GPUs:         {torch.cuda.device_count()}")
+print(f"  Band drop:    {'ON (p_applied=' + str(args.p_dropout_applied) + ', p_whole_mod=' + str(args.p_whole_modality) + ', p_band=' + str(args.p_band_drop) + ')' if args.band_dropout else 'OFF'}")
 print(f"{'='*60}\n")
 
 print(f"  Train: {len(train_ds)} samples")

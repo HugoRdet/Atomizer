@@ -15,13 +15,34 @@ class Sen1Floods11SkipDataset(Dataset):
     """
     Sen1Floods11 Dataset — grouped token format (8 columns), SKIP variant.
 
-    Identical to Sen1Floods11Dataset, with ONE addition: it emits a
-    per-query gather index `query_token_idx` of shape [N_q, bands_per_pixel],
-    where each row holds the row indices (into this sample's `image_tokens`
-    pool) of that query-pixel's own band-tokens. This lets a decoder skip
-    cross-attention read each pixel's own raw tokens directly.
+    Identical to Sen1Floods11Dataset, with TWO additions relative to the
+    base dataset:
 
-    Everything tagged with  # >>> SKIP  is new relative to the base dataset.
+      1. (pre-existing) A per-query gather index `query_token_idx` of shape
+         [N_q, bands_per_pixel], where each row holds the row indices (into
+         this sample's `image_tokens` pool) of that query-pixel's own
+         band-tokens. This lets a decoder skip cross-attention read each
+         pixel's own raw tokens directly. Tagged  # >>> SKIP.
+
+      2. (new) Training-time STOCHASTIC band-dropout augmentation, tagged
+         # >>> AUGMENTATION. Reuses the exact same mechanism as the
+         eval-time static band-drop ablation (`bands.drop` config ->
+         `_apply_drop_mask`: zero the token value, set mask=1.0 for every
+         token whose spectral index matches a dropped band) — just with a
+         randomly-sampled set of spectral indices per __getitem__ call
+         instead of a fixed config-driven set, and gated to split=="train"
+         only. This gives Atomiser training-time exposure to missing
+         modalities/bands, matching the baselines' band-dropout
+         augmentation for a fair comparison (see
+         Sen1Floods11BaselineDataset). Configured via
+         config_model["trainer"]["band_dropout_augmentation"], following
+         the same config-dict convention as `bands` (keep/drop).
+
+         Because the augmentation modifies image_tokens/attention_mask
+         in-place before they're stored in result["groups"][resolution],
+         it automatically flows through to the >>> SKIP pixel cross-
+         attention too (which reads pool_tokens/pool_mask from that same
+         dict) — no separate wiring needed there.
 
     S2 (13 optical bands) + S1 (2 SAR bands), all at 10m, 512×512.
     Both modalities share the same resolution -> single group.
@@ -46,6 +67,10 @@ class Sen1Floods11SkipDataset(Dataset):
         "B08", "B08A", "B09", "B10", "B11", "B12",
         "VV", "VH",
     ]
+
+    # >>> AUGMENTATION: band names belonging to the SAR modality, used to
+    # split spectral indices into S1/S2 pools for whole-modality dropout.
+    S1_BAND_NAMES = {"VV", "VH"}
 
     def __init__(
         self,
@@ -115,6 +140,22 @@ class Sen1Floods11SkipDataset(Dataset):
 
         self.dropped_spectral_indices = self._resolve_drop_indices()
 
+        # >>> AUGMENTATION: split the (post band-selection) spectral index
+        # pool into S1/S2 subsets, for whole-modality dropout sampling.
+        # Computed once here rather than per-sample.
+        s1_mask = torch.tensor(
+            [name in self.S1_BAND_NAMES for name in self.band_names], dtype=torch.bool
+        )
+        self.s1_spectral_indices = self.spectral_indices[s1_mask]
+        self.s2_spectral_indices = self.spectral_indices[~s1_mask]
+
+        aug_cfg = config_model["trainer"].get("band_dropout_augmentation", {}) or {}
+        self.band_dropout_enabled = bool(aug_cfg.get("enabled", True)) and (mode == "train")
+        self.p_dropout_applied = float(aug_cfg.get("p_dropout_applied", 0.5))
+        self.p_whole_modality  = float(aug_cfg.get("p_whole_modality", 0.5))
+        self.p_band_drop       = float(aug_cfg.get("p_band_drop", 0.15))
+        # >>> END AUGMENTATION
+
         self.resolution_idx = self.look_up.get_resolution_idx(self.OPTICAL_RESOLUTION)
         self.norm_stats = self._load_or_compute_normalization()
 
@@ -125,6 +166,13 @@ class Sen1Floods11SkipDataset(Dataset):
         print(f"[Sen1Floods11Skip] Loaded {len(self.bandwidths)} bands")
         print(f"[Sen1Floods11Skip] Resolution idx: {self.resolution_idx}")
         print(f"[Sen1Floods11Skip] D4 augmentations: {'ON' if self.split == 'train' else 'OFF'}")
+        if self.band_dropout_enabled:
+            print(f"[Sen1Floods11Skip] Band-dropout augmentation: ON "
+                  f"(p_applied={self.p_dropout_applied}, "
+                  f"p_whole_modality={self.p_whole_modality}, "
+                  f"p_band_drop={self.p_band_drop})")
+        else:
+            print(f"[Sen1Floods11Skip] Band-dropout augmentation: OFF")
 
     # =========================================================================
     # BAND SELECTION HELPERS
@@ -206,8 +254,20 @@ class Sen1Floods11SkipDataset(Dataset):
             return image
         return image[self.selected_channels]
 
-    def _apply_drop_mask(self, tokens: torch.Tensor, mask: torch.Tensor):
-        if not self.dropped_spectral_indices:
+    def _zero_and_mask_by_spectral_indices(self, tokens: torch.Tensor,
+                                            mask: torch.Tensor,
+                                            spectral_indices_to_drop):
+        """
+        Shared primitive: zero the token value and set mask=1.0 for every
+        token whose spectral index (col 3) is in `spectral_indices_to_drop`.
+        Used both by the static eval-time drop config (_apply_drop_mask)
+        and the stochastic training-time augmentation
+        (_sample_band_dropout_indices), so both go through identical
+        semantics — a "dropped" band always means the same thing to the
+        model regardless of whether it came from a fixed ablation config
+        or a random per-sample augmentation draw.
+        """
+        if not spectral_indices_to_drop:
             return tokens, mask
 
         tokens = tokens.clone()
@@ -215,13 +275,48 @@ class Sen1Floods11SkipDataset(Dataset):
 
         spec_idx = tokens[:, 3]
         drop = torch.zeros(tokens.shape[0], dtype=torch.bool)
-        for sid in self.dropped_spectral_indices:
+        for sid in spectral_indices_to_drop:
             drop |= (spec_idx == sid)
 
         tokens[drop, 0] = 0.0
         mask[drop]      = 1.0
 
         return tokens, mask
+
+    def _apply_drop_mask(self, tokens: torch.Tensor, mask: torch.Tensor):
+        """Static, config-driven band drop (bands.drop) — applied at every split."""
+        return self._zero_and_mask_by_spectral_indices(tokens, mask, self.dropped_spectral_indices)
+
+    # =========================================================================
+    # >>> AUGMENTATION: stochastic per-sample band dropout (train only)
+    # =========================================================================
+
+    def _sample_band_dropout_indices(self):
+        """
+        Per-sample stochastic augmentation, mirroring the baseline dataset's
+        band-dropout mixture:
+          - with prob (1 - p_dropout_applied): no-op, all bands kept
+          - else with prob p_whole_modality: drop ALL S1 or ALL S2 spectral
+            indices (mirrors the "S2 only"/"S1 only" eval ablations)
+          - else: drop each currently-kept spectral index independently
+            with probability p_band_drop (covers RGB-only/no-SWIR/no-red-
+            edge style subset ablations without hardcoding to them)
+
+        Returns a set of spectral indices to drop this sample (possibly
+        empty). Does not read or write self.dropped_spectral_indices —
+        this is layered ON TOP of the static eval-config drop, applied
+        separately in __getitem__.
+        """
+        if torch.rand(1).item() >= self.p_dropout_applied:
+            return set()
+
+        if torch.rand(1).item() < self.p_whole_modality:
+            pool = (self.s1_spectral_indices if torch.rand(1).item() < 0.5
+                    else self.s2_spectral_indices)
+            return set(pool.tolist())
+        else:
+            keep_mask = torch.rand(self.spectral_indices.shape[0]) < self.p_band_drop
+            return set(self.spectral_indices[keep_mask].tolist())
 
     # =========================================================================
     # >>> SKIP: per-query gather index into own band-tokens
@@ -314,6 +409,20 @@ class Sen1Floods11SkipDataset(Dataset):
 
         attention_mask = torch.zeros(image_tokens.shape[0])
         image_tokens, attention_mask = self._apply_drop_mask(image_tokens, attention_mask)
+
+        # >>> AUGMENTATION: stochastic per-sample band dropout (train only).
+        # Layered on top of the static eval-config drop above; reuses the
+        # same zero-value + mask=1.0 primitive so the model can't tell the
+        # difference between an ablation-config drop and an augmentation
+        # drop — which is exactly the point (matches what happens at
+        # eval-time ablation, so training exposes the model to the same
+        # kind of missingness it'll be tested under).
+        if self.band_dropout_enabled:
+            aug_drop_indices = self._sample_band_dropout_indices()
+            image_tokens, attention_mask = self._zero_and_mask_by_spectral_indices(
+                image_tokens, attention_mask, aug_drop_indices
+            )
+        # >>> END AUGMENTATION
 
         if self.reconstruction:
             queries = image_tokens.clone()
@@ -413,6 +522,11 @@ class Sen1Floods11SkipDataset(Dataset):
         image_full = torch.cat([image_s2, image_s1], dim=0)
         image      = self._select_channels(image_full)
         C, H, W    = image.shape
+
+        # NOTE: get_viz_sample deliberately does NOT apply the training-time
+        # band-dropout augmentation (only the static eval-config drop, via
+        # _apply_drop_mask, same as before) — viz should show the model's
+        # real deployed behavior, not augmentation noise.
 
         if self.reconstruction:
             dummy_label = torch.full((H, W), self.IGNORE_INDEX, dtype=torch.long)

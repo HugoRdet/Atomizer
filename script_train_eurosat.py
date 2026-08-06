@@ -1,17 +1,32 @@
 """
-Atomiser EuroSAT Training Script
-==================================
+Atomiser EuroSAT-SAR Training Script
+=======================================
 
-10-class S2 land cover classification on geo-bench m-eurosat.
-Mirror of script_train_forestnet.py — same Model_ForestNet trainer.
+10-class land cover classification, S2 optical (13 bands) + S1 SAR (VV, VH)
+fused by default (all 15 bands go into the token pool unless the model
+config restricts them via trainer.bands.keep / trainer.bands.drop).
+
+Mirror of script_train_eurosat.py — same Model_ForestNet trainer, same
+"classification" task path. Only the dataset differs.
 
 --test_only mode:
-    Pass --test_only <path/to/checkpoint.ckpt> to skip training.
+    Pass --test_only <path/to/checkpoint.ckpt> to skip training entirely
+    and run test on the provided checkpoint with a single GPU.
 
 Required:
     - bands_eurosat section in ./data/bands_info/bands.yaml (13 S2 bands)
-    - configs_dataset_eurosat.yaml under ./data/Tiny_BigEarthNet/
-    - atomiser_eurosat.yaml under ./training/configs/
+    - bands_senflood section in ./data/bands_info/bands.yaml (for VV/VH —
+      EuroSATSARDataset reuses bands_senflood's VV/VH entries so SAR tokens
+      share spectral_idx with Sen1Floods11)
+    - configs_dataset_u_regular.yaml under ./data/Tiny_BigEarthNet/
+    - atomiser_eurosat_sar.yaml under ./training/configs/
+    - ./data/EuroSAT_MS/{ClassName}/*.tif  and  ./data/EuroSAT-SAR/{ClassName}/*.tif
+      (paired by identical filename)
+
+Modality ablation at inference:
+    Set trainer.bands.drop: [VV, VH] in the config (or pass a separate
+    --test_only config) to zero+mask the SAR channels post-training and
+    re-run test, without touching token count/shape.
 """
 
 import os
@@ -35,22 +50,20 @@ from training.utils import read_yaml
 from training.utils import Lookup_encoding
 
 from training.trainer_FORESTNET import Model_ForestNet
-from training.utils.datasets.utils_dataset_EUROSAT import EuroSATDataset
+from training.utils.datasets.utils_dataset_EUROSAT_SAR import EuroSATSARDataset
 from training.utils.datasets.dataloaders import UnifiedDataModule
 
-UnifiedDataModule.GROUPED_DATASET_CLASSES = (
-    UnifiedDataModule.GROUPED_DATASET_CLASSES | {"EuroSATDataset"}
-)
+# NOTE: EuroSATSARDataset is already registered in
+# UnifiedDataModule.GROUPED_DATASET_CLASSES (see dataloaders.py), so no
+# manual |= registration is needed here, unlike the ForestNet/EuroSAT scripts.
 
 
 # =============================================================================
 # ARGS
 # =============================================================================
 
-parser = argparse.ArgumentParser(description="Atomiser EuroSAT training")
+parser = argparse.ArgumentParser(description="Atomiser EuroSAT-SAR training")
 parser.add_argument("--xp_name",      type=str, required=True)
-parser.add_argument("--config_model", type=str, required=True,
-                    help="Model config yaml (e.g. atomiser_eurosat.yaml)")
 parser.add_argument("--clipping",     action="store_true")
 parser.add_argument("--use_class_weights", action="store_true")
 parser.add_argument("--label_smoothing",   type=float, default=0.0)
@@ -58,12 +71,25 @@ parser.add_argument("--label_smoothing",   type=float, default=0.0)
 parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a .ckpt file. Skip training, test directly.")
 
+parser.add_argument("--resume", action="store_true",
+                    help="Resume training from the '-last' checkpoint for this "
+                         "xp_name, if one exists. Restores full trainer state "
+                         "(epoch, optimizer, LR schedule, EarlyStopping/"
+                         "ModelCheckpoint state) — not just weights. Safe to "
+                         "pass on every submission: if no checkpoint is found "
+                         "yet, training just starts fresh. Ignored if "
+                         "--test_only is set.")
+parser.add_argument("--resume_from", type=str, default=None,
+                    help="Explicit checkpoint path to resume from (overrides "
+                         "--resume auto-detection).")
+
 args = parser.parse_args()
 
 xp_name           = args.xp_name
-config_model      = read_yaml("./training/configs/" + args.config_model)
+config_model      = read_yaml("./training/configs/config_test-EUROSAT.yaml")
 configs_dataset   = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 bands_yaml        = "./data/bands_info/bands.yaml"
+data_root         = "./data"   # parent of EuroSAT_MS/ and EuroSAT-SAR/
 
 if os.environ.get("LOCAL_RANK", "0") == "0":
     if args.test_only:
@@ -72,6 +98,11 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"[Train] Gradient clipping: {'ON' if args.clipping else 'OFF'}")
         print(f"[Train] Class weights:     {'ON' if args.use_class_weights else 'OFF'}")
         print(f"[Train] Label smoothing:   {args.label_smoothing}")
+        print(f"[Train] Resume:            "
+              f"{'ON (' + (args.resume_from or 'auto-detect last ckpt') + ')' if (args.resume or args.resume_from) else 'OFF'}")
+    bands_cfg = config_model.get("trainer", {}).get("bands", {})
+    print(f"[Train] Bands keep: {bands_cfg.get('keep', 'ALL (S1+S2 fused)')}")
+    print(f"[Train] Bands drop: {bands_cfg.get('drop', 'none')}")
 
 
 # =============================================================================
@@ -94,10 +125,10 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
     import wandb
     wandb.init(
         name=config_model["encoder"] + "_" + xp_name,
-        project="Atomizer_EuroSAT",
+        project="Atomizer_EuroSAT_SAR",
         config=config_model,
     )
-    wandb_logger = WandbLogger(project="Atomizer_EuroSAT")
+    wandb_logger = WandbLogger(project="Atomizer_EuroSAT_SAR")
 
 
 # =============================================================================
@@ -105,7 +136,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # =============================================================================
 
 data_module = UnifiedDataModule(
-    path="./data/geo-bench-1.0/classification_v1.0/m-eurosat",
+    path=data_root,
     batch_size=config_model["trainer"]["train_batch_size"],
     num_workers=4,
     trans_modalities=None,
@@ -114,7 +145,7 @@ data_module = UnifiedDataModule(
     dataset_config=read_yaml(bands_yaml),
     config_model=config_model,
     look_up=lookup_table,
-    dataset_class=EuroSATDataset,
+    dataset_class=EuroSATSARDataset,
 )
 
 
@@ -124,14 +155,14 @@ data_module = UnifiedDataModule(
 
 class_weights = None
 if args.use_class_weights and args.test_only is None:
-    tmp_train = EuroSATDataset(
-        root_path="./data/geo-bench-1.0/classification_v1.0/m-eurosat",
+    tmp_train = EuroSATSARDataset(
+        root_path=data_root,
         mode="train",
         dataset_config=read_yaml(bands_yaml),
         config_model=config_model,
         look_up=lookup_table,
     )
-    counts  = Counter(tmp_train.name_to_label[n] for n in tmp_train.sample_names)
+    counts  = Counter(cls for cls, _ in tmp_train.sample_list)
     weights = torch.zeros(tmp_train.NUM_CLASSES, dtype=torch.float32)
     for c in range(tmp_train.NUM_CLASSES):
         weights[c] = 1.0 / max(counts.get(c, 1), 1)
@@ -160,17 +191,35 @@ model = Model_ForestNet(
 # TRAIN (skipped in test-only mode)
 # =============================================================================
 
-ckpt_dir = "./checkpoints/eurosat/"
+ckpt_dir = "./checkpoints/eurosat_sar/"
 os.makedirs(ckpt_dir, exist_ok=True)
 
 if args.test_only is None:
+    # ── Resume detection (full trainer state, not just weights) ──────────
+    resume_ckpt_path = None
+    if args.resume_from is not None:
+        resume_ckpt_path = args.resume_from
+        if not os.path.exists(resume_ckpt_path):
+            raise FileNotFoundError(
+                f"--resume_from checkpoint not found: {resume_ckpt_path}"
+            )
+        print(f"[Resume] Using explicit checkpoint: {resume_ckpt_path}")
+    elif args.resume:
+        auto_path = os.path.join(ckpt_dir, f"{config_model['encoder']}_{xp_name}-last.ckpt")
+        if os.path.exists(auto_path):
+            resume_ckpt_path = auto_path
+            print(f"[Resume] Found existing checkpoint, resuming: {auto_path}")
+        else:
+            print(f"[Resume] --resume set but no checkpoint found at "
+                  f"{auto_path} — starting fresh.")
+
     lr_monitor   = LearningRateMonitor(logging_interval="step")
     accumulator  = GradientAccumulationScheduler(scheduling={0: 1})
 
     checkpoint_val = ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename=f"{config_model['encoder']}_{xp_name}-{{epoch:02d}}-{{val_macro_f1:.4f}}",
-        monitor="val_macro_f1",
+        filename=f"{config_model['encoder']}_{xp_name}-{{epoch:02d}}-{{val_top1:.4f}}",
+        monitor="val_top1",
         mode="max",
         save_top_k=1,
         verbose=True,
@@ -185,7 +234,7 @@ if args.test_only is None:
     )
 
     early_stop = EarlyStopping(
-        monitor="val_macro_f1",
+        monitor="val_top1",
         mode="max",
         patience=int(config_model["trainer"].get("patience", 20)),
         verbose=True,
@@ -203,10 +252,10 @@ if args.test_only is None:
         log_every_n_steps=5,
         callbacks=callbacks,
         default_root_dir=ckpt_dir,
-        gradient_clip_val=1.0
+        gradient_clip_val=1.0 if args.clipping else None,
     )
 
-    trainer.fit(model, datamodule=data_module)
+    trainer.fit(model, datamodule=data_module, ckpt_path=resume_ckpt_path)
 
     best_ckpt = checkpoint_val.best_model_path
 

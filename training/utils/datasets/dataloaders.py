@@ -144,7 +144,10 @@ class UnifiedDataModule(pl.LightningDataModule):
                                 'ForestNetDataset',
                                 "pv4ger",
                                 "BurnScarsDataset",
-                                'Sen1Floods11SkipDataset'
+                                'Sen1Floods11SkipDataset',
+                                'MADOSDataset',
+                                'EuroSATSARDataset',
+                                'BioMasstersSkipDataset'
                                 }
 
     def __init__(
