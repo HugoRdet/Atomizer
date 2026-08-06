@@ -99,8 +99,12 @@ class XView2Dataset(Dataset):
     ):
         super().__init__()
         assert mode in self.SPLIT_MAPPING, f"Unknown split: {mode}"
+        root_path="./data/xview"
 
-        self.root_path     = "./data/xview"
+        # NOTE: was hardcoded to "./data/xview" in a prior edit, which
+        # silently ignored the root_path argument (and thus --data_dir).
+        # Reverted to actually use the constructor argument.
+        self.root_path     = root_path
         self.split         = mode
         self.look_up       = look_up
         self.config_model  = config_model
@@ -368,10 +372,10 @@ class XView2Dataset(Dataset):
         kept_indices=None means queries were NOT subsampled (val/test: all
         H*W pixels), so the full per-pixel index is used as-is. Otherwise
         kept_indices are row indices into the pre-subsample, row-major
-        [0, H*W) pixel ordering returned by subsample_queries(...,
-        return_indices=True) -- same ordering _build_full_pixel_index is
-        built over, so full[kept_indices] lines up 1:1 with the surviving
-        queries.
+        [0, H*W) pixel ordering returned by _subsample_queries_building_priority
+        (or, previously, subsample_queries(..., return_indices=True)) -- same
+        ordering _build_full_pixel_index is built over, so full[kept_indices]
+        lines up 1:1 with the surviving queries.
 
         `valid` is unconditionally True: every index here always points to
         a real position in image_tokens (this dataset never pads/replicates
@@ -383,6 +387,56 @@ class XView2Dataset(Dataset):
         idx = full if kept_indices is None else full[kept_indices]
         valid = torch.ones(idx.shape[0], dtype=torch.bool)
         return idx, valid
+
+    # ─────────────────────────────────────────────────────────────────────
+    # QUERY SUBSAMPLING: building-priority
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _subsample_queries_building_priority(queries: torch.Tensor,
+                                              target: torch.Tensor,
+                                              max_queries: int):
+        """
+        Training-time query subsampling that prioritizes building/damage
+        pixels (label > 0) over background (label == 0), filling any
+        remaining budget with background once all building pixels are kept.
+
+        Replaces token_builder.subsample_queries(..., prioritize_valid=True)
+        for this dataset: that flag only distinguishes ignore_index from
+        everything else, but xView2's target NEVER contains IGNORE_INDEX
+        (see module docstring -- invalid mask values are mapped to 0/
+        background in __getitem__), so prioritize_valid=True was a no-op
+        here. This gives an actual class-aware priority instead, consistent
+        with the building bias already applied elsewhere in this pipeline
+        (_crop_prefer_buildings, _oversample_building_files).
+
+        queries: [H*W, 8], row-major over pixels (row p == target.flatten()[p]).
+        target:  [H, W] class labels for this sample.
+
+        Returns (queries_subsampled, kept_indices) where kept_indices are
+        row indices into the pre-subsample [0, H*W) ordering -- same
+        convention _build_query_token_index expects for query_token_idx.
+        """
+        flat_labels = target.reshape(-1)  # [H*W], row-major, matches queries' row order
+        building_idx = (flat_labels > 0).nonzero(as_tuple=True)[0]
+        background_idx = (flat_labels == 0).nonzero(as_tuple=True)[0]
+
+        n_building = building_idx.shape[0]
+        if n_building >= max_queries:
+            # More building pixels than budget: subsample among them only.
+            perm = torch.randperm(n_building)[:max_queries]
+            kept_indices = building_idx[perm]
+        else:
+            # Keep every building pixel, fill the rest with random background.
+            n_background_needed = max_queries - n_building
+            if background_idx.shape[0] > n_background_needed:
+                perm = torch.randperm(background_idx.shape[0])[:n_background_needed]
+                background_kept = background_idx[perm]
+            else:
+                background_kept = background_idx  # fewer background px than budget: keep all
+            kept_indices = torch.cat([building_idx, background_kept])
+
+        return queries[kept_indices], kept_indices
 
     # ─────────────────────────────────────────────────────────────────────
     # DATASET INTERFACE
@@ -489,12 +543,13 @@ class XView2Dataset(Dataset):
             queries = queries[perm]
         else:
             if self.split == "train":
-                queries, kept_indices = self.token_builder.subsample_queries(
-                    seg_queries,
-                    max_queries=self.max_tokens_reconstruction,
-                    ignore_index=IGNORE_INDEX,
-                    prioritize_valid=True,
-                    return_indices=True,
+                # Building-priority subsampling: keep every building/damage
+                # pixel first, fill remaining budget with background. See
+                # _subsample_queries_building_priority's docstring for why
+                # this replaces token_builder.subsample_queries(...,
+                # prioritize_valid=True) for this dataset specifically.
+                queries, kept_indices = self._subsample_queries_building_priority(
+                    seg_queries, target, self.max_tokens_reconstruction,
                 )
             else:
                 # Val/test: all pixels for accurate evaluation

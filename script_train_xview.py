@@ -271,7 +271,7 @@ if args.test_only is None:
     early_stop = EarlyStopping(
         monitor="val_mIoU",
         mode="max",
-        patience=int(config_model["trainer"].get("patience", 20)),
+        patience=int(config_model["trainer"].get("patience", 50)),
         verbose=True,
     )
 
