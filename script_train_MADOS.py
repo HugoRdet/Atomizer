@@ -1,6 +1,6 @@
 """
-MADOS Training Script (SKIP variant) — with --test_only mode
-==============================================================
+MADOS Training Script (SKIP variant) — with --test_only / --val_only modes
+=============================================================================
 Uses the SAME grouped-token, multi-resolution batch format as before
 (10m / 20m / 60m groups), plus the SKIP fields (query_token_idx,
 query_token_valid) emitted by the updated MADOSDataset:
@@ -32,7 +32,20 @@ both true (the skip fields aren't currently forwarded per-crop in
 _forward_crop). Set trainer.slide=False in config_test-MADOS.yaml to run
 the skip cascade, or extend Model_MADOS_Skip._forward_crop first.
 
+FIXED (this version): the train-and-test flow now loads the BEST
+checkpoint (checkpoint_val.best_model_path) before testing, instead of
+testing whatever weights happen to be in memory at the end of fit()
+(i.e. the last epoch, not necessarily the best-val one). This was
+silently testing the wrong weights every time trainer.fit + trainer.test
+was run end-to-end without an explicit --test_only.
+
+NEW: --val_only, for isolating the val pipeline from test-time-specific
+issues (wrong checkpoint, differences between how val vs test batches
+are built, etc.) by running ONLY trainer.validate() on a given checkpoint,
+mirroring --test_only's pattern exactly.
+
 All changes vs the v2 MADOS script are tagged  # >>> SKIP.
+Additional fixes in this version are tagged  # >>> FIX.
 """
 
 # =============================================================================
@@ -79,7 +92,24 @@ parser.add_argument("--deterministic", action="store_true",
 parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a checkpoint: load it and run ONLY trainer.test "
                          "(skips fit and the complexity block).")
+# >>> FIX: val_only, for isolating val from test-time-specific bugs
+parser.add_argument("--val_only", type=str, default=None,
+                    help="Path to a checkpoint: load it and run ONLY "
+                         "trainer.validate on the validation split (skips "
+                         "fit, test, and the complexity block). Useful for "
+                         "sanity-checking a checkpoint's val_mIoU directly "
+                         "against the number embedded in its filename, and "
+                         "for isolating whether a val/test discrepancy "
+                         "comes from the checkpoint/weights being tested "
+                         "vs. something specific to how the test split is "
+                         "built or evaluated. Mutually exclusive with "
+                         "--test_only.")
 args = parser.parse_args()
+
+if args.test_only is not None and args.val_only is not None:
+    raise ValueError(
+        "--test_only and --val_only are mutually exclusive — pick one."
+    )
 
 xp_name = args.xp_name
 config_model = read_yaml("./training/configs/config_test-MADOS.yaml")
@@ -93,6 +123,8 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"[Train] RESUMING from: {args.resume}")
     if args.test_only:
         print(f"[Train] TEST-ONLY mode, loading: {args.test_only}")
+    if args.val_only:
+        print(f"[Train] VAL-ONLY mode, loading: {args.val_only}")
     _skip_on = config_model.get("Atomiser", {}).get("use_decoder_skip", False)
     _slide_on = config_model.get("trainer", {}).get("slide", False)
     print(f"[Train] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
@@ -104,10 +136,11 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
 
 # =============================================================================
-# WANDB  (skip in test-only mode)
+# WANDB  (skip in test-only / val-only mode)
 # =============================================================================
 wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0" and args.test_only is None:
+if (os.environ.get("LOCAL_RANK", "0") == "0"
+        and args.test_only is None and args.val_only is None):
     import wandb
     wandb.init(name=config_model["encoder"], project="MADOS", config=config_model)
     wandb_logger = WandbLogger(project="MADOS")
@@ -115,11 +148,12 @@ if os.environ.get("LOCAL_RANK", "0") == "0" and args.test_only is None:
     wandb.define_metric("val_loss", step_metric="trainer/global_step")
 
 # =============================================================================
-# MODEL  (load ckpt if test-only, else fresh)
+# MODEL  (load ckpt if test-only/val-only, else fresh)
 # =============================================================================
-if args.test_only is not None:
+_eval_ckpt = args.test_only or args.val_only
+if _eval_ckpt is not None:
     model = Model_MADOS_Skip.load_from_checkpoint(
-        args.test_only, strict=False, config=config_model, wand=False,
+        _eval_ckpt, strict=False, config=config_model, wand=False,
         name=xp_name, transform=None, lookup_table=lookup_table)
     model.eval()
 else:
@@ -152,8 +186,15 @@ accumulator = GradientAccumulationScheduler(scheduling={0: 1})
 
 checkpoint_val = ModelCheckpoint(
     dirpath="./checkpoints/",
-    filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_mIoU:.4f}}",
-    monitor="val_mIoU",
+    filename=f"{config_model['encoder']}{xp_name}-val_loss-{{epoch:02d}}-{{val_mIoU_weighted:.4f}}",
+    # >>> FIX: monitor val_mIoU_weighted instead of macro val_mIoU.
+    # See Model_MADOS_Skip's metric_IoU_val_weighted docstring: macro
+    # mIoU on MADOS is dominated by noisy rare-class swings (several
+    # classes have only a few hundred labeled val pixels), so checkpoint
+    # selection via macro val_mIoU was largely picking whichever epoch
+    # got lucky on those classes rather than the genuinely best epoch.
+    # Weighted-by-support IoU is far more stable epoch to epoch.
+    monitor="val_mIoU_weighted",
     mode="max",
     save_top_k=1,
     verbose=True,
@@ -179,6 +220,27 @@ trainer = Trainer(
 )
 
 # =============================================================================
+# VAL-ONLY EARLY EXIT
+# =============================================================================
+# >>> FIX: mirrors --test_only exactly, but calls trainer.validate() on the
+# validation split instead of trainer.test() on the test split. Lets you
+# check a checkpoint's val_mIoU in isolation -- e.g. to confirm it matches
+# the number embedded in the checkpoint's own filename (sanity check on
+# checkpoint selection), or to compare against a --test_only run on the
+# SAME checkpoint to isolate whether a val/test gap comes from the model
+# itself or from something specific to the test split/pipeline.
+if args.val_only is not None:
+    results = trainer.validate(model, datamodule=data_module, verbose=True)
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        metrics = results[0] if results else {}
+        miou = metrics.get("val_mIoU", float("nan"))
+        acc  = metrics.get("val_accuracy", float("nan"))
+        print(f"RESULT val_only ckpt={args.val_only} "
+              f"val_mIoU={miou:.6f} val_accuracy={acc:.6f}")
+    import sys
+    sys.exit(0)
+
+# =============================================================================
 # TEST-ONLY EARLY EXIT
 # =============================================================================
 if args.test_only is not None:
@@ -196,7 +258,15 @@ if args.test_only is not None:
 # TRAIN & TEST
 # =============================================================================
 trainer.fit(model, datamodule=data_module, ckpt_path=args.resume)
-trainer.test(model, datamodule=data_module)
+
+# >>> FIX: load the BEST checkpoint before testing, instead of testing
+# whatever weights are in memory at the end of fit() (the last epoch,
+# which is not necessarily the best-val epoch). This was the source of a
+# real, previously-unnoticed test/val discrepancy.
+best_ckpt = checkpoint_val.best_model_path
+if os.environ.get("LOCAL_RANK", "0") == "0":
+    print(f"[MADOS] Testing BEST checkpoint (by val_mIoU): {best_ckpt}")
+trainer.test(model, datamodule=data_module, ckpt_path=best_ckpt)
 
 
 # =============================================================================

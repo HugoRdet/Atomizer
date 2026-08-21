@@ -1,18 +1,47 @@
 """
-BurnScars (SKIP) — Test ONE checkpoint under a given (tpl, cross_k)
-=====================================================================
+BurnScars (SKIP) — Test ONE checkpoint under a given (tpl, cross_k, decoder_k_spatial)
+=======================================================================================
 
 Inference-time density generalization for the SKIP model. Loads a single
 trained Atomiser_Senflood_Skip checkpoint (shared encoder class, used for
-BurnScars here) and evaluates on the BurnScars test split at an arbitrary
-latent density (tokens_per_latent) and cross-attention budget (cross_k).
+BurnScars here) and evaluates on the BurnScars val OR test split at an
+arbitrary latent density (tokens_per_latent), cross-attention budget
+(cross_k), and decoder spatial-sampler budget (decoder_k_spatial).
 No training.
 
-Ported from the Sen1Floods11 density-eval worker. All changes tagged:
-  # >>> RENAME  cosmetic (paths, defaults, class names)
+# >>> PORTED_FROM_SENFLOOD: this is a rename+feature-port of
+# script_test_senflood_skip_density.py onto BurnScars. All the same
+# machinery applies here (same tags kept for traceability):
+#   # >>> VAL_SPLIT        --split {val,test}, explicit dataloaders
+#   # >>> LIGHT_GFLOPS      --gflops_scope {full,light,skip}, light = a
+#                           small sampled forward-pass budget instead of
+#                           the entire split (GFLOPs is ~content-
+#                           independent for a fixed (tpl, cross_k, dks),
+#                           unlike mIoU)
+#   # >>> MULTI_GPU_GFLOPS  GFLOPs measurement is sharded round-robin
+#                           across DDP ranks and combined via all_reduce,
+#                           instead of every rank redundantly profiling
+#                           the whole (shard of the) split
+#   # >>> GFLOPS_METHOD     torch.utils.flop_counter.FlopCounterMode
+#                           (SDPA-aware) instead of torch.profiler's
+#                           with_flops=True
+#   # >>> RESULTS_TRACKING  per-run JSON to ./scripts_GFLOPS/tmp_results/
+#                           for resume support
+#
+# >>> DROPPED vs the original BurnScars script: the torch.profiler-based
+# per-op-type table, Chrome trace export, and REGION_LABELS/record_function
+# interval-matching breakdown. Those relied on torch.profiler's
+# with_flops=True + per-event timing, which is a different measurement
+# path than FlopCounterMode and isn't compatible with the no_grad
+# module-tracker patch FlopCounterMode needs for per-rank sharded
+# measurement under torch.no_grad(). If you need the region-level
+# breakdown again, it would have to be re-added as a SEPARATE one-off
+# profiling pass (not folded into the sharded GFLOPs loop), since mixing
+# the two FLOPs-counting methodologies in one number is exactly what the
+# GFLOPS_METHOD note in the Sen1Floods11 script warns against.
 
 IMPORTANT — this uses the SKIP stack:
-    Model_BurnScars_Skip + BurnScarsSkipDataset + collate_grouped_skip
+    Model_BurnScars_Skip + BurnScarsDataset + collate_grouped_skip
 A previous non-skip version would silently drop the pixel_query /
 pixel_cross_attn weights (strict=False), disabling the skip cascade and
 lowering the score.
@@ -24,15 +53,20 @@ Density override:
     saved hyperparameters. To reproduce the trained test score, use the
     config's val_sampling value from config_test-BURNSCARS.yaml.
 
-Emits a single parseable line:
-    RESULT tpl=<T> cross_k=<K> test_mIoU=<V> test_accuracy=<A> gflops=<G>
+# >>> DECODER_K: decoder_k_spatial lives at config_model["Atomiser"]["decoder_k_spatial"]
+# and is likewise overridden before load_from_checkpoint so it takes effect
+# regardless of what was saved in the checkpoint's hparams.
 
-# >>> NOTE: the REGION_LABELS set below matches record_function names inside
-# the shared Atomiser_Senflood_Skip encoder. Since the encoder class is
-# identical for BurnScars, these labels should still be valid and don't
-# need updating — flagging only because I haven't seen the encoder source
-# myself to confirm the label strings haven't changed since this was
-# written for Sen1Floods11.
+Emits a single parseable line:
+    RESULT split=<val|test> tpl=<T> cross_k=<K> decoder_k_spatial=<DKS> mIoU=<V> accuracy=<A> gflops=<G> gflops_n=<N>
+
+# >>> RESULTS_TRACKING: additionally writes a small JSON file to
+# ./scripts_GFLOPS/tmp_results/ once the run completes, recording the
+# checkpoint used, the (split, gflops_scope, tpl, cross_k, decoder_k_spatial)
+# config, the scores, and whether config["Atomiser"]["use_quadtree_decode"] /
+# config["Atomiser"]["use_adaptive_decode"] were set. The driver script
+# checks for this file before launching a run, so an interrupted sweep can
+# be resumed without re-scoring configs that already finished.
 """
 import os
 import sys
@@ -40,7 +74,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 import argparse
+import json                     # >>> RESULTS_TRACKING
+import re                       # >>> RESULTS_TRACKING
+import hashlib                  # >>> RESULTS_TRACKING
+from datetime import datetime   # >>> RESULTS_TRACKING
 import torch
+from torch.utils.flop_counter import FlopCounterMode   # >>> GFLOPS_METHOD
 from pytorch_lightning import Trainer, seed_everything
 
 seed_everything(42, workers=True)
@@ -54,14 +93,180 @@ from training.utils.datasets.utils_dataset_BURNSCARS import BurnScarsDataset
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.collate_grouped_skip import collate_grouped_skip
 
+
+# =============================================================================
+# >>> RESULTS_TRACKING: per-run result file (checkpointing the sweep itself)
+# =============================================================================
+TMP_RESULTS_DIR = "./scripts_GFLOPS/tmp_results"
+VALID_TYPES = ("regular", "quadtree", "zoneprobe")
+
+
+def _ckpt_tag(ckpt_path):
+    """Short, filesystem-safe, collision-resistant tag for a checkpoint path."""
+    base = os.path.splitext(os.path.basename(ckpt_path))[0]
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", base)
+    h = hashlib.md5(os.path.abspath(ckpt_path).encode()).hexdigest()[:8]
+    return f"{safe}_{h}"
+
+
+def _decode_mode(use_quadtree_decode, use_adaptive_decode):
+    """Derived only for a sanity cross-check against --type; not the source
+    of truth for filenames (that's --type, since callers dedicate one
+    script/config per method)."""
+    if use_quadtree_decode:
+        return "quadtree"
+    if use_adaptive_decode:
+        return "zoneprobe"
+    return "regular"
+
+
+# >>> VAL_SPLIT / LIGHT_GFLOPS: split AND gflops_scope folded into the
+# tmp_results filename so a val-split score, a light-GFLOPs score, and a
+# full-GFLOPs score for the SAME (ckpt, tpl, ck, dks, type) never
+# collide/overwrite each other in the resume cache.
+def tmp_result_path(ckpt_path, tpl, ck, dks, decode_type, split="test",
+                    gflops_scope="full", task="burnscars"):
+    return os.path.join(
+        TMP_RESULTS_DIR,
+        f"{task}_{_ckpt_tag(ckpt_path)}_{decode_type}_{split}_{gflops_scope}_"
+        f"tpl{tpl}_ck{ck}_dks{dks}.json",
+    )
+
+
+# =============================================================================
+# >>> GFLOPS_METHOD: FlopCounterMode measurement — module-tracker no_grad
+# patch + measurement helper (see script_test_senflood_skip_density.py for
+# the full rationale, identical here).
+# =============================================================================
+
+def _patch_module_tracker_for_no_grad():
+    """Idempotently patches torch.utils.module_tracker so its forward-pre
+    hook's register_multi_grad_hook call no longer raises under
+    torch.no_grad() — needed for FlopCounterMode's TOTAL to remain
+    reliable even though per-module attribution becomes unreliable."""
+    import torch.utils.module_tracker as _mt
+
+    if getattr(_mt, "_flopcounter_noop_patch_applied", False):
+        return
+    _mt._flopcounter_noop_patch_applied = True
+
+    _orig_register_multi_grad_hook = _mt.register_multi_grad_hook
+
+    class _NoOpHandle:
+        def remove(self):
+            pass
+
+    def _safe_register_multi_grad_hook(tensors, fn, *args, **kwargs):
+        try:
+            return _orig_register_multi_grad_hook(tensors, fn, *args, **kwargs)
+        except AssertionError:
+            return _NoOpHandle()
+
+    _mt.register_multi_grad_hook = _safe_register_multi_grad_hook
+
+
+@torch.no_grad()
+def measure_gflops_forward_shard(forward_fn, loader, device, n_warmup=1):
+    """
+    # >>> MULTI_GPU_GFLOPS (sharded)
+    Profiles every batch in `loader` (already a per-rank SHARD — see
+    _shard_dataset_round_robin) with FlopCounterMode, first `n_warmup`
+    batches discarded unprofiled. Returns a local SUM (not mean) + local
+    count so the caller can all-reduce sums/counts across ranks and only
+    then divide — correct even when shards are uneven sizes.
+
+    Returns (sum_gflops, n_measured, fc_last) — local to this process.
+    """
+    flops_list = []
+    fc_last = None
+    n_measured = 0
+
+    for i, raw_b in enumerate(loader):
+        b = _to_device(raw_b, device)
+
+        if i < n_warmup:
+            out = forward_fn(b)
+            del out
+            if str(device).startswith("cuda"):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            continue
+
+        fc = FlopCounterMode(display=False)
+        with fc:
+            out = forward_fn(b)
+        flops_list.append(fc.get_total_flops())
+        fc_last = fc
+        n_measured += 1
+        del out
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    if n_measured == 0:
+        return 0.0, 0, None
+
+    if all(f == 0 for f in flops_list):
+        print("[measure_gflops_forward_shard] WARNING: all measured "
+              "passes on this rank returned exactly 0 FLOPs. This suggests "
+              "the assumption behind the no_grad patch (FlopCounterMode's "
+              "'Global' bucket still accumulates totals even when its "
+              "per-module attribution hook is patched to a no-op) does not "
+              "hold for the installed torch version. Treat this GFLOPs "
+              "number as UNRELIABLE -- please report the torch version so "
+              "the patch can be adjusted.")
+
+    return (sum(flops_list) / 1e9), n_measured, fc_last
+
+
+def _shard_dataset_round_robin(dataset, rank, world_size, limit_n=None):
+    """
+    # >>> MULTI_GPU_GFLOPS: round-robin sharding (index i -> rank i % world_size)
+    rather than torch's DistributedSampler, which pads the tail by
+    REPEATING samples (would double-count in a FLOPs SUM). Round-robin
+    gives shard sizes differing by at most 1, combined correctly via
+    sum(flops)/sum(count) regardless of unevenness.
+
+    # >>> LIGHT_GFLOPS: `limit_n`, if given, restricts sharding to the
+    first `limit_n` GLOBAL indices before round-robin split across ranks.
+    """
+    n = len(dataset) if limit_n is None else min(limit_n, len(dataset))
+    indices = list(range(rank, n, world_size))
+    return torch.utils.data.Subset(dataset, indices)
+
+
+def _allreduce_sum(value, device):
+    """Sums a Python scalar across all DDP ranks (no-op if not distributed)."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return value
+    t = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+    return t.item()
+
+
+def _to_device(b, dev):
+    if isinstance(b, torch.Tensor):
+        return b.to(dev)
+    if isinstance(b, dict):
+        return {k: _to_device(v, dev) for k, v in b.items()}
+    if isinstance(b, (list, tuple)):
+        return type(b)(_to_device(v, dev) for v in b)
+    return b
+
+
 # =============================================================================
 # ARGS
 # =============================================================================
-parser = argparse.ArgumentParser(description="Test one SKIP ckpt at a given density")
+parser = argparse.ArgumentParser(description="Test one BurnScars SKIP ckpt at a given density")
 parser.add_argument("--ckpt", type=str, required=True, help="Checkpoint path")
 parser.add_argument("--xp_name", type=str, default="density_eval")
 parser.add_argument("--tokens_per_latent", type=int, required=True)
 parser.add_argument("--cross_k", type=int, required=True)
+parser.add_argument("--decoder_k_spatial", type=int, required=True)
+parser.add_argument("--type", type=str, default="regular",
+                    choices=VALID_TYPES,
+                    help="Decode method label: regular | quadtree | zoneprobe. "
+                         "Used to keep per-run result files from colliding "
+                         "across methods run at the same (tpl, cross_k, dks).")
 # >>> RENAME: BurnScars config/data defaults
 parser.add_argument("--config", type=str,
                     default="./training/configs/config_test-BURNSCARS.yaml")
@@ -71,9 +276,39 @@ parser.add_argument("--bands_yaml", type=str,
                     default="./data/bands_info/bands.yaml")
 parser.add_argument("--data_dir", type=str, default="./data/hls_burn_scars")
 parser.add_argument("--num_workers", type=int, default=4)
+# >>> LIGHT_GFLOPS
+parser.add_argument("--gflops_scope", type=str, default="full",
+                    choices=("full", "light"),
+                    help="'full' (default): stream the ENTIRE (sharded) "
+                         "split for a precise mean — use for final "
+                         "reported numbers. 'light': profile only "
+                         "--gflops_light_n samples total (split round-"
+                         "robin across ranks like the full path) — use "
+                         "for cheap per-config GFLOPs across a wide sweep.")
+parser.add_argument("--gflops_light_n", type=int, default=30,
+                    help="Total number of samples to profile (summed "
+                         "across ALL ranks) when --gflops_scope light. "
+                         "Ignored when --gflops_scope full.")
+parser.add_argument("--flops_n", type=int, default=1,
+                    help="Number of leading batches of THIS RANK's shard "
+                         "treated as unprofiled warmup before GFLOPs "
+                         "measurement begins.")
+parser.add_argument("--skip_gflops", action="store_true",
+                    help="Skip GFLOPs measurement entirely (mIoU/accuracy "
+                         "only). Use this with --split val for a fast "
+                         "scoring pass over a wide config grid.")
+# >>> VAL_SPLIT
+parser.add_argument("--split", type=str, default="test", choices=("val", "test"),
+                    help="Which split to score on. 'val' is intended for "
+                         "cheap model/config SELECTION (combine with "
+                         "--gflops_scope light); 'test' (default) is for "
+                         "final reported numbers on the shortlisted "
+                         "configs (combine with --gflops_scope full).")
 args = parser.parse_args()
 
 tpl, ck = int(args.tokens_per_latent), int(args.cross_k)
+dks = int(args.decoder_k_spatial)  # >>> DECODER_K
+decode_type = args.type
 
 # =============================================================================
 # CONFIG + DENSITY OVERRIDE  (before model build)
@@ -85,10 +320,25 @@ config_model["latent_grid"]["val_sampling"]   = [[tpl, ck]]
 print(f"[Test] Density override -> [[{tpl}, {ck}]] "
       f"(tokens_per_latent={tpl}, cross_k={ck})")
 
+# >>> DECODER_K: override decoder_k_spatial so it takes effect regardless of
+# what was saved in the checkpoint's hparams.
+config_model.setdefault("Atomiser", {})
+config_model["Atomiser"]["decoder_k_spatial"] = dks
+print(f"[Test] Decoder override -> decoder_k_spatial={dks}")
+
 # sanity: this worker targets the skip model
 if not config_model.get("Atomiser", {}).get("use_decoder_skip", False):
     print("[Test][WARN] config has use_decoder_skip=False but this is the SKIP "
           "worker. Ensure the config matches the skip checkpoint.")
+
+_uqd = bool(config_model.get("Atomiser", {}).get("use_quadtree_decode", False))
+_uad = bool(config_model.get("Atomiser", {}).get("use_adaptive_decode", False))
+_inferred_type = _decode_mode(_uqd, _uad)
+if _inferred_type != decode_type:
+    print(f"[Test][WARN] --type={decode_type} but config implies "
+          f"'{_inferred_type}' (use_quadtree_decode={_uqd}, "
+          f"use_adaptive_decode={_uad}). Double-check --type and --config "
+          f"match the intended method.")
 
 lookup_table = Lookup_encoding(
     read_yaml(args.configs_dataset), read_yaml(args.bands_yaml), config_model)
@@ -125,7 +375,7 @@ data_module = UnifiedDataModule(
 )
 
 # =============================================================================
-# TEST
+# SCORE  (>>> VAL_SPLIT: trainer.validate() on 'val', trainer.test() on 'test')
 # =============================================================================
 trainer = Trainer(
     devices=-1,
@@ -136,285 +386,227 @@ trainer = Trainer(
     enable_model_summary=False,
 )
 
-results = trainer.test(model, datamodule=data_module, verbose=True)
+split = args.split
+# >>> EXPLICIT_DATALOADER: pass the dataloader directly via `dataloaders=`
+# rather than relying on trainer.validate()/trainer.test() internal
+# datamodule dispatch — unambiguous for a script whose whole point is
+# getting the val/test split boundary right.
+data_module.setup("validate" if split == "val" else "test")
+if split == "val":
+    results = trainer.validate(
+        model=model, dataloaders=data_module.val_dataloader(), verbose=True)
+else:
+    results = trainer.test(
+        model=model, dataloaders=data_module.test_dataloader(), verbose=True)
 metrics = results[0] if results else {}
 
-miou = metrics.get("test_mIoU", float("nan"))
-acc  = metrics.get("test_accuracy", float("nan"))
+# >>> VAL_SPLIT: try a few common logged-metric-name candidates per split
+# rather than hardcoding "test_mIoU"/"test_accuracy".
+_miou_candidates = [f"{split}_mIoU", "test_mIoU", "val_mIoU", "mIoU"]
+_acc_candidates  = [f"{split}_accuracy", "test_accuracy", "val_accuracy", "accuracy"]
+
+def _first_present(d, candidates):
+    for k in candidates:
+        if k in d:
+            return d[k], k
+    return float("nan"), None
+
+miou, _miou_key = _first_present(metrics, _miou_candidates)
+acc,  _acc_key  = _first_present(metrics, _acc_candidates)
+
+if _miou_key is None or _acc_key is None:
+    print(f"[Test][WARN] split='{split}': could not find expected metric "
+          f"keys among {list(metrics.keys())}. Tried mIoU candidates="
+          f"{_miou_candidates}, accuracy candidates={_acc_candidates}. "
+          f"Reporting NaN for whichever key was not found — check your "
+          f"validation_step/test_step logging names.")
+else:
+    print(f"[Test] split='{split}': using metric keys "
+          f"mIoU<-'{_miou_key}' accuracy<-'{_acc_key}'")
 
 
 # =============================================================================
-# GFLOPS MEASUREMENT (torch.profiler, after scoring)
+# GFLOPS MEASUREMENT (FlopCounterMode, sharded across all DDP ranks,
+# scope full or light — >>> MULTI_GPU_GFLOPS / LIGHT_GFLOPS)
 # =============================================================================
-# Profile a few real test forward passes in eval/no_grad and average the
-# profiler-reported FLOPs. Notes:
-#   - with_flops=True counts recognized ops (matmul/conv); some elementwise/
-#     custom ops are NOT counted, so the absolute number is a LOWER BOUND.
-#     It is consistent across configs, so the cross-config COMPARISON is the
-#     trustworthy part.
-#   - one warmup pass is run and discarded (CUDA init / autotune).
-#   - profiler "FLOPs" are multiply-adds counted as the op defines; we divide
-#     by 1e9 to report GFLOPs PER FORWARD (per tile / per sample at bs=1).
-
-def _to_device(b, dev):
-    if isinstance(b, torch.Tensor):
-        return b.to(dev)
-    if isinstance(b, dict):
-        return {k: _to_device(v, dev) for k, v in b.items()}
-    if isinstance(b, (list, tuple)):
-        return type(b)(_to_device(v, dev) for v in b)
-    return b
-
 gflops = float("nan")
+gflops_n = 0
 
-# Everything is written under ./profiler/<tag>/ where tag identifies this config.
-# >>> RENAME: keep tag scoped to this task to avoid clobbering Sen1Floods11 runs
+is_main = trainer.is_global_zero
+world_size = trainer.world_size
+rank = trainer.global_rank
+device = trainer.strategy.root_device
+
 PROFILE_DIR = "./profiler_burnscars"
-tag = f"tpl{tpl}_ck{ck}"
+tag = f"{split}_tpl{tpl}_ck{ck}_dks{dks}_{args.gflops_scope}"
 out_dir = os.path.join(PROFILE_DIR, tag)
-os.makedirs(out_dir, exist_ok=True)
-print(f"[Profile] Saving profiler artifacts to {out_dir}/")
+if is_main:
+    os.makedirs(out_dir, exist_ok=True)
+    scope_desc = (f"light, {args.gflops_light_n} samples total"
+                  if args.gflops_scope == "light" else "full split")
+    print(f"[GFLOPs] Saving artifacts to {out_dir}/ "
+          f"(world_size={world_size} rank(s), scope={scope_desc})")
 
-try:
-    from torch.profiler import profile, ProfilerActivity
+if args.skip_gflops:
+    if is_main:
+        print("[GFLOPs] Skipped (--skip_gflops)")
+else:
+    local_sum_gflops, local_n = 0.0, 0
+    fc_last = None
+    try:
+        _patch_module_tracker_for_no_grad()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-    model.eval()
+        model = model.to(device)
+        model.eval()
 
-    # grab a few real test batches
-    data_module.setup("test")
-    test_loader = data_module.test_dataloader()
+        # >>> MULTI_GPU_GFLOPS + VAL_SPLIT: shard the SAME split used for
+        # scoring, round-robin across ranks, BEFORE building the DataLoader.
+        data_module.setup(split if split == "val" else "test")
+        full_test_loader = (data_module.val_dataloader() if split == "val"
+                            else data_module.test_dataloader())
+        full_dataset = full_test_loader.dataset
+        n_total = len(full_dataset)
 
-    n_profile = 30          # batches to average over
-    n_warmup  = 1          # discarded
-    batches = []
-    for i, b in enumerate(test_loader):
-        batches.append(_to_device(b, device))
-        if len(batches) >= n_profile + n_warmup:
-            break
+        limit_n = args.gflops_light_n if args.gflops_scope == "light" else None
+        n_warmup = args.flops_n
+        if args.gflops_scope == "light":
+            n_warmup = min(n_warmup, max(0, (limit_n // max(world_size, 1)) - 1))
 
-    if not batches:
-        print("[Profile] No test batches available; skipping profiling.")
+        shard_dataset = _shard_dataset_round_robin(
+            full_dataset, rank, world_size, limit_n=limit_n)
+        shard_loader = torch.utils.data.DataLoader(
+            shard_dataset,
+            batch_size=full_test_loader.batch_size or 1,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=full_test_loader.collate_fn,
+            pin_memory=True,
+        )
+        print(f"[GFLOPs][rank {rank}/{world_size}] scope={args.gflops_scope} "
+              f"shard = {len(shard_dataset)}/{n_total} samples "
+              f"({n_warmup} warmup batch(es) discarded on this rank).")
+
+        def _fwd(b, m=model):
+            return m(b, training=False)
+
+        local_sum_gflops, local_n, fc_last = measure_gflops_forward_shard(
+            _fwd, shard_loader, device, n_warmup=n_warmup,
+        )
+        print(f"[GFLOPs][rank {rank}] local sum={local_sum_gflops:.2f} GFLOPs "
+              f"over {local_n} profiled samples.")
+
+    except Exception as e:
+        import traceback
+        print(f"[GFLOPs][rank {rank}] GFLOPs measurement failed: {e}")
+        if is_main:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "ERROR.txt"), "w") as f:
+                f.write(traceback.format_exc())
+        local_sum_gflops, local_n = 0.0, 0
+
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+    except Exception:
+        pass
+
+    global_sum_gflops = _allreduce_sum(local_sum_gflops, device)
+    global_n = int(_allreduce_sum(local_n, device))
+
+    if global_n > 0:
+        gflops = global_sum_gflops / global_n
+        gflops_n = global_n
     else:
-        with torch.no_grad():
-            # warmup (CUDA init / autotune / one-time cache population) — not profiled
-            for b in batches[:n_warmup]:
-                _ = model(b, training=False)
-            if device == "cuda":
-                torch.cuda.synchronize()
+        gflops = float("nan")
+        gflops_n = 0
 
-            # ---- profile the measured passes, keep the LAST prof for export ----
-            flops_list = []
-            prof_last = None
-            for b in batches[n_warmup:]:
-                with profile(activities=[ProfilerActivity.CPU,
-                                         ProfilerActivity.CUDA],
-                             with_flops=True,
-                             record_shapes=True,
-                             profile_memory=True) as prof:
-                    _ = model(b, training=False)
-                    if device == "cuda":
-                        torch.cuda.synchronize()
-                total = sum(evt.flops for evt in prof.key_averages()
-                            if getattr(evt, "flops", None))
-                flops_list.append(total)
-                prof_last = prof
+    if is_main and gflops_n > 0:
+        print(f"[GFLOPs] GLOBAL mean GFLOPs/forward "
+              f"(sharded over {world_size} rank(s), {gflops_n} samples "
+              f"profiled total): {gflops:.3f}  "
+              f"[lower bound; matmul/conv/attention ops only]")
 
-            # ---- aggregate GFLOPs ----
-            if flops_list:
-                mean_flops = sum(flops_list) / len(flops_list)
-                gflops = mean_flops / 1e9
-                print(f"[Profile] GFLOPs/forward (mean of {len(flops_list)} "
-                      f"passes): {gflops:.3f}  "
-                      f"[lower bound; profiler-counted ops only]")
+        summary_path = os.path.join(out_dir, f"gflops_summary_{tag}.txt")
+        with open(summary_path, "w") as f:
+            f.write(f"Config: tpl={tpl} cross_k={ck} decoder_k_spatial={dks}\n")
+            f.write(f"Scope: {args.gflops_scope}"
+                    + (f" ({args.gflops_light_n} samples budget)"
+                       if args.gflops_scope == "light" else " (entire split)")
+                    + "\n")
+            f.write(f"Method: torch.utils.flop_counter.FlopCounterMode "
+                    f"(SDPA attention counted)\n")
+            f.write(f"Scope: sharded round-robin across {world_size} DDP "
+                    f"rank(s) (warmup={args.flops_n} batches/rank discarded, "
+                    f"{gflops_n} total samples profiled)\n")
+            f.write(f"GFLOPs/forward (global mean of {gflops_n} passes): "
+                    f"{gflops:.4f}\n")
+            f.write(f"Measured under torch.no_grad() via the "
+                    f"module-tracker no-op patch (see script comments).\n")
+        print(f"[GFLOPs] summary -> {summary_path}")
 
-            # =================================================================
-            # SAVE EVERYTHING to ./profiler_burnscars/<tag>/
-            # =================================================================
-            if prof_last is not None:
-                ka = prof_last.key_averages()
-
-                # 1) Chrome trace (open in chrome://tracing or perfetto.dev)
-                try:
-                    trace_path = os.path.join(out_dir, f"trace_{tag}.json")
-                    prof_last.export_chrome_trace(trace_path)
-                    print(f"[Profile] chrome trace -> {trace_path}")
-                except Exception as ee:
-                    print(f"[Profile] chrome trace export failed: {ee}")
-
-                # 2) Full key-averages table, sorted by CUDA time AND by FLOPs
-                try:
-                    table_path = os.path.join(out_dir, f"table_{tag}.txt")
-                    with open(table_path, "w") as f:
-                        f.write(f"Config: tpl={tpl} cross_k={ck}\n")
-                        f.write(f"GFLOPs/forward (mean): {gflops:.4f}\n")
-                        f.write(f"num profiled passes: {len(flops_list)}\n")
-                        f.write(f"per-pass FLOPs: {flops_list}\n\n")
-                        f.write("=== sorted by self CUDA time ===\n")
-                        try:
-                            f.write(ka.table(sort_by="self_cuda_time_total",
-                                             row_limit=50))
-                        except Exception:
-                            f.write(ka.table(sort_by="self_cpu_time_total",
-                                             row_limit=50))
-                        f.write("\n\n=== sorted by self CPU time ===\n")
-                        f.write(ka.table(sort_by="self_cpu_time_total",
-                                         row_limit=50))
-                    print(f"[Profile] full table -> {table_path}")
-                except Exception as ee:
-                    print(f"[Profile] table export failed: {ee}")
-
-                # 3) Per-op FLOPs CSV (the one you actually want for the breakdown)
-                try:
-                    import csv
-                    csv_path = os.path.join(out_dir, f"ops_flops_{tag}.csv")
-                    rows = []
-                    for e in ka:
-                        fl = getattr(e, "flops", None) or 0
-                        rows.append((
-                            e.key,
-                            fl,
-                            fl / 1e9,
-                            getattr(e, "self_cuda_time_total", 0),
-                            getattr(e, "self_cpu_time_total", 0),
-                            getattr(e, "count", 0),
-                        ))
-                    # sort by FLOPs desc
-                    rows.sort(key=lambda r: r[1], reverse=True)
-                    with open(csv_path, "w", newline="") as f:
-                        w = csv.writer(f)
-                        w.writerow(["op", "flops", "gflops",
-                                    "self_cuda_time_us", "self_cpu_time_us", "count"])
-                        for r in rows:
-                            w.writerow(r)
-                    print(f"[Profile] per-op FLOPs CSV -> {csv_path}")
-
-                    # also echo top-10 to stdout
-                    nonzero = [r for r in rows if r[1] > 0]
-                    print(f"[Profile] Top FLOP ops (GFLOPs)  "
-                          f"[{len(nonzero)} ops with nonzero flops]:")
-                    for r in rows[:10]:
-                        print(f"[Profile]   {r[0][:40]:<40} {r[2]:>10.2f}")
-                    if not nonzero:
-                        print("[Profile] WARNING: no ops reported nonzero FLOPs. "
-                              "with_flops is unreliable on this torch build — "
-                              "use the CUDA-time table or switch to fvcore.")
-                except Exception as ee:
-                    print(f"[Profile] CSV export failed: {ee}")
-
-                # 4) REGION SUMMARY — attribute leaf-op FLOPs/time to the
-                #    INNERMOST enclosing record_function label.
-                #    FLOPs live on aten:: leaf ops (addmm/mm/bmm), NOT on the
-                #    record_function parent rows, so key_averages() shows 0 for
-                #    your labels. We fix that by walking the flat event list and
-                #    assigning each leaf op to the deepest user label whose CPU
-                #    time interval contains it.
-                try:
-                    import csv as _csv
-
-                    # Record_function names from the shared encoder. See
-                    # module-level NOTE above.
-                    REGION_LABELS = {
-                        "Compute grid config", "encode", "Latents init",
-                        "geo pruning", "Cross Attention - Encoder",
-                        "Encoder Process data", "Encoder Cross Attention:",
-                        "Self Attention",
-                        "Decoder pre processing", "Decoder Cross attention",
-                        "Decoder skip", "Decoder Cross Attention",
-                        "Decoder Logits",
-                    }
-
-                    # flat event list with timestamps (microseconds)
-                    evlist = prof_last.events()
-
-                    def _start(e):
-                        # different torch versions expose different attrs
-                        for a in ("time_range",):
-                            tr = getattr(e, a, None)
-                            if tr is not None:
-                                return tr.start, tr.end
-                        s = getattr(e, "cpu_interval", None)
-                        if s is not None:
-                            return s.start, s.end
-                        return None
-
-                    # collect label intervals (name, start, end)
-                    label_iv = []
-                    for e in evlist:
-                        nm = getattr(e, "name", getattr(e, "key", ""))
-                        if nm in REGION_LABELS:
-                            iv = _start(e)
-                            if iv:
-                                label_iv.append((nm, iv[0], iv[1]))
-
-                    # accumulate FLOPs + cuda time per label from leaf ops that
-                    # fall inside the label's interval (deepest = smallest span)
-                    region_flops = {n: 0 for n in REGION_LABELS}
-                    region_cuda  = {n: 0.0 for n in REGION_LABELS}
-                    region_count = {n: 0 for n in REGION_LABELS}
-
-                    for e in evlist:
-                        fl = getattr(e, "flops", None) or 0
-                        cu = getattr(e, "cuda_time_total", 0) or 0
-                        if fl == 0 and cu == 0:
-                            continue
-                        iv = _start(e)
-                        if not iv:
-                            continue
-                        s, en = iv
-                        # find deepest enclosing label (smallest interval containing e)
-                        best = None
-                        best_span = None
-                        for (nm, ls, le) in label_iv:
-                            if ls <= s and en <= le:
-                                span = le - ls
-                                if best_span is None or span < best_span:
-                                    best, best_span = nm, span
-                        if best is not None:
-                            region_flops[best] += fl
-                            region_cuda[best]  += cu
-                            region_count[best] += 1
-
-                    region_path = os.path.join(out_dir, f"regions_{tag}.csv")
-                    with open(region_path, "w", newline="") as f:
-                        w = _csv.writer(f)
-                        w.writerow(["region", "gflops", "cuda_ms", "leaf_ops"])
-                        # sort by gflops desc
-                        for nm in sorted(REGION_LABELS,
-                                         key=lambda n: region_flops[n],
-                                         reverse=True):
-                            w.writerow([nm, region_flops[nm]/1e9,
-                                        region_cuda[nm]/1e3, region_count[nm]])
-                    print(f"[Profile] REGION summary -> {region_path}")
-
-                    print("[Profile] Per-region breakdown "
-                          "(GFLOPs | CUDA ms | leaf ops):")
-                    any_nonzero = False
-                    for nm in sorted(REGION_LABELS,
-                                     key=lambda n: region_flops[n], reverse=True):
-                        gf = region_flops[nm]/1e9
-                        cu = region_cuda[nm]/1e3
-                        if region_flops[nm] > 0 or region_cuda[nm] > 0:
-                            any_nonzero = True
-                        print(f"[Profile]   {nm:<26} {gf:>9.1f} | "
-                              f"{cu:>7.2f} ms | {region_count[nm]:>4d}")
-                    if not any_nonzero:
-                        print("[Profile]   (no FLOPs attributed — interval "
-                              "matching found no enclosing labels; check that "
-                              "record_function regions wrap the heavy ops)")
-                except Exception as ee:
-                    import traceback as _tb
-                    print(f"[Profile] region summary failed: {ee}")
-                    print(_tb.format_exc())
-except Exception as e:
-    import traceback
-    print(f"[Profile] GFLOPs measurement failed: {e}")
-    with open(os.path.join(out_dir, "ERROR.txt"), "w") as f:
-        f.write(traceback.format_exc())
-    gflops = float("nan")
+        if fc_last is not None:
+            try:
+                import csv
+                op_flops = fc_last.flop_counts.get("Global", {})
+                rows = sorted(
+                    ((str(op), int(fl)) for op, fl in op_flops.items()),
+                    key=lambda r: r[1], reverse=True,
+                )
+                csv_path = os.path.join(out_dir, f"ops_flops_{tag}.csv")
+                with open(csv_path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["op", "flops", "gflops"])
+                    for op, fl in rows:
+                        w.writerow([op, fl, fl / 1e9])
+                print(f"[GFLOPs] per-op-type FLOPs CSV (rank 0's last "
+                      f"profiled batch) -> {csv_path}")
+                print(f"[GFLOPs] Top FLOP op types (GFLOPs, rank 0's last "
+                      f"profiled batch) [{len(rows)} op types with nonzero flops]:")
+                for op, fl in rows[:10]:
+                    print(f"[GFLOPs]   {op[:50]:<50} {fl / 1e9:>10.2f}")
+            except Exception as ee:
+                print(f"[GFLOPs] per-op-type CSV export failed: {ee}")
 
 
-# RESULT line now carries GFLOPs for the driver to parse.
-print(f"RESULT tpl={tpl} cross_k={ck} "
-      f"test_mIoU={miou:.6f} test_accuracy={acc:.6f} gflops={gflops:.6f}")
+# RESULT line: rank-0 only.
+if is_main:
+    print(f"RESULT split={split} tpl={tpl} cross_k={ck} decoder_k_spatial={dks} "
+          f"mIoU={miou:.6f} accuracy={acc:.6f} gflops={gflops:.6f} "
+          f"gflops_n={gflops_n}")
+
+    # =========================================================================
+    # >>> RESULTS_TRACKING: write per-run result file (rank-0 only)
+    # =========================================================================
+    os.makedirs(TMP_RESULTS_DIR, exist_ok=True)
+    run_record = {
+        "task": "burnscars",
+        "split": split,
+        "ckpt": os.path.abspath(args.ckpt),
+        "xp_name": args.xp_name,
+        "tokens_per_latent": tpl,
+        "cross_k": ck,
+        "decoder_k_spatial": dks,
+        "mIoU": miou,
+        "accuracy": acc,
+        "gflops": gflops,
+        "gflops_n": gflops_n,
+        "gflops_method": None if args.skip_gflops else "FlopCounterMode",
+        "gflops_scope": None if args.skip_gflops else args.gflops_scope,
+        "gflops_light_n_budget": (args.gflops_light_n
+                                  if args.gflops_scope == "light" else None),
+        "gflops_world_size": world_size,
+        "gflops_skipped": bool(args.skip_gflops),
+        "type": decode_type,
+        "use_quadtree_decode": _uqd,
+        "use_adaptive_decode": _uad,
+        "config_path": args.config,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    out_result_path = tmp_result_path(
+        args.ckpt, tpl, ck, dks, decode_type, split=split,
+        gflops_scope=("skipped" if args.skip_gflops else args.gflops_scope),
+        task="burnscars")
+    with open(out_result_path, "w") as f:
+        json.dump(run_record, f, indent=2)
+    print(f"[Test] Wrote per-run result -> {out_result_path} "
+          f"(type={decode_type}, split={split})")

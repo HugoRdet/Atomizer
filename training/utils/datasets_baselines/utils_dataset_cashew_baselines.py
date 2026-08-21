@@ -12,8 +12,8 @@ Output format (compatible with BaselineTrainer):
         "metadata": {...},
     }
 
-Splits: from default_partition.json (train/valid/test → 1350/400/50).
-Native size: 256×256 (no cropping needed; divides cleanly by 16 for ViT).
+Splits: from default_partition.json (train/valid/test -> 1350/400/50).
+Native size: 256x256 (no cropping needed; divides cleanly by 16 for ViT).
 Bands: 12 S2 (B02 B03 B04 B08 B05 B06 B07 B08A B11 B12 B01 B09).
 """
 
@@ -30,12 +30,15 @@ class CashewBaselineDataset(Dataset):
     """Cashew (m-cashew-plant) dataset for baseline segmentation models."""
 
     NUM_CHANNELS = 12
-    NUM_CLASSES = 6
+    NUM_CLASSES = 7
     IGNORE_INDEX = 255
     PATCH_SIZE = 256
 
-    # Label scheme: 1..6 are real classes, 0 is no-data/unlabeled.
-    # We remap to 0..5 for cross-entropy and use IGNORE for no-data.
+    # GeoBench's own HDF5 metadata declares n_classes=7 for this task (see
+    # the 'label' dataset's embedded SegmentationClasses pickle attrs).
+    # Labels are already 0-indexed over the full 0..6 range with no
+    # nodata/unlabeled sentinel value -- unlike some other geo-bench seg
+    # tasks, there is no remap here: raw label value == training target.
 
     BAND_PREFIXES = [
         "02 - Blue",
@@ -62,7 +65,7 @@ class CashewBaselineDataset(Dataset):
         self,
         root_path: str = "./data/geo-bench-1.0/segmentation_v1.0/m-cashew-plant",
         mode: str = "train",
-        crop_size: int = None,        # None = full 256×256
+        crop_size: int = None,        # None = full 256x256
         augment: bool = True,
     ):
         super().__init__()
@@ -95,18 +98,18 @@ class CashewBaselineDataset(Dataset):
 
         print(f"[Cashew-BL] split={mode}, samples={len(self.sample_names)}")
         print(f"[Cashew-BL] channels: {self.NUM_CHANNELS} S2 bands")
-        print(f"[Cashew-BL] patch size: {self.PATCH_SIZE}×{self.PATCH_SIZE}")
+        print(f"[Cashew-BL] patch size: {self.PATCH_SIZE}x{self.PATCH_SIZE}")
         if self.crop_size is not None:
             crop_kind = "random" if mode == "train" else "center"
-            print(f"[Cashew-BL] {crop_kind} crop: {self.crop_size}×{self.crop_size}")
+            print(f"[Cashew-BL] {crop_kind} crop: {self.crop_size}x{self.crop_size}")
         else:
             print(f"[Cashew-BL] no crop (full image)")
         print(f"[Cashew-BL] D4 augment: {'ON' if self.augment else 'OFF'}")
         print(f"[Cashew-BL] num_classes: {self.NUM_CLASSES}")
 
-    # ─────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
     # AUGMENTATION
-    # ─────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _d4_augment(image, label):
@@ -135,9 +138,9 @@ class CashewBaselineDataset(Dataset):
         left = (W - size) // 2
         return image[:, top:top + size, left:left + size], label[top:top + size, left:left + size]
 
-    # ─────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
     # DATASET INTERFACE
-    # ─────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
 
     def __len__(self):
         return len(self.sample_names)
@@ -161,23 +164,27 @@ class CashewBaselineDataset(Dataset):
         image = torch.from_numpy(np.stack(bands, axis=0))
         target = torch.from_numpy(target).long()
 
-        # ── NaN cleanup ─────────────────────────────────────
+        # -- NaN cleanup ----------------------------------------------
         image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # ── Label remap: 1-indexed → 0-indexed, 0 → IGNORE ──
-        # README: classes 1..6 are real, 0 is no-data/unlabeled.
-        ignore_mask = (target == 0) | (target > self.NUM_CLASSES)
-        target = target - 1
-        target = torch.where(ignore_mask, torch.full_like(target, self.IGNORE_INDEX), target)
+        # -- No label remap: raw value in [0, NUM_CLASSES) IS the
+        # training target (see NUM_CLASSES note above). Any value outside
+        # that range (shouldn't occur, but guard anyway) is sent to
+        # IGNORE_INDEX rather than silently corrupting a real class.
+        out_of_range = (target < 0) | (target >= self.NUM_CLASSES)
+        if out_of_range.any():
+            target = torch.where(
+                out_of_range, torch.full_like(target, self.IGNORE_INDEX), target
+            )
 
-        # ── Normalize ───────────────────────────────────────
+        # -- Normalize --------------------------------------------------
         image = (image - self.norm_mean) / self.norm_std
 
-        # ── D4 augmentation (training only) ─────────────────
+        # -- D4 augmentation (training only) -----------------------------
         if self.augment:
             image, target = self._d4_augment(image, target)
 
-        # ── Crop if requested ───────────────────────────────
+        # -- Crop if requested --------------------------------------------
         if self.crop_size is not None:
             if self.split == "train":
                 image, target = self._random_crop(image, target, self.crop_size)

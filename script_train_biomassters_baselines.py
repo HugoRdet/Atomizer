@@ -25,6 +25,57 @@ Supported models (via --model):
                         directly, DOY from batch["dates"]["s2"] via `doy`
                         kwarg (matches BaselineRegressionTrainer's default,
                         no temporal_kwarg override needed).
+  - universat         : UniverSat encoder (gastruc/UniverSat, AnySat v2)
+                        trained FROM SCRATCH (random init) + linear per-token
+                        head (num_classes=1 -> single-channel regression map),
+                        via training.Universat.universat_augmenter.
+                        UniverSatSegmenter, wrapped in
+                        UniverSatBioMasstersAdapter which mimics RAMEN's
+                        trainer interface EXACTLY (forward(x_dict,
+                        dates=dict) + model.temporal_kwarg = "dates"), so
+                        whatever routing BaselineRegressionTrainer does for
+                        RAMEN applies unchanged.
+
+                        Uses make_universat_collate: the trainer's
+                        _get_image indexes batch["image"][modality]
+                        UNCONDITIONALLY (no dict path), so the collate
+                        fuses S2+S1 into one [B,T,14,H,W] tensor under
+                        "s2" (satisfying the literal contract) and packs
+                        both per-modality date tracks into [B,2,T]; the
+                        adapter splits channels back into UniverSat's
+                        {"optical","sar"} dict and unpacks the dates. The
+                        per-modality [B,T,C,H,W] layout after the split
+                        is UniverSat's native time-series format.
+
+                        This is the FIRST dataset where both UniverSat
+                        blocks that were structurally inert elsewhere are
+                        active TOGETHER: the Bi_ACA_in modality-fusion
+                        attention (two modalities) AND the UPE temporal
+                        axis (T real monthly frames with genuine
+                        day-of-year values from batch["dates"] -- no
+                        synthetic dates needed, unlike xView2).
+
+                        S1 CHANNEL CODES: UniverSat's learned channel-code
+                        registry has VV/VH/HH/HV (+ratios/DEM) but NO
+                        ascending/descending distinction (unlike RAMEN's
+                        pol_map). The 4 channels (VV_asc, VH_asc, VV_desc,
+                        VH_desc) are mapped to ["VV","VH","HH","HV"]: the
+                        desc pair borrows the unused HH/HV slots. Since
+                        training is from scratch, these embeddings carry no
+                        pretrained semantics -- they are just 4 distinct
+                        randomly-initialized identity vectors, which is
+                        exactly what 4 distinct channels need. Report as
+                        "desc polarizations assigned to unused channel-code
+                        slots; labels are arbitrary identifiers under
+                        from-scratch training". (The alternative
+                        ["VV","VH","VV","VH"] would make asc and desc
+                        indistinguishable by channel identity.)
+
+                        The adapter upsamples the (H/os)^2 regression map
+                        to full input resolution internally (bilinear), so
+                        UniverSat emits full-res 256x256 like every other
+                        model here -- no dependence on the trainer having
+                        an interpolate-on-mismatch path.
 
 Regression via num_classes=1: same trick used throughout this codebase
 (Atomizer's reconstruction_head, trainer_biomassters.py) -- these backbones'
@@ -66,6 +117,11 @@ Examples:
         --model perceiver --multi_temporal 3 --temporal_last \
         --batch_size 8 --lr 1e-4 --epochs 100
 
+    # UniverSat-S from scratch, last 3 months, S2+S1 (real dates)
+    python script_train_biomassters_baseline.py --xp_name universat_t3 \
+        --model universat --multi_temporal 3 --temporal_last \
+        --batch_size 8 --lr 1e-4 --epochs 100
+
     # Resume a chained SLURM job, waiting up to 10 minutes for the checkpoint
     python script_train_biomassters_baseline.py --xp_name resnet_mt_t3 \
         --model resnet_upernet_mt \
@@ -79,6 +135,7 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
@@ -99,6 +156,7 @@ from training.VIT.model_vit_upernet import ViTLTAEUPerNet
 from training.ResNet.model_resnet_upernet import build_resnet_upernet_mt
 from training.RAMEN.ramen_upernet import build_ramen_upernet
 from training.perceiverIO.perceiver_seg import PerceiverSeg
+from training.Universat.universat_augmenter import build_universat_segmenter
 from training.trainer_baselines_biomassters import BaselineRegressionTrainer
 
 
@@ -220,6 +278,44 @@ def make_ramen_collate():
     return ramen_collate
 
 
+def make_universat_collate():
+    """
+    UniverSat collate, tensor-contract version. The trainer's _get_image is
+    an UNCONDITIONAL batch["image"][self.modality] (no dict fallback -- the
+    dict(x) / KeyError crashes proved this empirically), so UniverSat must
+    satisfy the same literal contract as the fused models: a single tensor
+    under "s2". This collate therefore:
+
+      1. Fuses S2+S1 along channels like make_fused_collate:
+         [B, T, 14, H, W] under "s2". The ADAPTER splits channels
+         0:NUM_S2_BANDS -> optical, NUM_S2_BANDS: -> sar and rebuilds
+         UniverSat's modality dict internally.
+      2. Packs BOTH per-modality date tracks into one tensor under the
+         "s2" dates key: [B, 2, T] = stack(s2_doy, s1_doy). S2 months can
+         differ from S1 months (S2 has cloud gaps; S1 has full coverage),
+         so collapsing to a single track would stamp S1 frames with S2
+         dates -- packing preserves exact per-modality dates through the
+         trainer's single-tensor doy plumbing. The adapter unpacks
+         [:, 0] -> optical dates, [:, 1] -> sar dates (and degrades
+         gracefully to a shared [B, T] track if a trainer variant strips
+         the extra dim).
+    """
+    def universat_collate(batch):
+        out = biomassters_collate(batch)
+        s2 = out["image"]["s2"]  # [B, T, 10, H, W]
+        s1 = out["image"]["s1"]  # [B, T,  4, H, W]
+        T = min(s2.shape[1], s1.shape[1])
+        fused = torch.cat([s2[:, :T], s1[:, :T]], dim=2)          # [B, T, 14, H, W]
+        packed_dates = torch.stack(
+            [out["dates"]["s2"][:, :T], out["dates"]["s1"][:, :T]], dim=1
+        )                                                          # [B, 2, T]
+        out["image"] = {"s2": fused}
+        out["dates"] = {"s2": packed_dates}
+        return out
+
+    return universat_collate
+
+
 def make_channel_stack_collate(base_collate):
     """[B, T, C, H, W] → [B, T*C, H, W] for non-temporal models."""
     def stacked_collate(batch):
@@ -258,6 +354,102 @@ RAMEN_S1_POLARIZATIONS = {
 
 RAMEN_INPUT_BANDS = {"optical": RAMEN_S2_BAND_ORDER, "sar": RAMEN_S1_BAND_ORDER}
 RAMEN_WAVELENGTHS = {"optical": RAMEN_S2_WAVELENGTHS, "sar": RAMEN_S1_POLARIZATIONS}
+
+
+# =============================================================================
+# UNIVERSAT BAND INFO
+# =============================================================================
+# UniverSat keys must match the image dict keys it receives. The keys are
+# renamed "optical"/"sar" by make_universat_collate -- NOT because UniverSat
+# branches on names (it doesn't, unlike RAMEN), but because
+# BaselineRegressionTrainer extracts batch["image"][modality] whenever the
+# modality key ("s2") is PRESENT, and only passes the whole image dict when
+# it's absent. Keeping the "s2" key made the trainer silently extract the
+# S2 tensor alone and drop S1 (the dict(x) ValueError). Renaming triggers
+# the same pass-whole-dict fallback RAMEN relies on.
+# S2: same 10-band order/wavelengths as RAMEN's table (nm; the adapter
+# converts to UniverSat's µm convention).
+# S1: UniverSat's learned channel-code registry has NO asc/desc distinction
+# (only VV/VH/HH/HV + ratios/DEM). The 4 channels (VV_asc, VH_asc,
+# VV_desc, VH_desc -- dataset order) map to ["VV","VH","HH","HV"]: the
+# desc pair borrows the unused HH/HV slots so all 4 channels get DISTINCT
+# learnable identity embeddings. From-scratch training makes the labels
+# arbitrary identifiers; see the module docstring's universat bullet.
+
+UNIVERSAT_S2_WAVELENGTHS = dict(RAMEN_S2_WAVELENGTHS)  # nm, same 10 bands/order
+UNIVERSAT_S1_CODES = ["VV", "VH", "HH", "HV"]  # = (VV_asc, VH_asc, VV_desc, VH_desc)
+
+UNIVERSAT_INPUT_BANDS = {
+    "optical": list(RAMEN_S2_BAND_ORDER),
+    "sar": ["VV_asc", "VH_asc", "VV_desc", "VH_desc"],  # channel-count source
+}
+UNIVERSAT_WAVELENGTHS = {
+    "optical": UNIVERSAT_S2_WAVELENGTHS,
+    "sar": UNIVERSAT_S1_CODES,         # string codes, order = dataset order
+}
+
+BIOMASSTERS_GSD_M = 10.0
+BIOMASSTERS_TILE = 256
+
+
+# =============================================================================
+# UNIVERSAT ADAPTER
+# =============================================================================
+
+class UniverSatBioMasstersAdapter(nn.Module):
+    """
+    Wraps UniverSatSegmenter behind the trainer's LITERAL contract:
+    forward(x_tensor, dates=tensor) with a plain [B, T, C, H, W] tensor
+    from batch["image"]["s2"] (the trainer's _get_image indexes the
+    modality unconditionally -- no dict path exists). temporal_kwarg =
+    "dates" (set in build_model) selects the dates kwarg name.
+
+    Differences from the RAMEN path it mimics:
+      - Consumes the trainer's literal single-tensor contract: a fused
+        [B, T, 14, H, W] tensor (make_universat_collate), split back into
+        UniverSat's {"optical","sar"} modality dict internally. The
+        [B,T,C,H,W] per-modality layout after the split IS UniverSat's
+        native time-series format (no permute, unlike RAMEN's
+        channel-before-time).
+      - Merges dates into the image dict as "<mod>_dates" keys (UniverSat's
+        own convention; its UPE runs the temporal-axis block when the key
+        is present). These are the dataset's REAL day-of-year proxies
+        (month*30+15), not placeholders.
+      - Upsamples the (H/output_stride)^2 single-channel regression map to
+        full input resolution (bilinear) INTERNALLY, so the output is
+        [B, 1, H, W] like every other model here -- no dependence on the
+        trainer having an interpolate-on-mismatch path.
+    """
+
+    def __init__(self, segmenter: nn.Module):
+        super().__init__()
+        self.model = segmenter
+
+    def forward(self, x: torch.Tensor, dates=None) -> torch.Tensor:
+        # x: [B, T, 14, H, W] fused tensor (make_universat_collate) --
+        # the trainer's literal contract. Split back into UniverSat's
+        # modality dict here.
+        merged = {
+            "optical": x[:, :, :NUM_S2_BANDS],                      # [B,T,10,H,W]
+            "sar":     x[:, :, NUM_S2_BANDS:NUM_S2_BANDS + NUM_S1_BANDS],
+        }
+        if torch.is_tensor(dates):
+            if dates.dim() == 3:      # [B, 2, T]: packed (optical, sar) tracks
+                merged["optical_dates"] = dates[:, 0]
+                merged["sar_dates"]     = dates[:, 1]
+            else:                     # [B, T]: single shared track fallback
+                merged["optical_dates"] = dates
+                merged["sar_dates"]     = dates
+        elif isinstance(dates, dict):  # defensive: dict-passing trainer variant
+            for k, v in dates.items():
+                if k in merged:
+                    merged[f"{k}_dates"] = v
+        out = self.model(merged)                       # [B, 1, H/os, W/os]
+        H, W = x.shape[-2], x.shape[-1]
+        if out.shape[-2] != H or out.shape[-1] != W:
+            out = F.interpolate(out, size=(H, W),
+                                mode="bilinear", align_corners=False)
+        return out
 
 
 # =============================================================================
@@ -339,10 +531,30 @@ def build_model(model_name, in_channels, args):
             ff_dropout=args.perceiver_ff_dropout,
         )
 
+    elif model_name == "universat":
+        # Random init, no pretrained weights anywhere on this path.
+        # in_channels unused (channel counts come from UNIVERSAT_INPUT_BANDS).
+        # num_classes=1 -> the per-token linear head becomes a 1-channel
+        # regression map (same trick as every other model here).
+        base = build_universat_segmenter(
+            input_bands=UNIVERSAT_INPUT_BANDS,
+            wavelengths=UNIVERSAT_WAVELENGTHS,
+            num_classes=1,
+            input_res={"optical": BIOMASSTERS_GSD_M, "sar": BIOMASSTERS_GSD_M},
+            patch_size_m=args.universat_patch_m,
+            output_stride=args.universat_output_stride,
+            size=args.universat_size,
+        )
+        model = UniverSatBioMasstersAdapter(base)
+        # Same trainer routing as RAMEN: forward(x, dates=...), see the
+        # adapter docstring.
+        model.temporal_kwarg = "dates"
+        return model
+
     else:
         raise ValueError(
             f"Unknown model: {model_name}. Available: 'resnet_upernet_mt', "
-            f"'vit_ltae', 'ramen', 'perceiver'"
+            f"'vit_ltae', 'ramen', 'perceiver', 'universat'"
         )
 
 
@@ -353,7 +565,8 @@ def build_model(model_name, in_channels, args):
 parser = argparse.ArgumentParser(description="BioMassters Baseline Training")
 parser.add_argument("--xp_name",    type=str, required=True)
 parser.add_argument("--model",      type=str, default="resnet_upernet_mt",
-                    choices=["resnet_upernet_mt", "vit_ltae", "ramen", "perceiver"])
+                    choices=["resnet_upernet_mt", "vit_ltae", "ramen",
+                             "perceiver", "universat"])
 parser.add_argument("--data_dir",   type=str, default="./data/biomassters")
 
 # Test-only mode
@@ -460,6 +673,31 @@ parser.add_argument("--max_freq",           type=float, default=16.0)
 parser.add_argument("--perceiver_attn_dropout", type=float, default=0.0)
 parser.add_argument("--perceiver_ff_dropout",   type=float, default=0.0)
 
+# UniverSat-specific (from scratch)
+parser.add_argument("--universat_size", type=str, default="small",
+                    choices=["tiny", "small", "base"],
+                    help="'small' (384-d, 12 SA blocks, heads=6) is ~36.1M "
+                         "total -- parameter-matched to the ViT-S / RAMEN "
+                         "~34M budget. 'tiny' ~6.2M; 'base' ~201M.")
+parser.add_argument("--universat_patch_m", type=float, default=80.0,
+                    help="Patch size in METRES. 80 m = 8 px at BioMassters' "
+                         "10 m GSD -- the same 8 px patch as every other "
+                         "dataset's default (and the same metre value as "
+                         "Sen1Floods11). 256 tile -> 32x32 latent grid = "
+                         "1024 trunk tokens. Must be an integer number of "
+                         "pixels, and 256 must be divisible by that count.")
+parser.add_argument("--universat_output_stride", type=int, default=8,
+                    help="Regression map at H/stride per side, bilinearly "
+                         "upsampled to 256 INSIDE the adapter. Default 8 "
+                         "(= patch_px, the knee found in both the BurnScars "
+                         "and Sen1Floods11 (patch x stride) sweeps: one "
+                         "CA_Sub query per latent patch, cost ~1/os^2 with "
+                         "near-flat accuracy down to that point). Native "
+                         "80 m prediction granularity -- AGB maps are "
+                         "smooth, so the coarse-stride argument is at its "
+                         "strongest here. Set 4 for the finer convention "
+                         "used on BurnScars.")
+
 # Band-dropout augmentation (train only) -- gives baselines training-time
 # exposure to missing modalities/bands, matching the intent of Atomiser's
 # own token-dropout augmentation. Applied consistently across ALL T
@@ -556,6 +794,31 @@ if args.model == "ramen":
         args.ramen_stride = args.ramen_window_size
 
 
+# =============================================================================
+# UNIVERSAT SANITY CHECKS
+# =============================================================================
+if args.model == "universat":
+    universat_patch_px = args.universat_patch_m / BIOMASSTERS_GSD_M
+    if abs(universat_patch_px - round(universat_patch_px)) > 1e-6:
+        raise ValueError(
+            f"--universat_patch_m ({args.universat_patch_m}) is not an "
+            f"integer number of pixels at {BIOMASSTERS_GSD_M} m GSD "
+            f"({universat_patch_px:.3f} px). Use a multiple of "
+            f"{BIOMASSTERS_GSD_M}."
+        )
+    universat_patch_px = int(round(universat_patch_px))
+
+    import math as _math
+    _lcm = _math.lcm(universat_patch_px, args.universat_output_stride)
+    if BIOMASSTERS_TILE % _lcm:
+        raise ValueError(
+            f"BioMassters' native {BIOMASSTERS_TILE} tile is not divisible "
+            f"by lcm(patch_px={universat_patch_px}, "
+            f"output_stride={args.universat_output_stride})={_lcm} -- pick "
+            f"--universat_patch_m / --universat_output_stride so that "
+            f"{BIOMASSTERS_TILE} is a valid input side."
+        )
+
 
 # =============================================================================
 # CONFIG
@@ -587,6 +850,22 @@ if args.model == "ramen":
           f"({NUM_S2_BANDS} + {NUM_S1_BANDS} bands)")
     print(f"  Window:     {args.ramen_window_size}x{args.ramen_window_size} "
           f"(res={args.ramen_res}m/px, input_res={args.ramen_input_res}m/px)")
+elif args.model == "universat":
+    print(f"  Sensors:    S2 (optical) + S1 (sar), kept SEPARATE "
+          f"({NUM_S2_BANDS} + {NUM_S1_BANDS} bands; S1 codes "
+          f"{UNIVERSAT_S1_CODES} for asc/desc VV/VH -- see band-info block)")
+    print(f"  UniverSat:  {args.universat_size} (from scratch, random init)")
+    print(f"  Patch:      {args.universat_patch_m:.0f} m "
+          f"({int(args.universat_patch_m / BIOMASSTERS_GSD_M)} px @ "
+          f"{BIOMASSTERS_GSD_M:.0f} m) -> "
+          f"{BIOMASSTERS_TILE // int(args.universat_patch_m / BIOMASSTERS_GSD_M)}^2 "
+          f"latent grid")
+    print(f"  Out stride: {args.universat_output_stride} (regression map at "
+          f"H/{args.universat_output_stride}, upsampled in-adapter; native "
+          f"{args.universat_output_stride * BIOMASSTERS_GSD_M:.0f} m "
+          f"granularity)")
+    print(f"  Temporal:   REAL dates (month*30+15 DOY) via the UPE temporal "
+          f"axis -- fusion + temporal blocks both active")
 else:
     print(f"  Sensors:    S2+S1 fused ({per_frame_channels} bands/frame)")
 print(f"  Temporal:   {temporal_str}")
@@ -636,11 +915,20 @@ print(f"  Test:  {len(test_ds)} chips")
 # COLLATE SELECTION
 # =============================================================================
 
-collate_fn = make_ramen_collate() if args.model == "ramen" else make_fused_collate()
 if args.model == "ramen":
+    collate_fn = make_ramen_collate()
     print("[BioMassters-BL] RAMEN: modalities kept separate (optical/sar), "
           "channel-before-time layout")
+elif args.model == "universat":
+    # Fused-tensor collate satisfying the trainer's literal
+    # batch["image"]["s2"] contract; the adapter splits modalities and
+    # unpacks the [B, 2, T] packed date tracks -- see make_universat_collate.
+    collate_fn = make_universat_collate()
+    print("[BioMassters-BL] UniverSat: fused 14ch tensor for the trainer, "
+          "split into optical/sar + exact per-modality dates inside the "
+          "adapter")
 else:
+    collate_fn = make_fused_collate()
     print("[BioMassters-BL] S2+S1 fusion: concatenating bands in collate")
 
 
@@ -683,7 +971,9 @@ print(f"[BioMassters-BL] AGB target normalization: z-score "
 
 trainer_module = BaselineRegressionTrainer(
     model=model,
-    modality="s2",  # fused collate merges S2+S1 into the "s2" key
+    modality="s2",  # fused collate merges S2+S1 into the "s2" key; for
+                    # ramen/universat the model consumes the whole image
+                    # dict via the temporal_kwarg="dates" routing instead
     temporal=is_temporal_model,
     lr=args.lr,
     weight_decay=args.weight_decay,
@@ -701,6 +991,9 @@ if os.environ.get("LOCAL_RANK", "0") == "0" and args.test_only is None:
     try:
         import wandb
         run_name = f"BL_{args.xp_name}_{args.model}"
+        if args.model == "universat":
+            run_name += (f"_{args.universat_size}"
+                         f"_os{args.universat_output_stride}")
         wandb_init_kwargs = dict(
             name=run_name,
             project="Atomizer_BioMassters_Baselines",
@@ -747,6 +1040,13 @@ if args.test_only is None:
 
     num_nodes = int(os.environ.get("SLURM_NNODES", 1))
 
+    # find_unused_parameters=True was already unconditional here (RAMEN's
+    # RadarProjector pattern). UniverSat needs it too: the UPE's S1-axis
+    # block at subpatch_px=1 and the unused channel codes
+    # (ratios/DSM/nDEM -- note VV/VH/HH/HV ARE used here, unlike every
+    # other dataset) never appear in the forward graph. The Bi_ACA_in
+    # fusion attention and the T-axis block, inert elsewhere, are BOTH
+    # active on this dataset.
     trainer = Trainer(
         strategy=DDPStrategy(find_unused_parameters=True),
         devices=-1, num_nodes=num_nodes,

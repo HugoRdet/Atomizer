@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torchvision
 from torch.utils.data import Dataset
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from .token_builder import TokenBuilder
@@ -27,6 +28,14 @@ class MNISTSparseCanvas(Dataset):
                                     key is what the classification head should use).
         - reconstruction:           queries = image tokens, col 4 = reflectance.
 
+    Splits:
+        - "train" -> torchvision's 60k train set, MINUS a stratified held-out
+                     val slice (see _load_mnist_with_val_split). Forced to
+                     subsample_keep_rate=1.0 regardless of config (see below).
+        - "val"   -> the stratified held-out slice carved out of the 60k
+                     train set. Disjoint from "train", untouched by "test".
+        - "test"  -> torchvision's real, untouched 10k test set.
+
     MNIST-specific notes:
         - D4 augmentation is INTENTIONALLY OFF. Digits are not symmetric:
             6 ↔ 9 under 180° rotation; 2/4/5/7 lose meaning under horizontal flip.
@@ -37,6 +46,11 @@ class MNISTSparseCanvas(Dataset):
         - The `label` key is always present (scalar digit class), even in
           reconstruction mode — it's a per-image property, unlike the per-pixel
           labels in Sen1Floods11 that get folded into col 4.
+        - subsample_keep_rate / subsample_mode are FORCED to (1.0, n/a) when
+          split=="train", regardless of what config_model says. This guarantees
+          the checkpoint is trained on full 784-token inputs, so any reduced-
+          token evaluation on "val"/"test" is a genuine zero-shot generalization
+          test rather than something the model saw during training.
     """
 
     RESOLUTION = 0.2          # m/px (arbitrary; must match train script registration)
@@ -45,6 +59,7 @@ class MNISTSparseCanvas(Dataset):
     CANVAS_SIZE = 28
     IGNORE_INDEX = 255        # unused for MNIST (no per-pixel labels), kept for symmetry
     TIME_IDX_NA = -1
+    VAL_SPLIT_SEED = 42
 
     def __init__(
         self,
@@ -105,16 +120,17 @@ class MNISTSparseCanvas(Dataset):
         # Resolution index
         self.resolution_idx = self.look_up.get_resolution_idx(self.RESOLUTION)
 
-        # Load MNIST
-        is_train = self.split == "train"
-        self.mnist = torchvision.datasets.MNIST(
-            root=self.root_path, train=is_train, download=True
+        # ── Load MNIST with stratified train/val split ──────────────
+        assert self.split in ("train", "val", "test"), (
+            f"mode must be 'train', 'val', or 'test'; got {self.split!r}"
         )
+        self._load_mnist_with_val_split(config_model)
         self.num_samples = (
-            min(num_samples, len(self.mnist)) if num_samples else len(self.mnist)
+            min(num_samples, len(self.indices)) if num_samples else len(self.indices)
         )
 
-        # Normalization
+        # Normalization (computed only from the "train" split's own indices,
+        # never touching "val" or "test" data — see _compute_normalization_stats)
         self.norm_stats = self._load_or_compute_normalization()
 
         # ── Random subsampling ───────────────────────────────────────
@@ -124,9 +140,9 @@ class MNISTSparseCanvas(Dataset):
         # filtering, which would cluster latents in the digit region).
         #
         # Use this to test the architecture's flexibility to arbitrary
-        # sparse inputs: train with subsample_keep_rate=1.0, then evaluate
-        # checkpoints with rates 0.75 / 0.5 / 0.25 to measure graceful
-        # degradation.
+        # sparse inputs: train with subsample_keep_rate=1.0 (ENFORCED, see
+        # below), then evaluate checkpoints ("val"/"test" splits) with
+        # reduced rates to measure graceful degradation.
         #
         # Companion option `latent_layout`:
         #   "grid"      (default) — encoder builds its usual regular grid.
@@ -160,8 +176,26 @@ class MNISTSparseCanvas(Dataset):
             f"got {self.latent_layout!r}"
         )
 
-        print(f"[MNIST] Split: {self.split} ({'train' if is_train else 'test'} set), "
-              f"Samples: {self.num_samples}")
+        # ── Force full-token training ────────────────────────────────
+        # The checkpoint used for any token-removal ablation table must be
+        # trained on the complete 784-token input; otherwise "1.00 tokens
+        # kept" at eval time would itself be an out-of-distribution
+        # condition relative to training, undermining the "zero-shot
+        # generalization to unseen token layouts" framing. "val" and "test"
+        # splits are NOT touched by this override — they use whatever
+        # subsample_keep_rate / subsample_mode the config (or an external
+        # sweep script) requests.
+        if self.split == "train" and self.subsample_keep_rate != 1.0:
+            print(
+                f"[MNIST] WARNING: subsample_keep_rate={self.subsample_keep_rate} "
+                f"requested for split='train', but training must use the full "
+                f"784-token input so any downstream ablation's zero-shot claim "
+                f"holds. Forcing subsample_keep_rate=1.0 for training. "
+                f"(The requested rate/mode still apply normally for 'val'/'test'.)"
+            )
+            self.subsample_keep_rate = 1.0
+
+        print(f"[MNIST] Split: {self.split}, Samples: {self.num_samples}")
         print(f"[MNIST] Loaded {len(self.spectral_indices)} band(s)")
         print(f"[MNIST] Resolution idx: {self.resolution_idx} "
               f"(GSD={self.RESOLUTION} m/px)")
@@ -177,6 +211,89 @@ class MNISTSparseCanvas(Dataset):
         # filter is actually changing the attention mask (and not silently
         # leaving every token valid).
         self._filter_debug_logged = False
+
+    # =========================================================================
+    # DATA SPLITTING
+    # =========================================================================
+
+    def _load_mnist_with_val_split(self, config_model):
+        """
+        mode="train" -> torchvision train split, MINUS the held-out val slice
+        mode="val"   -> the held-out slice carved OUT of torchvision's train split
+        mode="test"  -> torchvision's real, untouched test split (10k images)
+
+        The val slice is chosen via sklearn's stratified train_test_split on
+        digit label, with a fixed random_state, so:
+          - "train" and "val" are always disjoint and reproducible across runs
+            (independent of global RNG state set elsewhere, e.g.
+            seed_everything(42) in the training script)
+          - each digit class (0-9) is represented in "val" at the same
+            proportion as in the full 60k train set, rather than leaving
+            class balance to chance -- with only a few thousand held out, a
+            plain random split could plausibly skew a class by a few points.
+        """
+        val_size = int(config_model["trainer"].get("val_size", 5000))
+
+        if self.split == "test":
+            self.mnist = torchvision.datasets.MNIST(
+                root=self.root_path, train=False, download=True
+            )
+            self.indices = list(range(len(self.mnist)))
+            return
+
+        # split in {"train", "val"} both draw from torchvision's TRAIN set
+        self.mnist = torchvision.datasets.MNIST(
+            root=self.root_path, train=True, download=True
+        )
+        full_len = len(self.mnist)
+
+        # ── val_size == 0: no held-out slice at all ──────────────────
+        # Used for the controlled "old-style" comparison: train on the
+        # full 60k, no validation carve-out. "val" split becomes a
+        # (trivially small) placeholder so DataLoader/Lightning plumbing
+        # that expects a val split doesn't have to be restructured --
+        # in this mode the training script should skip passing a real
+        # val_dataloaders to trainer.fit() and use save_last / last-epoch
+        # checkpointing instead of monitor-based selection.
+        if val_size == 0:
+            if self.split == "val":
+                print(f"[MNIST] val_size=0: 'val' split is EMPTY. "
+                      f"Checkpoint selection must not use val_loss in this mode "
+                      f"(use save_last / last-epoch checkpointing instead).")
+                self.indices = []
+            else:  # "train"
+                self.indices = list(range(full_len))
+                print(f"[MNIST] val_size=0: 'train' split uses the FULL "
+                      f"{full_len} train images (no held-out slice).")
+            return
+
+        all_indices = np.arange(full_len)
+        # .targets is a Tensor of digit labels, available without touching
+        # __getitem__ / any transform.
+        labels = self.mnist.targets.numpy()
+
+        assert val_size < full_len, (
+            f"val_size={val_size} must be smaller than the full train set "
+            f"({full_len})"
+        )
+
+        train_idx, val_idx = train_test_split(
+            all_indices,
+            test_size=val_size,
+            random_state=self.VAL_SPLIT_SEED,
+            stratify=labels,
+        )
+
+        if self.split == "val":
+            self.indices = val_idx.tolist()
+        else:  # "train"
+            self.indices = train_idx.tolist()
+
+        print(f"[MNIST] '{self.split}' split: {len(self.indices)} samples "
+              f"(val_size={val_size}, stratified, seed={self.VAL_SPLIT_SEED})")
+        if self.split == "val":
+            class_counts = np.bincount(labels[val_idx], minlength=10)
+            print(f"[MNIST] val class counts (0-9): {class_counts.tolist()}")
 
     # =========================================================================
     # AUGMENTATION
@@ -204,7 +321,8 @@ class MNISTSparseCanvas(Dataset):
     def __getitem__(self, index):
 
         # ── Load ────────────────────────────────────────────
-        digit_img, digit_label = self.mnist[index % len(self.mnist)]
+        real_idx = self.indices[index % len(self.indices)]
+        digit_img, digit_label = self.mnist[real_idx]
         image = torch.tensor(np.array(digit_img), dtype=torch.float32) / 255.0  # [H, W]
         image = image.unsqueeze(0)                                              # [1, H, W]
 
@@ -264,6 +382,9 @@ class MNISTSparseCanvas(Dataset):
         #                       at the configured rate. Isolates how much
         #                       background context the model actually needs.
         # batch_size=1 is required since N varies per sample.
+        #
+        # NOTE: for split=="train", subsample_keep_rate is forced to 1.0 in
+        # __init__, so this block is always a no-op during training.
         if self.subsample_mode == "uniform":
             if self.subsample_keep_rate < 1.0:
                 N = image_tokens.shape[0]
@@ -382,7 +503,8 @@ class MNISTSparseCanvas(Dataset):
         """
         Viz sample — mode-aware. No augmentation applied (deterministic).
         """
-        digit_img, digit_label = self.mnist[index % len(self.mnist)]
+        real_idx = self.indices[index % len(self.indices)]
+        digit_img, digit_label = self.mnist[real_idx]
         image = torch.tensor(np.array(digit_img), dtype=torch.float32) / 255.0
         image = image.unsqueeze(0)
         image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
@@ -465,7 +587,7 @@ class MNISTSparseCanvas(Dataset):
                 "std":  torch.ones(self.NUM_BANDS),
             }
 
-        print(f"[MNIST] Computing normalization from {len(self.mnist)} train samples...")
+        print(f"[MNIST] Computing normalization from {len(self.indices)} train samples...")
         stats = self._compute_normalization_stats()
         torch.save(stats, norm_file)
         print(f"[MNIST] Saved normalization stats to {norm_file}")
@@ -474,14 +596,15 @@ class MNISTSparseCanvas(Dataset):
 
     def _compute_normalization_stats(self):
         """
-        Streaming mean/std over the full train split, in [0, 1] reflectance space.
+        Streaming mean/std over the TRAIN split ONLY (self.indices, which
+        excludes the held-out val slice), in [0, 1] reflectance space.
         Single channel → returns 1-element tensors.
         """
         total_sum = 0.0
         total_sq = 0.0
         total_n = 0
-        for i in tqdm(range(len(self.mnist)), desc="Computing MNIST normalization"):
-            img, _ = self.mnist[i]
+        for real_idx in tqdm(self.indices, desc="Computing MNIST normalization"):
+            img, _ = self.mnist[real_idx]
             arr = np.array(img, dtype=np.float64) / 255.0
             total_sum += arr.sum()
             total_sq += (arr ** 2).sum()

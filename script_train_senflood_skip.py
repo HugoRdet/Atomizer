@@ -1,10 +1,20 @@
 """
 Sen1Floods11 Training Script (SKIP variant) — with --test_only mode
+
+# >>> MULTI_SEED_TEST: --test_only now runs N_TEST_RUNS repeats, each with a
+# different seed (list hardcoded below), and reports mean/max/min/std across
+# runs for test_mIoU and test_accuracy. This matters because test-time
+# forward passes are NOT fully deterministic across seeds: the spatial
+# sampler draws a random subset S_ell^(t) of size min(m, |V_ell|) from each
+# latent's Voronoi cell (see Appendix "Per-step random subsampling"), so a
+# single test() call only sees one such draw. Repeating under different
+# seeds captures that sampling variance.
 """
 
 import os
 import time
 import argparse
+import statistics
 import torch
 import numpy as np
 from collections import defaultdict
@@ -32,6 +42,12 @@ from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSe
 from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCallback
 
 # =============================================================================
+# >>> MULTI_SEED_TEST: config for the repeated test-only runs
+# =============================================================================
+N_TEST_RUNS = 2
+TEST_SEEDS = list(range(1, N_TEST_RUNS + 1))  # seed == run number (1, 2, 3, ...)
+
+# =============================================================================
 # ARGS
 # =============================================================================
 parser = argparse.ArgumentParser(description="Training script (skip variant)")
@@ -45,7 +61,8 @@ parser.add_argument("--deterministic", action="store_true",
 # >>> TEST_ONLY
 parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a checkpoint: load it and run ONLY trainer.test "
-                         "(skips fit and the complexity block).")
+                         "(skips fit and the complexity block). Runs N_TEST_RUNS "
+                         "repeats under different seeds and reports summary stats.")
 # >>> END TEST_ONLY
 args = parser.parse_args()
 
@@ -61,6 +78,8 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"[Train] RESUMING from: {args.resume}")
     if args.test_only:
         print(f"[Train] TEST-ONLY mode, loading: {args.test_only}")
+        print(f"[Train] TEST-ONLY will run {N_TEST_RUNS} repeats "
+              f"with seeds {TEST_SEEDS}")
     _skip_on = config_model.get("Atomiser", {}).get("use_decoder_skip", False)
     print(f"[Train] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
 
@@ -154,16 +173,86 @@ trainer = Trainer(
 )
 
 # =============================================================================
-# TEST-ONLY EARLY EXIT
+# TEST-ONLY EARLY EXIT  (>>> MULTI_SEED_TEST: now N repeats + summary stats)
 # =============================================================================
 if args.test_only is not None:
-    results = trainer.test(model, datamodule=data_module, verbose=True)
+    miou_runs, acc_runs = [], []
+
+    for run_idx, seed in enumerate(TEST_SEEDS, 1):
+        # Reseed before each run so the spatial sampler's random subsampling
+        # (and anything else stochastic at eval time) draws a fresh sample
+        # per run rather than repeating the same draw N times.
+        seed_everything(seed, workers=True)
+
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(f"\n[Train][TEST-ONLY] Run {run_idx}/{N_TEST_RUNS} "
+                  f"(seed={seed})")
+
+        # Fresh Trainer per run: avoids any state (e.g. logged metrics,
+        # internal loop counters) carrying over between repeated .test()
+        # calls on the same Trainer instance.
+        run_trainer = Trainer(
+            strategy="ddp_find_unused_parameters_true" if not is_unet else "auto",
+            devices=-1,
+            accelerator="gpu",
+            precision="bf16-mixed",
+            logger=False,
+            enable_progress_bar=True,
+            enable_model_summary=False,
+            deterministic=args.deterministic,
+        )
+        results = run_trainer.test(model, datamodule=data_module, verbose=True)
+
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            metrics = results[0] if results else {}
+            miou = metrics.get("test_mIoU", float("nan"))
+            acc  = metrics.get("test_accuracy", float("nan"))
+            miou_runs.append(miou)
+            acc_runs.append(acc)
+            print(f"RESULT test_only ckpt={args.test_only} run={run_idx} "
+                  f"seed={seed} test_mIoU={miou:.6f} test_accuracy={acc:.6f}")
+
     if os.environ.get("LOCAL_RANK", "0") == "0":
-        metrics = results[0] if results else {}
-        miou = metrics.get("test_mIoU", float("nan"))
-        acc  = metrics.get("test_accuracy", float("nan"))
-        print(f"RESULT test_only ckpt={args.test_only} "
-              f"test_mIoU={miou:.6f} test_accuracy={acc:.6f}")
+        def _stats(vals):
+            vals = [v for v in vals if v == v]  # drop nan
+            if not vals:
+                return dict(mean=float("nan"), max=float("nan"),
+                            min=float("nan"), std=float("nan"), n=0)
+            return dict(
+                mean=statistics.mean(vals),
+                max=max(vals),
+                min=min(vals),
+                std=statistics.stdev(vals) if len(vals) > 1 else 0.0,
+                n=len(vals),
+            )
+
+        miou_stats = _stats(miou_runs)
+        acc_stats  = _stats(acc_runs)
+
+        print("\n" + "=" * 78)
+        print(f"TEST-ONLY SUMMARY over {N_TEST_RUNS} runs "
+              f"(seeds={TEST_SEEDS}) — ckpt={args.test_only}")
+        print("=" * 78)
+        print(f"  test_mIoU     : mean={miou_stats['mean']:.6f}  "
+              f"max={miou_stats['max']:.6f}  min={miou_stats['min']:.6f}  "
+              f"std={miou_stats['std']:.6f}  (n={miou_stats['n']})")
+        print(f"  test_accuracy : mean={acc_stats['mean']:.6f}  "
+              f"max={acc_stats['max']:.6f}  min={acc_stats['min']:.6f}  "
+              f"std={acc_stats['std']:.6f}  (n={acc_stats['n']})")
+        print("=" * 78)
+
+        # Single parseable summary line, in addition to the per-run RESULT lines above.
+        print(f"RESULT_SUMMARY test_only ckpt={args.test_only} "
+              f"n_runs={miou_stats['n']} "
+              f"test_mIoU_mean={miou_stats['mean']:.6f} "
+              f"test_mIoU_max={miou_stats['max']:.6f} "
+              f"test_mIoU_min={miou_stats['min']:.6f} "
+              f"test_mIoU_std={miou_stats['std']:.6f} "
+              f"test_accuracy_mean={acc_stats['mean']:.6f} "
+              f"test_accuracy_max={acc_stats['max']:.6f} "
+              f"test_accuracy_min={acc_stats['min']:.6f} "
+              f"test_accuracy_std={acc_stats['std']:.6f}")
+
     import sys
     sys.exit(0)
 

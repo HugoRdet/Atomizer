@@ -1,47 +1,62 @@
 """
 Geographic Pruning with Voronoi Cells and Padded Tensors
+(DALES variant: PER-SAMPLE Voronoi assignment, LOADED from offline
+precomputation rather than computed on GPU)
 
-Memory-efficient, fully tensorized implementation.
+==============================================================================
+WHY THIS DIFFERS FROM THE ORIGINAL (raster-oriented) GeographicPruning
+==============================================================================
+The original implementation computes Voronoi cell membership from a SINGLE
+sample (`tokens[0:1]`) and applies the resulting index list to every sample
+in the batch. This is correct for fixed-grid rasters (FRACTAL's VHR, or any
+dense H×W tensor), because token index `i` always refers to the SAME pixel
+position across every sample of a given crop size — the raster's row-major
+flatten order is identical for every sample.
 
-All runtime parameters (geo_k, sigma, L_spatial) are passed as forward() args.
-Precomputed cells are cached by token shape + latent positions hash.
+It is NOT correct for point clouds. Token index `i` in one DALES patch's
+padded token array and token index `i` in another patch's array do not
+correspond to the same spatial location — points are read from different
+.laz files in whatever order laspy returns them, then (possibly) randomly
+subsampled. Applying one sample's Voronoi assignment to another sample's
+token array would silently gather the WRONG (spatially mismatched) points.
 
-For large token counts (>50k), an on-the-fly chunked top-k path is used
-instead of precomputation to avoid combinatorial cache explosion from
-variable-length inputs (e.g., FLAIR-HUB with temporal dropout).
+==============================================================================
+AUTHORITATIVE APPROACH: OFFLINE PRECOMPUTE, LOADED HERE (not computed)
+==============================================================================
+Per-token nearest-latent assignment is computed OFFLINE by
+precompute_dales_latent_assignment.py — once per (patch, D4 grid variant)
+combination — and stored as `.npz` sidecars next to each tiled patch. This
+module NO LONGER computes Voronoi assignment via GPU distance calculations
+for DALES; it only CONSUMES an already-computed per-token assignment array
+passed in via `forward(..., token_latent_assignment=...)`.
 
-Note: the bias returned by this module is a binary attention mask
-(0 for valid positions, -inf for invalid). The `sigma` parameter is
-retained in the forward signature for API compatibility but is no
-longer used to weight in-cell positions.
+Why not compute-and-cache on GPU instead (an earlier draft of this file):
+that approach cached by `patch_id` alone, but a patch's assignment
+depends on WHICH D4 augmentation was applied that call — caching by
+`patch_id` alone would silently reuse a stale assignment computed under a
+DIFFERENT rotation/flip on a later epoch. The offline precompute avoids
+this by producing one assignment per (patch, D4 variant) pair up front,
+and the caller (DalesDataset / collate) is responsible for selecting the
+correct variant's assignment and passing it in per-sample, per-call —
+no caching ambiguity possible since there's no runtime cache left to go
+stale.
 
-DDP NOTE (important):
-    Precomputed Voronoi tensors are stored via plain `setattr` on the
-    module rather than `register_buffer`. This is INTENTIONAL.
+`forward(..., patch_ids=...)` (compute-and-cache-by-patch_id) is KEPT as a
+fallback path for cases where a precomputed assignment isn't available
+(e.g. exploratory notebooks, tests) — but the recommended /
+production path for DALES training is `token_latent_assignment`.
 
-    Each rank in DDP sees a different batch and therefore computes
-    different cell assignments and different max_cell_size values. If
-    these were registered as buffers, PyTorch's DDP would try to sync
-    them across ranks at every forward pass via _sync_module_buffers,
-    causing two problems:
-
-      1. Shape mismatch deadlock: rank 0 has [L, 1038], rank 1 has
-         [L, 1095], etc. broadcast_coalesced expects matching shapes
-         and hangs until the 30-minute NCCL timeout fires.
-
-      2. Even if shapes matched, the broadcast would overwrite each
-         rank's per-batch cell data with rank-0's data — which is
-         wrong (rank N needs its own cells for its own samples).
-
-    Plain attributes are NOT touched by DDP buffer sync, so each rank
-    keeps its own per-batch precomputed data. This is exactly what we
-    want.
+DDP NOTE (unchanged from original): no persistent per-rank caching happens
+in the new path at all (nothing to desync across ranks); the fallback
+compute-and-cache path still stores plain dict entries (NOT buffers), same
+reasoning as before.
 """
 
 import torch
 import torch.nn as nn
 import gc
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
+from collections import OrderedDict
 import zlib
 import torch.distributed as dist
 
@@ -50,25 +65,27 @@ class GeographicPruning(nn.Module):
     """
     Voronoi-based geographic pruning with padded tensor storage.
 
-    Each token is assigned to its nearest latent (Voronoi cell).
-    Tokens are stored in padded tensors for fully tensorized sampling.
+    Three paths:
+        1. Cached Voronoi (N <= ON_THE_FLY_THRESHOLD): shared-batch, for
+           raster-uniform modalities (FRACTAL). Unchanged from original.
+        2. On-the-fly top-k (N > ON_THE_FLY_THRESHOLD): shared-batch,
+           unchanged from original.
+        3. Precomputed per-sample assignment (NEW, AUTHORITATIVE for DALES):
+           used when `token_latent_assignment` is passed to forward() —
+           builds the padded per-latent cell structure directly from a
+           given [B, N] nearest-latent-index tensor, no distance
+           computation at all.
+        4. Fallback per-sample compute-and-cache (kept for cases without a
+           precomputed assignment): used when `patch_ids` is passed
+           instead. NOTE the staleness caveat above — prefer path 3.
 
-    Two paths:
-        1. Cached Voronoi (N <= ON_THE_FLY_THRESHOLD):
-           Precomputes cell membership, caches padded tensors per (N, L, grid) key.
-           Fast for repeated identical shapes (e.g., MMEarth).
-
-        2. On-the-fly top-k (N > ON_THE_FLY_THRESHOLD):
-           Chunked distance computation + top-k per latent.
-           No caching, handles variable token counts efficiently.
-
-    Safety guarantees:
+    Safety guarantees (all paths):
         - Empty Voronoi cells produce index 0 + mask=True (masked out)
         - All gather indices clamped to [0, N-1]
         - Bias set to -inf for invalid positions, 0 for valid positions
-        - Cache key includes latent position hash to prevent collisions
-        - Precomputed tensors stored as plain attributes (NOT buffers) so
-          DDP does not try to synchronize them across ranks.
+        - Precomputed tensors (fallback path only) stored as plain
+          attributes/dict entries (NOT buffers) so DDP does not try to
+          synchronize them across ranks.
     """
 
     MIN_CELL_SIZE = 1
@@ -78,16 +95,193 @@ class GeographicPruning(nn.Module):
         self,
         geometry,
         chunk_size: int = 10,
+        max_cached_patches: int = 64,
     ):
         super().__init__()
         self.geometry = geometry
         self.chunk_size = chunk_size
 
-        # Cache keyed by shape + latent position hash
+        # ── Original shared-batch cache (unchanged) ─────────────────────
         self._precomputed_keys = set()
 
+        # ── Fallback per-sample (patch_id-keyed) LRU cache ──────────────
+        # Only used when the caller doesn't supply a precomputed
+        # token_latent_assignment. See module docstring for the staleness
+        # caveat that makes this a fallback, not the recommended path.
+        self.max_cached_patches = max_cached_patches
+        self._patch_cache: "OrderedDict[str, dict]" = OrderedDict()
+
     # =========================================================================
-    # Cache key computation
+    # NEW (AUTHORITATIVE): build padded cell structure from a GIVEN assignment
+    # =========================================================================
+
+    def _build_cell_from_assignment(
+        self,
+        assignment: torch.Tensor,   # [N] long — nearest-latent index per token,
+                                     # already selected for the correct D4
+                                     # variant and gathered to match this
+                                     # sample's current token order.
+        L_spatial: int,
+        device: torch.device,
+    ) -> dict:
+        """
+        Build the padded per-latent cell structure (cell_indices, cell_valid,
+        cell_counts) directly from a precomputed assignment array — no
+        distance computation, no geometry lookup. This is the O(N) "build
+        the Voronoi partition given the answer" step; the expensive part
+        (nearest-latent search) already happened offline.
+
+        VECTORIZED (no Python loop over L): the original implementation
+        looped `for l in range(L): torch.where(assignment == l)`, which is
+        fine at small L (~100) but scales badly — at L~450+ (e.g. bigger
+        patches with more latents), that loop dominates the pruning step's
+        cost every training batch. This version uses a single global
+        argsort to group tokens by latent id in O(N log N), with NO
+        per-latent Python iteration at all, regardless of how large L gets.
+
+        Within-cell randomization (originally a per-cell torch.randperm)
+        is achieved for free by pre-shuffling ALL N indices ONCE before
+        sorting by assignment — argsort is stable, so ties (tokens in the
+        same cell) keep the pre-shuffled relative order, giving the same
+        statistical effect as per-cell shuffling at a fraction of the cost.
+        """
+        N = assignment.shape[0]
+        L = L_spatial
+
+        cell_counts = torch.bincount(assignment, minlength=L)
+        max_cell_size = max(int(cell_counts.max().item()), self.MIN_CELL_SIZE)
+
+        # ── Global pre-shuffle (replaces per-cell torch.randperm) ────────
+        shuffle = torch.randperm(N, device=device)
+        assignment_shuffled = assignment[shuffle]
+
+        # ── Stable sort by latent id: groups tokens by cell in one pass ──
+        sort_order = torch.argsort(assignment_shuffled, stable=True)
+        # `order[i]` = original token index of the i-th token in
+        # cell-grouped order (composing the pre-shuffle with the sort).
+        order = shuffle[sort_order]
+        sorted_assignment = assignment_shuffled[sort_order]  # == assignment[order]
+
+        # ── Per-position column index within its own cell, vectorized ───
+        # start_offsets[l] = index in `order` where cell l's block begins.
+        start_offsets = torch.cumsum(cell_counts, dim=0) - cell_counts  # [L]
+        start_offset_per_pos = start_offsets[sorted_assignment]         # [N]
+        col_idx = torch.arange(N, device=device) - start_offset_per_pos  # [N]
+
+        # ── Scatter into the padded [L, max_cell_size] structure ────────
+        cell_indices_padded = torch.zeros(L, max_cell_size, dtype=torch.long, device=device)
+        cell_valid_mask = torch.zeros(L, max_cell_size, dtype=torch.bool, device=device)
+        cell_indices_padded[sorted_assignment, col_idx] = order
+        cell_valid_mask[sorted_assignment, col_idx] = True
+
+        return {
+            "cell_indices": cell_indices_padded,  # [L, max_cell_size]
+            "cell_valid":   cell_valid_mask,       # [L, max_cell_size]
+            "cell_counts":  cell_counts,             # [L]
+        }
+
+    def _forward_from_precomputed(
+        self,
+        tokens: torch.Tensor,                 # [B, N, D]
+        mask: torch.Tensor,                   # [B, N]
+        geo_k: int,
+        L_spatial: int,
+        token_latent_assignment: torch.Tensor,  # [B, N] long
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, N, D = tokens.shape
+        L = L_spatial
+        device = tokens.device
+        dtype = tokens.dtype
+
+        assert token_latent_assignment.shape == (B, N), (
+            f"token_latent_assignment must be [B, N] = [{B}, {N}], "
+            f"got {tuple(token_latent_assignment.shape)}"
+        )
+
+        # ── Early, clear diagnostic for a precompute/runtime L_spatial
+        # mismatch — this used to surface as a cryptic
+        # "expanded size of the tensor (X) must match existing size (Y)"
+        # error deep inside cell_counts_b assignment below, with no hint
+        # about WHAT was mismatched or WHY. Catch it here instead: the
+        # precomputed assignment's own max index tells us the L_spatial
+        # it was actually built for, which we can compare directly
+        # against what the runtime grid_config computed.
+        assign_max = int(token_latent_assignment.max().item())
+        if assign_max >= L:
+            raise RuntimeError(
+                f"[GeographicPruningDales] token_latent_assignment contains "
+                f"index {assign_max}, but the runtime grid_config computed "
+                f"L_spatial={L} for this batch. This means the PRECOMPUTED "
+                f"assignment (from precompute_dales_latent_assignment.py) "
+                f"was built with a DIFFERENT tokens_per_latent / "
+                f"patch_size_m / max_lidar_points than what the model is "
+                f"CURRENTLY configured with (config['latent_grid'] / "
+                f"the --config_model YAML passed at runtime).\n"
+                f"  -> Check that --config_model here matches EXACTLY the "
+                f"YAML used to run precompute_dales_latent_assignment.py "
+                f"(specifically latent_grid.train_sampling/val_sampling's "
+                f"tokens_per_latent value), and that --max_lidar_points "
+                f"matches too.\n"
+                f"  -> Run check_precompute_consistency.py to confirm what "
+                f"L_spatial your .npz files were actually built with, then "
+                f"either fix the config to match, or re-run precompute to "
+                f"match the config."
+            )
+
+        per_sample_cells = [
+            self._build_cell_from_assignment(
+                token_latent_assignment[b].long(), L, device
+            )
+            for b in range(B)
+        ]
+
+        max_cell_size = max(c["cell_indices"].shape[1] for c in per_sample_cells)
+
+        cell_indices_b = torch.zeros(B, L, max_cell_size, dtype=torch.long, device=device)
+        cell_valid_b   = torch.zeros(B, L, max_cell_size, dtype=torch.bool, device=device)
+        cell_counts_b  = torch.zeros(B, L, dtype=torch.long, device=device)
+
+        for b, c in enumerate(per_sample_cells):
+            m = c["cell_indices"].shape[1]
+            cell_indices_b[b, :, :m] = c["cell_indices"]
+            cell_valid_b[b, :, :m]   = c["cell_valid"]
+            cell_counts_b[b]         = c["cell_counts"]
+
+        k = min(geo_k, max_cell_size)
+        position_indices = torch.arange(k, device=device).view(1, 1, k)
+        selection_valid = (position_indices < cell_counts_b.unsqueeze(-1))  # [B,L,k]
+
+        if self.training:
+            rand_scores = torch.rand(B, L, max_cell_size, device=device, dtype=dtype)
+            rand_scores = torch.where(
+                cell_valid_b, rand_scores,
+                torch.tensor(float('-inf'), device=device, dtype=dtype),
+            )
+            _, perm = torch.sort(rand_scores, dim=-1, descending=True)
+            perm_k = perm[:, :, :k].clamp(0, max(max_cell_size - 1, 0))
+            selected_indices = torch.gather(cell_indices_b, dim=2, index=perm_k)
+        else:
+            selected_indices = cell_indices_b[:, :, :k].clone()
+
+        selected_indices = selected_indices.clamp(0, N - 1)
+        selected_indices = torch.where(
+            selection_valid, selected_indices, torch.zeros_like(selected_indices)
+        )
+
+        # Binary attention mask (0 valid, -inf invalid) — no distance-based
+        # weighting, same convention as the rest of this module.
+        bias = torch.zeros(B, L, k, device=device, dtype=dtype).masked_fill(
+            ~selection_valid, float('-inf')
+        )
+
+        tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
+        masks_per_latent = self._gather_masks(mask, selected_indices, N)
+        masks_per_latent = masks_per_latent | (~selection_valid)
+
+        return tokens_per_latent, masks_per_latent, bias.to(dtype)
+
+    # =========================================================================
+    # Cache key computation (shared-batch path, unchanged from original)
     # =========================================================================
 
     def _make_cache_key(
@@ -97,28 +291,15 @@ class GeographicPruning(nn.Module):
         hexagonal: bool,
         latent_coords: torch.Tensor,
     ) -> str:
-        """
-        Build a cache key that includes latent positions.
-
-        Prevents cache collisions when the same N/L/grid_type is used
-        with different latent coordinates (e.g., callbacks vs training,
-        or different grid configs).
-
-        Uses zlib.crc32 (not Python's built-in hash()) so the same input
-        produces the same key across DDP ranks. Python's hash() is salted
-        per-process via PYTHONHASHSEED → inconsistent keys across ranks.
-        """
         grid_type = "hex" if hexagonal else "sq"
-
-        # Hash latent positions — round to integer to be robust to float noise
         coords_flat = latent_coords[0].detach().float().cpu()
         coords_rounded = coords_flat.long()
         pos_hash = zlib.crc32(coords_rounded.numpy().tobytes()) % (10**8)
-
         return f"{N}_{L_spatial}_{grid_type}_{pos_hash}"
 
     # =========================================================================
-    # Voronoi assignment (for cached path)
+    # Voronoi assignment (shared helper, used by both shared-batch and
+    # per-sample paths)
     # =========================================================================
 
     def _compute_nearest_latent_chunked(
@@ -176,7 +357,167 @@ class GeographicPruning(nn.Module):
         return nearest_latent, min_dist_sq.to(original_dtype)
 
     # =========================================================================
-    # Precomputation (cached path, small N only)
+    # FALLBACK per-sample precomputation (one scene, keyed by patch_id) —
+    # only used when no precomputed token_latent_assignment is supplied.
+    # See module docstring for the staleness caveat vs the offline path.
+    # =========================================================================
+
+    def _compute_one_sample_cell(
+        self,
+        tokens_b: torch.Tensor,   # [N, D] — single sample's tokens
+        latent_coords_b: torch.Tensor,  # [L, 2] — this sample's latent positions
+        L_spatial: int,
+    ) -> dict:
+        N = tokens_b.shape[0]
+        L = L_spatial
+        device = tokens_b.device
+        dtype = tokens_b.dtype
+
+        with torch.no_grad():
+            pixel_coords = self.geometry.get_token_centers(
+                tokens_b.unsqueeze(0)
+            ).squeeze(0)  # [N, 2]
+
+            cell_membership, dist_to_nearest = self._compute_nearest_latent_chunked(
+                pixel_coords, latent_coords_b
+            )
+
+            cell_counts = torch.bincount(cell_membership, minlength=L)
+            max_cell_size = max(cell_counts.max().item(), self.MIN_CELL_SIZE)
+
+            cell_indices_padded = torch.zeros(L, max_cell_size, dtype=torch.long, device=device)
+            cell_valid_mask = torch.zeros(L, max_cell_size, dtype=torch.bool, device=device)
+            cell_distances = torch.zeros(L, max_cell_size, dtype=dtype, device=device)
+
+            for l in range(L):
+                in_cell_mask = (cell_membership == l)
+                in_cell_indices = torch.where(in_cell_mask)[0]
+                in_cell_distances = dist_to_nearest[in_cell_mask]
+                n_in_cell = in_cell_indices.shape[0]
+                if n_in_cell > 0:
+                    perm = torch.randperm(n_in_cell, device=device)
+                    cell_indices_padded[l, :n_in_cell] = in_cell_indices[perm]
+                    cell_valid_mask[l, :n_in_cell] = True
+                    cell_distances[l, :n_in_cell] = in_cell_distances[perm]
+
+            del pixel_coords, cell_membership, dist_to_nearest
+
+        return {
+            "cell_indices":   cell_indices_padded,   # [L, max_cell_size]
+            "cell_valid":     cell_valid_mask,        # [L, max_cell_size]
+            "cell_distances": cell_distances,          # [L, max_cell_size]
+            "cell_counts":    cell_counts,              # [L]
+        }
+
+    def _get_or_compute_patch_cell(
+        self,
+        patch_id: str,
+        tokens_b: torch.Tensor,
+        latent_coords_b: torch.Tensor,
+        L_spatial: int,
+    ) -> dict:
+        """
+        FALLBACK ONLY. LRU-cached per-scene Voronoi lookup keyed by
+        patch_id alone — STALE across differing D4 augmentations of the
+        same patch (see module docstring). Prefer
+        forward(..., token_latent_assignment=...) instead.
+        """
+        if patch_id in self._patch_cache:
+            self._patch_cache.move_to_end(patch_id)
+            return self._patch_cache[patch_id]
+
+        cell_data = self._compute_one_sample_cell(tokens_b, latent_coords_b, L_spatial)
+        self._patch_cache[patch_id] = cell_data
+
+        if len(self._patch_cache) > self.max_cached_patches:
+            oldest_id, oldest_data = self._patch_cache.popitem(last=False)
+            del oldest_data
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        return cell_data
+
+    # =========================================================================
+    # FALLBACK per-sample forward path (compute-and-cache by patch_id only)
+    # =========================================================================
+
+    def _forward_per_sample(
+        self,
+        tokens: torch.Tensor,       # [B, N, D]
+        mask: torch.Tensor,         # [B, N]
+        latent_coords: torch.Tensor,  # [B, L, 2]
+        geo_k: int,
+        sigma: float,
+        L_spatial: int,
+        patch_ids: List[str],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, N, D = tokens.shape
+        L = L_spatial
+        device = tokens.device
+        dtype = tokens.dtype
+        assert len(patch_ids) == B, (
+            f"patch_ids must have length B={B}, got {len(patch_ids)}"
+        )
+
+        per_sample_cells = []
+        for b in range(B):
+            cell_data = self._get_or_compute_patch_cell(
+                patch_ids[b], tokens[b], latent_coords[b], L_spatial
+            )
+            per_sample_cells.append(cell_data)
+
+        max_cell_size = max(c["cell_indices"].shape[1] for c in per_sample_cells)
+
+        cell_indices_b = torch.zeros(B, L, max_cell_size, dtype=torch.long, device=device)
+        cell_valid_b   = torch.zeros(B, L, max_cell_size, dtype=torch.bool, device=device)
+        cell_distances_b = torch.zeros(B, L, max_cell_size, dtype=dtype, device=device)
+        cell_counts_b  = torch.zeros(B, L, dtype=torch.long, device=device)
+
+        for b, c in enumerate(per_sample_cells):
+            m = c["cell_indices"].shape[1]
+            cell_indices_b[b, :, :m]   = c["cell_indices"]
+            cell_valid_b[b, :, :m]     = c["cell_valid"]
+            cell_distances_b[b, :, :m] = c["cell_distances"].to(dtype)
+            cell_counts_b[b]           = c["cell_counts"]
+
+        k = min(geo_k, max_cell_size)
+        position_indices = torch.arange(k, device=device).view(1, 1, k)
+        selection_valid = (position_indices < cell_counts_b.unsqueeze(-1))
+
+        if self.training:
+            rand_scores = torch.rand(B, L, max_cell_size, device=device, dtype=dtype)
+            rand_scores = torch.where(
+                cell_valid_b, rand_scores,
+                torch.tensor(float('-inf'), device=device, dtype=dtype),
+            )
+            _, perm = torch.sort(rand_scores, dim=-1, descending=True)
+            perm_k = perm[:, :, :k].clamp(0, max(max_cell_size - 1, 0))
+
+            selected_indices = torch.gather(cell_indices_b, dim=2, index=perm_k)
+            selected_dist_sq = torch.gather(cell_distances_b, dim=2, index=perm_k)
+        else:
+            selected_indices = cell_indices_b[:, :, :k].clone()
+            selected_dist_sq = cell_distances_b[:, :, :k].clone()
+
+        selected_indices = selected_indices.clamp(0, N - 1)
+        selected_indices = torch.where(
+            selection_valid, selected_indices, torch.zeros_like(selected_indices)
+        )
+
+        bias = torch.zeros_like(selected_dist_sq).masked_fill(
+            ~selection_valid, float('-inf')
+        )
+
+        tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
+        masks_per_latent = self._gather_masks(mask, selected_indices, N)
+        masks_per_latent = masks_per_latent | (~selection_valid)
+
+        return tokens_per_latent, masks_per_latent, bias.to(dtype)
+
+    # =========================================================================
+    # ORIGINAL: shared-batch precomputation (unchanged, kept for FRACTAL /
+    # raster-uniform modalities where sample-0 geometry IS valid for the
+    # whole batch)
     # =========================================================================
 
     def _precompute_voronoi_cells(
@@ -186,15 +527,6 @@ class GeographicPruning(nn.Module):
         L_spatial: int,
         cache_key: str,
     ):
-        """
-        Precompute Voronoi cell membership and build padded tensors.
-
-        Empty cells are safe: indices default to 0, valid mask is False,
-        and downstream code masks them out with -inf bias.
-
-        The precomputed tensors are stored as PLAIN ATTRIBUTES (via setattr),
-        not buffers. See the DDP NOTE at the top of this file for why.
-        """
         B, N, D = tokens.shape
         L = L_spatial
         device = tokens.device
@@ -204,16 +536,13 @@ class GeographicPruning(nn.Module):
         print(f"  Tokens: {N}, Latents: {L}")
 
         with torch.no_grad():
-            # Get coordinates
             pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)
             lat_coords = latent_coords[0]
 
-            # Voronoi assignment
             cell_membership, dist_to_nearest = self._compute_nearest_latent_chunked(
                 pixel_coords, lat_coords
             )
 
-            # Count tokens per cell
             cell_counts = torch.bincount(cell_membership, minlength=L)
 
             empty_cells = (cell_counts == 0).sum().item()
@@ -221,13 +550,11 @@ class GeographicPruning(nn.Module):
                 print(f"  WARNING: {empty_cells}/{L} latents have EMPTY Voronoi cells!")
                 print(f"  These will be masked out during attention (bias=-inf).")
 
-            # max_cell_size must be >= 1 for safe tensor ops
             max_cell_size = max(cell_counts.max().item(), self.MIN_CELL_SIZE)
 
             print(f"  Cell sizes: min={cell_counts.min().item()}, "
                   f"max={max_cell_size}, mean={cell_counts.float().mean().item():.0f}")
 
-            # Build padded tensors
             cell_indices_padded = torch.zeros(L, max_cell_size, dtype=torch.long, device=device)
             cell_valid_mask = torch.zeros(L, max_cell_size, dtype=torch.bool, device=device)
             cell_distances = torch.zeros(L, max_cell_size, dtype=dtype, device=device)
@@ -244,14 +571,7 @@ class GeographicPruning(nn.Module):
                     cell_indices_padded[l, :n_in_cell] = in_cell_indices[perm]
                     cell_valid_mask[l, :n_in_cell] = True
                     cell_distances[l, :n_in_cell] = in_cell_distances[perm]
-                # Empty cells: indices=0, valid=False, distances=0
-                # Index 0 is a safe fallback — the token will be masked out
 
-            # ── Store as plain attributes (NOT buffers) ───────────────
-            # See DDP NOTE at top of file. register_buffer would cause
-            # DDP to broadcast these across ranks at every forward pass,
-            # leading to either shape-mismatch deadlocks or corrupted
-            # per-rank data.
             setattr(self, f"cell_indices_{cache_key}",   cell_indices_padded)
             setattr(self, f"cell_valid_{cache_key}",     cell_valid_mask)
             setattr(self, f"cell_distances_{cache_key}", cell_distances)
@@ -264,7 +584,7 @@ class GeographicPruning(nn.Module):
             torch.cuda.empty_cache()
 
     # =========================================================================
-    # On-the-fly path (large N, no caching)
+    # ORIGINAL: on-the-fly path (large N, shared-batch, unchanged)
     # =========================================================================
 
     def _forward_on_the_fly(
@@ -276,15 +596,6 @@ class GeographicPruning(nn.Module):
         sigma: float,
         L_spatial: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        On-the-fly geographic pruning for large token counts.
-
-        Uses chunked top-k per latent instead of full Voronoi precomputation.
-        No caching — handles variable token counts without memory explosion.
-
-        Chunks over latents to keep peak memory bounded:
-            peak ≈ chunk_size × N × sizeof(float)
-        """
         B, N, D = tokens.shape
         k = min(geo_k, N)
         L = L_spatial
@@ -294,27 +605,24 @@ class GeographicPruning(nn.Module):
         print(f"[GeoPruning] On-the-fly: N={N}, L={L}, k={k} ...")
 
         with torch.no_grad():
-            pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)  # [N, 2]
-            lat_coords = latent_coords[0]  # [L, 2]
+            pixel_coords = self.geometry.get_token_centers(tokens[0:1]).squeeze(0)
+            lat_coords = latent_coords[0]
 
             selected_indices = torch.zeros(L, k, dtype=torch.long, device=device)
             selected_dist_sq = torch.zeros(L, k, dtype=dtype, device=device)
             selection_valid = torch.zeros(L, k, dtype=torch.bool, device=device)
 
-            # Chunk over latents to bound memory at chunk_size × N
             chunk = max(self.chunk_size, 1)
             for l_start in range(0, L, chunk):
                 l_end = min(l_start + chunk, L)
-                lat_chunk = lat_coords[l_start:l_end]  # [c, 2]
+                lat_chunk = lat_coords[l_start:l_end]
 
-                # [c, N] distance matrix
-                diff = pixel_coords.unsqueeze(0) - lat_chunk.unsqueeze(1)  # [c, N, 2]
-                dist_sq = (diff ** 2).sum(dim=-1)  # [c, N]
+                diff = pixel_coords.unsqueeze(0) - lat_chunk.unsqueeze(1)
+                dist_sq = (diff ** 2).sum(dim=-1)
                 del diff
 
                 actual_k = min(k, N)
 
-                # Top-k nearest tokens per latent in this chunk
                 topk_dist, topk_idx = torch.topk(
                     dist_sq, actual_k, dim=-1, largest=False
                 )
@@ -324,12 +632,10 @@ class GeographicPruning(nn.Module):
                 selected_dist_sq[l_start:l_end, :actual_k] = topk_dist
                 selection_valid[l_start:l_end, :actual_k] = True
 
-        # Expand to batch dimension
         selected_indices = selected_indices.unsqueeze(0).expand(B, -1, -1).contiguous()
         selected_dist_sq = selected_dist_sq.unsqueeze(0).expand(B, -1, -1).contiguous()
         selection_valid = selection_valid.unsqueeze(0).expand(B, -1, -1).contiguous()
 
-        # Training: shuffle the k selected tokens per latent for stochastic sampling
         if self.training:
             rand_perm = torch.rand(B, L, k, device=device, dtype=dtype)
             rand_perm = torch.where(
@@ -342,24 +648,17 @@ class GeographicPruning(nn.Module):
             selected_dist_sq = torch.gather(selected_dist_sq, dim=2, index=perm)
             selection_valid = torch.gather(selection_valid, dim=2, index=perm)
 
-        # Safety: clamp indices
         selected_indices = selected_indices.clamp(0, N - 1)
         selected_indices = torch.where(
             selection_valid, selected_indices, torch.zeros_like(selected_indices)
         )
 
-        # Binary attention mask: 0 for valid positions, -inf for invalid.
-        # The `sigma` argument is kept in the signature for API compatibility
-        # but is no longer used; in-cell positions are not distance-weighted.
         bias = torch.zeros_like(selected_dist_sq).masked_fill(
             ~selection_valid, float('-inf')
         )
 
-        # Gather tokens and masks
         tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
         masks_per_latent = self._gather_masks(mask, selected_indices, N)
-
-        # Force-mask invalid positions
         masks_per_latent = masks_per_latent | (~selection_valid)
 
         print(f"[GeoPruning] On-the-fly done.")
@@ -367,7 +666,7 @@ class GeographicPruning(nn.Module):
         return tokens_per_latent, masks_per_latent, bias.to(dtype)
 
     # =========================================================================
-    # Forward (routes to cached or on-the-fly path)
+    # Forward (routes to precomputed / fallback per-sample / shared-batch)
     # =========================================================================
 
     def forward(
@@ -379,55 +678,52 @@ class GeographicPruning(nn.Module):
         sigma: float,
         L_spatial: int,
         hexagonal: bool = False,
+        patch_ids: Optional[List[str]] = None,
+        token_latent_assignment: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         B, N, D = tokens.shape
-        k = geo_k
-        device = tokens.device
-        dtype = tokens.dtype
 
-        # =================================================================
-        # Route: on-the-fly for large inputs, cached for small
-        # =================================================================
+        # ── AUTHORITATIVE (DALES): precomputed per-token assignment ─────
+        if token_latent_assignment is not None:
+            return self._forward_from_precomputed(
+                tokens, mask, geo_k, L_spatial, token_latent_assignment
+            )
+
+        # ── FALLBACK (DALES without precompute available): per-sample,
+        # compute-and-cache by patch_id only (staleness caveat applies) ──
+        if patch_ids is not None:
+            return self._forward_per_sample(
+                tokens, mask, latent_coords, geo_k, sigma, L_spatial, patch_ids
+            )
+
+        # ── ORIGINAL: shared-batch paths (raster-uniform modalities) ────
         if N > self.ON_THE_FLY_THRESHOLD:
             return self._forward_on_the_fly(
                 tokens, mask, latent_coords, geo_k, sigma, L_spatial
             )
 
-        # =================================================================
-        # Cached Voronoi path (original logic, for small N)
-        # =================================================================
+        k = geo_k
+        device = tokens.device
+        dtype = tokens.dtype
 
         cache_key = self._make_cache_key(N, L_spatial, hexagonal, latent_coords)
 
         if cache_key not in self._precomputed_keys:
             self._precompute_voronoi_cells(tokens, latent_coords, L_spatial, cache_key)
 
-        # Retrieve cached tensors (stored as plain attributes, not buffers)
         cell_indices = getattr(self, f"cell_indices_{cache_key}")
         cell_valid = getattr(self, f"cell_valid_{cache_key}")
         cell_distances = getattr(self, f"cell_distances_{cache_key}")
         cell_counts = getattr(self, f"cell_counts_{cache_key}")
 
         max_cell_size = cell_indices.shape[1]
-
-        # =====================================================================
-        # Clamp k to available tokens
-        # =====================================================================
         k = min(k, max_cell_size)
 
-        # =====================================================================
-        # Build selection validity mask (ALWAYS, not just when min < k)
-        # This is the key fix: always track which positions are valid
-        # =====================================================================
-        position_indices = torch.arange(k, device=device).unsqueeze(0)      # [1, k]
-        cell_counts_clamped = cell_counts.unsqueeze(1)                       # [L, 1]
-        selection_valid = (position_indices < cell_counts_clamped)            # [L, k]
-        selection_valid = selection_valid.unsqueeze(0).expand(B, -1, -1)     # [B, L, k]
-
-        # =====================================================================
-        # TENSORIZED SAMPLING
-        # =====================================================================
+        position_indices = torch.arange(k, device=device).unsqueeze(0)
+        cell_counts_clamped = cell_counts.unsqueeze(1)
+        selection_valid = (position_indices < cell_counts_clamped)
+        selection_valid = selection_valid.unsqueeze(0).expand(B, -1, -1)
 
         if self.training:
             rand_scores = torch.rand(B, L_spatial, max_cell_size, device=device, dtype=dtype)
@@ -439,8 +735,6 @@ class GeographicPruning(nn.Module):
 
             _, perm = torch.sort(rand_scores, dim=-1, descending=True)
             perm_k = perm[:, :, :k]
-
-            # Clamp to valid buffer range
             perm_k = perm_k.clamp(0, max(max_cell_size - 1, 0))
 
             indices_expanded = cell_indices.unsqueeze(0).expand(B, -1, -1)
@@ -452,39 +746,23 @@ class GeographicPruning(nn.Module):
             selected_indices = cell_indices[:, :k].unsqueeze(0).expand(B, -1, -1).clone()
             selected_dist_sq = cell_distances[:, :k].unsqueeze(0).expand(B, -1, -1).clone()
 
-        # =====================================================================
-        # Clamp ALL indices to valid token range [0, N-1]
-        # This is the critical safety net for empty cells
-        # =====================================================================
         selected_indices = selected_indices.clamp(0, N - 1)
-
-        # Zero out invalid positions (redundant with clamp but explicit)
         selected_indices = torch.where(
             selection_valid, selected_indices, torch.zeros_like(selected_indices)
         )
 
-        # =====================================================================
-        # Binary attention mask: 0 for valid positions, -inf for invalid.
-        # The `sigma` argument is kept in the signature for API compatibility
-        # but is no longer used; in-cell positions are not distance-weighted.
-        # =====================================================================
         bias = torch.zeros_like(selected_dist_sq).masked_fill(
             ~selection_valid, float('-inf')
         )
 
-        # =====================================================================
-        # Gather tokens and masks
-        # =====================================================================
         tokens_per_latent = self._gather_tokens(tokens, selected_indices, N)
         masks_per_latent = self._gather_masks(mask, selected_indices, N)
-
-        # Force-mask invalid positions
         masks_per_latent = masks_per_latent | (~selection_valid)
 
         return tokens_per_latent, masks_per_latent, bias.to(dtype)
 
     # =========================================================================
-    # Gather helpers (with bounds checking)
+    # Gather helpers (with bounds checking) — unchanged
     # =========================================================================
 
     def _gather_tokens(
@@ -520,12 +798,7 @@ class GeographicPruning(nn.Module):
     # =========================================================================
 
     def clear_cache(self, cache_key: Optional[str] = None):
-        """
-        Clear precomputed attributes.
-
-        Works for both buffer-style storage (legacy) and plain attribute
-        storage (current) — delattr handles both transparently.
-        """
+        """Clear the ORIGINAL shared-batch cache (unchanged behavior)."""
         keys_to_clear = [cache_key] if cache_key else list(self._precomputed_keys)
 
         for key in keys_to_clear:
@@ -538,10 +811,20 @@ class GeographicPruning(nn.Module):
         gc.collect()
         torch.cuda.empty_cache()
 
+    def clear_patch_cache(self, patch_id: Optional[str] = None):
+        """Clear the FALLBACK per-sample (patch_id-keyed) cache."""
+        if patch_id is not None:
+            self._patch_cache.pop(patch_id, None)
+        else:
+            self._patch_cache.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def extra_repr(self) -> str:
         cached = ", ".join(self._precomputed_keys) if self._precomputed_keys else "none"
         return (
             f"chunk_size={self.chunk_size}, "
             f"on_the_fly_threshold={self.ON_THE_FLY_THRESHOLD}, "
-            f"cached=[{cached}]"
+            f"shared_batch_cached=[{cached}], "
+            f"fallback_per_sample_cache_size={len(self._patch_cache)}/{self.max_cached_patches}"
         )

@@ -1,3 +1,0 @@
-table,idx,tokens_per_latent,cross_k,test_mIoU,test_accuracy,gflops,rc
-1,0,4000,2000,0.902255,0.9396,7378.238769,0
-1,1,8000,2000,0.900208,0.938472,7141.215243,0

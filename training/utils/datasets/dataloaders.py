@@ -147,7 +147,11 @@ class UnifiedDataModule(pl.LightningDataModule):
                                 'Sen1Floods11SkipDataset',
                                 'MADOSDataset',
                                 'EuroSATSARDataset',
-                                'BioMasstersSkipDataset'
+                                'BioMasstersSkipDataset',
+                                'CashewSkipDataset',
+                                'XView2Dataset',
+                                'XView2TemporalDataset'
+
                                 }
 
     def __init__(

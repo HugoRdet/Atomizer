@@ -9,6 +9,15 @@ All model / latent-grid / token-budget settings come from
 applied here is `num_classes = 10`, which is a property of the
 task rather than the model.
 
+CHANGES vs. original:
+    - val_dataset now draws from a genuine held-out slice of the TRAIN set
+      (see the patched MNISTSparseCanvas / _load_mnist_with_val_split),
+      not the test set. ModelCheckpoint(monitor="val_loss") therefore
+      selects the best checkpoint without ever touching test data.
+    - A separate test_dataset/test_loader (mode="test") is now built and
+      used for the final trainer.test() call, instead of reusing
+      val_loader. This is the actual, untouched 10k MNIST test set.
+
 Usage:
     # Train + auto-test on best checkpoint
     python train_mnist.py
@@ -122,7 +131,7 @@ config_model["trainer"]["num_classes"] = 10
 bands_yaml = "./data/bands_info/bands.yaml"
 configs_dataset = "./data/Tiny_BigEarthNet/configs_dataset_regular.yaml"
 lookup_table = Lookup_encoding(
-    read_yaml(configs_dataset), read_yaml(bands_yaml), config_model
+    None, read_yaml(bands_yaml), config_model
 )
 
 # Register MNIST resolution (0.2 m/px, 28×28 canvas)
@@ -153,12 +162,21 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # =============================================================================
 # DATASETS
 # =============================================================================
+# train: 55k (60k train minus held-out val), FORCED subsample_keep_rate=1.0
+#        by MNISTSparseCanvas regardless of config.
+# val:   5k, stratified held-out slice of the TRAIN set (used for checkpoint
+#        selection only -- never touches test data).
+# test:  the real, untouched 10k MNIST test set. Only used once, at the end,
+#        for the final reported numbers.
 
 train_dataset = MNISTSparseCanvas(
     mode="train", config_model=config_model, look_up=lookup_table,
 )
 val_dataset = MNISTSparseCanvas(
     mode="val", config_model=config_model, look_up=lookup_table,
+)
+test_dataset = MNISTSparseCanvas(
+    mode="test", config_model=config_model, look_up=lookup_table,
 )
 
 batch_size = config_model["trainer"]["batchsize"]
@@ -169,6 +187,10 @@ train_loader = DataLoader(
 )
 val_loader = DataLoader(
     val_dataset, batch_size=batch_size, shuffle=False,
+    num_workers=4, collate_fn=mnist_collate, pin_memory=True,
+)
+test_loader = DataLoader(
+    test_dataset, batch_size=batch_size, shuffle=False,
     num_workers=4, collate_fn=mnist_collate, pin_memory=True,
 )
 
@@ -190,8 +212,8 @@ callbacks = [
     GradientAccumulationScheduler(scheduling={0: 1}),
     ModelCheckpoint(
         dirpath="./checkpoints/mnist/",
-        filename=f"{xp_name}-{{epoch:02d}}-{{val_loss:.4f}}",
-        monitor="val_loss", mode="min", save_top_k=1, verbose=True,
+        filename=f"{xp_name}-{{epoch:02d}}-{{val_acc:.4f}}",
+        monitor="val_accuracy", mode="max", save_top_k=1, verbose=True,
     ),
 ]
 
@@ -223,7 +245,8 @@ if test_only:
     if args.wandb_run_id:
         print(f"  Wandb run:  {args.wandb_run_id} (resumed)")
     print("=" * 60)
-    trainer.test(model, dataloaders=val_loader, ckpt_path=args.test_ckpt)
+    # Real test set, not val_loader.
+    trainer.test(model, dataloaders=test_loader, ckpt_path=args.test_ckpt)
 
 else:
     print("=" * 60)
@@ -241,6 +264,9 @@ else:
     print(f"  mode:             {config_model['trainer'].get('mode', 'segmentation')}")
     print(f"  Batch:            {batch_size}")
     print(f"  Epochs:           {config_model['trainer']['epochs']}")
+    print(f"  Train samples:    {len(train_dataset)}")
+    print(f"  Val samples:      {len(val_dataset)}  (held-out from train, stratified)")
+    print(f"  Test samples:     {len(test_dataset)}  (real MNIST test set)")
     print("=" * 60)
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
@@ -248,14 +274,13 @@ else:
     # =========================================================================
     # TEST (auto, on best checkpoint)
     # =========================================================================
-    # MNIST has no separate val split, so val_loader already wraps the test
-    # set. We reuse it here and load the best checkpoint (lowest val_loss)
-    # saved by ModelCheckpoint so reported metrics reflect the best model,
-    # not the last.
+    # Best checkpoint is selected via val_loss on the held-out train slice
+    # (never touches test data). Final reported metrics come from a single
+    # pass over the real, untouched MNIST test set.
     print("\n" + "=" * 60)
     print("Running final test on best checkpoint...")
     print("=" * 60)
-    trainer.test(model, dataloaders=val_loader, ckpt_path="best")
+    trainer.test(model, dataloaders=test_loader, ckpt_path="best")
 
 # =============================================================================
 # SAVE RUN ID

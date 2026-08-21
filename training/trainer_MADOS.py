@@ -31,7 +31,22 @@ IMPORTANT — sliding window:
   which case _forward_crop below should be extended to slice and pass them
   through (see the commented-out lines in _forward_crop).
 
+FIXED (this version): validation now tracks per-class IoU/accuracy too,
+not just the macro average. Previously metric_IoU_val / metric_acc_val
+were built with average="macro" (a single scalar), unlike the test-side
+metrics which used average=None — this meant there was no way to compare
+a given class's IoU on validation vs. test, which is exactly the
+comparison needed to tell whether a class collapses specifically on the
+test split (a distribution-shift issue) or is uniformly hard everywhere
+(a genuine model weakness). val_IoU_<class> / val_acc_<class> are now
+logged every validation epoch end, mirroring the test-side per-class
+logging exactly. The scalar val_mIoU / val_accuracy logging (used by
+ModelCheckpoint's monitor="val_mIoU") is unchanged — it's just the mean
+of the same per-class tensor, computed once now instead of via a
+separately-configured macro metric.
+
 All changes vs the Sen1Floods11 skip trainer are tagged  # >>> MADOS.
+Additional fixes in this version are tagged  # >>> FIX.
 """
 
 import torch
@@ -98,9 +113,29 @@ class Model_MADOS_Skip(pl.LightningModule):
             task="multiclass", num_classes=self.num_classes,
             average="macro", ignore_index=self.ignore_index,
         )
+        # >>> FIX: was average="macro" (scalar-only). Now per-class, same
+        # as metric_IoU_test, so val and test can be compared class-by-
+        # class. The scalar val_mIoU logged in on_validation_epoch_end is
+        # now just this tensor's mean, computed explicitly there.
         self.metric_IoU_val = torchmetrics.JaccardIndex(
             task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
+            average=None, ignore_index=self.ignore_index,
+        )
+        # >>> FIX: frequency-weighted val mIoU, for checkpoint selection.
+        # Macro mIoU weights every class equally regardless of pixel
+        # support, which on MADOS (99% ignored, several classes with only
+        # a few hundred labeled val pixels) means checkpoint selection via
+        # ModelCheckpoint(monitor="val_mIoU") is largely driven by noise on
+        # rare classes rather than genuine model quality. average="weighted"
+        # weights each class's IoU by its pixel support before averaging,
+        # so a rare class's noisy per-epoch swing can't dominate which
+        # checkpoint gets saved the way it can under macro averaging.
+        # Logged as val_mIoU_weighted; use THIS as the ModelCheckpoint
+        # monitor instead of val_mIoU for more stable checkpoint selection
+        # on datasets with this kind of class-sparsity profile.
+        self.metric_IoU_val_weighted = torchmetrics.JaccardIndex(
+            task="multiclass", num_classes=self.num_classes,
+            average="weighted", ignore_index=self.ignore_index,
         )
         self.metric_IoU_test = torchmetrics.JaccardIndex(
             task="multiclass", num_classes=self.num_classes,
@@ -110,9 +145,10 @@ class Model_MADOS_Skip(pl.LightningModule):
             task="multiclass", num_classes=self.num_classes,
             average="macro", ignore_index=self.ignore_index,
         )
+        # >>> FIX: same change as metric_IoU_val, for accuracy.
         self.metric_acc_val = torchmetrics.Accuracy(
             task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
+            average=None, ignore_index=self.ignore_index,
         )
         self.metric_acc_test = torchmetrics.Accuracy(
             task="multiclass", num_classes=self.num_classes,
@@ -288,6 +324,7 @@ class Model_MADOS_Skip(pl.LightningModule):
             if valid.sum() > 0:
                 self.metric_IoU_val.update(preds_full[valid], label_full[valid])
                 self.metric_acc_val.update(preds_full[valid], label_full[valid])
+                self.metric_IoU_val_weighted.update(preds_full[valid], label_full[valid])
             self.log("val_loss", loss, on_step=False, on_epoch=True,
                      prog_bar=True, logger=True)
             return loss
@@ -296,6 +333,7 @@ class Model_MADOS_Skip(pl.LightningModule):
             batch, training=False)
         self.metric_IoU_val.update(preds, labels)
         self.metric_acc_val.update(preds, labels)
+        self.metric_IoU_val_weighted.update(preds, labels)
         self.log("val_loss", seg_loss, on_step=False, on_epoch=True,
                  prog_bar=True, logger=True)
         return seg_loss
@@ -331,12 +369,35 @@ class Model_MADOS_Skip(pl.LightningModule):
         self.metric_acc_train.reset()
 
     def on_validation_epoch_end(self):
-        self.log("val_mIoU",     self.metric_IoU_val.compute(),
-                 on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_accuracy", self.metric_acc_val.compute(),
-                 on_epoch=True, prog_bar=True, logger=True)
+        # >>> FIX: metric_IoU_val / metric_acc_val are now per-class
+        # (average=None), same as test. Compute the mean explicitly for
+        # the scalar val_mIoU / val_accuracy logs (unchanged behavior for
+        # ModelCheckpoint's monitor="val_mIoU"), AND log each class
+        # individually so val can be compared directly against test's
+        # per-class breakdown -- e.g. to tell whether a class that's weak
+        # on test is ALSO weak on val (a genuinely hard class) or only
+        # collapses on test specifically (a val/test distribution issue).
+        val_iou = self.metric_IoU_val.compute()
+        val_acc = self.metric_acc_val.compute()
+        val_iou_weighted = self.metric_IoU_val_weighted.compute()
+
+        self.log("val_mIoU",     val_iou.mean(), on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_accuracy", val_acc.mean(), on_epoch=True, prog_bar=True, logger=True)
+        # >>> FIX: frequency-weighted alternative to macro val_mIoU, for
+        # more stable checkpoint selection -- see metric_IoU_val_weighted's
+        # definition above for why this matters on MADOS specifically.
+        self.log("val_mIoU_weighted", val_iou_weighted, on_epoch=True,
+                 prog_bar=True, logger=True)
+
+        for i, name in enumerate(self.class_names):
+            if i < len(val_iou):
+                self.log(f"val_IoU_{name}", val_iou[i], on_epoch=True, logger=True)
+            if i < len(val_acc):
+                self.log(f"val_acc_{name}", val_acc[i], on_epoch=True, logger=True)
+
         self.metric_IoU_val.reset()
         self.metric_acc_val.reset()
+        self.metric_IoU_val_weighted.reset()
 
     def on_test_epoch_end(self):
         test_iou = self.metric_IoU_test.compute()

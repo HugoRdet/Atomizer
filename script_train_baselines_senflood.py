@@ -10,6 +10,48 @@ Sen1Floods11 is single-temporal — no LTAE needed. Supports:
   - resnet : ResNet encoder + UPerNet decoder (variant via --resnet_variant)
   - ramen  : RAMEN multi-modal encoder + UPerNet decoder (separate S2/S1
              modality tensors, per-band spectral encoding)
+  - universat : UniverSat encoder (gastruc/UniverSat, AnySat v2) trained
+             FROM SCRATCH (random init — no pretrained weights anywhere on
+             this path) + linear per-token head, via
+             training.Universat.universat_augmenter.UniverSatSegmenter.
+
+             TRUE multimodal path: like RAMEN, UniverSat receives separate
+             {"optical": [B,13,H,W], "sar": [B,2,H,W]} tensors (reusing
+             senflood_collate_ramen — no new collate needed). Optical bands
+             are embedded by continuous wavelength (the adapter converts
+             the nm dict to UniverSat's µm convention); SAR channels use
+             UniverSat's learned string channel codes "VV"/"VH" (matching
+             its Encoding_<code> embeddings — note these are NOT RAMEN's
+             "asc_vv"-style pol_map keys). With two modalities the
+             Bi_ACA_in fusion block is active (unlike single-modality
+             BurnScars, where it is structurally inert).
+
+             Unlike RAMEN, NO window size is baked at construction: the
+             latent grid is recomputed per input (H / patch_px per side),
+             so the same weights handle any crop and the full 512 image.
+             Default eval is a SINGLE full-image dense forward
+             (window_size=None); set --universat_window_size to fall back
+             to RAMEN-style sliding-window eval if the full-image forward
+             OOMs (most likely at --universat_output_stride 1).
+
+             Geometry constraints: every input side must be divisible by
+             the patch size in pixels (--universat_patch_m / 10 = 8 px at
+             the 80 m default — Sen1Floods11 is 10 m GSD, so the metre
+             value differs from the BurnScars script's 240 m default,
+             which is the SAME 8 px at HLS's 30 m) and by
+             --universat_output_stride. The default 512 crop satisfies
+             both (64x64 latent grid, 128x128 logits at stride 4,
+             bilinearly upsampled to 512 by BaselineTrainer). NOTE: 512
+             training crops mean 4096 trunk tokens per sample — if that's
+             heavy at --batch_size 8, prefer --crop_size 256 (translation
+             augmentation + 4x fewer tokens) over shrinking the batch;
+             UniverSat evals at full 512 regardless of the train crop.
+
+             Band-dropout augmentation applies unchanged: the dataset
+             zeroes channels in the merged tensor BEFORE the collate
+             splits it, so UniverSat sees zeroed bands exactly like every
+             other baseline (zeroed channels, not Atomiser-style padding
+             tokens — that distinction is the point of the comparison).
 
 Same conditions as Atomiser:
   - Same train/val/test splits
@@ -17,7 +59,7 @@ Same conditions as Atomiser:
   - Same NaN cleanup, ignore_index=255
   - Same D4 augmentation
   - 15 input channels (13 S2 + 2 S1) — merged for unet/vit/resnet,
-    kept as separate {"optical","sar"} tensors for ramen
+    kept as separate {"optical","sar"} tensors for ramen/universat
 
 GFLOPs: measured once after testing completes, with the SAME harness used
 across the other baseline scripts (torch.profiler, with_flops=True, mean
@@ -25,8 +67,11 @@ over --flops_n passes, bs=1, full 512x512 image, one discarded warmup).
 UNet/ViT/ResNet all do a single dense forward on the full image (ViT
 already trains/evals at native 512x512 here, no tiling). RAMEN's number
 is the full sliding-window pass over the whole image (all tiles),
-directly comparable to the others' single dense forward. Rank-zero only
-(avoids redundant profiling across DDP ranks). Disable with --no_flops.
+directly comparable to the others' single dense forward. UniverSat's
+number matches whatever eval mode produced its mIoU: a single full-image
+dense forward by default, or the full sliding-window pass if
+--universat_window_size is set. Rank-zero only (avoids redundant
+profiling across DDP ranks). Disable with --no_flops.
 
 Examples:
     # ResNet50 + UPerNet on S2+S1
@@ -48,6 +93,19 @@ Examples:
     python script_train_senflood_baseline.py --xp_name ramen_s2s1 \
         --model ramen \
         --batch_size 8 --lr 1e-4 --epochs 80
+
+    # UniverSat-S from scratch (~34.9M effective, parameter-matched):
+    # 256 crops (recommended over full-512 training), full-image eval
+    python script_train_senflood_baseline.py --xp_name universat_s2s1 \
+        --model universat --crop_size 256 \
+        --batch_size 4 --grad_accum 2 --lr 1e-4 --epochs 80
+
+    # UniverSat per-pixel decoding ablation (expensive CA_Sub setting);
+    # windowed eval fallback shown in case full-image per-pixel OOMs
+    python script_train_senflood_baseline.py --xp_name universat_px \
+        --model universat --universat_output_stride 1 --crop_size 256 \
+        --universat_window_size 256 --universat_stride 192 \
+        --batch_size 1 --grad_accum 8 --lr 1e-4 --epochs 80
 """
 
 import os
@@ -76,6 +134,7 @@ from training.unet.model_unet import UNet
 from training.VIT.model_vit_upernet import ViTUPerNet
 from training.ResNet.model_resnet_upernet import build_resnet_upernet
 from training.RAMEN.ramen_upernet import build_ramen_upernet  # adjust import path
+from training.Universat.universat_augmenter import build_universat_segmenter
 from training.sliding_window import sliding_window_inference  # adjust import path
 from training.trainer_baselines import BaselineTrainer
 
@@ -90,6 +149,9 @@ NUM_CHANNELS = Sen1Floods11BaselineDataset.NUM_CHANNELS      # 15
 NUM_S2_BANDS = Sen1Floods11BaselineDataset.NUM_S2_BANDS      # 13
 NUM_S1_BANDS = Sen1Floods11BaselineDataset.NUM_S1_BANDS      # 2
 MODALITY_KEY = "s2s1"  # dataset returns image[{MODALITY_KEY}]
+SENFLOOD_GSD_M = 10.0  # Sentinel-1/2 common grid — used by UniverSat
+                       # (patch_px = patch_m / GSD); RAMEN keeps its own
+                       # --ramen_input_res flag (same 10.0 default).
 
 
 # =============================================================================
@@ -131,6 +193,28 @@ RAMEN_WAVELENGTHS = {
 
 
 # =============================================================================
+# UniverSat band metadata — same modality split ({"optical","sar"}, same
+# collate) but DIFFERENT SAR channel identifiers: UniverSat's UPE looks up
+# string codes as learned Encoding_<code> embeddings, whose attribute names
+# are exactly "VV" / "VH" (plus HH/HV/ratios/DSM/nDEM) — NOT RAMEN's
+# "asc_vv"-style pol_map keys. Optical reuses the same nm dict; the adapter
+# converts it to UniverSat's µm convention internally, in S2_BAND_NAMES
+# order (all 13 L1C bands incl. B10 are fine — continuous wavelengths go
+# through MP-Fourier, no registry membership required).
+# =============================================================================
+
+UNIVERSAT_INPUT_BANDS = {
+    "optical": S2_BAND_NAMES,
+    "sar": S1_BAND_NAMES,
+}
+
+UNIVERSAT_WAVELENGTHS = {
+    "optical": S2_WAVELENGTHS_NM,
+    "sar": S1_BAND_NAMES,          # the names ARE the codes: ["VV", "VH"]
+}
+
+
+# =============================================================================
 # COLLATE — stacks per-modality images, stacks targets, keeps metadata as list
 # =============================================================================
 
@@ -158,14 +242,17 @@ def senflood_collate(batch):
 
 def senflood_collate_ramen(batch):
     """
-    RAMEN collate for Sen1Floods11BaselineDataset.
+    RAMEN / UniverSat collate for Sen1Floods11BaselineDataset.
 
     The dataset still returns the merged image["s2s1"] : [15, H, W]
     tensor (no dataset changes needed) — this splits it into separate
     "optical" (first NUM_S2_BANDS channels) and "sar" (remaining
-    NUM_S1_BANDS channels) tensors at batch-collation time, since
-    RAMENUPerNet needs each modality separately to look up its own
-    spectral projector and band wavelengths.
+    NUM_S1_BANDS channels) tensors at batch-collation time, since both
+    RAMENUPerNet and UniverSatSegmenter need each modality separately to
+    look up its own spectral encoding (per-band projector for RAMEN;
+    wavelength MP-Fourier / Encoding_<code> embeddings for UniverSat).
+    Band-dropout zeroing happened inside the dataset on the merged
+    tensor, so it propagates to the split tensors unchanged.
     """
     merged = torch.stack([s["image"]["s2s1"] for s in batch])  # [B, 15, H, W]
 
@@ -235,9 +322,27 @@ def build_model(model_name: str, in_channels: int, num_classes: int, args):
             decoder_channels=args.vit_decoder_channels,
         )
 
+    elif model_name == "universat":
+        # Random init, no HF download anywhere on this path. Unlike RAMEN,
+        # no window size is baked at construction — the latent grid is
+        # recomputed per input, so the same weights handle any train crop
+        # and the 512 full image. Consumes the same {"optical","sar"} dict
+        # as RAMEN (senflood_collate_ramen), but with UniverSat's own SAR
+        # channel codes (see UNIVERSAT_WAVELENGTHS above).
+        return build_universat_segmenter(
+            input_bands=UNIVERSAT_INPUT_BANDS,
+            wavelengths=UNIVERSAT_WAVELENGTHS,
+            num_classes=num_classes,
+            input_res={"optical": SENFLOOD_GSD_M, "sar": SENFLOOD_GSD_M},
+            patch_size_m=args.universat_patch_m,
+            output_stride=args.universat_output_stride,
+            size=args.universat_size,
+        )
+
     else:
         raise ValueError(
-            f"Unknown model: {model_name}. Available: 'unet', 'vit', 'resnet', 'ramen'"
+            f"Unknown model: {model_name}. Available: 'unet', 'vit', "
+            f"'resnet', 'ramen', 'universat'"
         )
 
 
@@ -293,7 +398,7 @@ def measure_gflops_forward(forward_fn, batches, device, n_warmup=1):
 parser = argparse.ArgumentParser(description="Sen1Floods11 Baseline Training")
 parser.add_argument("--xp_name",   type=str, required=True)
 parser.add_argument("--model",     type=str, default="resnet",
-                    choices=["unet", "vit", "resnet", "ramen"])
+                    choices=["unet", "vit", "resnet", "ramen", "universat"])
 parser.add_argument("--data_dir",  type=str, default="./data/SENFLOOD")
 parser.add_argument("--resume",    type=str, default=None,
                     help="Path to a .ckpt file to resume training from "
@@ -315,11 +420,18 @@ parser.add_argument("--grad_accum",   type=int, default=1)
 # Crop / image size
 parser.add_argument("--crop_size", type=int, default=512,
                     help="Random crop size for training. Default 512 = no crop "
-                         "(use full image). For ViT/RAMEN, must match --img_size.")
+                         "(use full image). For ViT/RAMEN, must match --img_size. "
+                         "For UniverSat, must be divisible by the patch size in "
+                         "px (--universat_patch_m / 10) and by "
+                         "--universat_output_stride; 512 satisfies both at the "
+                         "defaults, but 256 is recommended (translation "
+                         "augmentation + 4x fewer trunk tokens — UniverSat "
+                         "still evals at full 512 regardless).")
 parser.add_argument("--img_size",  type=int, default=512,
                     help="Spatial size baked into ViT/RAMEN positional embeddings. "
                          "MUST equal --crop_size for ViT/RAMEN (and equal eval size). "
-                         "UNet/ResNet ignore this.")
+                         "UNet/ResNet/UniverSat ignore this (UniverSat bakes in "
+                         "no spatial size at all).")
 
 # UNet
 parser.add_argument("--unet_topology", type=int, nargs="+",
@@ -347,12 +459,12 @@ parser.add_argument("--ramen_depth",     type=int, default=12)
 parser.add_argument("--ramen_num_heads", type=int, default=8)
 parser.add_argument("--ramen_input_res", type=float, default=10.0,
                     help="Native GSD (m/px) of the input imagery.")
-parser.add_argument("--ramen_res",       type=float, default=40.0,
+parser.add_argument("--ramen_res",       type=float, default=20.0,
                     help="Common working resolution (m/px) all modalities are "
                          "resampled to before the shared ViT stack. Since "
                          "input_res is the same across modalities here, this "
                          "can be left equal to --ramen_input_res (no resampling).")
-parser.add_argument("--ramen_window_size", type=int, default=128,
+parser.add_argument("--ramen_window_size", type=int, default=256,
                     help="RAMEN tokenizes at the pixel level (no patch "
                          "embedding), so full self-attention over a "
                          "512x512 image is intractable. The model is "
@@ -379,6 +491,38 @@ parser.add_argument("--ramen_config", type=str, default=None,
                          "config values for keys passed on the command "
                          "line — see the override logic below.")
 
+# UniverSat (from scratch)
+parser.add_argument("--universat_size", type=str, default="small",
+                    choices=["tiny", "small", "base"],
+                    help="'small' (384-d, 12 SA blocks, heads=6) is ~36.1M "
+                         "total — parameter-matched to the ViT-S / RAMEN "
+                         "~34M budget. 'tiny' ~6.2M replicates the repo's "
+                         "Tiny recipe; 'base' ~201M the released config.")
+parser.add_argument("--universat_patch_m", type=float, default=40.0,
+                    help="Patch size in METRES (UniverSat convention; scale "
+                         "= patch_m/10 internally). 80 m = 8 px at "
+                         "Sen1Floods11's 10 m GSD — the SAME 8 px patch as "
+                         "the BurnScars script's 240 m default at 30 m HLS. "
+                         "160 m = 16 px (ViT patch-size parity). Must be an "
+                         "integer number of pixels, and every input side "
+                         "must be divisible by that pixel count.")
+parser.add_argument("--universat_output_stride", type=int, default=1,
+                    help="Logits at H/stride per side (BaselineTrainer "
+                         "bilinearly upsamples to the target). 1 = per-pixel "
+                         "decoding via the CA_Sub sub-patch skip — the "
+                         "paper's headline setting, and the expensive one.")
+parser.add_argument("--universat_window_size", type=int, default=None,
+                    help="None (default) = full-image eval in ONE dense "
+                         "forward — UniverSat's grids scale natively, no "
+                         "construction-time window exists. Set (e.g. 256) "
+                         "to fall back to RAMEN-style sliding-window eval "
+                         "if the 512 full-image forward OOMs (most likely "
+                         "at --universat_output_stride 1). Must satisfy the "
+                         "same divisibility constraints as --crop_size.")
+parser.add_argument("--universat_stride", type=int, default=192,
+                    help="Sliding-window stride for UniverSat eval; only "
+                         "used when --universat_window_size is set.")
+
 # GFLOPs
 parser.add_argument("--flops", action="store_true", default=True,
                     help="Measure GFLOPs/forward on the final model after "
@@ -393,7 +537,7 @@ parser.add_argument("--flops_n", type=int, default=3,
 # Atomiser's native padding-token robustness at the modality-drop eval
 # (script_test_senflood_baseline_modality_drop.py). See
 # Sen1Floods11BaselineDataset's docstring for exact semantics.
-parser.add_argument("--band_dropout", action="store_true", default=True,
+parser.add_argument("--band_dropout", action="store_true", default=False,
                     help="Enable band-dropout augmentation during training "
                          "(default: on). Matches the intent of Atomiser's "
                          "own token-dropout augmentation — set the "
@@ -509,6 +653,61 @@ if args.model == "ramen":
               f"({args.ramen_window_size}) for training crops.")
         args.crop_size = args.ramen_window_size
 
+# UniverSat: no baked-in spatial size, but the latent grid is H / patch_px
+# per side, so every input side (train crop, eval 512, optional window)
+# must be an exact multiple of the patch size in pixels AND of
+# --universat_output_stride. Validated here to fail fast rather than at
+# the adapter's forward-time assertion.
+if args.model == "universat":
+    universat_patch_px = args.universat_patch_m / SENFLOOD_GSD_M
+    if abs(universat_patch_px - round(universat_patch_px)) > 1e-6:
+        raise ValueError(
+            f"--universat_patch_m ({args.universat_patch_m}) is not an "
+            f"integer number of pixels at {SENFLOOD_GSD_M} m GSD "
+            f"({universat_patch_px:.3f} px). Use a multiple of "
+            f"{SENFLOOD_GSD_M}."
+        )
+    universat_patch_px = int(round(universat_patch_px))
+
+    import math as _math
+    _lcm = _math.lcm(universat_patch_px, args.universat_output_stride)
+
+    if args.crop_size % _lcm:
+        new_crop = ((args.crop_size + _lcm - 1) // _lcm) * _lcm
+        print(f"[INFO] UniverSat: --crop_size ({args.crop_size}) not divisible "
+              f"by lcm(patch_px={universat_patch_px}, "
+              f"output_stride={args.universat_output_stride})={_lcm}; "
+              f"rounding up -> {new_crop}.")
+        args.crop_size = new_crop
+
+    if 512 % _lcm:
+        raise ValueError(
+            f"The full 512x512 eval image is not divisible by "
+            f"lcm(patch_px={universat_patch_px}, "
+            f"output_stride={args.universat_output_stride})={_lcm} — "
+            f"pick --universat_patch_m / --universat_output_stride so that "
+            f"512 is a valid input side (or set --universat_window_size to "
+            f"a valid size and eval via sliding window)."
+        )
+
+    if args.universat_window_size is not None:
+        if args.universat_window_size % _lcm:
+            raise ValueError(
+                f"--universat_window_size ({args.universat_window_size}) must "
+                f"be divisible by lcm(patch_px={universat_patch_px}, "
+                f"output_stride={args.universat_output_stride})={_lcm}."
+            )
+        if args.universat_stride > args.universat_window_size:
+            print(f"[WARNING] --universat_stride ({args.universat_stride}) "
+                  f"exceeds --universat_window_size "
+                  f"({args.universat_window_size}); clamping to window_size "
+                  f"(non-overlapping tiling).")
+            args.universat_stride = args.universat_window_size
+    # No --crop_size override: unlike RAMEN there is no construction-time
+    # window, so any valid crop trains the same weights that eval on the
+    # full 512 (single dense forward by default; sliding-window only if
+    # --universat_window_size was set above).
+
 
 # =============================================================================
 # SUMMARY
@@ -524,6 +723,19 @@ if args.model == "ramen":
           f"(model built/trained at this size)")
     print(f"  Eval stride: {args.ramen_stride} "
           f"(sliding-window inference over full 512×512)")
+if args.model == "universat":
+    print(f"  Size:        {args.universat_size} (from scratch, random init)")
+    print(f"  Patch:       {args.universat_patch_m:.0f} m "
+          f"({int(args.universat_patch_m / SENFLOOD_GSD_M)} px @ "
+          f"{SENFLOOD_GSD_M:.0f} m)")
+    print(f"  Out stride:  {args.universat_output_stride} "
+          f"(logits at H/{args.universat_output_stride}, "
+          f"upsampled by trainer)")
+    if args.universat_window_size is not None:
+        print(f"  Eval:        sliding-window (window="
+              f"{args.universat_window_size}, stride={args.universat_stride})")
+    else:
+        print(f"  Eval:        full 512×512, single dense forward")
 print(f"  Channels:    {NUM_CHANNELS} (13 S2 + 2 S1)")
 print(f"  Crop (train):{args.crop_size}×{args.crop_size}")
 print(f"  Eval size:   512×512 (full)")
@@ -572,7 +784,8 @@ print(f"  Test:  {len(test_ds)} samples")
 # DATALOADERS
 # =============================================================================
 
-collate_fn = senflood_collate_ramen if args.model == "ramen" else senflood_collate
+collate_fn = (senflood_collate_ramen if args.model in ("ramen", "universat")
+              else senflood_collate)
 
 # Val/test use full 512×512 images → bigger memory footprint per sample.
 # Use batch_size=1 for eval to be safe; train uses cropped 256×256 at full BS.
@@ -607,19 +820,26 @@ model = build_model(args.model, NUM_CHANNELS, NUM_CLASSES, args)
 
 trainer_module = BaselineTrainer(
     model=model,
-    # RAMENUPerNet consumes the full image dict (see BaselineTrainer._get_image);
+    # RAMENUPerNet and UniverSatSegmenter consume the full image dict
+    # (expects_full_image_dict — see BaselineTrainer._get_image);
     # `modality` is unused in that case, only shown in the startup print.
-    modality=MODALITY_KEY if args.model != "ramen" else "optical+sar",
+    modality=MODALITY_KEY if args.model not in ("ramen", "universat")
+             else "optical+sar",
     temporal=False,                   # single-frame
     task="senflood",                  # registered in TASK_CLASS_NAMES (or falls back)
     lr=args.lr,
     weight_decay=args.weight_decay,
     num_classes=NUM_CLASSES,
     ignore_index=IGNORE_INDEX,
-    # Sliding-window inference at val/test — ignored by every model except
-    # RAMEN (see BaselineTrainer._shared_step / sliding_window_inference).
-    window_size=args.ramen_window_size if args.model == "ramen" else None,
-    window_stride=args.ramen_stride if args.model == "ramen" else None,
+    # Sliding-window inference at val/test — RAMEN always; UniverSat only
+    # when --universat_window_size is set (None = single full-image dense
+    # forward, its default); ignored by every other model.
+    window_size=(args.ramen_window_size if args.model == "ramen"
+                 else args.universat_window_size if args.model == "universat"
+                 else None),
+    window_stride=(args.ramen_stride if args.model == "ramen"
+                   else args.universat_stride if args.model == "universat"
+                   else None),
 )
 
 
@@ -634,6 +854,9 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         run_name = f"BL_{args.xp_name}_{args.model}"
         if args.model == "resnet":
             run_name += f"_{args.resnet_variant}"
+        if args.model == "universat":
+            run_name += (f"_{args.universat_size}"
+                         f"_os{args.universat_output_stride}")
         wandb.init(
             name=run_name,
             project="Atomizer_SenFlood_Baselines",
@@ -681,6 +904,13 @@ callbacks = [
 # TRAINER
 # =============================================================================
 
+# find_unused_parameters=True is REQUIRED for UniverSat (not merely
+# convenient): even in this two-modality setting, several parameter
+# tensors are structurally inert and never receive gradients — the UPE's
+# S1-axis block at subpatch_px=1, the T-axis block at T=1, and the
+# channel codes for sensors not present here (HH/HV/ratios/DSM/nDEM).
+# It also covers RAMEN's RadarProjector/DemProjector pattern, and was
+# already set unconditionally for all models.
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
     devices=-1,
@@ -755,6 +985,25 @@ if args.flops and os.environ.get("LOCAL_RANK", "0") == "0":
                     num_classes=NUM_CLASSES,
                 )
             size_note = "full 512x512, sliding-window (all tiles)"
+        elif args.model == "universat":
+            # Match whatever eval mode produced the reported mIoU: a single
+            # full-image dense forward by default, or the full sliding-
+            # window pass if --universat_window_size was set. UniverSat
+            # consumes the {"optical","sar"} dict directly
+            # (expects_full_image_dict; senflood_collate_ramen built it).
+            if args.universat_window_size is not None:
+                def fwd(b, m=eval_model):
+                    return sliding_window_inference(
+                        m, b["image"],
+                        window_size=args.universat_window_size,
+                        stride=args.universat_stride,
+                        num_classes=NUM_CLASSES,
+                    )
+                size_note = "full 512x512, sliding-window (all tiles)"
+            else:
+                def fwd(b, m=eval_model):
+                    return m(b["image"])
+                size_note = "full 512x512, single dense forward"
         else:
             # UNet/ViT/ResNet all consume the merged [B,15,H,W] tensor
             # directly. ViT already trains/evals at native 512x512 here

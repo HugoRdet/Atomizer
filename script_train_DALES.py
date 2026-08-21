@@ -341,7 +341,7 @@ callbacks = [
                  f"{{val_mIoU:.4f}}",
         monitor="val_mIoU",
         mode="max",
-        save_top_k=5,
+        save_top_k=1,
         verbose=True,
     ),
     ModelCheckpoint(

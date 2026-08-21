@@ -1,4 +1,0 @@
-region,gflops,cuda_ms,leaf_ops
-Decoder,8803.474997248,1019.9096569999997,82
-Encoder Cross Attention,690.420711424,231.951635,75
-Self Attention,37.598789632,5.841393000000004,124

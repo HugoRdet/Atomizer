@@ -5,24 +5,32 @@ DALES Atomizer Dataset (LIDAR-only, with jitter augmentation)
 Adapted from utils_dataset_fractal.py. Same conventions (token layout,
 echo encoding, z-normalization, TokenBuilder usage) but:
 
-  1. NO VHR / ortho branch — DALES ships LIDAR only. `groups` contains a
+  1. NO VHR / ortho branch -- DALES ships LIDAR only. `groups` contains a
      single modality (LIDAR-as-elevation) instead of VHR+LIDAR concatenated.
   2. NO D4 spatial flip/rotation augmentation on an image raster, since
-     there's no raster to keep aligned with — but we KEEP D4 on the point
+     there's no raster to keep aligned with -- but we KEEP D4 on the point
      cloud (x, y) itself, since square patches are still rotation/flip
      invariant. Only Gaussian XY/Z jitter changes semantics vs. FRACTAL:
      here it's applied unconditionally to all points (there's no VHR to
      leave un-jittered).
   3. Patches are expected to already be pre-tiled fixed-size .laz files
-     (see tile_dales.py) — DALES scenes are far too large to tile lazily
+     (see tile_dales.py) -- DALES scenes are far too large to tile lazily
      inside __getitem__.
   4. Label remap covers DALES' 8 semantic classes instead of FRACTAL's 7.
 
 If you don't need full-scene eval / vhr-drop-bands equivalents, those flags
 are simply absent here (there's no VHR to drop bands from).
 
+NOTE: class-balanced query sampling (sqrt-inverse-frequency weighted) has
+been REMOVED -- train-split query selection now uses the generic
+TokenBuilder.subsample_queries (uniform among valid queries), same as
+val/test. The k-NN decoder-skip cascade upgrade has also been left OUT of
+this version (query_token_idx stays the simple 1-atom identity/inverse
+mapping) -- both were deliberately deferred, not lost; ask for either to
+be re-added when ready.
+
 ==============================================================================
-IMPORTANT — verify against your actual DALES release before training:
+IMPORTANT -- verify against your actual DALES release before training:
 
 DALES semantic segmentation classes (official release) are commonly:
     0 : Unknown / unclassified
@@ -37,7 +45,7 @@ DALES semantic segmentation classes (official release) are commonly:
 
 Some DALES distributions (e.g. the "DALES Objects" instance-seg release)
 use different integer codes. Check `np.unique(las.classification)` on a
-few of your actual files before trusting DALES_TO_ATOMIZER below — update
+few of your actual files before trusting DALES_TO_ATOMIZER below -- update
 the LUT if your codes differ.
 ==============================================================================
 """
@@ -55,7 +63,7 @@ try:
     HAS_LASPY = True
 except ImportError:
     HAS_LASPY = False
-    print("[Warning] laspy not installed — required for DALES LAZ reading.")
+    print("[Warning] laspy not installed -- required for DALES LAZ reading.")
 
 from .token_grouping import *
 from .token_builder import TokenBuilder
@@ -63,7 +71,7 @@ from .augmentations import D4Augmentation, D4Transform
 
 
 # ============================================================================
-# Token column indices (must match TokenBuilder / TokenProcessor convention)
+# Token column indices (must match TokenProcessor / TokenBuilder convention)
 # ============================================================================
 
 TOKEN_VALUE_IDX    = 0   # reflectance / z_norm value
@@ -98,45 +106,6 @@ def _build_remap_lut(mapping: dict, num_codes: int = 256,
 
 
 REMAP_LUT = _build_remap_lut(DALES_TO_ATOMIZER)
-
-
-# ============================================================================
-# Class frequencies for query sampling weights (NOT loss weights — those
-# live in trainer_DALES.py's DALES_CLASS_FREQS, kept separately since
-# they're used for a different purpose and may be tuned independently).
-# Taken from the same inspection numbers as the trainer's copy — VERIFY
-# against a full train-split aggregate if you haven't already.
-# ============================================================================
-
-DALES_QUERY_SAMPLING_FREQS = [
-    0.5040,   # ground
-    0.3034,   # vegetation
-    0.0078,   # cars
-    0.0011,   # trucks
-    0.0017,   # power_lines
-    0.0046,   # fences
-    0.0007,   # poles
-    0.1716,   # buildings
-]
-
-
-def _build_query_sampling_weight_lut(freqs=DALES_QUERY_SAMPLING_FREQS,
-                                      num_classes: int = 8) -> np.ndarray:
-    """Per-class sampling weight, SOFT inverse-frequency (sqrt, not raw
-    inverse) — deliberately gentler than the loss-weight clip, since query
-    oversampling and loss weighting compound if both are aggressive. Raw
-    inverse-frequency here would mean poles (0.07% of points) get sampled
-    ~700x more per-point than ground — with so few actual pole points per
-    patch, that means near-total duplication of the same handful of points
-    every step (memorization risk, not real exposure diversity). sqrt
-    tempers this: poles get ~27x oversampling instead of ~700x.
-    """
-    freqs = np.asarray(freqs, dtype=np.float64)
-    weights = 1.0 / np.sqrt(np.clip(freqs, 1e-6, None))
-    return weights  # NOT normalized here — normalized per-patch at sample time
-
-
-QUERY_SAMPLING_WEIGHT_LUT = _build_query_sampling_weight_lut()
 
 
 # ============================================================================
@@ -217,13 +186,13 @@ def _normalize_intensity(intensity: "np.ndarray", p_lo: float = 1.0,
 
     WHY per-scene, not a fixed global constant: raw intensity is NOT
     radiometrically calibrated across flight lines/sensors (see prior
-    discussion) — a fixed divisor (e.g. /255 or /65535) would be wrong if
+    discussion) -- a fixed divisor (e.g. /255 or /65535) would be wrong if
     DALES' effective range doesn't actually span that, and would make
     intensity incomparable across scenes with different flight
     conditions. Percentile normalization per scene is a reasonable
     default; VERIFY against your actual intensity value ranges (inspect
     a few files' `las.intensity.min()/.max()/.mean()`) before trusting
-    this blindly — if DALES' intensity turns out to already be
+    this blindly -- if DALES' intensity turns out to already be
     well-behaved/consistent across files, a fixed normalization constant
     might be preferable for consistency with any pretrained expectations.
     """
@@ -263,14 +232,14 @@ class DalesDataset(Dataset):
                             REQUIRES batch_size=1.
     """
 
-    # DALES is airborne. Patches are FIXED SIZE (reverted from an earlier
-    # adaptive per-patch extent) — see tile_dales.py's module docstring for
-    # why: Atomiser_Senflood_Skip computes ONE latent grid PER BATCH (not
-    # per sample), so every patch must share byte-identical geometry for
-    # that batch-shared assumption to hold. PATCH_SIZE_M MUST match
-    # whatever tile_dales.py used to produce the tiled patches, and
-    # PIXEL_RESOLUTION is purely for TokenBuilder coordinate-frame
-    # compatibility (no raster exists at this "resolution").
+    # DALES is airborne. Patches are FIXED SIZE -- see tile_dales.py's
+    # module docstring for why: Atomiser_Senflood_Skip computes ONE latent
+    # grid PER BATCH (not per sample), so every patch must share
+    # byte-identical geometry for that batch-shared assumption to hold.
+    # PATCH_SIZE_M MUST match whatever tile_dales.py used to produce the
+    # tiled patches, and PIXEL_RESOLUTION is purely for TokenBuilder
+    # coordinate-frame compatibility (no raster exists at this
+    # "resolution").
     PIXEL_RESOLUTION = 0.2      # meters/px equivalent, same convention as FRACTAL
     PATCH_SIZE_M     = 50.0     # MUST match tile_dales.py --patch_size_m
     PATCH_SIZE_PX    = int(PATCH_SIZE_M / PIXEL_RESOLUTION)   # 250
@@ -283,7 +252,7 @@ class DalesDataset(Dataset):
 
     # Ground-relative Z normalization, same convention as FRACTAL. DALES
     # scenes include taller structures (power line pylons, tall buildings)
-    # so you may want to widen Z_GROUND_REL_HI — check your data's z-range
+    # so you may want to widen Z_GROUND_REL_HI -- check your data's z-range
     # relative to ground before trusting these defaults.
     Z_GROUND_REL_LO    = -15.0
     Z_GROUND_REL_HI    = 30.0
@@ -320,7 +289,7 @@ class DalesDataset(Dataset):
         # NOTE on defaults: DALES averages ~49 pts/m^2, so a 50x50m tiled
         # patch (PATCH_SIZE_M) contains ~122,500 points on average.
         # max_lidar_points=256_000 therefore means MOST patches see NO
-        # subsampling at all — only unusually dense patches (dense
+        # subsampling at all -- only unusually dense patches (dense
         # vegetation/building clusters) get trimmed. This is a deliberate
         # choice for an H100 80GB with flexible batch size; if you hit
         # OOM, lower this before shrinking batch size further, since the
@@ -340,11 +309,11 @@ class DalesDataset(Dataset):
         self.eval_full_scene = bool(eval_full_scene)
         if self.eval_full_scene and self.split != "test":
             print(f"[DALES] WARNING: eval_full_scene=True with split="
-                  f"'{self.split}' — full-scene queries only take effect "
+                  f"'{self.split}' -- full-scene queries only take effect "
                   f"during test evaluation. Ignored for this split.")
 
-        # ── Augmentation config ─────────────────────────────────
-        # D4 still applies to the point cloud (x, y) — patches are square
+        # -- Augmentation config -----------------------------------
+        # D4 still applies to the point cloud (x, y) -- patches are square
         # and flip/rotation invariant even without a raster to align to.
         self.augmenter = D4Augmentation(
             enabled=(use_augmentation and self.split == "train"),
@@ -367,7 +336,7 @@ class DalesDataset(Dataset):
             "max_tokens_reconstruction", max_queries
         )
         # Reuse the same "resolution" bucket convention as FRACTAL LIDAR
-        # tokens — this is a bookkeeping index into the lookup table, not a
+        # tokens -- this is a bookkeeping index into the lookup table, not a
         # physical pixel size claim.
         self.resolution_idx = look_up.get_resolution_idx(self.PIXEL_RESOLUTION)
 
@@ -378,7 +347,7 @@ class DalesDataset(Dataset):
               f"split='{self.split}'")
         print(f"[DALES] Modalities: LIDAR-only "
               f"(elev@{self.PIXEL_RESOLUTION}m equiv, "
-              f"≤{self.max_lidar_points if self.max_lidar_points else '∞'} pts)")
+              f"<={self.max_lidar_points if self.max_lidar_points else 'inf'} pts)")
         if self.eval_full_scene and self.split == "test":
             print(f"[DALES] eval_full_scene=True: queries cover ALL points "
                   f"per patch (REQUIRES batch_size=1 in DataLoader)")
@@ -391,72 +360,6 @@ class DalesDataset(Dataset):
         self.lidar_spectral_idx = _resolve_elevation_spectral_idx(self.look_up)
         print(f"[DALES] LIDAR spectral_idx (ELEVATION): "
               f"{self.lidar_spectral_idx}")
-
-    @staticmethod
-    def _subsample_queries_class_balanced(queries: torch.Tensor,
-                                           max_queries: int,
-                                           ignore_index: int = 255):
-        """
-        Class-balanced alternative to TokenBuilder.subsample_queries.
-
-        WHY a separate method instead of modifying the shared one: the
-        generic subsample_queries only distinguishes valid/invalid (padding)
-        — among VALID queries it selects uniformly at random, which for
-        DALES means the training query set stays dominated by ground/
-        vegetation by sheer point-count majority, giving the model almost
-        no gradient exposure to rare classes (trucks/poles/fences) most
-        training steps regardless of loss weighting (loss weighting
-        amplifies gradient magnitude for a class, but can't amplify a
-        gradient that never arrives because the class was never sampled).
-
-        This samples valid queries WITHOUT replacement, weighted by
-        QUERY_SAMPLING_WEIGHT_LUT[class] (soft sqrt-inverse-frequency —
-        see that constant's docstring for why sqrt, not raw inverse).
-        Falls back to keeping everything (+ padding) if there are fewer
-        valid queries than max_queries, same as the generic method.
-
-        Returns:
-            (queries_selected, kept_indices) — same contract as
-            TokenBuilder.subsample_queries(..., return_indices=True).
-        """
-        query_labels = queries[:, 4].long()
-        valid_mask = (query_labels != ignore_index)
-        valid_indices = torch.where(valid_mask)[0]
-
-        if valid_indices.numel() <= max_queries:
-            # Not enough (or exactly enough) valid queries to need
-            # subsampling at all — keep everything, same as the generic
-            # method's early-return path. Caller pads the rest.
-            if valid_indices.numel() < queries.shape[0]:
-                invalid_indices = torch.where(~valid_mask)[0]
-                n_needed = max_queries - valid_indices.numel()
-                n_needed = min(n_needed, invalid_indices.numel())
-                if n_needed > 0:
-                    inv_perm = torch.randperm(invalid_indices.numel())[:n_needed]
-                    selected = torch.cat([valid_indices, invalid_indices[inv_perm]])
-                else:
-                    selected = valid_indices
-            else:
-                selected = valid_indices
-            selected = selected[torch.randperm(selected.numel())]
-            return queries[selected], selected
-
-        # ── Weighted sampling WITHOUT replacement among valid queries ────
-        # Gumbel-top-k trick: argsort(log(weight) - log(-log(uniform)))
-        # gives an unbiased weighted-without-replacement sample, vectorized
-        # (no Python loop over classes needed).
-        valid_labels = query_labels[valid_indices]
-        class_weights_np = QUERY_SAMPLING_WEIGHT_LUT[valid_labels.cpu().numpy()]
-        weights = torch.from_numpy(class_weights_np).float()
-        weights = weights.clamp(min=1e-8)
-
-        u = torch.rand(weights.shape[0]).clamp(min=1e-8, max=1 - 1e-8)
-        gumbel_keys = torch.log(weights) - torch.log(-torch.log(u))
-        top_k = torch.topk(gumbel_keys, max_queries).indices
-        selected = valid_indices[top_k]
-        selected = selected[torch.randperm(selected.numel())]
-
-        return queries[selected], selected
 
     def _collect_patches(self, valid_patches_file: str = None):
         split_dir = self.SPLIT_DIRS.get(self.split)
@@ -513,7 +416,7 @@ class DalesDataset(Dataset):
         aug = self.augmenter.sample(index=index)
         full_scene_active = (self.eval_full_scene and self.split == "test")
 
-        # ── Load LIDAR ─────────────────────────────────────────────
+        # -- Load LIDAR -----------------------------------------------
         las = laspy.read(row["laz_path"])
         n_points_raw = las.x.shape[0]
         if n_points_raw < self.MIN_POINTS:
@@ -523,11 +426,11 @@ class DalesDataset(Dataset):
         # FRACTAL; the "pixel" frame here is purely for TokenBuilder
         # compatibility, there's no raster underneath it). Patches are
         # FIXED SIZE (self.PATCH_SIZE_PX, matching tile_dales.py's
-        # --patch_size_m) — origin is still each patch's own (x_min, y_max)
+        # --patch_size_m) -- origin is still each patch's own (x_min, y_max)
         # so points are correctly placed within the shared-size frame, but
         # the FRAME SIZE ITSELF is the constant, not derived from this
         # patch's actual point extent (which may be smaller than the full
-        # tile, e.g. near a scene boundary — that's fine, those points
+        # tile, e.g. near a scene boundary -- that's fine, those points
         # just don't reach the frame's far edge).
         x_min = float(las.x.min())
         y_max = float(las.y.max())
@@ -539,19 +442,19 @@ class DalesDataset(Dataset):
         lidar_x = np.clip(lidar_x, 0.0, patch_size_px - 1e-3)
         lidar_y = np.clip(lidar_y, 0.0, patch_size_px - 1e-3)
 
-        # ── Echo info (return_number, number_of_returns) ───────────
+        # -- Echo info (return_number, number_of_returns) -------------
         return_number     = np.asarray(las.return_number,     dtype=np.int64)
         number_of_returns = np.asarray(las.number_of_returns, dtype=np.int64)
 
-        # ── Intensity (NEW: second token channel alongside elevation) ──
+        # -- Intensity --------------------------------------------------
         intensity_raw = np.asarray(las.intensity, dtype=np.float32)
 
-        # ── Labels (BEFORE z-norm since z-norm uses ground mask) ───
+        # -- Labels (BEFORE z-norm since z-norm uses ground mask) -----
         las_cls = np.asarray(las.classification, dtype=np.int64)
         las_cls = np.clip(las_cls, 0, REMAP_LUT.shape[0] - 1)
         labels  = REMAP_LUT[las_cls]
 
-        # ── Z normalization (ground-relative) ──────────────────────
+        # -- Z normalization (ground-relative) -------------------------
         z_raw = np.asarray(las.z, dtype=np.float32)
         ground_mask = (labels == 0)   # 0 == "ground" in DALES_TO_ATOMIZER
         if ground_mask.sum() >= self.GROUND_MEDIAN_MIN_PTS:
@@ -567,8 +470,8 @@ class DalesDataset(Dataset):
         # comparability).
         intensity_norm = _normalize_intensity(intensity_raw)
 
-        # ── Load precomputed token->latent assignment (offline, see
-        # precompute_dales_latent_assignment.py) ────────────────────────
+        # -- Load precomputed token->latent assignment (offline, see
+        # precompute_dales_latent_assignment.py) ------------------------
         # variant_idx encoding MUST match precompute's
         # variant_idx_to_params: n_rot*4 + int(flip_h)*2 + int(flip_v).
         variant_idx = aug.n_rot * 4 + int(aug.flip_h) * 2 + int(aug.flip_v)
@@ -580,19 +483,19 @@ class DalesDataset(Dataset):
         assert full_assignment.shape[0] == n_points_raw, (
             f"Precomputed assignment for {assign_path.name} has "
             f"{full_assignment.shape[0]} points, but this patch has "
-            f"{n_points_raw} — re-run precompute_dales_latent_assignment.py "
+            f"{n_points_raw} -- re-run precompute_dales_latent_assignment.py "
             f"(tiling/precompute out of sync, or points changed since "
             f"precompute ran)."
         )
 
-        # ── Apply D4 to LIDAR (x, y) ───────────────────────────────
+        # -- Apply D4 to LIDAR (x, y) -----------------------------------
         xy_stacked = np.stack([lidar_x, lidar_y], axis=1).astype(np.float32)
         if not aug.is_identity:
             xy_stacked = self.augmenter.apply_to_xy(
                 xy_stacked, aug, patch_size_px=patch_size_px
             )
 
-        # ── Apply jitter (always on, no VHR to preserve exactness for) ──
+        # -- Apply jitter (always on, no VHR to preserve exactness for) --
         if self.augmenter.enabled and (self.sigma_xy_pixels > 0
                                        or self.sigma_z_normed > 0):
             jitter_seed = (index * 2147483647) ^ 0x9E3779B9
@@ -610,10 +513,10 @@ class DalesDataset(Dataset):
         lidar_x = xy_stacked[:, 0]
         lidar_y = xy_stacked[:, 1]
 
-        # ═══════════════════════════════════════════════════════════════
+        # ===================================================================
         # CONTEXT vs QUERY SPLIT (full-scene-eval logic, unchanged logic
-        # from FRACTAL — just no VHR alongside it)
-        # ═══════════════════════════════════════════════════════════════
+        # from FRACTAL -- just no VHR alongside it)
+        # ===================================================================
         if full_scene_active:
             full_lidar_x = lidar_x.copy()
             full_lidar_y = lidar_y.copy()
@@ -675,40 +578,33 @@ class DalesDataset(Dataset):
             n_real_lidar_ctx     = ctx_lidar_x.shape[0]
             n_real_lidar_queries = n_real_lidar_ctx
 
-        # ── Gather precomputed assignment by the SAME sel indices used for
-        # elevation/intensity/labels context subsampling — sel=None means
+        # -- Gather precomputed assignment by the SAME sel indices used for
+        # elevation/intensity/labels context subsampling -- sel=None means
         # every point was kept (no subsampling), so the assignment is used
         # as-is (already in the ctx point order, since ctx == full there).
         ctx_assignment = (full_assignment if sel is None
                           else full_assignment[sel])
 
-        # ── Build context_map for the decoder-skip cascade ──────────────
+        # -- Build context_map for the decoder-skip cascade ----------------
         # For each QUERY row (in the order build_sparse_queries will
-        # produce — i.e. same order as positions_query/full_lidar_x), the
+        # produce -- i.e. same order as positions_query/full_lidar_x), the
         # index into the CONTEXT (ctx) token array where the SAME point
         # lives, or -1 if that point isn't part of the (possibly
-        # subsampled) context. This is a simple index-mapping problem for
-        # DALES (unlike FRACTAL/FLAIR-HUB's multi-atom-per-pixel gather)
-        # since each point yields exactly one context token (elevation in
-        # col 0, intensity folded into col 6 — not a separate channel).
+        # subsampled) context. Single-atom identity/inverse mapping (the
+        # k-NN upgrade has been deliberately deferred, see module docstring).
         if full_scene_active:
-            # queries = ALL points (full_lidar_x preserves original point
-            # order); context = subsampled from that same order via `sel`.
             context_map = np.full(n_points_raw, -1, dtype=np.int64)
             if sel is not None:
                 context_map[sel] = np.arange(sel.shape[0], dtype=np.int64)
             else:
                 context_map[:] = np.arange(n_points_raw, dtype=np.int64)
         else:
-            # queries (BEFORE any train-only extra subsampling below) are
-            # exactly the context array, same order, same count — trivial
-            # identity mapping.
             context_map = np.arange(n_real_lidar_ctx, dtype=np.int64)
 
         positions_ctx_lidar = torch.from_numpy(
             np.stack([ctx_lidar_x, ctx_lidar_y], axis=1)).float()
         # Single channel now: col 0 = elevation only (z_norm). Intensity is
-        # NOT a second channel — it rides in column 6 (normally
+        # NOT a second channel -- it rides in column 6 (normally
         # resolution_idx, constant/uninformative for LIDAR) via
         # intensity_override, routed by DalesTokenProcessor.
         values_ctx_lidar = torch.from_numpy(ctx_z_norm).float()
@@ -724,7 +620,7 @@ class DalesDataset(Dataset):
         values_query    = torch.from_numpy(full_z_norm).float()
         labels_query    = torch.from_numpy(full_labels.astype(np.int64))
 
-        # ── Tokenize LIDAR (sparse) — this is now the ONLY modality ───
+        # -- Tokenize LIDAR (sparse) -- this is now the ONLY modality -----
         lidar_tokens = self.token_builder.build_sparse_tokens(
             values=values_ctx_lidar,
             positions=positions_ctx_lidar,
@@ -739,10 +635,7 @@ class DalesDataset(Dataset):
             intensity_override=intensity_override_ctx,
         )
 
-        # ── Pad LIDAR context tokens to fixed size ──────────────────
-        # Single channel per point again (elevation only; intensity rides
-        # in col 6, not a separate token) — token budget is back to
-        # max_lidar_points, not 2x.
+        # -- Pad LIDAR context tokens to fixed size ------------------------
         n_lidar_tokens = lidar_tokens.shape[0]
         if (self.max_lidar_points is not None
                 and n_lidar_tokens < self.max_lidar_points):
@@ -755,7 +648,7 @@ class DalesDataset(Dataset):
                 torch.ones(n_pad, dtype=torch.bool),
             ])
             # Pad token_latent_assignment in lockstep with lidar_tokens.
-            # Padded positions get index 0 — harmless: those rows are
+            # Padded positions get index 0 -- harmless: those rows are
             # already flagged masked=True above, and GeographicPruningDales
             # gathers the INPUT mask too (not just its own validity mask),
             # so a padded token landing in latent 0's cell just wastes a
@@ -770,7 +663,7 @@ class DalesDataset(Dataset):
             token_latent_assignment.astype(np.int64)
         )
 
-        # No VHR to concatenate — LIDAR tokens ARE the hires group.
+        # No VHR to concatenate -- LIDAR tokens ARE the hires group.
         groups = {
             self.PIXEL_RESOLUTION: {
                 "tokens": lidar_tokens,
@@ -779,7 +672,7 @@ class DalesDataset(Dataset):
             }
         }
 
-        # ── Build queries from FULL positions/labels ────────────────
+        # -- Build queries from FULL positions/labels ----------------------
         queries = self.token_builder.build_sparse_queries(
             positions=positions_query,
             labels=labels_query,
@@ -801,16 +694,21 @@ class DalesDataset(Dataset):
         query_token_idx_full = context_map.copy()
 
         if self.split == "train":
-            queries, kept_indices = self._subsample_queries_class_balanced(
+            # Class-balanced sampling REMOVED -- back to the generic
+            # method (uniform random among valid queries, same as
+            # val/test's implicit behavior). See module docstring.
+            queries, kept_indices = self.token_builder.subsample_queries(
                 queries,
                 max_queries=self.max_tokens_reconstruction,
                 ignore_index=self.IGNORE_INDEX,
+                prioritize_valid=True,
+                return_indices=True,
             )
             kept_indices_np = kept_indices.cpu().numpy()
             query_token_idx_full = query_token_idx_full[kept_indices_np]
 
-        # Split into (idx, valid) — invalid (-1) entries get clamped to 0
-        # (harmless dummy — masked via query_token_valid=False, and
+        # Split into (idx, valid) -- invalid (-1) entries get clamped to 0
+        # (harmless dummy -- masked via query_token_valid=False, and
         # _pixel_skip's force-keep guard + "output discarded" handling
         # takes care of the rest).
         query_token_valid_full = (query_token_idx_full >= 0)

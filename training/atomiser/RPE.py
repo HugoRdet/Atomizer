@@ -224,6 +224,12 @@ class SelfAttentionRoPE(nn.Module):
         num_spatial: Optional[int] = None,
         positions: Optional[torch.Tensor] = None,   # [B, N, 2] alternative
         gsd: Optional[torch.Tensor] = None,         # unused, kept for API compat
+        attn_mask: Optional[torch.Tensor] = None,   # [B, 1, 1, N] or broadcastable
+                                                      # to [B, H, N, N]; bool,
+                                                      # True = attend/keep. None ->
+                                                      # no masking (existing
+                                                      # behavior, fully backward
+                                                      # compatible).
     ) -> torch.Tensor:
         B, N, _ = x.shape
         H, d    = self.heads, self.dim_head
@@ -259,6 +265,7 @@ class SelfAttentionRoPE(nn.Module):
 
         out = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
 

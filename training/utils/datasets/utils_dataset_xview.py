@@ -33,8 +33,39 @@ Output format (compatible with Model_SenFlood — segmentation):
     }
 
 Augmentations (training only): D4 group + random crop with building preference.
-Val: deterministic center crop. Test: full 1024×1024 (sliding-window evaluation
-handled by trainer / inference loop).
+Val: deterministic center crop. Test: default center crop (crop_size=512,
+same path as val) UNLESS a sliding-window evaluation loop is driving
+get_tile_sample directly -- see "SLIDING-WINDOW TEST TILES" below.
+
+FULL_IMAGE FLAG (opt-in only -- NOT auto-enabled for test):
+    `full_image` (constructor arg) defaults to a sentinel (None), which
+    resolves to False for every split, including test -- i.e. by default,
+    test behaves exactly like val (crop_size=512 center crop). Passing
+    full_image=True explicitly makes __getitem__/get_viz_sample return the
+    native uncropped image instead, BUT THIS IS ONLY VALID IF THE MODEL'S
+    POSITION LOOKUP TABLE COVERS THE FULL NATIVE RESOLUTION. It does not
+    for the default 0.5m-GSD / 512px-reference-grid config: TokenBuilder's
+    absolute position-encoding lookup table is precomputed at a fixed
+    maximum size per resolution (REFERENCE_SIZES[0.5] = 512, visible in
+    the startup log as "0.5 m/px x 512px -> offset 1536"), so a single
+    forward pass over the full 1024x1024 image requests positions beyond
+    that table and raises
+    ValueError("Crop size (1024x1024) exceeds reference size (512x512)...").
+    Fixing that would require regenerating the lookup tables with larger
+    REFERENCE_SIZES (a model/config-level change, likely requiring
+    retraining), which is out of scope here -- don't set full_image=True
+    unless you've done that.
+
+SLIDING-WINDOW TEST TILES (the actual way to get full-image test coverage):
+    get_tile_sample(index, top, left, tile_size) builds one deterministic,
+    non-overlapping tile sample (default tile_size=512, matching the
+    reference grid exactly, so it never hits the limit above) for use by a
+    sliding-window evaluation loop (see SlidingWindowTileDataset /
+    run_sliding_window_test in script_train_xview.py), which tiles each
+    test image and scores it via the model's existing per-tile test_step,
+    mathematically equivalent to stitching all tiles into the full image
+    and scoring once. This is independent of self.full_image and works
+    regardless of its value.
 
 Splits (matching PANGAEA's xView2.py):
     - Train: stratified 90% of (train + tier3) by disaster name
@@ -95,15 +126,18 @@ class XView2Dataset(Dataset):
         crop_size: int = 512,
         oversample_building_damage: bool = True,
         random_state: int = 23,
-        full_image: bool = False,
+        full_image: bool = None,
     ):
         super().__init__()
         assert mode in self.SPLIT_MAPPING, f"Unknown split: {mode}"
+
         root_path="./data/xview"
 
-        # NOTE: was hardcoded to "./data/xview" in a prior edit, which
-        # silently ignored the root_path argument (and thus --data_dir).
-        # Reverted to actually use the constructor argument.
+        # NOTE: a `root_path = "./data/xview"` reassignment had crept back
+        # in right here, shadowing the constructor argument one line above
+        # where it's used -- same bug as before, just moved up a line.
+        # Removed again; self.root_path below now actually uses the
+        # argument passed in (and thus --data_dir).
         self.root_path     = root_path
         self.split         = mode
         self.look_up       = look_up
@@ -114,7 +148,42 @@ class XView2Dataset(Dataset):
             oversample_building_damage and (mode == "train")
         )
         self.random_state  = random_state
-        self.full_image    = full_image  # if True, skip cropping (sliding-window test)
+
+        # ── Full-image single-forward mode (opt-in ONLY -- do not auto-
+        # enable for test) ────────────────────────────────────────────
+        # An earlier version of this comment auto-resolved full_image=True
+        # for the test split by default. That turned out to be a dead end:
+        # TokenBuilder's absolute position-encoding lookup table
+        # (Lookup_encoding's "Position table", see get_position_coordinates
+        # in token_builder.py) is PRECOMPUTED at a fixed maximum size per
+        # resolution -- REFERENCE_SIZES[0.5] = 512 for this dataset's 0.5m
+        # GSD, visible in the startup log ("0.5 m/px x 512px -> offset
+        # 1536"). A single forward pass over the full 1024x1024 image
+        # requests position coordinates beyond that precomputed table and
+        # raises ValueError("Crop size (1024x1024) exceeds reference size
+        # (512x512)..."). Fixing that would mean regenerating the lookup
+        # tables with larger REFERENCE_SIZES (a model/config-level change,
+        # likely requiring retraining since existing checkpoints' learned
+        # position embeddings are tied to the current table), which is out
+        # of scope here.
+        #
+        # Sliding-window evaluation (see SlidingWindowTileDataset /
+        # get_tile_sample below) sidesteps this entirely -- every tile is
+        # exactly crop_size (512x512 by default), well within the existing
+        # reference grid -- and is therefore the actual way to get
+        # full-image test coverage with this dataset/config, not this flag.
+        #
+        # full_image therefore stays OPT-IN: None (not passed) now resolves
+        # to False for every split (test included), same as passing False
+        # explicitly. get_tile_sample is entirely independent of this flag
+        # and always works regardless of its value.
+        if full_image is None:
+            full_image = False
+        self.full_image = full_image  # if True, skip cropping (single whole-image
+                                       # forward -- ONLY valid if the model's
+                                       # position lookup table covers the full
+                                       # native resolution; NOT true for the
+                                       # default 0.5m/512px config, see above)
 
         self.token_builder = TokenBuilder(look_up)
 
@@ -145,7 +214,8 @@ class XView2Dataset(Dataset):
                   f"(FULL IMAGE mode, 1024×1024)")
         else:
             print(f"[xView2-Atom] split={mode}, samples={len(self.all_files)}")
-        print(f"[xView2-Atom] crop_size={self.crop_size}, "
+        print(f"[xView2-Atom] crop_size="
+              f"{self.crop_size if not self.full_image else 'N/A (full image)'}, "
               f"oversample={self.oversample_building_damage}")
         print(f"[xView2-Atom] num_classes={NUM_CLASSES} (PANGAEA setup)")
         print(f"[xView2-Atom] T=2 frames (pre, post) at {self.OPTICAL_RESOLUTION}m")
@@ -372,8 +442,8 @@ class XView2Dataset(Dataset):
         kept_indices=None means queries were NOT subsampled (val/test: all
         H*W pixels), so the full per-pixel index is used as-is. Otherwise
         kept_indices are row indices into the pre-subsample, row-major
-        [0, H*W) pixel ordering returned by _subsample_queries_building_priority
-        (or, previously, subsample_queries(..., return_indices=True)) -- same
+        [0, H*W) pixel ordering returned by
+        token_builder.subsample_queries(..., return_indices=True) -- same
         ordering _build_full_pixel_index is built over, so full[kept_indices]
         lines up 1:1 with the surviving queries.
 
@@ -389,63 +459,22 @@ class XView2Dataset(Dataset):
         return idx, valid
 
     # ─────────────────────────────────────────────────────────────────────
-    # QUERY SUBSAMPLING: building-priority
-    # ─────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _subsample_queries_building_priority(queries: torch.Tensor,
-                                              target: torch.Tensor,
-                                              max_queries: int):
-        """
-        Training-time query subsampling that prioritizes building/damage
-        pixels (label > 0) over background (label == 0), filling any
-        remaining budget with background once all building pixels are kept.
-
-        Replaces token_builder.subsample_queries(..., prioritize_valid=True)
-        for this dataset: that flag only distinguishes ignore_index from
-        everything else, but xView2's target NEVER contains IGNORE_INDEX
-        (see module docstring -- invalid mask values are mapped to 0/
-        background in __getitem__), so prioritize_valid=True was a no-op
-        here. This gives an actual class-aware priority instead, consistent
-        with the building bias already applied elsewhere in this pipeline
-        (_crop_prefer_buildings, _oversample_building_files).
-
-        queries: [H*W, 8], row-major over pixels (row p == target.flatten()[p]).
-        target:  [H, W] class labels for this sample.
-
-        Returns (queries_subsampled, kept_indices) where kept_indices are
-        row indices into the pre-subsample [0, H*W) ordering -- same
-        convention _build_query_token_index expects for query_token_idx.
-        """
-        flat_labels = target.reshape(-1)  # [H*W], row-major, matches queries' row order
-        building_idx = (flat_labels > 0).nonzero(as_tuple=True)[0]
-        background_idx = (flat_labels == 0).nonzero(as_tuple=True)[0]
-
-        n_building = building_idx.shape[0]
-        if n_building >= max_queries:
-            # More building pixels than budget: subsample among them only.
-            perm = torch.randperm(n_building)[:max_queries]
-            kept_indices = building_idx[perm]
-        else:
-            # Keep every building pixel, fill the rest with random background.
-            n_background_needed = max_queries - n_building
-            if background_idx.shape[0] > n_background_needed:
-                perm = torch.randperm(background_idx.shape[0])[:n_background_needed]
-                background_kept = background_idx[perm]
-            else:
-                background_kept = background_idx  # fewer background px than budget: keep all
-            kept_indices = torch.cat([building_idx, background_kept])
-
-        return queries[kept_indices], kept_indices
-
-    # ─────────────────────────────────────────────────────────────────────
     # DATASET INTERFACE
     # ─────────────────────────────────────────────────────────────────────
 
     def __len__(self):
         return len(self.all_files)
 
-    def __getitem__(self, index):
+    def _load_full_sample(self, index: int):
+        """
+        Load + stack + normalize the FULL (uncropped, native-resolution)
+        [T, C, H, W] image and [H, W] target for file index `index`.
+
+        Extracted from __getitem__ so it can also be used by
+        get_tile_sample (sliding-window evaluation tiles slice a window
+        out of this) without duplicating the image/mask loading code.
+        Byte-for-byte identical to what __getitem__ used to do inline.
+        """
         fn_pre = self.all_files[index]
         fn_post = fn_pre.replace("_pre_", "_post_")
 
@@ -480,16 +509,32 @@ class XView2Dataset(Dataset):
         # ── Normalize ──
         img = (img - self.norm_mean.unsqueeze(0)) / self.norm_std.unsqueeze(0)
 
-        # ── Crop ──
-        if not self.full_image:
-            img, target = self._crop_prefer_buildings(
-                img, target, self.crop_size, random=(self.split == "train"),
-            )
+        return img, target
 
-        # ── Augment (training only) ──
-        if self.split == "train":
-            img, target = self._d4_augment(img, target)
+    def _build_sample_from_crop(
+        self, img: torch.Tensor, target: torch.Tensor, subsample_queries: bool,
+    ) -> dict:
+        """
+        Shared token/query construction for an already-cropped (or full-
+        extent, or sliding-window-tiled) [T, C, H, W] image and [H, W]
+        target -- i.e. everything downstream of cropping/augmentation in
+        the original __getitem__. Used by __getitem__ (train/val/test
+        crops, or the full uncropped image when self.full_image is True)
+        and by get_tile_sample (sliding-window evaluation tiles).
 
+        NOT used by get_viz_sample, which keeps its own standalone
+        implementation unchanged -- viz has slightly different, deliberate
+        semantics (e.g. it always builds query_token_idx even in
+        reconstruction mode) that this shared path does not replicate, so
+        reusing it there would be a behavior change, not just a refactor.
+
+        `subsample_queries` replaces the old inline `self.split == "train"`
+        check -- __getitem__ still passes exactly that, so behavior is
+        unchanged; get_tile_sample always passes False (every pixel in a
+        sliding-window tile must be queried for the tile-accumulation ==
+        full-image-stitching equivalence to hold -- see
+        SlidingWindowTileDataset's docstring in script_train_xview.py).
+        """
         T, C, H, W = img.shape
 
         # ── Build tokens for each (T, C, H, W) slot ──
@@ -534,26 +579,33 @@ class XView2Dataset(Dataset):
         # kept_indices tracks which of the seg_queries' H*W rows survived
         # subsampling -- needed below to build query_token_idx so the SKIP
         # gather index stays aligned with the (possibly subsampled) queries.
-        # None means "not subsampled" (reconstruction mode, or val/test).
+        # None means "not subsampled" (reconstruction mode, or val/test/tile).
+        #
+        # Plain uniform subsampling here -- a class-priority variant
+        # (always keeping every building pixel first) was tried and
+        # reverted: forcing the same building pixels into every epoch's
+        # query set reduces sample diversity and was found to increase
+        # overfitting rather than help. token_builder.subsample_queries's
+        # prioritize_valid=True is left on, though it's a no-op for this
+        # dataset specifically -- target never contains IGNORE_INDEX (see
+        # module docstring), so there's nothing for it to deprioritize.
         kept_indices = None
         if self.reconstruction:
             queries = image_tokens.clone()
             queries[:, 4] = queries[:, 0].clone()
             perm = torch.randperm(queries.shape[0])[:self.max_tokens_reconstruction]
             queries = queries[perm]
+        elif subsample_queries:
+            queries, kept_indices = self.token_builder.subsample_queries(
+                seg_queries,
+                max_queries=self.max_tokens_reconstruction,
+                ignore_index=IGNORE_INDEX,
+                prioritize_valid=True,
+                return_indices=True,
+            )
         else:
-            if self.split == "train":
-                # Building-priority subsampling: keep every building/damage
-                # pixel first, fill remaining budget with background. See
-                # _subsample_queries_building_priority's docstring for why
-                # this replaces token_builder.subsample_queries(...,
-                # prioritize_valid=True) for this dataset specifically.
-                queries, kept_indices = self._subsample_queries_building_priority(
-                    seg_queries, target, self.max_tokens_reconstruction,
-                )
-            else:
-                # Val/test: all pixels for accurate evaluation
-                queries = seg_queries
+            # Val/test/sliding-window tile: all pixels for accurate evaluation
+            queries = seg_queries
 
         # ── Masks ──
         attention_mask = torch.zeros(image_tokens.shape[0])
@@ -589,6 +641,65 @@ class XView2Dataset(Dataset):
 
         return result
 
+    def __getitem__(self, index):
+        img, target = self._load_full_sample(index)
+
+        # ── Crop ──
+        # Skipped entirely when self.full_image is True -- opt-in ONLY
+        # (see the module docstring's "FULL_IMAGE FLAG" section for why
+        # this defaults to False even for test), leaving img/target at
+        # native 1024x1024.
+        if not self.full_image:
+            img, target = self._crop_prefer_buildings(
+                img, target, self.crop_size, random=(self.split == "train"),
+            )
+
+
+        # ── Augment (training only) ──
+        if self.split == "train":
+            img, target = self._d4_augment(img, target)
+
+        return self._build_sample_from_crop(
+            img, target, subsample_queries=(self.split == "train"),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SLIDING-WINDOW TEST TILE (deterministic, non-overlapping)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_tile_sample(self, index: int, top: int, left: int, tile_size: int) -> dict:
+        """
+        Build a single deterministic, non-overlapping sliding-window tile
+        sample for full-image test-time evaluation -- the Atomiser
+        equivalent of script_train_xview_baselines.py's _build_tile_batch,
+        but returning one Atomiser-format sample dict per tile (tokens +
+        per-pixel queries covering exactly this tile), since Atomiser
+        consumes tokenized queries rather than a plain image tensor.
+
+        Unlike __getitem__, this ALWAYS loads the full native-resolution
+        image (regardless of self.full_image / self.crop_size) and slices
+        out exactly [top:top+tile_size, left:left+tile_size] -- no
+        augmentation, no query subsampling (every pixel in the tile is a
+        query). Query subsampling must stay off here: the
+        confusion-matrix-accumulation-equals-full-image-stitching
+        equivalence that SlidingWindowTileDataset relies on (see its
+        docstring in script_train_xview.py) requires every pixel of every
+        tile to be scored exactly once.
+
+        Used by SlidingWindowTileDataset (script_train_xview.py) to build
+        a sliding-window test set out of this dataset's test split, and
+        by measure_test_gflops for tile-level FLOPs measurement.
+        """
+        img, target = self._load_full_sample(index)
+        _, _, H, W = img.shape
+        assert top >= 0 and left >= 0 and top + tile_size <= H and left + tile_size <= W, (
+            f"[xView2-Atom] tile (top={top}, left={left}, size={tile_size}) "
+            f"is out of bounds for image {H}x{W} at index {index}"
+        )
+        img_tile    = img[:, :, top:top + tile_size, left:left + tile_size]
+        target_tile = target[top:top + tile_size, left:left + tile_size]
+        return self._build_sample_from_crop(img_tile, target_tile, subsample_queries=False)
+
     # ─────────────────────────────────────────────────────────────────────
     # VIZ SAMPLE (no augmentation, deterministic)
     # ─────────────────────────────────────────────────────────────────────
@@ -613,7 +724,8 @@ class XView2Dataset(Dataset):
         target = torch.from_numpy(target).long()
         img = (img - self.norm_mean.unsqueeze(0)) / self.norm_std.unsqueeze(0)
 
-        # Deterministic center crop (no augmentation)
+        # Deterministic center crop (no augmentation). Skipped when
+        # self.full_image is True (opt-in only -- see module docstring).
         if not self.full_image:
             img, target = self._crop_prefer_buildings(
                 img, target, self.crop_size, random=False,

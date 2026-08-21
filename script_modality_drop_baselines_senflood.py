@@ -18,13 +18,27 @@ RAMEN is different in two ways that this script accounts for:
      the image the same way script_train_senflood_baseline.py does for
      training/eval.
 
+UniverSat is handled like RAMEN on the input side ({"optical","sar"}
+dict, split from the merged tensor by the same wrapper) but like the
+dense baselines on the eval side: a SINGLE full 512x512 dense forward
+(no sliding window -- matching how it was trained/evaluated in
+script_train_senflood_baseline.py). Its --universat_* args MUST match
+the checkpoint's training config (notably --universat_output_stride:
+the universat_px run trained at 1, not the flag default).
+
 FLOPs: measured with the SAME harness as Atomizer (torch.profiler,
 with_flops=True, sum over key_averages(), averaged over N passes, bs=1, one
 discarded warmup), on the BASE model under the 'all' config (no channels
 dropped). For RAMEN, the profiled forward is the FULL sliding-window
 pass over the 512x512 image (all windows), so the resulting GFLOPs number
 is directly comparable to the other baselines' full-image dense forward —
-not just the cost of a single window.
+not just the cost of a single window. KNOWN LIMITATION: this profiler
+harness has no formulas for fused scaled_dot_product_attention kernels,
+so ALL attention FLOPs are silently dropped for SDPA-based models (ViT,
+Perceiver, RAMEN, UniverSat) -- these numbers are lower bounds, worst
+for token-heavy models. For UniverSat use the FlopCounterMode numbers
+from script_universat_sweep_senflood.py's JSON instead; never mix the
+two harnesses in one table.
 
 Channel layout (fixed, matches Sen1Floods11BaselineDataset):
     indices 0–12  : S2 bands (B01–B12, order = idx field in bands_senflood)
@@ -71,6 +85,7 @@ from training.VIT.model_vit_upernet import ViTUPerNet
 from training.ResNet.model_resnet_upernet import build_resnet_upernet
 from training.perceiverIO.perceiver_seg import PerceiverSeg
 from training.RAMEN.ramen_upernet import build_ramen_upernet  # adjust import path
+from training.Universat.universat_augmenter import build_universat_segmenter
 from training.sliding_window import sliding_window_inference  # adjust import path
 from training.trainer_baselines import BaselineTrainer
 
@@ -160,6 +175,26 @@ RAMEN_BAND_TO_MODALITY_CHANNEL.update({
 
 
 # =============================================================================
+# UniverSat band metadata — same {"optical","sar"} split as RAMEN (and the
+# SAME per-modality drop mapping, RAMEN_BAND_TO_MODALITY_CHANNEL, applies),
+# but SAR uses UniverSat's own string channel codes "VV"/"VH" (learned
+# Encoding_<code> embeddings), NOT RAMEN's "asc_vv" pol_map keys. Optical
+# reuses this script's nm dict (band-name spelling differs from the
+# training script's table -- "B08A" here vs "B8A" there -- but only the
+# VALUES and their order matter to UniverSat, and both are identical).
+# =============================================================================
+
+UNIVERSAT_INPUT_BANDS = {
+    "optical": ALL_S2,
+    "sar": ALL_S1,
+}
+UNIVERSAT_WAVELENGTHS = {
+    "optical": S2_WAVELENGTHS_NM,
+    "sar": ALL_S1,                 # the names ARE the codes: ["VV", "VH"]
+}
+
+
+# =============================================================================
 # CHANNEL-ZEROING WRAPPERS
 # =============================================================================
 
@@ -181,7 +216,8 @@ class ChannelDropWrapper(nn.Module):
 
 class RAMENChannelDropWrapper(nn.Module):
     """
-    Wraps a RAMENUPerNet for modality-drop ablations.
+    Wraps a RAMENUPerNet -- or a UniverSatSegmenter, which consumes the
+    exact same {"optical","sar"} dict -- for modality-drop ablations.
 
     Input is the raw merged tensor under key MODALITY_KEY ("s2s1"):
     {"s2s1": [B, 15, h, w]} — exactly what sliding_window_inference
@@ -295,6 +331,22 @@ def build_model(model_name: str, args) -> nn.Module:
             res=args.ramen_res,
             output_layers=tuple(args.vit_output_layers),
             decoder_channels=args.vit_decoder_channels,
+        )
+    elif model_name == "universat":
+        # No window size baked at construction -- the latent grid is
+        # recomputed per input, so the eval is a single full-512 dense
+        # forward (matching training-time eval), NOT sliding-window.
+        # All --universat_* args MUST match the checkpoint's training
+        # config for the strict load to be meaningful.
+        return build_universat_segmenter(
+            input_bands=UNIVERSAT_INPUT_BANDS,
+            wavelengths=UNIVERSAT_WAVELENGTHS,
+            num_classes=NUM_CLASSES,
+            input_res={"optical": args.universat_input_res,
+                       "sar": args.universat_input_res},
+            patch_size_m=args.universat_patch_m,
+            output_stride=args.universat_output_stride,
+            size=args.universat_size,
         )
     else:
         raise ValueError(f"Unknown model: {model_name}")
@@ -454,6 +506,12 @@ def profile_baselines_flops(model_ckpts, args, test_loader,
                 window_size=args.ramen_window_size,
                 window_stride=args.ramen_stride,
             )
+        elif model_name == "universat":
+            load_kwargs.update(
+                modality="optical+sar",
+                window_size=None,       # full-512 single dense forward
+                window_stride=None,
+            )
         else:
             load_kwargs.update(modality=MODALITY_KEY)
 
@@ -479,6 +537,15 @@ def profile_baselines_flops(model_ckpts, args, test_loader,
                     stride=args.ramen_stride,
                     num_classes=NUM_CLASSES,
                 )
+        elif model_name == "universat":
+            # Same dict-splitting wrapper, but a single full-image dense
+            # forward (no sliding window) -- matching its trained eval
+            # mode. NOTE the profiler undercount for SDPA models (see
+            # module docstring); prefer the FlopCounterMode sweep numbers.
+            wrapped = RAMENChannelDropWrapper(base_model, []).to(device).eval()
+
+            def fwd(b, m=wrapped):
+                return m(b["image"])
         else:
             def fwd(b, m=base_model):
                 x = stack_image_dict(b["image"], device)      # [1, 15, 512, 512]
@@ -506,7 +573,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt",  type=str, default=None,
                     help="Path to a single checkpoint")
 parser.add_argument("--model", type=str, default="resnet",
-                    choices=["unet","vit","resnet","perceiver","ramen"],
+                    choices=["unet","vit","resnet","perceiver","ramen","universat"],
                     help="Architecture for --ckpt")
 
 # Multi-checkpoint mode: name=path pairs
@@ -547,13 +614,13 @@ parser.add_argument("--resnet_variant",       type=str, default="resnet50")
 
 # Perceiver IO args
 parser.add_argument("--num_latents",        type=int, default=512)
-parser.add_argument("--latent_dim",         type=int, default=768)
+parser.add_argument("--latent_dim",         type=int, default=512)
 parser.add_argument("--depth",              type=int, default=1)
 parser.add_argument("--cross_heads",        type=int, default=8)
 parser.add_argument("--latent_heads",       type=int, default=8)
 parser.add_argument("--cross_dim_head",     type=int, default=64)
 parser.add_argument("--latent_dim_head",    type=int, default=64)
-parser.add_argument("--self_per_cross_attn", type=int, default=2)
+parser.add_argument("--self_per_cross_attn", type=int, default=6)
 parser.add_argument("--no_weight_tie",      action="store_true",
                     help="Disable weight-tying across encoder blocks.")
 parser.add_argument("--num_freq_bands",     type=int, default=16)
@@ -578,8 +645,40 @@ parser.add_argument("--ramen_config",      type=str, default=None,
                          "--ramen_config. Use the SAME config the "
                          "checkpoint was trained with.")
 
+# UniverSat args — every one of these MUST match the checkpoint's training
+# config (the strict state-dict load succeeds at any geometry, so a
+# mismatch would be a silent protocol error, not a crash).
+parser.add_argument("--universat_size", type=str, default="small",
+                    choices=["tiny", "small", "base"])
+parser.add_argument("--universat_patch_m", type=float, default=80.0,
+                    help="Patch size in metres (80 = 8 px @ 10 m, the "
+                         "training default).")
+parser.add_argument("--universat_output_stride", type=int, default=4,
+                    help="MUST match the checkpoint (the universat_px run "
+                         "trained at 1, NOT this default -- pass "
+                         "--universat_output_stride 1 for it).")
+parser.add_argument("--universat_input_res", type=float, default=10.0,
+                    help="Native GSD (m/px); Sen1Floods11 is 10 m.")
+
 args = parser.parse_args()
 args = apply_ramen_config(args)
+
+# UniverSat geometry sanity (fail fast, before dataset construction)
+_needs_universat = (args.model == "universat" and args.ckpt) or any(
+    item.split("=", 1)[0] == "universat" for item in (args.ckpts or []))
+if _needs_universat:
+    import math as _math
+    _px = args.universat_patch_m / args.universat_input_res
+    if abs(_px - round(_px)) > 1e-6:
+        raise ValueError(
+            f"--universat_patch_m ({args.universat_patch_m}) is not an "
+            f"integer pixel count at {args.universat_input_res} m GSD.")
+    _px = int(round(_px))
+    _lcm = _math.lcm(_px, args.universat_output_stride)
+    if 512 % _lcm:
+        raise ValueError(
+            f"512 eval side not divisible by lcm(patch_px={_px}, "
+            f"output_stride={args.universat_output_stride})={_lcm}.")
 
 # Build (model_name, ckpt_path) list
 if args.ckpts:
@@ -675,6 +774,12 @@ if not args.flops_only:
                 window_size=args.ramen_window_size,
                 window_stride=args.ramen_stride,
             )
+        elif model_name == "universat":
+            load_kwargs.update(
+                modality="optical+sar",
+                window_size=None,       # full-512 single dense forward
+                window_stride=None,
+            )
         else:
             load_kwargs.update(modality=MODALITY_KEY)
 
@@ -691,7 +796,7 @@ if not args.flops_only:
             print(f"  Ablation : {ablation_name}   Drop : {drop_str}")
             print(f"  {'─'*50}")
 
-            if model_name == "ramen":
+            if model_name in ("ramen", "universat"):
                 drop_specs = [RAMEN_BAND_TO_MODALITY_CHANNEL[b] for b in drop_bands]
                 trainer_module.model = RAMENChannelDropWrapper(base_model, drop_specs)
             else:

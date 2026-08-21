@@ -2,15 +2,21 @@
 PASTIS Crop Segmentation Trainer
 ==================================
 
-PyTorch Lightning module for training Atomizer (± LTAE ± decoder skip) on
-PASTIS-HD for multi-temporal crop type segmentation.
+PyTorch Lightning module for training Atomizer (± LTAE ± decoder skip ±
+temporal transformer) on PASTIS-HD for multi-temporal crop type segmentation.
 
 Encoder selection (priority order):
-    1. config["Atomiser"]["use_decoder_skip"] == True
+    1. config["Atomiser"]["use_temporal_transformer"] == True
+         -> AtomiserTemporal   (per-timestep Atomiser_Senflood_Skip encoding
+                                 + TemporalTransformer aggregation; internally
+                                 wraps Atomiser_Senflood_Skip, so set
+                                 use_decoder_skip: True too if you want the
+                                 pixel-skip cascade active)
+    2. config["Atomiser"]["use_decoder_skip"] == True
          -> Atomiser_Senflood_Skip   (decoder pixel-skip cascade)
-    2. config["Atomiser"]["use_ltae"] == True
+    3. config["Atomiser"]["use_ltae"] == True
          -> AtomiserLTAE             (per-timestamp encoding + LTAE)
-    3. otherwise
+    4. otherwise
          -> Atomiser_Senflood        (no temporal reasoning; the 0.38 baseline)
 
 Metric convention:
@@ -31,6 +37,8 @@ from training.atomiser import Atomiser_Senflood
 from training.atomiser.atomiser_ltae_wrapper import AtomiserLTAE
 # >>> SKIP: decoder pixel-skip variant (adjust path if the class lives elsewhere)
 from training.atomiser.Atomiser_senflood_skip import Atomiser_Senflood_Skip
+# >>> TEMPORAL: per-timestep encoding + TemporalTransformer aggregation
+from training.atomiser.Atomiser_temporal import AtomiserTemporal
 from training.atomiser.error_supervision import (
     compute_latent_errors,
     compute_error_predictor_loss,
@@ -92,12 +100,26 @@ class PASTISTrainer(pl.LightningModule):
 
         # =====================================================================
         # MODEL — encoder selection
-        #   use_decoder_skip  > use_ltae > base Atomiser_Senflood
+        #   use_temporal_transformer > use_decoder_skip > use_ltae > base
         # =====================================================================
+        self.use_temporal_transformer = config["Atomiser"].get(
+            "use_temporal_transformer", False)
         self.use_decoder_skip = config["Atomiser"].get("use_decoder_skip", False)
         self.use_ltae         = config["Atomiser"].get("use_ltae", True)
 
-        if self.use_decoder_skip:
+        if self.use_temporal_transformer:
+            print("[PASTIS] Using AtomiserTemporal "
+                  "(per-timestep Atomiser_Senflood_Skip encoding + "
+                  "TemporalTransformer aggregation)")
+            if not self.use_decoder_skip:
+                print("[PASTIS] [WARNING] use_temporal_transformer=True but "
+                      "use_decoder_skip=False — the SKIP cascade "
+                      "(query_token_idx/query_token_valid) will be ignored "
+                      "by AtomiserTemporal.forward. Set "
+                      "use_decoder_skip=True if you want it active.")
+            self.encoder = AtomiserTemporal(
+                config=self.config, lookup_table=self.lookup_table)
+        elif self.use_decoder_skip:
             print("[PASTIS] Using Atomiser_Senflood_Skip "
                   "(decoder pixel-skip cascade)")
             self.encoder = Atomiser_Senflood_Skip(
@@ -122,6 +144,10 @@ class PASTISTrainer(pl.LightningModule):
 
         # =====================================================================
         # ERROR PREDICTOR SUPERVISION (zone-CE, same setup as Sen1Floods11)
+        # Note: this is a no-op with AtomiserTemporal — its forward() does not
+        # return predicted_errors/topk_indices/topk_dists_sq, so the block in
+        # _compute_loss_and_preds below silently skips adding the error loss.
+        # Leave use_error_predictor: false in temporal-transformer configs.
         # =====================================================================
         self.use_error_predictor = config["Atomiser"].get(
             "use_error_predictor", False)
@@ -132,6 +158,9 @@ class PASTISTrainer(pl.LightningModule):
                 config["Atomiser"].get("error_supervision_warmup_epochs", 0))
             print(f"[PASTIS] Error predictor supervision ENABLED "
                   f"(lambda={self.lambda_error}, warmup={self.error_warmup} epochs)")
+            if self.use_temporal_transformer:
+                print("[PASTIS] [WARNING] use_error_predictor=True has no "
+                      "effect with AtomiserTemporal (no-op).")
         else:
             print(f"[PASTIS] Error predictor supervision DISABLED")
 
@@ -146,7 +175,8 @@ class PASTISTrainer(pl.LightningModule):
     def _ensure_flat_batch(self, batch):
         """Lift queries/queries_mask from batch['tasks'] to the top level.
         Preserves all other top-level keys (incl. query_token_idx /
-        query_token_valid for the skip) via the shallow dict() copy."""
+        query_token_valid for the skip, and time_indices for the temporal
+        transformer) via the shallow dict() copy."""
         if "queries" in batch and batch["queries"] is not None:
             return batch
         if "tasks" in batch and isinstance(batch["tasks"], dict) and len(batch["tasks"]) > 0:

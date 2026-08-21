@@ -27,6 +27,16 @@ class MADOSDataset(Dataset):
     split only, after the focus crop and before token building. Val/test
     (sliding window) remain unaugmented for fair benchmarking.
 
+    Query subsampling (via TokenBuilder.subsample_queries) is ALSO
+    train-only, same gate as D4 augmentation. _getitem_train is reused for
+    val/test when use_sliding=False (see __getitem__), so without this
+    gate val/test queries were being randomly subsampled down to
+    max_tokens_reconstruction on every call — non-deterministic across
+    runs, and evaluating on a partial/random subset of each tile's pixels
+    instead of the full dense label. Fixed: val/test now always use the
+    full pixel grid, in order (kept_indices=None), matching the
+    sliding-window path's convention.
+
     SKIP: emits a per-query gather index `query_token_idx` of shape
     [N_q, bands_per_pixel] (and `query_token_valid`), where each row holds
     the row indices (into this sample's `image_tokens` pool) of that
@@ -125,6 +135,7 @@ class MADOSDataset(Dataset):
             print(f"  idx={b['idx']:2d}: {b['band_key']:4s} (native {b['resolution']}m) → "
                   f"wl={b['wavelength']}nm, bw={b['bandwidth']}nm")
         print(f"[MADOS] D4 augmentations: {'ON' if self.split == 'train' else 'OFF'}")
+        print(f"[MADOS] Query subsampling: {'ON (max_tokens_reconstruction=' + str(self.max_tokens_reconstruction) + ')' if self.split == 'train' else 'OFF (full pixel grid)'}")
         if self.split != "train" and self.use_sliding:
             print(f"[MADOS] Val/test: sliding window, crop={self.FOCUS_CROP_SIZE}, "
                   f"stride={self.SLIDING_STRIDE}")
@@ -229,11 +240,12 @@ class MADOSDataset(Dataset):
             C, H, W      : image dims used to build the token pool
             kept_indices : [N_q] long or None.
                            None  -> queries are the full pixel grid in order
-                                    (sliding crops: queries == seg_queries).
+                                    (sliding crops, and now also val/test
+                                    non-sliding: queries == seg_queries).
                            tensor-> the row positions (into the full pixel
                                     grid) that subsample_queries kept, in the
                                     SAME order as the returned queries
-                                    (train / non-sliding eval). Obtained via
+                                    (train only). Obtained via
                                     subsample_queries(..., return_indices=True).
 
         Returns:
@@ -279,11 +291,18 @@ class MADOSDataset(Dataset):
             return self._getitem_train(image, label_full)
 
     # =========================================================================
-    # TRAIN: focus crop → D4 augment → token building
+    # TRAIN (and non-sliding val/test): focus crop → D4 augment → tokens
     # =========================================================================
 
     def _getitem_train(self, image, label_full):
-        """Focus crop + D4 augmentation (train split only) + token building."""
+        """
+        Focus crop + D4 augmentation (train split only) + token building.
+
+        Also used for val/test when use_sliding=False (see __getitem__).
+        D4 augmentation and query subsampling are BOTH gated to
+        self.split == "train" — val/test get the deterministic, full
+        pixel grid with no augmentation, same as the sliding-window path.
+        """
 
         crop_coords = self._get_focus_crop(label_full)
 
@@ -313,17 +332,27 @@ class MADOSDataset(Dataset):
             }
         }
 
-        # Build and subsample queries using TokenBuilder
+        # Build queries using TokenBuilder. Subsampling is TRAIN-ONLY,
+        # same gate as D4 augmentation above — see class docstring for
+        # why this matters (this fixes a bug where val/test were being
+        # randomly, non-deterministically subsampled).
         queries = self._build_queries(label, self.TARGET_RESOLUTION)
-        # SKIP: capture which queries were kept so the gather index can be
-        #       selected to match (subsample shuffles/truncates order).
-        queries, kept_indices = self.token_builder.subsample_queries(
-            queries,
-            max_queries=self.max_tokens_reconstruction,
-            ignore_index=self.IGNORE_INDEX,
-            prioritize_valid=True,
-            return_indices=True,
-        )
+        if self.split == "train":
+            # SKIP: capture which queries were kept so the gather index
+            #       can be selected to match (subsample shuffles/truncates
+            #       order).
+            queries, kept_indices = self.token_builder.subsample_queries(
+                queries,
+                max_queries=self.max_tokens_reconstruction,
+                ignore_index=self.IGNORE_INDEX,
+                prioritize_valid=True,
+                return_indices=True,
+            )
+        else:
+            # Full pixel grid, in order — matches the sliding-window
+            # path's convention (_build_query_token_index treats
+            # kept_indices=None as "use the full grid unchanged").
+            kept_indices = None
         queries_mask = torch.zeros(queries.shape[0])
 
         # SKIP: vectorized per-query gather index (closed form) into this

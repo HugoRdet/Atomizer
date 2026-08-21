@@ -21,6 +21,22 @@ windows tiling the full 512x512 image stays fixed too. Only the number
 of TOKENS per window changes with `res` (coarser res -> fewer tokens ->
 cheaper forward, smaller effective receptive detail).
 
+# >>> FULL_TEST_SET_GFLOPS: GFLOPs/forward is now measured over EVERY
+# sample in the test split, not a small fixed pool of --flops_n batches.
+# Rationale: a forward pass's cost is not perfectly constant across
+# samples (sliding-window tiling count is fixed, but per-tile attention
+# cost is only per-token constant; images differ in content-driven
+# ragged shapes wherever the pipeline has any data-dependent branching).
+# Averaging over the full split removes the risk that a small handful of
+# batches happens to be unrepresentative. One warmup pass is still run
+# first and discarded (compile/cache warmup), and it is drawn from the
+# same loader rather than a separately materialized pool. This trades
+# sweep runtime (now ~len(test_ds) forwards per resolution) for a
+# GFLOPs number that is a genuine mean over the whole test set. Since
+# each measured pass is profiled independently, per-pass results are
+# retained so the reported number can be a true mean (and, if needed
+# later, a std) instead of just the mean of a small sample.
+
 Usage
 -----
     python script_ramen_resolution_sweep_senflood.py \
@@ -47,7 +63,7 @@ import torch
 import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
-from torch.profiler import profile, ProfilerActivity
+from torch.utils.flop_counter import FlopCounterMode   # >>> FLOPS_METHOD
 from pytorch_lightning import Trainer, seed_everything
 
 seed_everything(42, workers=True)
@@ -126,7 +142,7 @@ def senflood_collate(batch):
 
 
 # =============================================================================
-# FLOPs MEASUREMENT — same harness as the other baseline scripts
+# FLOPs MEASUREMENT — now streams over the WHOLE test loader
 # =============================================================================
 
 def _to_device(b, dev):
@@ -140,32 +156,53 @@ def _to_device(b, dev):
 
 
 @torch.no_grad()
-def measure_gflops_forward(forward_fn, batches, device, n_warmup=1):
+def measure_gflops_forward_full_testset(forward_fn, loader, device, n_warmup=1):
     """
-    One warmup pass discarded; each measured pass profiled separately
-    with with_flops=True; per-pass total summed over key_averages();
-    report mean / 1e9. forward_fn internally loops over sliding-window
-    tiles, so this captures the TOTAL cost of one full-image forward.
-    """
-    for b in batches[:n_warmup]:
-        _ = forward_fn(b)
-    if device == "cuda":
-        torch.cuda.synchronize()
+    # >>> FULL_TEST_SET_GFLOPS
+    Streams every batch in `loader` through `forward_fn`, counting each
+    with FlopCounterMode individually.
 
-    flops_list = []
-    for b in batches[n_warmup:]:
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     with_flops=True, record_shapes=True, profile_memory=True) as prof:
+    # >>> FLOPS_METHOD: switched from torch.profiler(with_flops=True) to
+    # torch.utils.flop_counter.FlopCounterMode, matching
+    # script_universat_sweep_burnscars.py / _senflood.py exactly.
+    # torch.profiler's with_flops=True has no formulas for fused
+    # scaled_dot_product_attention kernels and silently drops ALL
+    # attention FLOPs — a large undercount for a transformer backbone like
+    # RAMEN's ViT blocks. Do not mix these numbers with any older
+    # torch.profiler-harness numbers from a previous run of this script.
+
+    The first `n_warmup` batches yielded by the loader are run through
+    forward_fn but NOT profiled/counted (JIT/cudnn autotune warmup, as
+    before). Every subsequent batch is counted and its total FLOPs
+    accumulated. Returns (mean_gflops, n_batches_measured, per_batch_gflops)
+    so callers can report a true full-test-set mean (and inspect the
+    per-batch distribution if needed).
+    """
+    per_batch_gflops = []
+    n_measured = 0
+
+    for i, raw_b in enumerate(loader):
+        b = _to_device(raw_b, device)
+
+        if i < n_warmup:
             _ = forward_fn(b)
             if device == "cuda":
                 torch.cuda.synchronize()
-        total = sum(evt.flops for evt in prof.key_averages()
-                    if getattr(evt, "flops", None))
-        flops_list.append(total)
+            continue
 
-    if not flops_list:
-        return float("nan")
-    return (sum(flops_list) / len(flops_list)) / 1e9
+        fc = FlopCounterMode(display=False)
+        with fc:
+            _ = forward_fn(b)
+            if device == "cuda":
+                torch.cuda.synchronize()
+        per_batch_gflops.append(fc.get_total_flops() / 1e9)
+        n_measured += 1
+
+    if n_measured == 0:
+        return float("nan"), 0, []
+
+    mean_gflops = sum(per_batch_gflops) / n_measured
+    return mean_gflops, n_measured, per_batch_gflops
 
 
 # =============================================================================
@@ -183,8 +220,14 @@ parser.add_argument("--resolutions", type=float, nargs="+", default=None,
                     help="Explicit list of `res` values (m/px) to sweep. "
                          "Default: 10, 20, ..., 200 (step 10, 20 values).")
 
-parser.add_argument("--flops_n", type=int, default=3,
-                    help="Number of profiled forward passes per resolution (mean).")
+# >>> FULL_TEST_SET_GFLOPS: --flops_n is kept only to control the number
+# of WARMUP passes discarded before profiling starts; it no longer caps
+# how many batches are profiled (that's now every remaining batch in the
+# test split).
+parser.add_argument("--flops_n_warmup", type=int, default=1,
+                    help="Number of un-profiled warmup forward passes "
+                         "before GFLOPs profiling begins over the rest "
+                         "of the (full) test set.")
 
 # RAMEN architecture args — fixed across the sweep, must match the
 # checkpoint's training config EXCEPT `res` itself, which is swept.
@@ -192,7 +235,7 @@ parser.add_argument("--ramen_embed_dim",   type=int, default=384)
 parser.add_argument("--ramen_depth",       type=int, default=12)
 parser.add_argument("--ramen_num_heads",   type=int, default=8)
 parser.add_argument("--ramen_input_res",   type=float, default=10.0)
-parser.add_argument("--ramen_window_size", type=int, default=128,
+parser.add_argument("--ramen_window_size", type=int, default=512,
                     help="MUST match the checkpoint's training window size.")
 parser.add_argument("--ramen_stride",      type=int, default=96,
                     help="Sliding-window stride for full 512x512 eval.")
@@ -260,6 +303,7 @@ print(f"  Checkpoint:   {args.ckpt}")
 print(f"  Window size:  {args.ramen_window_size}x{args.ramen_window_size}")
 print(f"  Stride:       {args.ramen_stride}")
 print(f"  Resolutions:  {args.resolutions}")
+print(f"  GFLOPs scope: FULL TEST SET (warmup={args.flops_n_warmup} batches discarded)")
 print(f"{'='*60}\n")
 
 
@@ -271,31 +315,16 @@ test_ds = Sen1Floods11BaselineDataset(
     root_path=args.data_dir, mode="test",
     crop_size=None, augment=False,
 )
-test_loader = DataLoader(
-    test_ds, batch_size=1, shuffle=False,
-    num_workers=args.num_workers,
-    collate_fn=senflood_collate,
-    pin_memory=True,
-    persistent_workers=args.num_workers > 0,
-    prefetch_factor=2 if args.num_workers > 0 else None,
-)
 print(f"[Eval] Test set: {len(test_ds)} samples\n")
 
-# Fixed batch pool for FLOPs profiling — same input geometry reused
-# across every resolution so the comparison is apples-to-apples.
 device = "cuda" if torch.cuda.is_available() else "cpu"
-_flops_raw = []
-for b in test_loader:
-    _flops_raw.append(_to_device(b, device))
-    if len(_flops_raw) >= args.flops_n + 1:  # +1 warmup
-        break
 
 
 # =============================================================================
 # SWEEP
 # =============================================================================
 
-results = []  # list of dicts: {res, effective_size, tokens_per_modality, gflops, miou}
+results = []  # list of dicts: {res, effective_size, tokens_per_modality, gflops, gflops_n, miou}
 
 for res in args.resolutions:
     effective_size = int(args.ramen_window_size * (args.ramen_input_res / res))
@@ -340,7 +369,19 @@ for res in args.resolutions:
     trainer_module.model = RAMENInputAdapter(model)
     trainer_module.eval()
 
-    # ── FLOPs (full sliding-window pass over the 512x512 image) ─────────
+    # ── GFLOPs, streamed over the FULL 512x512 test split ───────────────
+    # >>> FULL_TEST_SET_GFLOPS: a fresh DataLoader is built per resolution
+    # (cheap — it's just an iterator wrapper) so each resolution's GFLOPs
+    # sweep starts from sample 0 of the test set deterministically.
+    flops_loader = DataLoader(
+        test_ds, batch_size=1, shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=senflood_collate,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+    )
+
     adapter = trainer_module.model.to(device).eval()
 
     def fwd(b, m=adapter):
@@ -351,10 +392,21 @@ for res in args.resolutions:
             num_classes=NUM_CLASSES,
         )
 
-    gflops = measure_gflops_forward(fwd, _flops_raw, device, n_warmup=1)
-    print(f"  GFLOPs/forward (bs=1, full 512x512, sliding-window): {gflops:.2f}")
+    gflops, gflops_n, _per_batch = measure_gflops_forward_full_testset(
+        fwd, flops_loader, device, n_warmup=args.flops_n_warmup,
+    )
+    print(f"  GFLOPs/forward (bs=1, full 512x512, sliding-window, "
+          f"mean over {gflops_n}/{len(test_ds)} test samples): {gflops:.2f}")
 
     # ── mIoU (full test split, all modalities, no dropping) ─────────────
+    test_loader = DataLoader(
+        test_ds, batch_size=1, shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=senflood_collate,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+    )
     pl_trainer = Trainer(
         devices=-1,
         accelerator="gpu",
@@ -373,6 +425,7 @@ for res in args.resolutions:
         "effective_size": effective_size,
         "tokens_per_modality": tokens_per_modality,
         "gflops": gflops,
+        "gflops_n": gflops_n,
         "miou": miou,
     })
 
@@ -387,13 +440,15 @@ for res in args.resolutions:
 
 print(f"\n\n{'='*70}")
 print(f"  RAMEN RESOLUTION SWEEP SUMMARY — {args.xp_name}")
+print(f"  (GFLOPs = mean over the full test set)")
 print(f"{'='*70}")
-print(f"  {'Resolution':<14}{'Tokens/mod':<14}{'GFLOPs':<12}{'mIoU':<10}")
-print(f"  {'─'*50}")
+print(f"  {'Resolution':<14}{'Tokens/mod':<14}{'GFLOPs':<12}{'#samples':<10}{'mIoU':<10}")
+print(f"  {'─'*60}")
 for r in results:
     print(f"  {str(int(r['res']))+' m':<14}"
           f"{r['tokens_per_modality']:<14}"
           f"{r['gflops']:<12.2f}"
+          f"{r['gflops_n']:<10}"
           f"{r['miou']:<10.4f}")
 print(f"{'='*70}\n")
 
@@ -411,13 +466,16 @@ out_path = f"./results_{args.xp_name}_resolution_sweep.txt"
 with open(out_path, "w") as f:
     f.write(f"RAMEN Resolution Sweep — {args.xp_name}\n")
     f.write(f"Checkpoint: {args.ckpt}\n")
-    f.write(f"Window size: {args.ramen_window_size}, stride: {args.ramen_stride}\n\n")
-    f.write(f"{'Resolution':<14}{'Tokens/mod':<14}{'GFLOPs':<12}{'mIoU':<10}\n")
-    f.write(f"{'─'*50}\n")
+    f.write(f"Window size: {args.ramen_window_size}, stride: {args.ramen_stride}\n")
+    f.write(f"GFLOPs measured over the full test set "
+            f"({len(test_ds)} samples, {args.flops_n_warmup} warmup discarded)\n\n")
+    f.write(f"{'Resolution':<14}{'Tokens/mod':<14}{'GFLOPs':<12}{'#samples':<10}{'mIoU':<10}\n")
+    f.write(f"{'─'*60}\n")
     for r in results:
         f.write(f"{str(int(r['res']))+' m':<14}"
                 f"{r['tokens_per_modality']:<14}"
                 f"{r['gflops']:<12.2f}"
+                f"{r['gflops_n']:<10}"
                 f"{r['miou']:<10.4f}\n")
     f.write("\nCompact summary:\n")
     for r in results:

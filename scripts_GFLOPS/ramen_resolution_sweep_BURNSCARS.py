@@ -29,6 +29,23 @@ crop of the *input* image) stays fixed across the sweep, so the number
 of windows tiling the full native image stays fixed too. Only the
 number of TOKENS per window changes with `res`.
 
+# >>> PARETO_HULL: after the sweep, this script also computes the Pareto
+# front (mIoU maximize, GFLOPs minimize) over ALL swept resolutions and
+# reduces it to its convex hull (the efficient frontier — points where
+# marginal mIoU gain per extra GFLOP is diminishing; a non-dominated
+# point that still sits below the line connecting two better trade-off
+# points is dropped). Both are printed and saved. Point identity here is
+# a single axis (`res`, the working resolution in m/px), unlike the
+# UniverSat sweep scripts which key on (patch_size_m, output_stride[,
+# subpatch_px]). Every point already has a REAL measured gflops (this
+# sweep never skips GFLOPs), so the hull is a genuine GFLOPs-vs-mIoU
+# curve directly, no fallback needed.
+#
+# >>> ADDED: this script previously only wrote a .txt summary. A JSON
+# output (./scripts_GFLOPS/results/<xp_name>_resolution_sweep.json) is
+# now also written, for consistency with the other GFLOPs sweep scripts
+# and so recompute_pareto_hull.py can be pointed at it directly.
+
 Usage
 -----
     python script_ramen_resolution_sweep_burnscars.py \
@@ -50,12 +67,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import os
 import argparse
+import json
 
 import torch
 import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
-from torch.profiler import profile, ProfilerActivity
+from torch.utils.flop_counter import FlopCounterMode   # >>> FLOPS_METHOD
 from pytorch_lightning import Trainer, seed_everything
 
 seed_everything(42, workers=True)
@@ -111,7 +129,17 @@ def burnscars_collate(batch):
 
 
 # =============================================================================
-# FLOPs MEASUREMENT — same harness as the other baseline scripts
+# >>> FLOPS_METHOD: FlopCounterMode (SDPA attention counted) — matches
+# script_universat_sweep_burnscars.py / _senflood.py exactly, replacing the
+# previous torch.profiler(with_flops=True) harness. This matters beyond
+# consistency: torch.profiler's with_flops=True has no formulas for fused
+# scaled_dot_product_attention kernels and silently drops ALL attention
+# FLOPs — a large undercount for a transformer backbone like RAMEN's ViT
+# blocks. Mixing the two methodologies in the same table would make RAMEN
+# look artificially cheap relative to UniverSat. Do not mix FlopCounterMode
+# numbers with any older torch.profiler-harness numbers you may already
+# have on disk from a previous run of this script — re-run to get numbers
+# on the same footing.
 # =============================================================================
 
 def _to_device(b, dev):
@@ -127,10 +155,11 @@ def _to_device(b, dev):
 @torch.no_grad()
 def measure_gflops_forward(forward_fn, batches, device, n_warmup=1):
     """
-    One warmup pass discarded; each measured pass profiled separately
-    with with_flops=True; per-pass total summed over key_averages();
-    report mean / 1e9. forward_fn internally loops over sliding-window
-    tiles, so this captures the TOTAL cost of one full-image forward.
+    One warmup pass discarded; each measured pass counted with
+    FlopCounterMode; report mean / 1e9 (analytic and deterministic per
+    shape — the mean is a sanity check). forward_fn internally loops over
+    sliding-window tiles, so this captures the TOTAL cost of one
+    full-image forward.
     """
     for b in batches[:n_warmup]:
         _ = forward_fn(b)
@@ -139,18 +168,90 @@ def measure_gflops_forward(forward_fn, batches, device, n_warmup=1):
 
     flops_list = []
     for b in batches[n_warmup:]:
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     with_flops=True, record_shapes=True, profile_memory=True) as prof:
+        fc = FlopCounterMode(display=False)
+        with fc:
             _ = forward_fn(b)
             if device == "cuda":
                 torch.cuda.synchronize()
-        total = sum(evt.flops for evt in prof.key_averages()
-                    if getattr(evt, "flops", None))
-        flops_list.append(total)
+        flops_list.append(fc.get_total_flops())
 
     if not flops_list:
         return float("nan")
     return (sum(flops_list) / len(flops_list)) / 1e9
+
+
+# =============================================================================
+# >>> PARETO_HULL: Pareto front + convex hull over (gflops, miou)
+# =============================================================================
+
+def _pareto_front(points, cost_key="gflops", score_key="miou"):
+    """
+    point A dominates point B iff A.score >= B.score AND A.cost <= B.cost,
+    with at least one strict inequality. NaN score/cost are excluded.
+    """
+    valid = [p for p in points
+             if p.get(score_key) == p.get(score_key)
+             and p.get(cost_key) == p.get(cost_key)]
+    front = []
+    for p in valid:
+        dominated = False
+        for q in valid:
+            if q is p:
+                continue
+            better_or_equal = (q[score_key] >= p[score_key]) and (q[cost_key] <= p[cost_key])
+            strictly_better = (q[score_key] > p[score_key]) or (q[cost_key] < p[cost_key])
+            if better_or_equal and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            front.append(p)
+    front.sort(key=lambda p: p[cost_key])
+    return front
+
+
+def _cross(o, a, b):
+    """2D cross product of (a-o) and (b-o); >0 = left/CCW turn."""
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _upper_convex_hull(points, cost_key="gflops", score_key="miou"):
+    """
+    Upper convex hull in (cost, score) space — the concave, diminishing-
+    returns boundary. Points below the segment through their cost-
+    neighbors on the front are dropped even if individually non-dominated.
+    Monotone-chain (Andrew's algorithm), upper half only.
+    """
+    pts = sorted(points, key=lambda p: (p[cost_key], -p[score_key]))
+    hull = []
+    for p in pts:
+        xy = (p[cost_key], p[score_key])
+        while len(hull) >= 2:
+            o_xy = (hull[-2][cost_key], hull[-2][score_key])
+            a_xy = (hull[-1][cost_key], hull[-1][score_key])
+            if _cross(o_xy, a_xy, xy) >= 0:
+                hull.pop()
+            else:
+                break
+        hull.append(p)
+    return hull
+
+
+def _fmt(v):
+    if v is None or v != v:
+        return "nan"
+    return f"{v:.4f}"
+
+
+def _print_pareto_table(title, pts):
+    print(f"\n{title}")
+    if not pts:
+        print("  (no valid points — all miou or gflops values were NaN)")
+        return
+    print(f"  {'resolution':>12} {'tokens/mod':>12} {'gflops':>12} {'miou':>8}")
+    print("  " + "-" * 48)
+    for p in pts:
+        print(f"  {str(int(p['res']))+' m':>12} {p['tokens_per_modality']:>12} "
+              f"{p['gflops']:>12.2f} {_fmt(p['miou']):>8}")
 
 
 # =============================================================================
@@ -400,8 +501,76 @@ for r in results:
 
 
 # =============================================================================
+# >>> PARETO_HULL: Pareto front + convex hull over ALL swept resolutions
+# =============================================================================
+# Every point already has a real measured GFLOPs (this sweep never skips
+# it), so this is a genuine GFLOPs-vs-mIoU curve, no proxy/fallback needed.
+
+pareto_front = _pareto_front(results, cost_key="gflops", score_key="miou")
+convex_hull = _upper_convex_hull(pareto_front, cost_key="gflops", score_key="miou")
+convex_hull.sort(key=lambda p: p["gflops"])
+
+print(f"\n{'='*78}")
+print(f"PARETO FRONT + CONVEX HULL — GFLOPs x mIoU  ({args.xp_name})")
+print(f"{'='*78}")
+_print_pareto_table(
+    f"Pareto front ({len(pareto_front)} points, all non-dominated):",
+    pareto_front)
+_print_pareto_table(
+    f"Convex hull / efficient frontier ({len(convex_hull)} points, "
+    f"the ones actually worth plotting/using):",
+    convex_hull)
+
+
+# =============================================================================
 # WRITE RESULTS
 # =============================================================================
+
+def _jf(v):
+    v = float(v)
+    return None if v != v else v
+
+json_results = [
+    {**r, "gflops": _jf(r["gflops"]), "miou": _jf(r["miou"])}
+    for r in results
+]
+json_pareto_front = [
+    {**p, "gflops": _jf(p["gflops"]), "miou": _jf(p["miou"])}
+    for p in pareto_front
+]
+json_convex_hull = [
+    {**p, "gflops": _jf(p["gflops"]), "miou": _jf(p["miou"])}
+    for p in convex_hull
+]
+
+# >>> ADDED: this script previously wrote only a .txt file. A JSON output
+# is now also written (matching the other GFLOPs sweep scripts) so
+# recompute_pareto_hull.py and any downstream tooling can consume it
+# directly via its "pareto_front" auto-detection path.
+json_dir = "./scripts_GFLOPS/results/"
+os.makedirs(json_dir, exist_ok=True)
+json_path = os.path.join(json_dir, f"{args.xp_name}_resolution_sweep.json")
+with open(json_path, "w") as f:
+    json.dump(
+        {
+            "experiment": args.xp_name,
+            "model": "ramen",
+            "dataset": "burnscars",
+            "checkpoint": args.ckpt,
+            "ramen_window_size": args.ramen_window_size,
+            "ramen_stride": args.ramen_stride,
+            "ramen_input_res": args.ramen_input_res,
+            "resolutions": args.resolutions,
+            "flops_method": "torch.utils.flop_counter.FlopCounterMode",
+            "flops_n": args.flops_n,
+            "results": json_results,
+            # >>> PARETO_HULL
+            "pareto_front": json_pareto_front,
+            "convex_hull": json_convex_hull,
+        },
+        f, indent=2,
+    )
+print(f"[Sweep] JSON results saved to {json_path}")
 
 out_path = f"./results_{args.xp_name}_resolution_sweep.txt"
 with open(out_path, "w") as f:
@@ -418,5 +587,23 @@ with open(out_path, "w") as f:
     f.write("\nCompact summary:\n")
     for r in results:
         f.write(f"resolution {int(r['res'])}: GFLOPS: {r['gflops']:.2f} mIoU: {r['miou']:.4f}\n")
+
+    # >>> PARETO_HULL
+    f.write(f"\n\n{'='*78}\n")
+    f.write(f"PARETO FRONT + CONVEX HULL — GFLOPs x mIoU\n")
+    f.write(f"{'='*78}\n")
+    f.write(f"\nPareto front ({len(pareto_front)} points, all non-dominated):\n")
+    f.write(f"  {'resolution':>12} {'tokens/mod':>12} {'gflops':>12} {'miou':>8}\n")
+    f.write("  " + "-" * 48 + "\n")
+    for p in pareto_front:
+        f.write(f"  {str(int(p['res']))+' m':>12} {p['tokens_per_modality']:>12} "
+                f"{p['gflops']:>12.2f} {_fmt(p['miou']):>8}\n")
+    f.write(f"\nConvex hull / efficient frontier ({len(convex_hull)} points, "
+            f"the ones actually worth plotting/using):\n")
+    f.write(f"  {'resolution':>12} {'tokens/mod':>12} {'gflops':>12} {'miou':>8}\n")
+    f.write("  " + "-" * 48 + "\n")
+    for p in convex_hull:
+        f.write(f"  {str(int(p['res']))+' m':>12} {p['tokens_per_modality']:>12} "
+                f"{p['gflops']:>12.2f} {_fmt(p['miou']):>8}\n")
 
 print(f"\n[Sweep] Results saved to {out_path}")

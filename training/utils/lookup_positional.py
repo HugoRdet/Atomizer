@@ -168,7 +168,6 @@ class Lookup_encoding(pl.LightningModule):
             (1.6,  512),
         ]
         self.modalities = reference_modalities
-        print(f"[Lookup] Configured {len(reference_modalities)} reference grids")
 
     # =========================================================================
     # POSITION LOOKUP (unchanged)
@@ -183,10 +182,7 @@ class Lookup_encoding(pl.LightningModule):
             idx_torch_array += size
         self.table = table
         self.next_position_offset = idx_torch_array
-        print(f"[Lookup] Position table: {len(table)} reference grids")
-        for (res_key, size), offset in sorted(table.items()):
-            gsd = res_key / 1000
-            print(f"  {gsd:>8.1f} m/px × {size:4d}px → offset {offset:6d}")
+
 
     def get_offset_for_resolution(self, resolution: float) -> tuple:
         res_key = int(resolution * 1000)
@@ -207,8 +203,7 @@ class Lookup_encoding(pl.LightningModule):
         self.table_queries[key] = self.next_query_offset
         self.next_query_offset += self.nb_tokens_queries
         gsd = resolution
-        print(f"[Lookup] Registered modality: {gsd:>8.1f} m/px × {size:4d}px → "
-              f"position offset {offset:6d}, query offset {self.table_queries[key]:6d}")
+
         return offset
 
     def get_or_register_modality(self, resolution: float, size: int) -> int:
@@ -227,7 +222,6 @@ class Lookup_encoding(pl.LightningModule):
             idx_torch_array += self.nb_tokens_queries
         self.table_queries = table
         self.next_query_offset = idx_torch_array
-        print(f"[Lookup] Query table: {len(table)} entries ({self.nb_tokens_queries} slots each)")
 
     def get_query_offset(self, resolution: float, size: int) -> int:
         res_key = int(resolution * 1000)
@@ -264,10 +258,6 @@ class Lookup_encoding(pl.LightningModule):
         self.table_wave = table
         n_physical = sum(1 for k in table if k[1] >= 0)
         n_abstract = sum(1 for k in table if k[1] < 0)
-        print(f"[Lookup] Wavelength table: {len(table)} entries "
-              f"({n_physical} physical, {n_abstract} abstract)")
-        if self.abstract_channel_indices:
-            print(f"[Lookup] Abstract channels: {self.abstract_channel_indices}")
 
     # =========================================================================
     # RESOLUTION LOOKUP (unchanged)
@@ -285,11 +275,6 @@ class Lookup_encoding(pl.LightningModule):
                 idx += 1
         self.table_resolution = table
         self.num_resolution_indices = idx
-        print(f"[Lookup] Resolution table: {len(table)} optical entries + "
-              f"1 learned (idx=0). Total = {self.num_resolution_indices}")
-        for res_key, res_idx in sorted(table.items()):
-            gsd = res_key / 1000
-            print(f"  {gsd:>8.1f} m/px → idx {res_idx}")
 
     def get_resolution_idx(self, resolution: float) -> int:
         res_key = int(resolution * 1000)
@@ -303,7 +288,7 @@ class Lookup_encoding(pl.LightningModule):
         self.table_resolution[res_key] = new_idx
         self.num_resolution_indices += 1
         gsd = res_key / 1000
-        print(f"[Lookup] Registered resolution {gsd} m/px → idx {new_idx}")
+
         return new_idx
 
     # =========================================================================
@@ -313,7 +298,6 @@ class Lookup_encoding(pl.LightningModule):
     def init_time_lookup_table(self):
         self.table_time = dict()
         self.num_time_indices = 1
-        print(f"[Lookup] Time table: initialized (idx=0 reserved for learned/no-time)")
 
     def get_time_idx(self, time_key) -> int:
         return self.table_time.get(time_key, LEARNED_TIME_IDX)
@@ -335,8 +319,7 @@ class Lookup_encoding(pl.LightningModule):
         indices = []
         for key in time_keys:
             indices.append(self.register_time(key))
-        print(f"[Lookup] Registered {len(indices)} time steps "
-              f"(total = {self.num_time_indices})")
+
         return indices
 
     # =========================================================================
@@ -366,17 +349,8 @@ class Lookup_encoding(pl.LightningModule):
             for r in range(1, t + 1):
                 self.register_echo(r, t)
 
-        print(f"[Lookup] Echo table: {len(self.table_echo)} (r, t) entries + "
-              f"1 learned (idx=0). Total = {self.num_echo_indices}")
-        # Print a small summary, not every entry
-        sample_keys = [(1, 1), (1, 2), (2, 2), (1, 5), (3, 5), (5, 5)]
-        print(f"[Lookup]   sample: ", end="")
-        sample_strs = []
-        for k in sample_keys:
-            if k in self.table_echo:
-                a, b = self._continuous_for(k[0], k[1])
-                sample_strs.append(f"(r={k[0]},t={k[1]})→idx{self.table_echo[k]} (a={a:.2f},b={b:.2f})")
-        print(", ".join(sample_strs))
+
+
 
     @staticmethod
     def _continuous_for(r: int, t: int) -> tuple:
@@ -490,7 +464,7 @@ class Lookup_encoding(pl.LightningModule):
         new_idx = len(self.table_wave)
         self.table_wave[key] = new_idx
         self.abstract_channel_indices[channel_name] = new_idx
-        print(f"[Lookup] Registered abstract channel '{channel_name}' at index {new_idx}")
+
         return new_idx
 
     def get_abstract_channel_idx(self, channel_name: str) -> int:
@@ -515,29 +489,6 @@ class Lookup_encoding(pl.LightningModule):
 
     def is_non_optical_band(self, bandwidth: int, central_wavelength: int) -> bool:
         return bandwidth < 0 or central_wavelength < 0
-
-    # =========================================================================
-    # SUMMARY (extended with echo info)
-    # =========================================================================
-
-    def print_summary(self):
-        print("\n" + "=" * 70)
-        print("LOOKUP TABLE SUMMARY")
-        print("=" * 70)
-        print(f"  Position modalities:  {len(self.modalities)} (reference grids)")
-        print(f"  Spectral entries:     {len(self.table_wave)}")
-        print(f"  Resolution entries:   {self.num_resolution_indices} "
-              f"(1 learned + {self.num_resolution_indices - 1} optical)")
-        print(f"  Time entries:         {self.num_time_indices} "
-              f"(1 learned + {self.num_time_indices - 1} registered)")
-        print(f"  Echo entries:         {self.num_echo_indices} "
-              f"(1 learned + {self.num_echo_indices - 1} (r,t) pairs, "
-              f"max returns = {MAX_ECHOS})")
-        if self.abstract_channel_indices:
-            print(f"  Abstract channels:    {list(self.abstract_channel_indices.keys())}")
-        print(f"  Next position offset: {self.next_position_offset}")
-        print(f"  Next query offset:    {self.next_query_offset}")
-        print("=" * 70 + "\n")
 
 
 # =============================================================================

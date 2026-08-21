@@ -3,7 +3,8 @@ BioMassters Baseline — Modality Drop Inference + FLOPs Script
 ================================================================
 
 Load trained baseline checkpoints (ResNet+MT / ViT+LTAE / Perceiver-IO /
-RAMEN) and evaluate on the test split under different band configurations.
+RAMEN / UniverSat) and evaluate on the test split under different band
+configurations.
 
 Adapted from script_test_senflood_baseline_modality_drop.py. Key differences,
 since BioMassters is multi-temporal regression rather than single-frame
@@ -31,6 +32,26 @@ segmentation:
      excluded -- no B01/B09/B10 the way Sen1Floods11 has); S1 is 4 bands
      (VV/VH x ascending/descending), not Sen1Floods11's plain VV/VH.
 
+UniverSat: consumes the SAME fused [B, T, 14, H, W] tensor as the fused
+models (via UniverSatBioMasstersAdapter, which splits channels back into
+its {"optical","sar"} modality dict internally and unpacks the [B, 2, T]
+packed per-modality date tracks -- mirrors script_train_biomassters_
+baseline.py's make_universat_collate/adapter exactly). Channel zeroing
+therefore uses the PLAIN ChannelDropWrapper on the fused tensor, applied
+BEFORE the adapter's split, with the same flat BAND_TO_CHANNEL indices as
+every other fused model -- no RAMEN-style per-modality drop mapping
+needed. Eval is the native full-256 dense forward (no windowing). All
+--universat_* args MUST match the checkpoint's training config (the
+strict state-dict load succeeds at any geometry, so a mismatch is a
+silent protocol error, not a crash).
+
+FLOPs NOTE: this torch.profiler harness has no formulas for fused
+scaled_dot_product_attention kernels, so ALL attention FLOPs are silently
+dropped for SDPA-based models (ViT-LTAE, Perceiver, RAMEN, UniverSat) --
+these numbers are lower bounds, worst for token-heavy models. For
+UniverSat prefer FlopCounterMode-based measurements (see the sweep
+scripts' harness); never mix the two harnesses in one table.
+
 Channel layout (fixed, matches BioMasstersBaselineDataset / the fused
 collate's channel-concat order):
     indices 0-9   : S2 bands (B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12)
@@ -44,9 +65,10 @@ Usage
         --model resnet_upernet_mt \
         --xp_name resnet_drop_eval
 
-    # Multiple checkpoints, including RAMEN
+    # Multiple checkpoints, including RAMEN and UniverSat
     python script_test_biomassters_baseline_modality_drop.py \
         --ckpts resnet_upernet_mt=./ckpts/bl_resnet.ckpt ramen=./ckpts/bl_ramen.ckpt \
+                universat=./ckpts/bl_universat.ckpt \
         --xp_name baseline_drop_eval \
         --ablations all s2_only s1_only rgb_only no_swir no_re
 
@@ -60,6 +82,7 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.profiler import profile, ProfilerActivity
 from pytorch_lightning import Trainer, seed_everything
@@ -73,6 +96,7 @@ from training.VIT.model_vit_upernet import ViTLTAEUPerNet
 from training.ResNet.model_resnet_upernet import build_resnet_upernet_mt
 from training.RAMEN.ramen_upernet import build_ramen_upernet
 from training.perceiverIO.perceiver_seg import PerceiverSeg
+from training.Universat.universat_augmenter import build_universat_segmenter
 from training.trainer_baselines_biomassters import BaselineRegressionTrainer
 
 
@@ -135,6 +159,30 @@ RAMEN_BAND_TO_MODALITY_CHANNEL.update({band: ("sar", i) for i, band in enumerate
 
 
 # =============================================================================
+# UniverSat band metadata (mirrors script_train_biomassters_baseline.py
+# exactly -- see that script's band-info block for the full rationale)
+# =============================================================================
+# S1 codes: UniverSat's channel-code registry has NO asc/desc distinction,
+# so (VV_asc, VH_asc, VV_desc, VH_desc) map to ["VV","VH","HH","HV"] --
+# the desc pair borrows the unused HH/HV slots so all 4 channels get
+# DISTINCT learnable identity embeddings (arbitrary labels under
+# from-scratch training). MUST match the training script or the loaded
+# embeddings won't correspond to the intended channels.
+
+UNIVERSAT_INPUT_BANDS = {
+    "optical": list(ALL_S2),
+    "sar": list(ALL_S1),               # channel-count source
+}
+UNIVERSAT_WAVELENGTHS = {
+    "optical": dict(RAMEN_S2_WAVELENGTHS),   # nm; adapter converts to µm
+    "sar": ["VV", "VH", "HH", "HV"],         # codes, order = dataset order
+}
+
+BIOMASSTERS_GSD_M = 10.0
+BIOMASSTERS_TILE = 256
+
+
+# =============================================================================
 # CHANNEL-ZEROING WRAPPERS
 # =============================================================================
 
@@ -147,6 +195,15 @@ class ChannelDropWrapper(nn.Module):
     applied to EVERY timestep (consistent with the training-time band-
     dropout augmentation's convention: a missing band/sensor stays missing
     for the whole time series).
+
+    Also used for UniverSat (wrapping UniverSatBioMasstersAdapter): the
+    zeroing happens on the fused tensor BEFORE the adapter splits it into
+    {"optical","sar"}, so the flat BAND_TO_CHANNEL indices apply
+    unchanged. NOTE: BaselineRegressionTrainer.forward() looks up
+    temporal_kwarg on trainer_module.model -- which during the ablation
+    loop is THIS wrapper -- so the ablation loop copies the wrapped
+    model's temporal_kwarg onto the wrapper instance (UniverSat needs
+    "dates", the fused models use the "doy" default).
     """
     def __init__(self, model: nn.Module, drop_channels: list):
         super().__init__()
@@ -202,7 +259,53 @@ class RAMENChannelDropWrapper(nn.Module):
 
 
 # =============================================================================
-# COLLATE (mirrors script_train_biomassters_baseline.py's two collate paths)
+# UNIVERSAT ADAPTER (mirrors script_train_biomassters_baseline.py exactly)
+# =============================================================================
+
+class UniverSatBioMasstersAdapter(nn.Module):
+    """
+    Wraps UniverSatSegmenter behind the trainer's literal contract:
+    forward(x_tensor, dates=tensor) with the fused [B, T, 14, H, W]
+    tensor from batch["image"]["s2"]. Splits channels back into
+    UniverSat's {"optical","sar"} modality dict, unpacks the [B, 2, T]
+    packed per-modality date tracks ([:, 0] -> optical, [:, 1] -> sar;
+    degrades to a shared [B, T] track), and upsamples the
+    (H/output_stride)^2 regression map to full input resolution so the
+    output is [B, 1, H, W] like every other model here. Keep in sync
+    with the training script's copy of this class.
+    """
+    temporal_kwarg = "dates"
+
+    def __init__(self, segmenter: nn.Module):
+        super().__init__()
+        self.model = segmenter
+
+    def forward(self, x: torch.Tensor, dates=None) -> torch.Tensor:
+        merged = {
+            "optical": x[:, :, :NUM_S2_BANDS],
+            "sar":     x[:, :, NUM_S2_BANDS:NUM_S2_BANDS + NUM_S1_BANDS],
+        }
+        if torch.is_tensor(dates):
+            if dates.dim() == 3:      # [B, 2, T]: packed (optical, sar) tracks
+                merged["optical_dates"] = dates[:, 0]
+                merged["sar_dates"]     = dates[:, 1]
+            else:                     # [B, T]: single shared track fallback
+                merged["optical_dates"] = dates
+                merged["sar_dates"]     = dates
+        elif isinstance(dates, dict):
+            for k, v in dates.items():
+                if k in merged:
+                    merged[f"{k}_dates"] = v
+        out = self.model(merged)
+        H, W = x.shape[-2], x.shape[-1]
+        if out.shape[-2] != H or out.shape[-1] != W:
+            out = F.interpolate(out, size=(H, W),
+                                mode="bilinear", align_corners=False)
+        return out
+
+
+# =============================================================================
+# COLLATE (mirrors script_train_biomassters_baseline.py's collate paths)
 # =============================================================================
 
 def biomassters_collate(batch):
@@ -242,6 +345,26 @@ def make_ramen_collate():
         out["dates"] = {"optical": out["dates"]["s2"], "sar": out["dates"]["s1"]}
         return out
     return ramen_collate
+
+
+def make_universat_collate():
+    """Mirrors the training script: fused [B, T, 14, H, W] under "s2"
+    (the trainer's literal contract) + BOTH per-modality date tracks
+    packed into [B, 2, T] under the "s2" dates key (S2 months can differ
+    from S1 months; the adapter unpacks them)."""
+    def universat_collate(batch):
+        out = biomassters_collate(batch)
+        s2 = out["image"]["s2"]  # [B, T, 10, H, W]
+        s1 = out["image"]["s1"]  # [B, T,  4, H, W]
+        T = min(s2.shape[1], s1.shape[1])
+        fused = torch.cat([s2[:, :T], s1[:, :T]], dim=2)          # [B, T, 14, H, W]
+        packed_dates = torch.stack(
+            [out["dates"]["s2"][:, :T], out["dates"]["s1"][:, :T]], dim=1
+        )                                                          # [B, 2, T]
+        out["image"] = {"s2": fused}
+        out["dates"] = {"s2": packed_dates}
+        return out
+    return universat_collate
 
 
 # =============================================================================
@@ -288,12 +411,27 @@ def build_model(model_name: str, args) -> nn.Module:
             num_freq_bands=args.num_freq_bands, max_freq=args.max_freq,
             attn_dropout=args.perceiver_attn_dropout, ff_dropout=args.perceiver_ff_dropout,
         )
+    elif model_name == "universat":
+        # From scratch at training; here the geometry (--universat_*) MUST
+        # match the checkpoint for the strict load to be meaningful. The
+        # adapter carries temporal_kwarg="dates" as a class attribute.
+        base = build_universat_segmenter(
+            input_bands=UNIVERSAT_INPUT_BANDS,
+            wavelengths=UNIVERSAT_WAVELENGTHS,
+            num_classes=1,
+            input_res={"optical": BIOMASSTERS_GSD_M, "sar": BIOMASSTERS_GSD_M},
+            patch_size_m=args.universat_patch_m,
+            output_stride=args.universat_output_stride,
+            size=args.universat_size,
+        )
+        return UniverSatBioMasstersAdapter(base)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
 
 # =============================================================================
 # FLOPs MEASUREMENT -- same harness as Atomizer / the Sen1Floods11 version
+# (LOWER BOUND for SDPA models: attention FLOPs uncounted -- see docstring)
 # =============================================================================
 
 def _to_device(b, dev):
@@ -328,16 +466,18 @@ def measure_gflops_forward(forward_fn, batches, device, n_warmup=1):
     return (sum(flops_list) / len(flops_list)) / 1e9
 
 
-def profile_baselines_flops(model_ckpts, args, ramen_loader, fused_loader, n_profile=2, n_warmup=1):
+def profile_baselines_flops(model_ckpts, args, ramen_loader, fused_loader,
+                            universat_loader, n_profile=2, n_warmup=1):
     """
     Returns {model_name: gflops}. RAMEN uses ramen_loader (separate
-    optical/sar tensors), everything else uses fused_loader (single fused
-    tensor) -- SAME underlying chips/batches either way, just different
-    collate, so input geometry is comparable across models.
+    optical/sar tensors), UniverSat uses universat_loader (fused tensor +
+    packed [B,2,T] dates), everything else uses fused_loader -- SAME
+    underlying chips/batches either way, just different collate, so input
+    geometry is comparable across models.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    raw_fused, raw_ramen = [], []
+    raw_fused, raw_ramen, raw_universat = [], [], []
     for b in fused_loader:
         raw_fused.append(_to_device(b, device))
         if len(raw_fused) >= n_profile + n_warmup:
@@ -345,6 +485,10 @@ def profile_baselines_flops(model_ckpts, args, ramen_loader, fused_loader, n_pro
     for b in ramen_loader:
         raw_ramen.append(_to_device(b, device))
         if len(raw_ramen) >= n_profile + n_warmup:
+            break
+    for b in universat_loader:
+        raw_universat.append(_to_device(b, device))
+        if len(raw_universat) >= n_profile + n_warmup:
             break
 
     gflops = {}
@@ -372,6 +516,15 @@ def profile_baselines_flops(model_ckpts, args, ramen_loader, fused_loader, n_pro
             def fwd(b, m=wrapped):
                 return m(b["image"], dates=b["dates"])
             raw = raw_ramen
+        elif model_name == "universat":
+            # Fused tensor + packed dates; adapter (inside base_model)
+            # splits/unpacks. Single full-256 dense forward. NOTE: this
+            # profiler harness drops SDPA attention FLOPs -- lower bound.
+            wrapped = ChannelDropWrapper(base_model, []).to(device).eval()
+
+            def fwd(b, m=wrapped):
+                return m(b["image"][MODALITY_KEY], dates=b["dates"][MODALITY_KEY])
+            raw = raw_universat
         else:
             wrapped = ChannelDropWrapper(base_model, []).to(device).eval()
 
@@ -406,10 +559,11 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--ckpt",  type=str, default=None)
 parser.add_argument("--model", type=str, default="resnet_upernet_mt",
-                    choices=["resnet_upernet_mt", "vit_ltae", "ramen", "perceiver"])
+                    choices=["resnet_upernet_mt", "vit_ltae", "ramen",
+                             "perceiver", "universat"])
 parser.add_argument("--ckpts", type=str, nargs="+", default=None,
                     help="name=path pairs, e.g. resnet_upernet_mt=./ckpts/bl_resnet.ckpt "
-                         "ramen=./ckpts/bl_ramen.ckpt")
+                         "ramen=./ckpts/bl_ramen.ckpt universat=./ckpts/bl_universat.ckpt")
 
 parser.add_argument("--xp_name",     type=str, required=True)
 parser.add_argument("--data_dir",    type=str, default="./data/biomassters")
@@ -468,7 +622,36 @@ parser.add_argument("--ramen_res",         type=float, default=40.0)
 parser.add_argument("--ramen_window_size", type=int, default=256,
                     help="MUST match the checkpoint being loaded.")
 
+# UniverSat args -- every one MUST match the checkpoint's training config
+# (the strict state-dict load succeeds at any geometry, so a mismatch is
+# a silent protocol error, not a crash).
+parser.add_argument("--universat_size", type=str, default="small",
+                    choices=["tiny", "small", "base"])
+parser.add_argument("--universat_patch_m", type=float, default=80.0,
+                    help="Patch size in metres (80 = 8 px @ 10 m, the "
+                         "training default).")
+parser.add_argument("--universat_output_stride", type=int, default=8,
+                    help="MUST match the checkpoint (8 is the BioMassters "
+                         "training default).")
+
 args = parser.parse_args()
+
+# UniverSat geometry sanity (fail fast, before dataset construction)
+_needs_universat = (args.model == "universat" and args.ckpt) or any(
+    item.split("=", 1)[0] == "universat" for item in (args.ckpts or []))
+if _needs_universat:
+    import math as _math
+    _px = args.universat_patch_m / BIOMASSTERS_GSD_M
+    if abs(_px - round(_px)) > 1e-6:
+        raise ValueError(
+            f"--universat_patch_m ({args.universat_patch_m}) is not an "
+            f"integer pixel count at {BIOMASSTERS_GSD_M} m GSD.")
+    _px = int(round(_px))
+    _lcm = _math.lcm(_px, args.universat_output_stride)
+    if BIOMASSTERS_TILE % _lcm:
+        raise ValueError(
+            f"{BIOMASSTERS_TILE} tile not divisible by lcm(patch_px={_px}, "
+            f"output_stride={args.universat_output_stride})={_lcm}.")
 
 if args.ckpts:
     model_ckpts = []
@@ -482,7 +665,7 @@ else:
 
 
 # =============================================================================
-# TEST DATASETS + LOADERS (one dataset instance, two collates)
+# TEST DATASETS + LOADERS (one dataset instance, three collates)
 # =============================================================================
 
 test_ds = BioMasstersBaselineDataset(
@@ -500,6 +683,12 @@ fused_loader = DataLoader(
 ramen_loader = DataLoader(
     test_ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
     collate_fn=make_ramen_collate(), pin_memory=True,
+    persistent_workers=args.num_workers > 0,
+    prefetch_factor=2 if args.num_workers > 0 else None,
+)
+universat_loader = DataLoader(
+    test_ds, batch_size=1, shuffle=False, num_workers=args.num_workers,
+    collate_fn=make_universat_collate(), pin_memory=True,
     persistent_workers=args.num_workers > 0,
     prefetch_factor=2 if args.num_workers > 0 else None,
 )
@@ -533,12 +722,16 @@ if args.flops:
     print(f"  BASELINE FLOPs (same harness as Atomizer)")
     print(f"{'='*60}")
     flops_table = profile_baselines_flops(
-        model_ckpts, args, ramen_loader, fused_loader, n_profile=args.flops_n)
+        model_ckpts, args, ramen_loader, fused_loader, universat_loader,
+        n_profile=args.flops_n)
     n_bands = NUM_S2_BANDS + NUM_S1_BANDS
     print(f"\n[FLOPs] Summary (GFLOPs/forward, bs=1, "
           f"{n_bands}x{args.multi_temporal}x{args.img_size}x{args.img_size}):")
     for name, g in flops_table.items():
         print(f"    {name:<16} {g:.1f}")
+    print(f"[FLOPs] NOTE: profiler drops fused-SDPA attention FLOPs -- "
+          f"lower bounds for vit_ltae/perceiver/ramen/universat; prefer "
+          f"FlopCounterMode numbers for cross-model comparisons.")
 
 
 # =============================================================================
@@ -559,6 +752,9 @@ if not args.flops_only:
         if model_name == "ramen":
             load_kwargs.update(modality="optical+sar")
             loader = ramen_loader
+        elif model_name == "universat":
+            load_kwargs.update(modality=MODALITY_KEY)   # fused "s2" contract
+            loader = universat_loader
         else:
             load_kwargs.update(modality=MODALITY_KEY)
             loader = fused_loader
@@ -581,7 +777,12 @@ if not args.flops_only:
                 trainer_module.model = RAMENChannelDropWrapper(base_model, drop_specs)
             else:
                 drop_channels = [BAND_TO_CHANNEL[b] for b in drop_bands]
-                trainer_module.model = ChannelDropWrapper(base_model, drop_channels)
+                wrapper = ChannelDropWrapper(base_model, drop_channels)
+                # The trainer looks up temporal_kwarg on trainer_module.model
+                # (= this wrapper) -- propagate the wrapped model's value so
+                # UniverSat gets dates=... instead of the doy=... default.
+                wrapper.temporal_kwarg = getattr(base_model, "temporal_kwarg", "doy")
+                trainer_module.model = wrapper
 
             trainer = Trainer(
                 devices=-1, accelerator="gpu", precision="bf16-mixed",
@@ -653,7 +854,8 @@ with open(out_path, "w") as f:
         n_bands = NUM_S2_BANDS + NUM_S1_BANDS
         f.write(f"FLOPs (GFLOPs/forward, bs=1, "
                 f"{n_bands}x{args.multi_temporal}x{args.img_size}x{args.img_size}, "
-                f"torch.profiler, same harness as Atomizer):\n")
+                f"torch.profiler, same harness as Atomizer; LOWER BOUND for "
+                f"SDPA models -- attention FLOPs uncounted):\n")
         for name, g in flops_table.items():
             f.write(f"  {name:<16} {g:.1f}\n")
         f.write("\n")

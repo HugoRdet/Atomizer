@@ -29,6 +29,40 @@ Differs from the baseline script: full 512x512 used throughout (no random
 crop), matching the BurnScars Perceiver run. Token count = 512^2 = 262,144.
 If you OOM, drop --batch_size or --num_latents.
 
+# >>> FLOPS_METHOD: GFLOPs is now measured with
+# torch.utils.flop_counter.FlopCounterMode (SDPA attention counted),
+# matching script_universat_sweep_burnscars.py / _senflood.py, the RAMEN
+# resolution-sweep scripts, script_train_burnscars_baselines.py, and
+# script_train_burnscars_perceiver.py — replacing the previous
+# torch.profiler(with_flops=True) harness. torch.profiler's with_flops=True
+# has no formulas for fused scaled_dot_product_attention kernels and
+# silently drops ALL attention FLOPs — a large undercount for Perceiver-IO's
+# cross-/latent-attention stack. Do NOT mix GFLOPs numbers produced by this
+# script before this change with numbers produced after it, or with any
+# other torch.profiler-harness numbers elsewhere in the paper.
+#
+# >>> NO_GRAD_PATCH: FlopCounterMode attributes FLOPs to individual modules
+# via torch.utils.module_tracker, which registers an autograd hook on each
+# module's output tensors. Under torch.no_grad(), an op whose inputs
+# include a requires_grad=True parameter still produces an output flagged
+# requires_grad=True (torch propagates that flag even under no_grad) but
+# WITHOUT a grad_fn — so the hook's internal grad-function lookup asserts
+# ("Expected gradient function to be set"). This only breaks PER-MODULE
+# attribution (unused here); FlopCounterMode's overall "Global" total stays
+# correct regardless. We patch the hook registration to fail silently
+# instead of raising — see _patch_module_tracker_for_no_grad() below. Same
+# fix as script_test_senflood_skip_density.py / script_test_burnscars_density.py
+# / script_train_burnscars_perceiver.py (this exact assertion is what broke
+# the BurnScars twin of this script before the patch was added).
+#
+# >>> DROPPED: the previous Chrome-trace export and the REGION_LABELS
+# record_function interval-matching breakdown (CSV + printed per-region
+# GFLOPs/CUDA-time table). Both relied on torch.profiler's per-event
+# timing, which FlopCounterMode does not provide — same trade-off already
+# made for the BurnScars Perceiver-IO script and the density-eval SKIP
+# scripts (a region-level breakdown would need a SEPARATE one-off
+# torch.profiler pass, not folded into the FlopCounterMode measurement).
+
 Examples:
     python script_train_senflood_perceiver.py --xp_name perceiver_senflood \
         --batch_size 2 --lr 1e-4 --epochs 80
@@ -40,7 +74,6 @@ Examples:
 
 import argparse
 import os
-import csv
 
 import pytorch_lightning as pl
 import torch
@@ -53,6 +86,7 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader
+from torch.utils.flop_counter import FlopCounterMode   # >>> FLOPS_METHOD
 
 seed_everything(42, workers=True)
 
@@ -110,7 +144,7 @@ parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a .ckpt file. Skip training, test directly.")
 
 # Training
-parser.add_argument("--batch_size",   type=int, default=1)
+parser.add_argument("--batch_size",   type=int, default=2)
 parser.add_argument("--lr",           type=float, default=1e-4)
 parser.add_argument("--weight_decay", type=float, default=1e-2)
 parser.add_argument("--epochs",       type=int, default=150)
@@ -124,13 +158,13 @@ parser.add_argument("--img_size", type=int, default=NATIVE_SIZE,
 
 # Perceiver-IO config (matches the PASTIS/MADOS/BurnScars runs for parameter parity)
 parser.add_argument("--num_latents",        type=int, default=512)
-parser.add_argument("--latent_dim",         type=int, default=768)
+parser.add_argument("--latent_dim",         type=int, default=512)
 parser.add_argument("--depth",              type=int, default=1)
 parser.add_argument("--cross_heads",        type=int, default=8)
 parser.add_argument("--latent_heads",       type=int, default=8)
 parser.add_argument("--cross_dim_head",     type=int, default=64)
 parser.add_argument("--latent_dim_head",    type=int, default=64)
-parser.add_argument("--self_per_cross_attn", type=int, default=2)
+parser.add_argument("--self_per_cross_attn", type=int, default=6)
 parser.add_argument("--no_weight_tie",      action="store_true",
                     help="Disable weight-tying across encoder blocks.")
 parser.add_argument("--num_freq_bands",     type=int, default=16)
@@ -142,7 +176,7 @@ parser.add_argument("--ff_dropout",         type=float, default=0.0)
 # exposure to missing modalities/bands, matching the other Sen1Floods11
 # baseline scripts and Atomiser's own token-dropout augmentation. See
 # Sen1Floods11BaselineDataset's docstring for exact semantics.
-parser.add_argument("--band_dropout", action="store_true", default=True,
+parser.add_argument("--band_dropout", action="store_true", default=False,
                     help="Enable band-dropout augmentation during training "
                          "(default: on). Set the probabilities below to the "
                          "SAME values used for the other baselines/Atomiser "
@@ -161,6 +195,11 @@ parser.add_argument("--p_band_drop", type=float, default=0.15,
                     help="Given a per-band (not whole-modality) drop, the "
                          "independent probability each of the 15 bands is "
                          "individually zeroed.")
+
+# GFLOPs
+parser.add_argument("--flops_n", type=int, default=30,
+                    help="Number of counted forward passes for GFLOPs "
+                         "measurement (mean).")
 
 args = parser.parse_args()
 
@@ -391,8 +430,34 @@ test_trainer.test(trainer_module, test_loader, ckpt_path=best_ckpt)
 
 
 # =============================================================================
-# GFLOPS MEASUREMENT (torch.profiler, after scoring)
+# >>> FLOPS_METHOD: GFLOPS MEASUREMENT (FlopCounterMode, after scoring)
 # =============================================================================
+# >>> NO_GRAD_PATCH (see module docstring for the full rationale)
+
+def _patch_module_tracker_for_no_grad():
+    """Idempotently patches torch.utils.module_tracker so its forward-pre
+    hook's register_multi_grad_hook call no longer raises under
+    torch.no_grad()."""
+    import torch.utils.module_tracker as _mt
+
+    if getattr(_mt, "_flopcounter_noop_patch_applied", False):
+        return
+    _mt._flopcounter_noop_patch_applied = True
+
+    _orig_register_multi_grad_hook = _mt.register_multi_grad_hook
+
+    class _NoOpHandle:
+        def remove(self):
+            pass
+
+    def _safe_register_multi_grad_hook(tensors, fn, *args, **kwargs):
+        try:
+            return _orig_register_multi_grad_hook(tensors, fn, *args, **kwargs)
+        except AssertionError:
+            return _NoOpHandle()
+
+    _mt.register_multi_grad_hook = _safe_register_multi_grad_hook
+
 
 def _to_device(b, dev):
     if isinstance(b, torch.Tensor):
@@ -403,159 +468,85 @@ def _to_device(b, dev):
         return type(b)(_to_device(v, dev) for v in b)
     return b
 
+
+@torch.no_grad()
+def measure_gflops_forward(forward_fn, batches, device, n_warmup=1):
+    """
+    One warmup pass discarded; each measured pass counted with
+    FlopCounterMode; report mean / 1e9 (analytic and deterministic per
+    shape — the mean is a sanity check). Every pass is one dense forward
+    over the full 512x512 image (Perceiver-IO's img_size, no cropping).
+    """
+    for b in batches[:n_warmup]:
+        _ = forward_fn(b)
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+    flops_list = []
+    for b in batches[n_warmup:]:
+        fc = FlopCounterMode(display=False)
+        with fc:
+            _ = forward_fn(b)
+            if device == "cuda":
+                torch.cuda.synchronize()
+        flops_list.append(fc.get_total_flops())
+
+    if not flops_list:
+        return float("nan")
+    return (sum(flops_list) / len(flops_list)) / 1e9
+
+
 gflops = float("nan")
 PROFILE_DIR = "./profiler"
 tag = f"{args.xp_name}_test"
 out_dir = os.path.join(PROFILE_DIR, tag)
 os.makedirs(out_dir, exist_ok=True)
-print(f"\n[Profile] Saving profiler artifacts to {out_dir}/")
+print(f"\n[GFLOPs] Saving artifacts to {out_dir}/ (FlopCounterMode)")
 
 try:
-    from torch.profiler import profile, ProfilerActivity
+    _patch_module_tracker_for_no_grad()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # To avoid the PyTorch Lightning wrapper overhead, we pull the base model
     # directly and pass the image tensor into it.
-    profiler_model = trainer_module.model.to(device)
-    profiler_model.eval()
+    eval_model = trainer_module.model.to(device)
+    eval_model.eval()
 
-    n_profile = 30
+    n_measure = args.flops_n
     n_warmup  = 1
     batches = []
 
     for i, b in enumerate(test_loader):
         batches.append(_to_device(b, device))
-        if len(batches) >= n_profile + n_warmup:
+        if len(batches) >= n_measure + n_warmup:
             break
 
     if not batches:
-        print("[Profile] No test batches available; skipping profiling.")
+        print("[GFLOPs] No test batches available; skipping measurement.")
     else:
-        with torch.no_grad():
-            # Warmup
-            for b in batches[:n_warmup]:
-                _ = profiler_model(b["image"][MODALITY_KEY])
-            if device == "cuda":
-                torch.cuda.synchronize()
+        def fwd(b, m=eval_model):
+            return m(b["image"][MODALITY_KEY])
 
-            flops_list = []
-            prof_last = None
+        gflops = measure_gflops_forward(fwd, batches, device, n_warmup=n_warmup)
+        n_measured = max(0, len(batches) - n_warmup)
+        print(f"[GFLOPs] GFLOPs/forward (mean of {n_measured} passes, "
+              f"FlopCounterMode, SDPA counted): {gflops:.3f}  "
+              f"[lower bound; matmul/conv/attention ops only]")
 
-            for b in batches[n_warmup:]:
-                img_tensor = b["image"][MODALITY_KEY]
-                with profile(activities=[ProfilerActivity.CPU,
-                                         ProfilerActivity.CUDA],
-                             with_flops=True,
-                             record_shapes=True,
-                             profile_memory=True) as prof:
-                    _ = profiler_model(img_tensor)
-                    if device == "cuda":
-                        torch.cuda.synchronize()
-
-                total = sum(evt.flops for evt in prof.key_averages()
-                            if getattr(evt, "flops", None))
-                flops_list.append(total)
-                prof_last = prof
-
-            if flops_list:
-                mean_flops = sum(flops_list) / len(flops_list)
-                gflops = mean_flops / 1e9
-                print(f"[Profile] GFLOPs/forward (mean of {len(flops_list)} "
-                      f"passes): {gflops:.3f}  "
-                      f"[lower bound; profiler-counted ops only]")
-
-            if prof_last is not None:
-                ka = prof_last.key_averages()
-
-                # Chrome trace
-                try:
-                    trace_path = os.path.join(out_dir, f"trace_{tag}.json")
-                    prof_last.export_chrome_trace(trace_path)
-                except Exception as ee:
-                    pass
-
-                # Region Summary Logic
-                try:
-                    # Specific custom regions requested
-                    REGION_LABELS = {
-                        "Self Attention",
-                        "Encoder Cross Attention",
-                        "Decoder"
-                    }
-
-                    evlist = prof_last.events()
-
-                    def _start(e):
-                        for a in ("time_range",):
-                            tr = getattr(e, a, None)
-                            if tr is not None:
-                                return tr.start, tr.end
-                        s = getattr(e, "cpu_interval", None)
-                        if s is not None:
-                            return s.start, s.end
-                        return None
-
-                    label_iv = []
-                    for e in evlist:
-                        nm = getattr(e, "name", getattr(e, "key", ""))
-                        if nm in REGION_LABELS:
-                            iv = _start(e)
-                            if iv:
-                                label_iv.append((nm, iv[0], iv[1]))
-
-                    region_flops = {n: 0 for n in REGION_LABELS}
-                    region_cuda  = {n: 0.0 for n in REGION_LABELS}
-                    region_count = {n: 0 for n in REGION_LABELS}
-
-                    for e in evlist:
-                        fl = getattr(e, "flops", None) or 0
-                        cu = getattr(e, "cuda_time_total", 0) or 0
-                        if fl == 0 and cu == 0:
-                            continue
-                        iv = _start(e)
-                        if not iv:
-                            continue
-                        s, en = iv
-                        best = None
-                        best_span = None
-                        for (nm, ls, le) in label_iv:
-                            if ls <= s and en <= le:
-                                span = le - ls
-                                if best_span is None or span < best_span:
-                                    best, best_span = nm, span
-                        if best is not None:
-                            region_flops[best] += fl
-                            region_cuda[best]  += cu
-                            region_count[best] += 1
-
-                    region_path = os.path.join(out_dir, f"regions_{tag}.csv")
-                    with open(region_path, "w", newline="") as f:
-                        w = csv.writer(f)
-                        w.writerow(["region", "gflops", "cuda_ms", "leaf_ops"])
-                        for nm in sorted(REGION_LABELS,
-                                         key=lambda n: region_flops[n],
-                                         reverse=True):
-                            w.writerow([nm, region_flops[nm]/1e9,
-                                        region_cuda[nm]/1e3, region_count[nm]])
-
-                    print("\n[Profile] Per-region breakdown (GFLOPs | CUDA ms | leaf ops):")
-                    any_nonzero = False
-                    for nm in sorted(REGION_LABELS, key=lambda n: region_flops[n], reverse=True):
-                        gf = region_flops[nm]/1e9
-                        cu = region_cuda[nm]/1e3
-                        if region_flops[nm] > 0 or region_cuda[nm] > 0:
-                            any_nonzero = True
-                        print(f"[Profile]   {nm:<26} {gf:>9.1f} | {cu:>7.2f} ms | {region_count[nm]:>4d}")
-
-                    if not any_nonzero:
-                        print("[Profile]   (no FLOPs attributed — verify record_function placement)")
-
-                except Exception as ee:
-                    print(f"[Profile] region summary failed: {ee}")
+        summary_path = os.path.join(out_dir, f"gflops_summary_{tag}.txt")
+        with open(summary_path, "w") as f:
+            f.write(f"xp_name: {args.xp_name}\n")
+            f.write(f"Method: torch.utils.flop_counter.FlopCounterMode "
+                    f"(SDPA attention counted)\n")
+            f.write(f"GFLOPs/forward (mean of {n_measured} passes): "
+                    f"{gflops:.4f}\n")
+        print(f"[GFLOPs] summary -> {summary_path}")
 
 except Exception as e:
     import traceback
-    print(f"[Profile] GFLOPs measurement failed: {e}")
+    print(f"[GFLOPs] GFLOPs measurement failed: {e}")
+    with open(os.path.join(out_dir, "ERROR.txt"), "w") as f:
+        f.write(traceback.format_exc())
     gflops = float("nan")
 
 print(f"\nRESULT xp={args.xp_name} test_gflops={gflops:.6f}")

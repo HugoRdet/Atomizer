@@ -590,7 +590,7 @@ class Sen1Floods11SkipDataset(Dataset):
 
     def _load_file_lists(self):
         s1_images, s2_images, labels = [], [], []
-        print(f"[Sen1Floods11Skip] Loading split file: {self.split_file}")
+
         with open(self.split_file, "r") as f:
             reader = csv.reader(f)
             for row in reader:
@@ -607,7 +607,7 @@ class Sen1Floods11SkipDataset(Dataset):
     def _filter_invalid_samples(self):
         valid_s1, valid_s2, valid_labels = [], [], []
         skipped = 0
-        print(f"[Sen1Floods11Skip] Filtering invalid samples...")
+
         for i in tqdm(range(len(self.label_list)), desc="Checking labels"):
             try:
                 with rasterio.open(self.label_list[i]) as src:
@@ -622,7 +622,7 @@ class Sen1Floods11SkipDataset(Dataset):
             except Exception as e:
                 print(f"[Warning] Could not read {self.label_list[i]}: {e}")
                 skipped += 1
-        print(f"[Sen1Floods11Skip] Skipped {skipped} invalid samples")
+
         self.s1_image_list = valid_s1
         self.s2_image_list = valid_s2
         self.label_list    = valid_labels
