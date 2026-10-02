@@ -8,18 +8,29 @@ Train Atomizer on BioMassters for above-ground biomass (AGB) regression.
   - S1 (4 bands: VV/VH x ascending/descending, multi-temporal, same fixed T)
     — always enabled
 
+>>> TEMPORAL: also supports config["Atomiser"]["use_temporal_transformer"]
+(or --use_temporal_transformer), which swaps the dataset/collate pair to
+BioMasstersTemporalDataset + biomassters_temporal_collate_fn. That dataset
+builds per-timestep [T, N, 8] token groups (S2 paired with S1 by index t --
+both already share the same fixed_T by construction, so no PASTIS-style
+nearest-date matching is needed) instead of one flat concatenated pool,
+required by AtomiserTemporal. Model_BioMassters_Skip's encoder-selection
+branches on the same config flag, so setting use_temporal_transformer: true
+(or passing --use_temporal_transformer) is sufficient for both sides to
+switch in lockstep -- same pattern as script_train_PASTIS.py / script_train_xview.py.
+
 Splits:
   - Train / Validation: carved from train_features/train_agbm (BioMassters
     ships no official val split -- see BioMasstersSkipDataset._carve_val_split,
     a deterministic 10% chip-level split, seed=42)
   - Test: test_features/test_agbm
 
-Modality/band dropping (NEW):
+Modality/band dropping:
   - STATIC eval-time drop: config trainer.bands.drop, or override via
     --drop_bands on the command line (takes precedence over the config
-    value if given) -- applied at EVERY split by BioMasstersSkipDataset.
-    This is how you drive a modality-drop ablation run without editing the
-    YAML, e.g.:
+    value if given) -- applied at EVERY split by BioMasstersSkipDataset /
+    BioMasstersTemporalDataset (inherited unchanged). This is how you drive
+    a modality-drop ablation run without editing the YAML, e.g.:
         --test_only --resume_from <ckpt> \
             --drop_bands VV_asc VH_asc VV_desc VH_desc   # "S2 only"
   - STOCHASTIC training-time augmentation: config
@@ -29,6 +40,10 @@ Modality/band dropping (NEW):
 
 Example:
     python train_biomassters.py --xp_name biomassters_run1
+
+    # Temporal transformer variant
+    python train_biomassters.py --xp_name biomassters_temporal \
+        --use_temporal_transformer
 
     # resume from a checkpoint that may not exist yet (e.g. chained SLURM
     # jobs where the previous job's checkpoint write hasn't landed on disk
@@ -68,6 +83,12 @@ from training.utils.datasets.utils_dataset_biomasters import BioMasstersSkipData
 from training.utils.datasets.collate_biomassters_skip import collate_biomassters_skip
 from training.trainer_biomassters import Model_BioMassters_Skip
 
+# >>> TEMPORAL
+from training.utils.datasets.biomassters_temporal_dataset import (
+    BioMasstersTemporalDataset,
+    biomassters_temporal_collate_fn,
+)
+
 # NOTE: create_biomassters_bands_info lives in Lookup_encoding.py per the
 # earlier patch (ABSTRACT_CHANNELS + this helper added there).
 from training.utils.lookup_positional import create_biomassters_bands_info
@@ -77,11 +98,18 @@ from training.utils.lookup_positional import create_biomassters_bands_info
 # COLLATE
 # =============================================================================
 # collate_biomassters_skip already handles the tasks->queries bridge and
-# query_token_idx/valid padding -- imported above, used directly.
+# query_token_idx/valid padding -- imported above, used directly for the
+# flat/SKIP path. biomassters_temporal_collate_fn does the analogous
+# padding for the [T, N, 8] path.
 
 
 # =============================================================================
 # DATAMODULE
+#
+# >>> TEMPORAL: dataset_cls / collate_fn are now parameters instead of being
+# hardcoded, so the SAME datamodule class serves both the flat/SKIP path and
+# the per-timestep TemporalTransformer path -- same pattern as PASTIS's
+# PastisDataModule.
 # =============================================================================
 
 class BioMasstersDataModule(pl.LightningDataModule):
@@ -93,6 +121,8 @@ class BioMasstersDataModule(pl.LightningDataModule):
         look_up,
         batch_size: int = 4,
         num_workers: int = 4,
+        dataset_cls=BioMasstersSkipDataset,
+        collate_fn=collate_biomassters_skip,
     ):
         super().__init__()
         self.root_path    = root_path
@@ -100,9 +130,11 @@ class BioMasstersDataModule(pl.LightningDataModule):
         self.look_up      = look_up
         self.batch_size   = batch_size
         self.num_workers  = num_workers
+        self.dataset_cls  = dataset_cls
+        self.collate_fn   = collate_fn
 
     def _make_dataset(self, mode: str):
-        return BioMasstersSkipDataset(
+        return self.dataset_cls(
             root_path=self.root_path,
             mode=mode,
             config_model=self.config_model,
@@ -119,6 +151,7 @@ class BioMasstersDataModule(pl.LightningDataModule):
         self.test_dataset  = self._make_dataset("test")
 
         print(f"\n[BioMassters-DM] Summary:")
+        print(f"  Dataset: {self.dataset_cls.__name__}")
         print(f"  Train: {len(self.train_dataset)} chips")
         print(f"  Val:   {len(self.val_dataset)} chips (10% held out from train)")
         print(f"  Test:  {len(self.test_dataset)} chips")
@@ -130,7 +163,7 @@ class BioMasstersDataModule(pl.LightningDataModule):
         return DataLoader(
             dataset, batch_size=self.batch_size,
             shuffle=(shuffle and sampler is None), sampler=sampler,
-            num_workers=self.num_workers, collate_fn=collate_biomassters_skip,
+            num_workers=self.num_workers, collate_fn=self.collate_fn,
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
             prefetch_factor=2 if self.num_workers > 0 else None,
@@ -212,7 +245,7 @@ parser.add_argument("--resume_poll_interval", type=int, default=15,
 parser.add_argument("--pretrained_encoder", type=str, default=None,
                     help="Load pretrained encoder weights (no head)")
 parser.add_argument("--num_workers",    type=int, default=4)
-parser.add_argument("--grad_accum",     type=int, default=4)
+parser.add_argument("--grad_accum",     type=int, default=1)
 
 # Wandb resume
 parser.add_argument("--wandb_run_id",   type=str, default=None,
@@ -227,6 +260,16 @@ parser.add_argument("--test_only",      action="store_true",
 parser.add_argument("--num_timesteps",  type=int, default=None,
                     help="Fixed number of timesteps per sensor (overrides config, "
                          "pad-by-replication / evenly-spaced subsample to this count)")
+
+# >>> TEMPORAL
+parser.add_argument("--use_temporal_transformer", action="store_true",
+                    help="Use AtomiserTemporal: per-timestep "
+                         "Atomiser_Senflood_Skip encoding + RoPE "
+                         "TemporalTransformer aggregation, with S2/S1 paired "
+                         "by timestep index (BioMasstersTemporalDataset). "
+                         "Both sensors already share the same fixed_T by "
+                         "construction, so no date-matching is needed "
+                         "(unlike PASTIS).")
 
 # Modality/band-drop override (static eval-time drop -- overrides config
 # trainer.bands.drop if given). Named band strings, e.g.:
@@ -273,6 +316,18 @@ if args.drop_bands is not None:
     print(f"[BioMassters] --drop_bands override: {args.drop_bands} "
           f"(overrides config trainer.bands.drop)")
 
+# >>> TEMPORAL: CLI flag wins, but keep the config value in sync so
+# Model_BioMassters_Skip's encoder-selection branch (which reads
+# config["Atomiser"]["use_temporal_transformer"]) matches what this script
+# actually wires up on the data side -- same pattern as script_train_PASTIS.py.
+if "Atomiser" not in config_model:
+    config_model["Atomiser"] = {}
+_use_temporal_transformer = (
+    args.use_temporal_transformer
+    or config_model["Atomiser"].get("use_temporal_transformer", False)
+)
+config_model["Atomiser"]["use_temporal_transformer"] = _use_temporal_transformer
+
 # NOTE: unlike PASTIS/Sen1Floods11 (which load bands.yaml from disk),
 # BioMassters' bands_info is built in Python via create_biomassters_bands_info()
 # -- it references ABSTRACT_CHANNELS codes directly rather than a YAML file.
@@ -287,7 +342,18 @@ print(f"[BioMassters] Timesteps:    {fixed_T} (fixed, pad-by-replication if a ch
 print(f"[BioMassters] num_classes:  {config_model['trainer']['num_classes']} "
       f"(must be 1 for regression -- check config_test-Biomassters.yaml if this looks wrong)")
 _skip_on = config_model.get("Atomiser", {}).get("use_decoder_skip", False)
-print(f"[BioMassters] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
+if _use_temporal_transformer:
+    print(f"[BioMassters] Temporal transformer: ON "
+          f"(AtomiserTemporal, BioMasstersTemporalDataset, S2/S1 paired by "
+          f"timestep index)")
+    if _skip_on:
+        print(f"[BioMassters] Decoder pixel-skip: ON (active inside AtomiserTemporal)")
+    else:
+        print(f"[BioMassters] Decoder pixel-skip: OFF "
+              f"(query_token_idx/query_token_valid computed and collated "
+              f"but ignored by AtomiserTemporal.forward)")
+else:
+    print(f"[BioMassters] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
 
 # Band-drop / dropout-augmentation visibility -- read the SAME config keys
 # BioMasstersSkipDataset itself reads, so this print can never drift from
@@ -322,7 +388,11 @@ if os.environ.get("LOCAL_RANK", "0") == "0" and not args.test_only:
     wandb_init_kwargs = dict(
         name=run_name,
         project="BioMassters",
-        config={**config_model, "num_timesteps": fixed_T},
+        config={
+            **config_model,
+            "num_timesteps": fixed_T,
+            "use_temporal_transformer": _use_temporal_transformer,
+        },
     )
 
     if args.wandb_run_id is not None:
@@ -337,13 +407,21 @@ if os.environ.get("LOCAL_RANK", "0") == "0" and not args.test_only:
 
 # =============================================================================
 # DATA MODULE
+#
+# >>> TEMPORAL: dataset_cls / collate_fn swapped based on
+# use_temporal_transformer. Everything else about the datamodule is shared.
 # =============================================================================
+_dataset_cls = BioMasstersTemporalDataset if _use_temporal_transformer else BioMasstersSkipDataset
+_collate_fn  = biomassters_temporal_collate_fn if _use_temporal_transformer else collate_biomassters_skip
+
 data_module = BioMasstersDataModule(
     root_path=args.data_dir,
     config_model=config_model,
     look_up=lookup_table,
     batch_size=config_model["trainer"]["batchsize"],
     num_workers=args.num_workers,
+    dataset_cls=_dataset_cls,
+    collate_fn=_collate_fn,
 )
 data_module.setup()
 print(f"[BioMassters] Lookup table: {len(lookup_table.table_wave)} entries")
@@ -351,7 +429,9 @@ print(f"[BioMassters] Lookup table: {len(lookup_table.table_wave)} entries")
 # Target normalization stats (plain z-score), computed/cached by
 # BioMasstersSkipDataset alongside the input band stats in the same
 # normalization_stats.pt -- pulled from the already-constructed train
-# dataset rather than re-reading the file separately.
+# dataset rather than re-reading the file separately. Works identically
+# for BioMasstersTemporalDataset, which inherits the base class's
+# normalization machinery unchanged.
 _agb_mean = data_module.train_dataset.norm_stats["agb_mean"].item()
 _agb_std  = data_module.train_dataset.norm_stats["agb_std"].item()
 print(f"[BioMassters] AGB target normalization: z-score "
@@ -450,6 +530,7 @@ if args.test_only:
     print(f"  BioMassters — TEST ONLY")
     print(f"  Checkpoint: {ckpt_to_load}")
     print(f"  Timesteps:  {fixed_T} (fixed)")
+    print(f"  Temporal transformer: {'ON' if _use_temporal_transformer else 'OFF'}")
     if args.drop_bands:
         print(f"  Modality-drop ablation: {args.drop_bands}")
     print(f"{'='*60}\n")
@@ -462,6 +543,10 @@ if args.test_only:
           f"unexpected: {len(result.unexpected_keys)}")
     if result.missing_keys:
         print(f"[BioMassters] First 5 missing: {result.missing_keys[:5]}")
+        print(f"[BioMassters] If this is unexpected, verify "
+              f"--use_temporal_transformer matches how this checkpoint was "
+              f"trained -- search state_dict keys for 'temporal' to confirm "
+              f"(same check used for PASTIS/xView2).")
     if result.unexpected_keys:
         print(f"[BioMassters] First 5 unexpected: {result.unexpected_keys[:5]}")
 
@@ -473,6 +558,7 @@ if args.test_only:
         mae  = metrics.get("test_MAE", float("nan"))
         drop_str = ",".join(args.drop_bands) if args.drop_bands else "none"
         print(f"RESULT test_only ckpt={ckpt_to_load} drop={drop_str} "
+              f"temporal={_use_temporal_transformer} "
               f"test_RMSE={rmse:.6f} test_MAE={mae:.6f}")
 else:
     fit_ckpt_path = None
@@ -483,6 +569,7 @@ else:
     print(f"\n{'='*60}")
     print(f"  BioMassters")
     print(f"  Timesteps: {fixed_T} (fixed, pad-by-replication)")
+    print(f"  Temporal transformer: {'ON' if _use_temporal_transformer else 'OFF'}")
     print(f"  Train/Val: carved from train_features (10% held out) → Test: test_features")
     if fit_ckpt_path is not None:
         print(f"  RESUMING from: {fit_ckpt_path}")

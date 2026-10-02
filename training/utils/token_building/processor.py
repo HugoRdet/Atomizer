@@ -101,7 +101,15 @@ class TokenProcessor(nn.Module):
         self.reflectance_encoder = build_reflectance_encoder(config)
         self.resolution_encoder  = build_resolution_encoder(config, lookup_table)
         self.time_encoder        = build_time_encoder(config, lookup_table)
-        self.compression_alpha   = config["Atomiser"].get("compression_alpha", 10.0)
+
+        # GSD is always constant in this setup, so the compression scale for
+        # relative-position encoding (used by both the encoder's cross-attn
+        # positional features and the decoder's rel_pe) is a fixed value
+        # rather than alpha * per-token gsd. Sourced from
+        # RoPE.cross_compression_scale so it's the single, actually-tunable
+        # knob for this quantity (previously only alpha was configurable,
+        # multiplied against a gsd that never varied).
+        self.compression_scale   = config["RoPE"].get("cross_compression_scale", 50.0)
 
         # ── 3. Temporal profile (direct feed, no projection) ───────────
         temporal_cfg = config.get("temporal_profile", {})
@@ -171,6 +179,8 @@ class TokenProcessor(nn.Module):
         print(f"[TokenProcessor] Decoder: spectral({self.spectral_encoder.out_dim}) + "
               f"resolution({self.resolution_encoder.out_dim}) = {self._raw_decoder_dim} → "
               f"MLP({tokenizer_layers}L, h={tokenizer_hidden}) → {tokenizer_out}")
+        print(f"[TokenProcessor] Position compression_scale={self.compression_scale} "
+              f"(from RoPE.cross_compression_scale, constant gsd)")
 
     # =========================================================================
     # PROPERTIES
@@ -235,14 +245,12 @@ class TokenProcessor(nn.Module):
         delta_x = token_coords[..., 0] - latent_coords[..., 0]  # [B, L, m]
         delta_y = token_coords[..., 1] - latent_coords[..., 1]  # [B, L, m]
 
-        gsd = (self._constant_gsd if self.use_constant_gsd
-               else self.geometry.get_token_gsd(base_tokens))
-
         # ── Step 2: Sub-encodings ──────────────────────────────────────
 
-        # Positional (relative, compressed)
-        compression_scale = self.compression_alpha * gsd
-        pos_features = self.pos_encoder(delta_x, delta_y, compression_scale=compression_scale)
+        # Positional (relative, compressed). GSD is always constant in this
+        # setup, so the compression scale is a fixed value (see __init__)
+        # rather than alpha * per-token gsd.
+        pos_features = self.pos_encoder(delta_x, delta_y, compression_scale=self.compression_scale)
         if pos_features.dim() < 4:
             pos_features = pos_features.unsqueeze(-2)
 
@@ -361,7 +369,8 @@ class TokenProcessor(nn.Module):
         return (
             f"encoder: {self._raw_encoder_dim}→{self._encoder_out_dim}  "
             f"decoder: {self._raw_decoder_dim}→{self._decoder_out_dim}  "
-            f"constant_gsd={self.use_constant_gsd}\n"
+            f"constant_gsd={self.use_constant_gsd}  "
+            f"compression_scale={self.compression_scale}\n"
             f"  pos={self.pos_encoder.out_dim} + "
             f"spectral={self.spectral_encoder.out_dim} + "
             f"reflectance={self.reflectance_encoder.out_dim} + "

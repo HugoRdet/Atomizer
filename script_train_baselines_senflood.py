@@ -16,15 +16,14 @@ Sen1Floods11 is single-temporal — no LTAE needed. Supports:
              training.Universat.universat_augmenter.UniverSatSegmenter.
 
              TRUE multimodal path: like RAMEN, UniverSat receives separate
-             {"optical": [B,13,H,W], "sar": [B,2,H,W]} tensors (reusing
-             senflood_collate_ramen — no new collate needed). Optical bands
-             are embedded by continuous wavelength (the adapter converts
-             the nm dict to UniverSat's µm convention); SAR channels use
-             UniverSat's learned string channel codes "VV"/"VH" (matching
-             its Encoding_<code> embeddings — note these are NOT RAMEN's
-             "asc_vv"-style pol_map keys). With two modalities the
-             Bi_ACA_in fusion block is active (unlike single-modality
-             BurnScars, where it is structurally inert).
+             {"optical": [B,13,H,W], "sar": [B,2,H,W]} tensors. Optical
+             bands are embedded by continuous wavelength (the adapter
+             converts the nm dict to UniverSat's µm convention); SAR
+             channels use UniverSat's learned string channel codes
+             "VV"/"VH" (matching its Encoding_<code> embeddings — note
+             these are NOT RAMEN's "asc_vv"-style pol_map keys). With two
+             modalities the Bi_ACA_in fusion block is active (unlike
+             single-modality BurnScars, where it is structurally inert).
 
              Unlike RAMEN, NO window size is baked at construction: the
              latent grid is recomputed per input (H / patch_px per side),
@@ -47,11 +46,50 @@ Sen1Floods11 is single-temporal — no LTAE needed. Supports:
              augmentation + 4x fewer tokens) over shrinking the batch;
              UniverSat evals at full 512 regardless of the train crop.
 
-             Band-dropout augmentation applies unchanged: the dataset
-             zeroes channels in the merged tensor BEFORE the collate
-             splits it, so UniverSat sees zeroed bands exactly like every
-             other baseline (zeroed channels, not Atomiser-style padding
-             tokens — that distinction is the point of the comparison).
+Band-dropout augmentation — TWO DIFFERENT MECHANISMS, deliberately:
+
+  1. PER-BAND dropout: unchanged, still handled entirely inside the
+     dataset (Sen1Floods11BaselineDataset._band_dropout_augment), which
+     zeroes individual bands of the merged [15,H,W] tensor BEFORE this
+     script's collate splits it. This is mathematically equivalent to
+     true removal for RAMEN (its spectral encoding is a linear sum over
+     the channel dim: a zeroed band contributes exactly zero, same as an
+     absent one) — see the encoder's `x_mod @ spectral_encoding` in
+     ramen_encoder.py. For UniverSat it is NOT proven equivalent (each
+     band becomes its own Fourier-encoded token processed by spectral
+     attention, not summed away) — true per-band removal for UniverSat is
+     a separate, NOT-yet-implemented change; this script still only
+     zero-masks per-band for both models, a known limitation flagged here
+     rather than silently assumed fixed.
+
+  2. WHOLE-MODALITY dropout: for --model ramen / --model universat, this
+     is now TRUE removal, not zero-masking. The dataset's own
+     whole-modality branch is disabled for these two models (dataset is
+     constructed with p_whole_modality=0.0, so it only ever does
+     per-band dropout, if any); whole-modality removal is instead decided
+     ONCE PER TRAINING BATCH (not per sample — a batch must share one
+     tensor shape, so "sample A keeps SAR, sample B doesn't" can't be
+     expressed in a single forward call) by make_senflood_collate_ramen()
+     below, which OMITS the dropped modality's key from the dict entirely
+     rather than zeroing its values. This requires the corresponding
+     encoder fix (see ramen_encoder.py's forward(), which now filters
+     self.modalities down to whatever keys are actually present in x --
+     UniverSat's UniverSat.forward() already did this natively, no
+     encoder change needed there). Val/test loaders are UNAFFECTED (use
+     the original full-band split collate) — this script's val/test are
+     standard full-image eval, not the separate modality-drop ablation
+     script.
+
+  CAVEAT for the paper: switching whole-modality dropout from per-sample
+  zero-masking to per-batch true removal changes what the model is
+  trained on — this is a deliberate methodological change (an
+  architecturally faithful representation of "modality absent"), not a
+  bugfix, and should be reported as such. It also coarsens dropout
+  granularity from per-sample to per-batch, which may affect training
+  dynamics independently of the masking-vs-removal distinction; if you
+  want to isolate the two effects, compare against a checkpoint trained
+  with the old per-sample zero-masking (--model ramen/universat with
+  --legacy_whole_modality_zero_masking, see below).
 
 Same conditions as Atomiser:
   - Same train/val/test splits
@@ -89,9 +127,14 @@ Examples:
         --model vit \
         --batch_size 8 --lr 1e-4 --epochs 80
 
-    # RAMEN baseline
+    # RAMEN baseline, TRUE per-batch whole-modality removal (default)
     python script_train_senflood_baseline.py --xp_name ramen_s2s1 \
         --model ramen \
+        --batch_size 8 --lr 1e-4 --epochs 80
+
+    # RAMEN baseline, OLD per-sample zero-masking (for A/B comparison)
+    python script_train_senflood_baseline.py --xp_name ramen_s2s1_legacy \
+        --model ramen --legacy_whole_modality_zero_masking \
         --batch_size 8 --lr 1e-4 --epochs 80
 
     # UniverSat-S from scratch (~34.9M effective, parameter-matched):
@@ -110,6 +153,7 @@ Examples:
 
 import os
 import argparse
+import random
 
 import torch
 import yaml
@@ -215,7 +259,7 @@ UNIVERSAT_WAVELENGTHS = {
 
 
 # =============================================================================
-# COLLATE — stacks per-modality images, stacks targets, keeps metadata as list
+# COLLATES — stacks per-modality images, stacks targets, keeps metadata as list
 # =============================================================================
 
 def senflood_collate(batch):
@@ -242,7 +286,11 @@ def senflood_collate(batch):
 
 def senflood_collate_ramen(batch):
     """
-    RAMEN / UniverSat collate for Sen1Floods11BaselineDataset.
+    RAMEN / UniverSat collate for Sen1Floods11BaselineDataset — FULL BAND
+    SET, no whole-modality removal. Used for val/test (always full-band)
+    and, when --legacy_whole_modality_zero_masking is set, for train too
+    (the dataset's own per-sample whole-modality zero-masking handles that
+    ablation in that legacy mode instead).
 
     The dataset still returns the merged image["s2s1"] : [15, H, W]
     tensor (no dataset changes needed) — this splits it into separate
@@ -251,7 +299,7 @@ def senflood_collate_ramen(batch):
     RAMENUPerNet and UniverSatSegmenter need each modality separately to
     look up its own spectral encoding (per-band projector for RAMEN;
     wavelength MP-Fourier / Encoding_<code> embeddings for UniverSat).
-    Band-dropout zeroing happened inside the dataset on the merged
+    Per-band dropout zeroing happened inside the dataset on the merged
     tensor, so it propagates to the split tensors unchanged.
     """
     merged = torch.stack([s["image"]["s2s1"] for s in batch])  # [B, 15, H, W]
@@ -269,6 +317,68 @@ def senflood_collate_ramen(batch):
         "target": targets,
         "metadata": metadata,
     }
+
+
+def make_senflood_collate_ramen_true_removal(p_dropout_applied: float,
+                                              p_whole_modality_batch: float):
+    """
+    TRAINING collate for --model ramen / --model universat implementing
+    TRUE whole-modality removal: once per BATCH (not per sample — a batch
+    must share one tensor shape, so per-sample true removal isn't
+    representable in a single forward call), decide whether to omit
+    "optical" or "sar" from the returned image dict entirely, rather than
+    zeroing that modality's values.
+
+    Requires the corresponding encoder fix: RAMEN_Encoder.forward() /
+    RAMEN_Encoder_MonoTemporal.forward() must filter self.modalities down
+    to whatever keys are actually present in the input dict (see
+    ramen_encoder.py) — without that fix, RAMEN raises a KeyError the
+    moment a modality is omitted. UniverSat's UniverSat.forward() already
+    filters this way natively; no encoder change was needed there.
+
+    Per-band dropout is UNCHANGED — still applied inside the dataset on
+    the merged tensor before this collate runs (Sen1Floods11BaselineDataset
+    must be constructed with p_whole_modality=0.0 so it never also does
+    its own whole-modality zeroing; p_band_drop and p_dropout_applied
+    still control per-band behavior as before).
+
+    Decision logic (per batch, train-loader calls only):
+      - With probability (1 - p_dropout_applied): no modality dropped.
+      - Otherwise, with probability p_whole_modality_batch: drop a whole
+        modality (50/50 which one). With probability
+        (1 - p_whole_modality_batch): drop nothing here (per-band
+        dropout, handled separately inside the dataset, still applies
+        regardless of this collate's decision).
+
+    NOTE the semantics differ slightly from the OLD per-sample scheme:
+    previously p_whole_modality was "given dropout is applied, P(whole
+    modality | dropout)"; here p_whole_modality_batch plays the same role
+    but the *unit* of randomness is the batch, not the sample. Comparable
+    but not identical dropout schedules — see module docstring's caveat.
+    """
+    def collate(batch):
+        merged = torch.stack([s["image"]["s2s1"] for s in batch])  # [B, 15, H, W]
+        images = {
+            "optical": merged[:, :NUM_S2_BANDS],
+            "sar": merged[:, NUM_S2_BANDS : NUM_S2_BANDS + NUM_S1_BANDS],
+        }
+
+        if random.random() < p_dropout_applied and random.random() < p_whole_modality_batch:
+            if random.random() < 0.5:
+                del images["sar"]      # true removal: key genuinely absent
+            else:
+                del images["optical"]
+
+        targets = torch.stack([s["target"] for s in batch])
+        metadata = [s["metadata"] for s in batch]
+
+        return {
+            "image": images,
+            "target": targets,
+            "metadata": metadata,
+        }
+
+    return collate
 
 
 # =============================================================================
@@ -327,8 +437,8 @@ def build_model(model_name: str, in_channels: int, num_classes: int, args):
         # no window size is baked at construction — the latent grid is
         # recomputed per input, so the same weights handle any train crop
         # and the 512 full image. Consumes the same {"optical","sar"} dict
-        # as RAMEN (senflood_collate_ramen), but with UniverSat's own SAR
-        # channel codes (see UNIVERSAT_WAVELENGTHS above).
+        # as RAMEN, but with UniverSat's own SAR channel codes (see
+        # UNIVERSAT_WAVELENGTHS above).
         return build_universat_segmenter(
             input_bands=UNIVERSAT_INPUT_BANDS,
             wavelengths=UNIVERSAT_WAVELENGTHS,
@@ -459,12 +569,12 @@ parser.add_argument("--ramen_depth",     type=int, default=12)
 parser.add_argument("--ramen_num_heads", type=int, default=8)
 parser.add_argument("--ramen_input_res", type=float, default=10.0,
                     help="Native GSD (m/px) of the input imagery.")
-parser.add_argument("--ramen_res",       type=float, default=20.0,
+parser.add_argument("--ramen_res",       type=float, default=40.0,
                     help="Common working resolution (m/px) all modalities are "
                          "resampled to before the shared ViT stack. Since "
                          "input_res is the same across modalities here, this "
                          "can be left equal to --ramen_input_res (no resampling).")
-parser.add_argument("--ramen_window_size", type=int, default=256,
+parser.add_argument("--ramen_window_size", type=int, default=512,
                     help="RAMEN tokenizes at the pixel level (no patch "
                          "embedding), so full self-attention over a "
                          "512x512 image is intractable. The model is "
@@ -506,7 +616,7 @@ parser.add_argument("--universat_patch_m", type=float, default=40.0,
                          "160 m = 16 px (ViT patch-size parity). Must be an "
                          "integer number of pixels, and every input side "
                          "must be divisible by that pixel count.")
-parser.add_argument("--universat_output_stride", type=int, default=1,
+parser.add_argument("--universat_output_stride", type=int, default=4,
                     help="Logits at H/stride per side (BaselineTrainer "
                          "bilinearly upsamples to the target). 1 = per-pixel "
                          "decoding via the CA_Sub sub-patch skip — the "
@@ -536,8 +646,10 @@ parser.add_argument("--flops_n", type=int, default=3,
 # exposure to missing modalities/bands, for fairer comparison against
 # Atomiser's native padding-token robustness at the modality-drop eval
 # (script_test_senflood_baseline_modality_drop.py). See
-# Sen1Floods11BaselineDataset's docstring for exact semantics.
-parser.add_argument("--band_dropout", action="store_true", default=False,
+# Sen1Floods11BaselineDataset's docstring for exact per-band semantics,
+# and this script's module docstring for the whole-modality TRUE REMOVAL
+# vs. zero-masking distinction.
+parser.add_argument("--band_dropout", action="store_true", default=True,
                     help="Enable band-dropout augmentation during training "
                          "(default: on). Matches the intent of Atomiser's "
                          "own token-dropout augmentation — set the "
@@ -547,16 +659,47 @@ parser.add_argument("--no_band_dropout", dest="band_dropout", action="store_fals
                     help="Disable band-dropout augmentation (e.g. for an "
                          "ablation isolating its effect).")
 parser.add_argument("--p_dropout_applied", type=float, default=0.5,
-                    help="Probability a given training sample gets ANY "
-                         "band dropout applied (the rest keep all bands).")
+                    help="Probability a given training sample/batch gets "
+                         "ANY band dropout applied (the rest keep all "
+                         "bands). For unet/vit/resnet this still gates "
+                         "the dataset's PER-SAMPLE dropout (both per-band "
+                         "and, for these models only, whole-modality "
+                         "zero-masking). For ramen/universat it gates "
+                         "PER-SAMPLE per-band dropout inside the dataset "
+                         "AND, independently, the PER-BATCH true-removal "
+                         "decision in make_senflood_collate_ramen_true_removal.")
 parser.add_argument("--p_whole_modality", type=float, default=0.5,
-                    help="Given dropout is applied, probability it's a "
-                         "whole-modality drop (all S1 or all S2) rather "
-                         "than a random per-band subset.")
+                    help="Given dropout is applied: for unet/vit/resnet, "
+                         "probability of a per-sample whole-modality "
+                         "zero-mask (passed straight to the dataset). For "
+                         "ramen/universat (unless "
+                         "--legacy_whole_modality_zero_masking), this is "
+                         "instead p_whole_modality_batch in the true-"
+                         "removal collate — same role, per-batch unit of "
+                         "randomness; the dataset itself is constructed "
+                         "with p_whole_modality=0.0 for these two models "
+                         "so it never also zero-masks a whole modality.")
 parser.add_argument("--p_band_drop", type=float, default=0.15,
                     help="Given a per-band (not whole-modality) drop, the "
                          "independent probability each of the 15 bands is "
-                         "individually zeroed.")
+                         "individually zeroed. Unchanged/identical "
+                         "semantics for all models, including ramen/"
+                         "universat — see module docstring on why "
+                         "per-band zero-masking is left as-is.")
+parser.add_argument("--legacy_whole_modality_zero_masking", action="store_true",
+                    help="For --model ramen / --model universat only: "
+                         "revert whole-modality dropout to the OLD "
+                         "per-sample zero-masking behavior (dataset-level, "
+                         "same as unet/vit/resnet), instead of the new "
+                         "per-batch TRUE removal. Useful for an A/B "
+                         "comparison isolating the effect of true removal "
+                         "vs. zero-masking on a matched training schedule. "
+                         "No effect for unet/vit/resnet (always "
+                         "zero-masked; RAMEN_Encoder's forward() fix and "
+                         "UniverSat's native modality filtering are what "
+                         "make true removal possible in the first place, "
+                         "and only ramen/universat consume a per-modality "
+                         "dict at all).")
 
 args = parser.parse_args()
 
@@ -708,6 +851,12 @@ if args.model == "universat":
     # full 512 (single dense forward by default; sliding-window only if
     # --universat_window_size was set above).
 
+if args.legacy_whole_modality_zero_masking and args.model not in ("ramen", "universat"):
+    print(f"[INFO] --legacy_whole_modality_zero_masking has no effect for "
+          f"--model {args.model} (only unet/vit/resnet's dataset-level "
+          f"zero-masking exists regardless; ramen/universat are the only "
+          f"models this flag toggles).")
+
 
 # =============================================================================
 # SUMMARY
@@ -736,6 +885,9 @@ if args.model == "universat":
               f"{args.universat_window_size}, stride={args.universat_stride})")
     else:
         print(f"  Eval:        full 512×512, single dense forward")
+if args.model in ("ramen", "universat"):
+    print(f"  Whole-mod drop: "
+          f"{'LEGACY per-sample zero-masking' if args.legacy_whole_modality_zero_masking else 'TRUE per-batch removal'}")
 print(f"  Channels:    {NUM_CHANNELS} (13 S2 + 2 S1)")
 print(f"  Crop (train):{args.crop_size}×{args.crop_size}")
 print(f"  Eval size:   512×512 (full)")
@@ -755,12 +907,24 @@ print(f"{'='*60}\n")
 # DATASETS
 # =============================================================================
 
+# For ramen/universat (unless reverting to legacy behavior), the dataset
+# must NEVER do its own whole-modality zero-masking -- that decision moves
+# to make_senflood_collate_ramen_true_removal() at per-batch granularity.
+# p_band_drop / p_dropout_applied still control the dataset's per-band
+# dropout exactly as before (unaffected by this change).
+_true_removal_active = (
+    args.model in ("ramen", "universat")
+    and not args.legacy_whole_modality_zero_masking
+    and args.band_dropout
+)
+_dataset_p_whole_modality = 0.0 if _true_removal_active else args.p_whole_modality
+
 train_ds = Sen1Floods11BaselineDataset(
     root_path=args.data_dir, mode="train",
     crop_size=args.crop_size, augment=True,
     band_dropout=args.band_dropout,
     p_dropout_applied=args.p_dropout_applied,
-    p_whole_modality=args.p_whole_modality,
+    p_whole_modality=_dataset_p_whole_modality,
     p_band_drop=args.p_band_drop,
 )
 val_ds = Sen1Floods11BaselineDataset(
@@ -784,15 +948,30 @@ print(f"  Test:  {len(test_ds)} samples")
 # DATALOADERS
 # =============================================================================
 
-collate_fn = (senflood_collate_ramen if args.model in ("ramen", "universat")
-              else senflood_collate)
+# Val/test ALWAYS use the plain full-band split collate (senflood_collate_ramen)
+# regardless of --legacy_whole_modality_zero_masking -- this script's val/test
+# are standard full-image eval, not the separate modality-drop ablation script,
+# so there's nothing to drop at eval time here.
+eval_collate_fn = (senflood_collate_ramen if args.model in ("ramen", "universat")
+                   else senflood_collate)
+
+if _true_removal_active:
+    train_collate_fn = make_senflood_collate_ramen_true_removal(
+        p_dropout_applied=args.p_dropout_applied,
+        p_whole_modality_batch=args.p_whole_modality,
+    )
+    print(f"[Sen1Floods11-BL] Train collate: TRUE per-batch whole-modality "
+          f"removal (p_dropout_applied={args.p_dropout_applied}, "
+          f"p_whole_modality_batch={args.p_whole_modality})")
+else:
+    train_collate_fn = eval_collate_fn
 
 # Val/test use full 512×512 images → bigger memory footprint per sample.
 # Use batch_size=1 for eval to be safe; train uses cropped 256×256 at full BS.
 loader_kwargs_train = dict(
     batch_size=args.batch_size,
     num_workers=args.num_workers,
-    collate_fn=collate_fn,
+    collate_fn=train_collate_fn,
     pin_memory=True,
     persistent_workers=args.num_workers > 0,
     prefetch_factor=2 if args.num_workers > 0 else None,
@@ -801,7 +980,7 @@ loader_kwargs_train = dict(
 loader_kwargs_eval = dict(
     batch_size=1,                       # full 512 — memory-conservative
     num_workers=args.num_workers,
-    collate_fn=collate_fn,
+    collate_fn=eval_collate_fn,
     pin_memory=True,
     persistent_workers=args.num_workers > 0,
     prefetch_factor=2 if args.num_workers > 0 else None,
@@ -857,6 +1036,9 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         if args.model == "universat":
             run_name += (f"_{args.universat_size}"
                          f"_os{args.universat_output_stride}")
+        if args.model in ("ramen", "universat"):
+            run_name += ("_legacyzero" if args.legacy_whole_modality_zero_masking
+                        else "_truerm")
         wandb.init(
             name=run_name,
             project="Atomizer_SenFlood_Baselines",
@@ -910,7 +1092,12 @@ callbacks = [
 # S1-axis block at subpatch_px=1, the T-axis block at T=1, and the
 # channel codes for sensors not present here (HH/HV/ratios/DSM/nDEM).
 # It also covers RAMEN's RadarProjector/DemProjector pattern, and was
-# already set unconditionally for all models.
+# already set unconditionally for all models. With TRUE whole-modality
+# removal now active by default for ramen/universat, some batches will
+# have an entire modality's projector/encoder path receive NO gradient
+# at all for that step (not just "small" gradient as with zero-masking)
+# -- find_unused_parameters=True already covers this, but it's worth
+# knowing DDP has more to reconcile per such batch than before.
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
     devices=-1,
@@ -976,7 +1163,10 @@ if args.flops and os.environ.get("LOCAL_RANK", "0") == "0":
             # senflood_collate_ramen already splits the batch into
             # {"optical","sar"} at collate time, so no adapter is needed
             # here — sliding_window_inference crops that dict generically
-            # and RAMENUPerNet consumes it directly.
+            # and RAMENUPerNet consumes it directly. Note this measures
+            # the FULL-BAND cost (test_loader always uses the full-band
+            # eval_collate_fn) -- not the true-removal condition's cost,
+            # which would differ (fewer tokens when a modality is absent).
             def fwd(b, m=eval_model):
                 return sliding_window_inference(
                     m, b["image"],
@@ -984,7 +1174,7 @@ if args.flops and os.environ.get("LOCAL_RANK", "0") == "0":
                     stride=args.ramen_stride,
                     num_classes=NUM_CLASSES,
                 )
-            size_note = "full 512x512, sliding-window (all tiles)"
+            size_note = "full 512x512, sliding-window (all tiles), full band set"
         elif args.model == "universat":
             # Match whatever eval mode produced the reported mIoU: a single
             # full-image dense forward by default, or the full sliding-
@@ -999,11 +1189,11 @@ if args.flops and os.environ.get("LOCAL_RANK", "0") == "0":
                         stride=args.universat_stride,
                         num_classes=NUM_CLASSES,
                     )
-                size_note = "full 512x512, sliding-window (all tiles)"
+                size_note = "full 512x512, sliding-window (all tiles), full band set"
             else:
                 def fwd(b, m=eval_model):
                     return m(b["image"])
-                size_note = "full 512x512, single dense forward"
+                size_note = "full 512x512, single dense forward, full band set"
         else:
             # UNet/ViT/ResNet all consume the merged [B,15,H,W] tensor
             # directly. ViT already trains/evals at native 512x512 here

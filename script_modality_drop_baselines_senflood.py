@@ -26,6 +26,50 @@ script_train_senflood_baseline.py). Its --universat_* args MUST match
 the checkpoint's training config (notably --universat_output_stride:
 the universat_px run trained at 1, not the flag default).
 
+MODALITY DROPPING — TWO DIFFERENT MECHANISMS, deliberately (matches
+script_train_senflood_baseline.py's training-time distinction):
+
+  For RAMEN / UniverSat, RAMENChannelDropWrapper now distinguishes
+  WHOLE-MODALITY drops from PARTIAL (per-band) drops:
+
+  - WHOLE-MODALITY (the "s2_only" and "s1_only" ablations, which by
+    construction drop every band of one modality — see BUILTIN_ABLATIONS
+    below): the dropped modality's key is now OMITTED from the dict
+    passed to the model entirely — TRUE removal, not zero-masking. This
+    exercises the same "genuinely absent modality" code path as the
+    training-time true-removal collate in
+    script_train_senflood_baseline.py, and requires the SAME
+    RAMEN_Encoder.forward() fix (filters self.modalities down to keys
+    present in the input dict — see ramen_encoder.py). UniverSat's
+    UniverSat.forward() already filters this way natively; no encoder
+    change was needed for it.
+
+  - PARTIAL (the "rgb_only", "no_swir", "no_re" ablations, which drop
+    a subset of bands within a modality that otherwise remains present):
+    UNCHANGED — still zero-masked. This is mathematically equivalent to
+    removal for RAMEN (its spectral encoding is a linear sum over the
+    channel dim: a zeroed band contributes exactly zero — see
+    `x_mod @ spectral_encoding` in ramen_encoder.py). For UniverSat it is
+    NOT proven equivalent (each band becomes its own Fourier-encoded
+    token processed by spectral attention, not summed away); true
+    per-band removal for UniverSat is a separate, NOT-yet-implemented
+    change — flagged here as a known limitation, not silently assumed
+    fixed.
+
+  UNet/ViT/ResNet/Perceiver (ChannelDropWrapper) are UNCHANGED — always
+  zero-masking, since these architectures have no notion of a variable
+  channel count at all (fixed [B,15,H,W] input); there is no "true
+  removal" possible for them regardless of ablation type.
+
+  --legacy_zero_masking_eval: forces RAMENChannelDropWrapper to ALWAYS
+  zero-mask, even for whole-modality ablations — i.e. reverts to the
+  OLD behavior. Use this to evaluate a checkpoint that was TRAINED under
+  the old zero-masking convention (script_train_senflood_baseline.py's
+  --legacy_whole_modality_zero_masking) under matching eval-time
+  semantics, or to run a clean A/B: same checkpoint, both eval
+  conventions, to isolate what true removal changes independent of what
+  the checkpoint was trained on.
+
 FLOPs: measured with the SAME harness as Atomizer (torch.profiler,
 with_flops=True, sum over key_averages(), averaged over N passes, bs=1, one
 discarded warmup), on the BASE model under the 'all' config (no channels
@@ -38,7 +82,10 @@ so ALL attention FLOPs are silently dropped for SDPA-based models (ViT,
 Perceiver, RAMEN, UniverSat) -- these numbers are lower bounds, worst
 for token-heavy models. For UniverSat use the FlopCounterMode numbers
 from script_universat_sweep_senflood.py's JSON instead; never mix the
-two harnesses in one table.
+two harnesses in one table. NOTE the 'all' config used for FLOPs profiling
+has no channels dropped, so it is UNAFFECTED by the true-removal change
+above — that number does not reflect the (lower) cost of a true-removal
+ablation condition; it's the full-band cost only.
 
 Channel layout (fixed, matches Sen1Floods11BaselineDataset):
     indices 0–12  : S2 bands (B01–B12, order = idx field in bands_senflood)
@@ -52,10 +99,19 @@ Usage
         --model perceiver \
         --xp_name perceiver_drop_eval
 
-    # Multiple checkpoints, including RAMEN
+    # Multiple checkpoints, including RAMEN — TRUE removal for s2_only/s1_only
     python script_test_senflood_baseline_modality_drop.py \
         --ckpts unet=./checkpoints/bl_unet.ckpt ramen=./checkpoints/bl_ramen.ckpt \
         --xp_name baseline_drop_eval \
+        --ramen_config training/RAMEN/config_SENFLOOD.yaml \
+        --ablations all s2_only s1_only rgb_only no_swir no_re
+
+    # Same, but eval under the OLD zero-masking convention (A/B against
+    # the above, or to match a checkpoint trained with
+    # --legacy_whole_modality_zero_masking)
+    python script_test_senflood_baseline_modality_drop.py \
+        --ckpts ramen=./checkpoints/bl_ramen_legacy.ckpt \
+        --xp_name baseline_drop_eval_legacy --legacy_zero_masking_eval \
         --ramen_config training/RAMEN/config_SENFLOOD.yaml \
         --ablations all s2_only s1_only rgb_only no_swir no_re
 
@@ -115,11 +171,11 @@ ALL_BANDS = ALL_S2 + ALL_S1
 
 BUILTIN_ABLATIONS = {
     "all":      [],                                                      # nothing zeroed
-    "s2_only":  ALL_S1,                                                  # zero S1
-    "s1_only":  ALL_S2,                                                  # zero S2
-    "rgb_only": [b for b in ALL_BANDS if b not in ["B02","B03","B04"]],      # keep only RGB
-    "no_swir":  ["B10","B11","B12"],
-    "no_re":    ["B05","B06","B07","B08A"],
+    "s2_only":  ALL_S1,                                                  # zero S1 (WHOLE modality -> true removal for ramen/universat)
+    "s1_only":  ALL_S2,                                                  # zero S2 (WHOLE modality -> true removal for ramen/universat)
+    "rgb_only": [b for b in ALL_BANDS if b not in ["B02","B03","B04"]],      # keep only RGB (PARTIAL -> stays zero-masked)
+    "no_swir":  ["B10","B11","B12"],                                     # PARTIAL -> stays zero-masked
+    "no_re":    ["B05","B06","B07","B08A"],                              # PARTIAL -> stays zero-masked
 }
 
 def parse_ablation(name: str):
@@ -195,12 +251,17 @@ UNIVERSAT_WAVELENGTHS = {
 
 
 # =============================================================================
-# CHANNEL-ZEROING WRAPPERS
+# CHANNEL-ZEROING / TRUE-REMOVAL WRAPPERS
 # =============================================================================
 
 class ChannelDropWrapper(nn.Module):
     """
     Wraps a baseline model and zeros specified input channels before forward.
+
+    UNet/ViT/ResNet/Perceiver only — these consume a fixed [B,15,H,W]
+    tensor with no notion of a variable channel count, so zero-masking is
+    the only possible "drop" mechanism for them regardless of ablation
+    type (unlike RAMENChannelDropWrapper below).
     """
     def __init__(self, model: nn.Module, drop_channels: list):
         super().__init__()
@@ -226,31 +287,81 @@ class RAMENChannelDropWrapper(nn.Module):
     arrives here as {"s2s1": [B, 15, window, window]}).
 
     This wrapper splits that merged tensor into RAMEN's expected
-    {"optical": [B,13,h,w], "sar": [B,2,h,w]} on the fly, zeros the
-    requested (modality, channel) entries, and forwards to the inner
-    RAMENUPerNet. Used for every ablation including "all" (drop_specs=[]),
-    so the same code path (and same sliding-window composition) is
-    exercised whether or not anything is actually zeroed.
+    {"optical": [B,13,h,w], "sar": [B,2,h,w]}, then handles `drop_specs`
+    (a list of (modality, channel_idx) pairs) in one of two ways:
+
+    - WHOLE-MODALITY drop (drop_specs covers EVERY channel of a given
+      modality — e.g. all 2 SAR channels for "s2_only", or all 13 optical
+      channels for "s1_only"): that modality's key is OMITTED from the
+      dict passed to the inner model entirely. TRUE removal, not
+      zero-masking — requires RAMEN_Encoder.forward()'s modality-filtering
+      fix (see ramen_encoder.py); UniverSat needs no change (its
+      forward() already filters natively). Set
+      --legacy_zero_masking_eval to force the old zero-masking behavior
+      here instead (e.g. to evaluate a checkpoint trained under
+      --legacy_whole_modality_zero_masking with matching semantics).
+
+    - PARTIAL drop (some but not all channels of a modality): zeroed in
+      place, exactly as before. Equivalent to removal for RAMEN
+      (mathematical proof: linear sum over channels), NOT proven
+      equivalent for UniverSat (see module docstring).
+
+    Used for every ablation including "all" (drop_specs=[]), so the same
+    code path (and same sliding-window composition) is exercised whether
+    or not anything is actually dropped.
     """
     expects_full_image_dict = True
 
-    def __init__(self, model: nn.Module, drop_specs: list):
+    _MODALITY_SIZES = {"optical": NUM_S2_BANDS, "sar": NUM_S1_BANDS}
+
+    def __init__(self, model: nn.Module, drop_specs: list,
+                legacy_zero_masking: bool = False):
         super().__init__()
         self.model = model
         self.drop_specs = drop_specs  # list of (modality, channel_idx)
+        self.legacy_zero_masking = legacy_zero_masking
+
+        dropped_by_modality = {}
+        for modality, idx in drop_specs:
+            dropped_by_modality.setdefault(modality, set()).add(idx)
+
+        if legacy_zero_masking:
+            # Old behavior: never omit a key, always zero in place —
+            # even for a whole-modality drop.
+            self.fully_dropped_modalities = set()
+        else:
+            self.fully_dropped_modalities = {
+                m for m, idxs in dropped_by_modality.items()
+                if len(idxs) == self._MODALITY_SIZES.get(m, -1)
+            }
+
+        # Whatever isn't a full-modality removal still gets zeroed
+        # per-channel (this includes ALL drop_specs when
+        # legacy_zero_masking=True, since fully_dropped_modalities is
+        # empty in that case).
+        self.partial_drop_specs = [
+            (m, idx) for m, idx in drop_specs
+            if m not in self.fully_dropped_modalities
+        ]
 
     def forward(self, x: dict, **kwargs):
         merged = x[MODALITY_KEY]  # [B, 15, h, w]
         optical = merged[:, :NUM_S2_BANDS].clone()
         sar = merged[:, NUM_S2_BANDS: NUM_S2_BANDS + NUM_S1_BANDS].clone()
 
-        for modality, idx in self.drop_specs:
+        for modality, idx in self.partial_drop_specs:
             if modality == "optical":
                 optical[:, idx, :, :] = 0.0
             elif modality == "sar":
                 sar[:, idx, :, :] = 0.0
 
-        return self.model({"optical": optical, "sar": sar}, **kwargs)
+        model_input = {}
+        if "optical" not in self.fully_dropped_modalities:
+            model_input["optical"] = optical
+        if "sar" not in self.fully_dropped_modalities:
+            model_input["sar"] = sar
+
+        return self.model(model_input, **kwargs)
 
 
 # =============================================================================
@@ -525,7 +636,9 @@ def profile_baselines_flops(model_ckpts, args, test_loader,
         base_model = base_model.to(device).eval()
 
         if model_name == "ramen":
-            wrapped = RAMENChannelDropWrapper(base_model, []).to(device).eval()
+            wrapped = RAMENChannelDropWrapper(
+                base_model, [], legacy_zero_masking=args.legacy_zero_masking_eval
+            ).to(device).eval()
 
             def fwd(b, m=wrapped):
                 # b["image"] is already {"s2s1": [1, 15, 512, 512]} — the
@@ -542,7 +655,9 @@ def profile_baselines_flops(model_ckpts, args, test_loader,
             # forward (no sliding window) -- matching its trained eval
             # mode. NOTE the profiler undercount for SDPA models (see
             # module docstring); prefer the FlopCounterMode sweep numbers.
-            wrapped = RAMENChannelDropWrapper(base_model, []).to(device).eval()
+            wrapped = RAMENChannelDropWrapper(
+                base_model, [], legacy_zero_masking=args.legacy_zero_masking_eval
+            ).to(device).eval()
 
             def fwd(b, m=wrapped):
                 return m(b["image"])
@@ -597,6 +712,23 @@ parser.add_argument("--flops_only", action="store_true",
 parser.add_argument("--flops_n", type=int, default=2,
                     help="Number of profiled forward passes (mean)")
 
+# Modality-drop mechanism control (ramen / universat only)
+parser.add_argument("--legacy_zero_masking_eval", action="store_true",
+                    help="For --model ramen / --model universat only: force "
+                         "RAMENChannelDropWrapper to ALWAYS zero-mask, even "
+                         "for whole-modality ablations (s2_only, s1_only) — "
+                         "i.e. revert to the OLD behavior instead of the new "
+                         "TRUE removal. Use this to evaluate a checkpoint "
+                         "trained with "
+                         "script_train_senflood_baseline.py's "
+                         "--legacy_whole_modality_zero_masking under matching "
+                         "eval-time semantics, or to run a clean A/B (same "
+                         "checkpoint, both eval conventions) isolating what "
+                         "true removal changes. No effect on unet/vit/resnet/"
+                         "perceiver (ChannelDropWrapper is always "
+                         "zero-masking; these architectures have no notion "
+                         "of a variable channel count).")
+
 # Shared Architecture args
 parser.add_argument("--img_size",             type=int, default=512)
 
@@ -633,7 +765,7 @@ parser.add_argument("--ramen_embed_dim",   type=int, default=384)
 parser.add_argument("--ramen_depth",       type=int, default=12)
 parser.add_argument("--ramen_num_heads",   type=int, default=8)
 parser.add_argument("--ramen_input_res",   type=float, default=10.0)
-parser.add_argument("--ramen_res",         type=float, default=20.0)
+parser.add_argument("--ramen_res",         type=float, default=40.0)
 parser.add_argument("--ramen_window_size", type=int, default=128,
                     help="Spatial size RAMEN was built/trained at. MUST "
                          "match the checkpoint being loaded.")
@@ -650,7 +782,7 @@ parser.add_argument("--ramen_config",      type=str, default=None,
 # mismatch would be a silent protocol error, not a crash).
 parser.add_argument("--universat_size", type=str, default="small",
                     choices=["tiny", "small", "base"])
-parser.add_argument("--universat_patch_m", type=float, default=80.0,
+parser.add_argument("--universat_patch_m", type=float, default=40.0,
                     help="Patch size in metres (80 = 8 px @ 10 m, the "
                          "training default).")
 parser.add_argument("--universat_output_stride", type=int, default=4,
@@ -691,6 +823,12 @@ elif args.ckpt:
 else:
     raise ValueError("Provide --ckpt or --ckpts")
 
+if args.legacy_zero_masking_eval:
+    print(f"[INFO] --legacy_zero_masking_eval: RAMEN/UniverSat "
+          f"whole-modality ablations (s2_only, s1_only) will be "
+          f"ZERO-MASKED, not truly removed — matching the OLD "
+          f"convention. No effect on unet/vit/resnet/perceiver.")
+
 
 # =============================================================================
 # TEST DATASET
@@ -723,7 +861,8 @@ if args.wandb and os.environ.get("LOCAL_RANK", "0") == "0":
     wandb.init(
         name=f"{args.xp_name}_baseline_drop",
         project="SenFlood",
-        config={"ckpts": str(model_ckpts), "ablations": args.ablations},
+        config={"ckpts": str(model_ckpts), "ablations": args.ablations,
+               "legacy_zero_masking_eval": args.legacy_zero_masking_eval},
     )
     wandb_logger = WandbLogger(project="SenFlood")
 
@@ -746,7 +885,10 @@ if args.flops:
           f"the full sliding-window pass (all tiles), so it's directly "
           f"comparable. Compare against the Atomizer-quadtree number, and "
           f"state in the caption that patch-grid baselines cannot use "
-          f"coordinate-native adaptive decode.")
+          f"coordinate-native adaptive decode. The 'all' config used here "
+          f"has no channels dropped, so this number is unaffected by the "
+          f"true-removal change to the ablation loop below and does NOT "
+          f"reflect the (lower) cost of a true-removal condition.")
 
 
 # =============================================================================
@@ -798,7 +940,14 @@ if not args.flops_only:
 
             if model_name in ("ramen", "universat"):
                 drop_specs = [RAMEN_BAND_TO_MODALITY_CHANNEL[b] for b in drop_bands]
-                trainer_module.model = RAMENChannelDropWrapper(base_model, drop_specs)
+                wrapper = RAMENChannelDropWrapper(
+                    base_model, drop_specs,
+                    legacy_zero_masking=args.legacy_zero_masking_eval,
+                )
+                if wrapper.fully_dropped_modalities:
+                    print(f"  -> TRUE removal: modality key(s) omitted "
+                          f"({sorted(wrapper.fully_dropped_modalities)})")
+                trainer_module.model = wrapper
             else:
                 drop_channels = [BAND_TO_CHANNEL[b] for b in drop_bands]
                 trainer_module.model = ChannelDropWrapper(base_model, drop_channels)
@@ -876,7 +1025,8 @@ if not args.flops_only and all_results:
 out_path = f"./results_{args.xp_name}_baseline_modality_drop.txt"
 with open(out_path, "w") as f:
     f.write(f"Experiment: {args.xp_name}\n")
-    f.write(f"Checkpoints: {model_ckpts}\n\n")
+    f.write(f"Checkpoints: {model_ckpts}\n")
+    f.write(f"legacy_zero_masking_eval: {args.legacy_zero_masking_eval}\n\n")
 
     if flops_table:
         f.write("FLOPs (GFLOPs/forward, bs=1, 15x512x512, torch.profiler, "

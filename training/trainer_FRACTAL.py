@@ -5,11 +5,12 @@ FRACTAL Atomizer Trainer (single-task)
 LIDAR + VHR semantic segmentation on FRACTAL. Mirrors Model_FlairHub:
 per-pixel cross-entropy, multi-resolution input groups, mIoU + accuracy
 metrics. Differences:
-  - 7 classes (FRACTAL), severe imbalance → class weighting ON by default
+  - 7 classes (FRACTAL), configured via config["trainer"]["num_classes"]
   - ignore_index=255 by default (matches FractalDataset's padding label
     for variable-length LIDAR point counts)
   - Per-class IoU at test time matches FRACTAL paper's reporting format
   - Queries are sparse (one per LIDAR point), not dense per-pixel
+  - Unweighted cross-entropy (no class weighting) — confirmed intentional.
 
 Forward contract (unchanged from FLAIR-HUB):
     model(batch, training=...) -> [B, M, K]
@@ -24,11 +25,16 @@ from transformers import get_cosine_schedule_with_warmup
 
 from torchmetrics.classification import MulticlassAccuracy, MulticlassJaccardIndex
 
-# Atomizer architecture — FRACTAL-specific subclass with z-aware decoder.
-# Atomiser_Fractal inherits from Atomiser_Senflood and overrides only the
-# decoder's query construction to derive per-pixel Q from query z values.
-# This lets the model distinguish LIDAR points sharing (x, y) but with
-# different z (e.g. bridge over road, tree canopy over ground).
+# Atomizer architecture — FRACTAL-specific subclass. Inherits from
+# Atomiser_Senflood_Skip; overrides _apply_pruning/encode/forward to thread
+# a precomputed per-token Voronoi assignment (token_latent_assignment) and
+# patch_ids fallback through to its own GeographicPruning (reused from
+# geographic_pruning_dales.py — dataset-agnostic despite the filename), and
+# overrides the decoder to combine the pixel-skip cascade (own-pixel VHR
+# band-token attention, gated by config["Atomiser"]["use_decoder_skip"])
+# additively with a z-aware query projection, so the model can distinguish
+# LIDAR points sharing (x, y) but differing in z (e.g. bridge over road,
+# tree canopy over ground).
 from training.atomiser.Atomiser_Fractal import Atomiser_Fractal
 
 
@@ -49,35 +55,6 @@ FRACTAL_CLASS_NAMES = [
 ]
 NUM_CLASSES_FRACTAL = 7
 
-# Global class frequencies (computed across all 80k train + 10k val patches;
-# matches FRACTAL paper Table). Used for inverse-frequency class weighting.
-# Source: aggregate diagnostic over the full dataset.
-FRACTAL_CLASS_FREQS = [
-    0.0056,   # other
-    0.3897,   # ground
-    0.5698,   # vegetation
-    0.0280,   # building
-    0.0052,   # water
-    0.0013,   # bridge
-    0.0005,   # permanent_structure
-]
-
-
-def default_fractal_class_weights(
-    freqs=FRACTAL_CLASS_FREQS,
-    weight_clip: float = 50.0,
-) -> torch.Tensor:
-    """
-    Inverse-frequency weights, clipped to avoid destabilizing extreme weights
-    on the rarest classes (permanent_structure raw weight is ~1900).
-
-    Median-frequency balancing is an alternative; we use clipped inverse-freq
-    because it's simpler and gives the rare classes meaningful gradient
-    signal without overwhelming the dominant ones.
-    """
-    raw = torch.tensor([1.0 / max(f, 1e-9) for f in freqs], dtype=torch.float32)
-    return raw.clamp(max=weight_clip)
-
 
 # ────────────────────────────────────────────────────────────────────
 # Trainer
@@ -88,7 +65,10 @@ class Model_Fractal(pl.LightningModule):
     FRACTAL LIDAR + VHR segmentation Lightning module.
 
     Args:
-        config:           Atomizer config dict.
+        config:           Atomizer config dict. config["trainer"]["num_classes"]
+                          MUST already be set to the class count (7 for
+                          FRACTAL) — this trainer reads it, not the other
+                          way around.
         wand:             Whether W&B logging is active (caller-managed).
         name:             Experiment name.
         transform:        Unused; API parity with other single-task trainers.
@@ -97,11 +77,6 @@ class Model_Fractal(pl.LightningModule):
                           Default 255 (matches FractalDataset's padding label
                           for variable-length LIDAR point counts).
                           Set to None to score all positions including padding.
-        class_weights:    Optional [7]-tensor of CE class weights.
-                          - "auto" (default): use inverse-frequency weights
-                                              clipped at 50 (see default_fractal_class_weights).
-                          - None:             unweighted CE.
-                          - tensor/list:      caller-provided weights.
     """
 
     def __init__(
@@ -112,7 +87,6 @@ class Model_Fractal(pl.LightningModule):
         transform=None,
         lookup_table=None,
         ignore_index: int = 255,
-        class_weights="auto",
     ):
         super().__init__()
         self.strict_loading = False
@@ -125,39 +99,19 @@ class Model_Fractal(pl.LightningModule):
         self.num_classes  = NUM_CLASSES_FRACTAL
         self.class_names  = FRACTAL_CLASS_NAMES
 
-        # Force the model's output head to 7 classes regardless of YAML.
-        config = dict(config)
-        config_model = dict(config.get("model", {}))
-        config_model["num_classes"] = self.num_classes
-        config["model"] = config_model
-        self.config = config
-
         # ── Build Atomizer model ─────────────────────────────────
+        # config["trainer"]["num_classes"] is read directly by
+        # Atomiser_Senflood_Skip.__init__ (self.num_classes = config
+        # ["trainer"]["num_classes"]) — set it in the YAML, not here.
         self.model = Atomiser_Fractal(
             config=config,
             lookup_table=lookup_table,
         )
 
-        # ── Class weights ────────────────────────────────────────
-        if class_weights == "auto":
-            class_weights = default_fractal_class_weights()
-            print(f"[FRACTAL-Trainer] Using auto inverse-frequency weights "
-                  f"(clipped at 50): {class_weights.tolist()}")
-        elif class_weights is None:
-            print(f"[FRACTAL-Trainer] No class weighting (unweighted CE).")
-        else:
-            if not torch.is_tensor(class_weights):
-                class_weights = torch.tensor(class_weights, dtype=torch.float32)
-            print(f"[FRACTAL-Trainer] Custom class weights: "
-                  f"{class_weights.tolist()}")
-
-        # ── Loss ─────────────────────────────────────────────────
+        # ── Loss (unweighted CE) ────────────────────────────────
         ce_kwargs = {}
         if self.ignore_index is not None:
             ce_kwargs["ignore_index"] = int(self.ignore_index)
-        if class_weights is not None:
-            self.register_buffer("_class_weights", class_weights)
-            #ce_kwargs["weight"] = self._class_weights
         self.loss_fn = nn.CrossEntropyLoss(**ce_kwargs)
 
         # ── Metrics ──────────────────────────────────────────────
@@ -185,8 +139,7 @@ class Model_Fractal(pl.LightningModule):
         self.weight_decay = float(config["trainer"]["weight_decay"])
 
         print(f"[FRACTAL-Trainer] {self.num_classes} classes, "
-              f"ignore_index={self.ignore_index}, "
-              f"class_weighted={'yes' if class_weights is not None else 'no'}")
+              f"ignore_index={self.ignore_index}, unweighted CE.")
 
     # ─────────────────────────────────────────────────────────────────
     # Forward

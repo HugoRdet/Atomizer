@@ -150,7 +150,11 @@ class UnifiedDataModule(pl.LightningDataModule):
                                 'BioMasstersSkipDataset',
                                 'CashewSkipDataset',
                                 'XView2Dataset',
-                                'XView2TemporalDataset'
+                                'XView2TemporalDataset',
+                                'BioMasstersTemporalDataset',
+                                'FractalDataset',
+                                'DalesDataset',
+                                'EurosatDataset'
 
                                 }
 

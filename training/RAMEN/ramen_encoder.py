@@ -121,12 +121,29 @@ class RAMEN_Encoder(Encoder):
             )
 
     def forward(self, x):
-        device = x[self.modalities[0]].device
-        dtype = x[self.modalities[0]].dtype
+        # Only process modalities actually present in this forward call's
+        # input dict, rather than assuming every modality this encoder was
+        # constructed with is present in every call. This is what enables
+        # TRUE modality removal (a genuinely absent key -> shorter token
+        # sequence) instead of zero-masking (key present, values zeroed,
+        # same sequence length) for the modality-drop ablation. With every
+        # modality present, present_modalities == self.modalities and
+        # behavior is byte-for-byte identical to before this change.
+        present_modalities = [m for m in self.modalities if m in x]
+        if not present_modalities:
+            raise ValueError(
+                "RAMEN_Encoder.forward(): no modality in self.modalities "
+                f"({self.modalities}) is present in the input dict (got "
+                f"keys: {list(x.keys())}). At least one modality must be "
+                f"present."
+            )
+
+        device = x[present_modalities[0]].device
+        dtype = x[present_modalities[0]].dtype
         output = []
         out = {}
         out['pos_embed'] = self.pos_embed.to(device=device, dtype=dtype)
-        for modality in self.modalities:
+        for modality in present_modalities:
             x_mod = x[modality] # [B, C, T, H, W]
             B, C, T, H, W = x_mod.shape
             x_mod = x_mod.permute(0, 2, 3, 4, 1).contiguous() # [B, T, H, W, C]
@@ -164,8 +181,8 @@ class RAMEN_Encoder(Encoder):
             out_mod = self.in_norm(out_mod)
             out[modality] = out_mod
 
-        tokens = torch.cat([out[modality] for modality in self.modalities], dim=1)
-        tokens = tokens + out['pos_embed'][:, 1:, :].repeat(1, len(self.modalities), 1)
+        tokens = torch.cat([out[modality] for modality in present_modalities], dim=1)
+        tokens = tokens + out['pos_embed'][:, 1:, :].repeat(1, len(present_modalities), 1)
 
         if self.cls_token is not None:
             cls_tokens = (self.cls_token + out['pos_embed'][:, :1, :]).expand(tokens.shape[0], -1, -1)
@@ -176,9 +193,9 @@ class RAMEN_Encoder(Encoder):
             if j == len(self.blocks) - 1:
                 tokens = self.norm(tokens)
             if j in self.output_layers:
-                if len(self.modalities) > 1:
-                    n_tok = tokens[:, 1:, :].shape[1] // len(self.modalities)
-                    patch_tokens = [tokens[:, 1 + i*n_tok : 1 + (i+1)*n_tok, :] for i in range(len(self.modalities))]
+                if len(present_modalities) > 1:
+                    n_tok = tokens[:, 1:, :].shape[1] // len(present_modalities)
+                    patch_tokens = [tokens[:, 1 + i*n_tok : 1 + (i+1)*n_tok, :] for i in range(len(present_modalities))]
                     patch_tokens = torch.cat(patch_tokens, dim=-1)
                     out = (
                         patch_tokens
@@ -276,6 +293,11 @@ class RAMEN_Encoder_MonoTemporal(Encoder):
 
         self.input_bands = input_bands
 
+        # NOTE: kept as a dict_keys view (not list(...)), matching the
+        # original -- harmless since we only ever iterate/index/filter it,
+        # never mutate it, but flagged here since RAMEN_Encoder above uses
+        # list(self.input_bands.keys()) instead. Left as-is to minimize
+        # the diff against the original file.
         self.modalities = self.input_bands.keys()
         self.input_res = input_res
         self.res = res
@@ -322,12 +344,24 @@ class RAMEN_Encoder_MonoTemporal(Encoder):
             )
 
     def forward(self, x):
-        device = x[self.modalities[0]].device
-        dtype = x[self.modalities[0]].dtype
+        # Same fix as RAMEN_Encoder.forward() above -- filter to modalities
+        # actually present in x, enabling true (not zero-masked) modality
+        # removal. See that method's comment for the full rationale.
+        present_modalities = [m for m in self.modalities if m in x]
+        if not present_modalities:
+            raise ValueError(
+                "RAMEN_Encoder_MonoTemporal.forward(): no modality in "
+                f"self.modalities ({list(self.modalities)}) is present in "
+                f"the input dict (got keys: {list(x.keys())}). At least "
+                f"one modality must be present."
+            )
+
+        device = x[present_modalities[0]].device
+        dtype = x[present_modalities[0]].dtype
         output = []
         out = {}
         out['pos_embed'] = self.pos_embed.to(device=device, dtype=dtype)
-        for modality in self.modalities:
+        for modality in present_modalities:
             x_mod = x[modality] # [B, C, T, H, W]
             B, C, H, W = x_mod.shape
             x_mod = x_mod.permute(0, 2, 3, 1).contiguous() # [B, H, W, C]
@@ -358,8 +392,8 @@ class RAMEN_Encoder_MonoTemporal(Encoder):
             out_mod = self.in_norm(out_mod)
             out[modality] = out_mod
 
-        tokens = torch.cat([out[modality] for modality in self.modalities], dim=1)
-        tokens = tokens + out['pos_embed'][:, 1:, :].repeat(1, len(self.modalities), 1)
+        tokens = torch.cat([out[modality] for modality in present_modalities], dim=1)
+        tokens = tokens + out['pos_embed'][:, 1:, :].repeat(1, len(present_modalities), 1)
 
         if self.cls_token is not None:
             cls_tokens = (self.cls_token + out['pos_embed'][:, :1, :]).expand(tokens.shape[0], -1, -1)
@@ -370,9 +404,9 @@ class RAMEN_Encoder_MonoTemporal(Encoder):
             if j == len(self.blocks) - 1:
                 tokens = self.norm(tokens)
             if j in self.output_layers:
-                if len(self.modalities) > 1:
-                    n_tok = tokens[:, 1:, :].shape[1] // len(self.modalities)
-                    patch_tokens = [tokens[:, 1 + i*n_tok : 1 + (i+1)*n_tok, :] for i in range(len(self.modalities))]
+                if len(present_modalities) > 1:
+                    n_tok = tokens[:, 1:, :].shape[1] // len(present_modalities)
+                    patch_tokens = [tokens[:, 1 + i*n_tok : 1 + (i+1)*n_tok, :] for i in range(len(present_modalities))]
                     patch_tokens = torch.cat(patch_tokens, dim=-1)
                     out = (
                         patch_tokens

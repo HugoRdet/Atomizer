@@ -199,7 +199,7 @@ class FractalTokenProcessor(TokenProcessor):
         # ── Step 2: Sub-encodings ──────────────────────────────────────
 
         # Positional (relative, compressed)
-        compression_scale = self.compression_alpha * gsd
+        compression_scale = self.compression_scale * gsd
         pos_features = self.pos_encoder(
             delta_x, delta_y, compression_scale=compression_scale
         )

@@ -1,23 +1,32 @@
 """
-Sen1Floods11 Trainer (SKIP variant) for Atomizer
-=================================================
+Sen1Floods11 / xView2 Trainer (SKIP + optional TEMPORAL variant) for Atomizer
+==============================================================================
 
-Identical to Model_SenFlood EXCEPT:
-  - instantiates Atomiser_Senflood_Skip (decoder pixel-skip cascade)
-  - guards against silent skip-disable under sliding-window inference
+Identical to the original Model_SenFlood EXCEPT:
+  - instantiates Atomiser_Senflood_Skip (decoder pixel-skip cascade) by
+    default, OR AtomiserTemporal (per-timestep Atomiser_Senflood_Skip
+    encoding + RoPE TemporalTransformer aggregation) when
+    config["Atomiser"]["use_temporal_transformer"] is True
+  - guards against silent skip/temporal disable under sliding-window inference
 
 The skip cascade reads query_token_idx / query_token_valid from the batch
-(provided by Sen1Floods11SkipDataset + collate_grouped_skip). Those flow
-straight through to the encoder, so the loss/label path here is unchanged.
+(provided by *SkipDataset + collate_grouped_skip, or by
+XView2TemporalDataset + xview2_temporal_collate_fn for the temporal path).
+Those flow straight through to the encoder, so the loss/label path here is
+unchanged.
 
 IMPORTANT — sliding window:
-  _forward_crop builds a mini_batch WITHOUT query_token_idx/valid, which
-  would silently fall back to the global_query path (skip disabled) at
-  eval time. To prevent a silently-invalid A/B, __init__ raises if
-  use_decoder_skip and slide are both true. Run this experiment with
-  config["trainer"]["slide"] = False (Sen1Floods11 is 512x512, decodes whole).
+  _forward_crop builds a mini_batch WITHOUT query_token_idx/valid (and,
+  for the temporal path, WITHOUT time_positions), which would silently
+  fall back to degraded behavior at eval time: the skip cascade disabled
+  (global_query path) and/or the TemporalTransformer's RoPE falling back
+  to ordinal positions instead of real acquisition time. To prevent a
+  silently-invalid A/B, __init__ raises if slide=True is combined with
+  EITHER use_decoder_skip OR use_temporal_transformer. Run these
+  experiments with config["trainer"]["slide"] = False (Sen1Floods11 is
+  512x512 and decodes whole; xView2 crops are handled the same way).
 
-All changes vs the original trainer are tagged  # >>> SKIP.
+All changes vs the original (skip-only) trainer are tagged  # >>> TEMPORAL.
 """
 
 import torch
@@ -30,6 +39,8 @@ from transformers import get_cosine_schedule_with_warmup
 
 # >>> SKIP: import the skip-variant encoder
 from training.atomiser.Atomiser_senflood_skip import Atomiser_Senflood_Skip
+# >>> TEMPORAL: per-timestep encoding + RoPE TemporalTransformer aggregation
+from training.atomiser.Atomiser_temporal import AtomiserTemporal
 from training.atomiser.error_supervision import (
     compute_latent_errors,
     compute_error_predictor_loss,
@@ -52,19 +63,29 @@ class Model_SenFlood_Skip(pl.LightningModule):
         self.ignore_index = 255
         self.use_sliding  = config["trainer"].get("slide", False)
 
-        # >>> SKIP: refuse to run a silently-invalid configuration.
-        # Sliding-window _forward_crop drops query_token_idx/valid, which would
-        # disable the skip at eval without error. Fail loudly instead.
+        # >>> SKIP / >>> TEMPORAL: refuse to run a silently-invalid
+        # configuration. Sliding-window _forward_crop drops
+        # query_token_idx/valid (breaks the skip cascade) AND, for the
+        # temporal path, drops time_positions too (breaks RoPE's real-time
+        # signal, silently falling back to ordinal positions) — fail loudly
+        # instead of running a degraded, misleading comparison.
         use_decoder_skip = config["Atomiser"].get("use_decoder_skip", False)
-        if use_decoder_skip and self.use_sliding:
+        self.use_temporal_transformer = config["Atomiser"].get(
+            "use_temporal_transformer", False)
+        if (use_decoder_skip or self.use_temporal_transformer) and self.use_sliding:
             raise ValueError(
-                "use_decoder_skip=True is incompatible with slide=True: the "
-                "sliding-window path drops query_token_idx/valid and would "
-                "silently disable the skip cascade at eval time, invalidating "
-                "the comparison. Set trainer.slide=False for the skip run "
-                "(Sen1Floods11 is 512x512 and decodes whole)."
+                "slide=True is incompatible with use_decoder_skip=True and/or "
+                "use_temporal_transformer=True: the sliding-window path "
+                "(_forward_crop) drops query_token_idx/valid, which would "
+                "silently disable the skip cascade at eval time, AND (for "
+                "the temporal path) drops time_positions, which would "
+                "silently fall back to ordinal RoPE positions instead of "
+                "real acquisition time — either way invalidating the "
+                "comparison. Set trainer.slide=False for these runs "
+                "(Sen1Floods11 is 512x512 and decodes whole; xView2 crops "
+                "are handled the same way)."
             )
-        # >>> END SKIP
+        # >>> END SKIP / TEMPORAL
 
         self.class_names = (
             class_names
@@ -101,11 +122,31 @@ class Model_SenFlood_Skip(pl.LightningModule):
         )
 
         # =====================================================================
-        # MODEL
+        # MODEL — encoder selection
+        #   use_temporal_transformer -> AtomiserTemporal (wraps
+        #     Atomiser_Senflood_Skip internally; set use_decoder_skip=True
+        #     too if you want the skip cascade active inside it)
+        #   otherwise -> Atomiser_Senflood_Skip directly (original,
+        #     unconditional behavior of this trainer)
         # =====================================================================
-        # >>> SKIP: build the skip-variant encoder
-        self.encoder = Atomiser_Senflood_Skip(
-            config=self.config, lookup_table=self.lookup_table)
+        # >>> TEMPORAL
+        if self.use_temporal_transformer:
+            print("[Trainer] Using AtomiserTemporal "
+                  "(per-timestep Atomiser_Senflood_Skip encoding + "
+                  "RoPE TemporalTransformer aggregation)")
+            if not use_decoder_skip:
+                print("[Trainer] [WARNING] use_temporal_transformer=True but "
+                      "use_decoder_skip=False — the SKIP cascade "
+                      "(query_token_idx/query_token_valid) will be ignored "
+                      "by AtomiserTemporal.forward. Set "
+                      "use_decoder_skip=True if you want it active.")
+            self.encoder = AtomiserTemporal(
+                config=self.config, lookup_table=self.lookup_table)
+        else:
+            # >>> SKIP: build the skip-variant encoder (original behavior)
+            self.encoder = Atomiser_Senflood_Skip(
+                config=self.config, lookup_table=self.lookup_table)
+        # >>> END TEMPORAL
 
         # =====================================================================
         # LOSS
@@ -114,6 +155,10 @@ class Model_SenFlood_Skip(pl.LightningModule):
 
         # =====================================================================
         # ERROR PREDICTOR SUPERVISION
+        # Note: this is a no-op with AtomiserTemporal — its forward() does
+        # not return predicted_errors/topk_indices/topk_dists_sq, so the
+        # block in _compute_loss_and_preds below silently skips adding the
+        # error loss. Leave use_error_predictor: false in temporal configs.
         # =====================================================================
         self.use_error_predictor = config["Atomiser"].get(
             "use_error_predictor", False)
@@ -124,6 +169,9 @@ class Model_SenFlood_Skip(pl.LightningModule):
                 config["Atomiser"].get("error_supervision_warmup_epochs", 0))
             print(f"[Trainer] Error predictor supervision ENABLED "
                   f"(lambda={self.lambda_error}, warmup={self.error_warmup} epochs)")
+            if self.use_temporal_transformer:
+                print("[Trainer] [WARNING] use_error_predictor=True has no "
+                      "effect with AtomiserTemporal (no-op).")
         else:
             print(f"[Trainer] Error predictor supervision DISABLED")
 
@@ -198,8 +246,10 @@ class Model_SenFlood_Skip(pl.LightningModule):
     # =========================================================================
     # SLIDING WINDOW INFERENCE
     # =========================================================================
-    # NOTE: guarded off for the skip run (see __init__). Kept intact so this
-    # trainer remains a drop-in for the non-skip baseline if skip is disabled.
+    # NOTE: guarded off for BOTH the skip run and the temporal run (see
+    # __init__). Kept intact so this trainer remains a drop-in for the
+    # plain baseline (use_decoder_skip=False, use_temporal_transformer=False)
+    # if sliding-window inference is needed.
 
     def _forward_crop(self, batch, crop_idx):
         mini_batch = {
@@ -359,13 +409,6 @@ class Model_SenFlood_Skip(pl.LightningModule):
     # =========================================================================
 
     def _compute_total_steps(self) -> int:
-        # Trust Lightning's estimate, which is computed AFTER it knows the
-        # world size, samplers, and grad-accumulation. The earlier manual
-        # dataset/num_training_batches computation overcounted under DDP
-        # (it did not divide num_training_batches by num_devices), which
-        # sized the cosine schedule for too many steps so the LR never
-        # reached 0 by end of training. This mirrors the working FRACTAL
-        # trainer.
         override = self.config.get("trainer", {}).get("total_steps", None)
         if override is not None:
             print(f"[Trainer] total_steps override: {override}")

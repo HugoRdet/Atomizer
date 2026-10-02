@@ -1,6 +1,6 @@
 """
-BioMassters Trainer (SKIP variant) for Atomizer
-================================================
+BioMassters Trainer (SKIP + optional TEMPORAL variant) for Atomizer
+======================================================================
 
 Mirrors Model_SenFlood_Skip's structure, adapted for:
 
@@ -24,20 +24,29 @@ Mirrors Model_SenFlood_Skip's structure, adapted for:
   4. Regression metrics: RMSE + MAE (the standard BioMassters leaderboard
      metrics) via torchmetrics, instead of IoU/Accuracy.
 
+  5. >>> TEMPORAL: encoder is Atomiser_Senflood_Skip by default, OR
+     AtomiserTemporal (per-timestep encoding + RoPE TemporalTransformer
+     aggregation) when config["Atomiser"]["use_temporal_transformer"] is
+     True -- same selection pattern as PASTISTrainer / Model_SenFlood_Skip.
+     Paired with BioMasstersTemporalDataset + biomassters_temporal_collate_fn
+     on the data side (see the training script). The forward()/_forward_crop
+     bridge (batch["tasks"] -> batch["queries"]/"time_positions") is
+     unchanged either way -- AtomiserTemporal reads batch["queries"] and
+     batch["time_positions"] directly, same convention as the flat encoder
+     reads batch["queries"], so no extra bridging is needed for the
+     temporal path specifically.
+
 Everything else (optimizer/scheduler, error-predictor supervision, sliding-
 window guard, save/load, complexity measurement hookup) follows the same
 pattern as Model_SenFlood_Skip.
 
-ENCODER: reuses Atomiser_Senflood_Skip -- same underlying architecture,
-config-driven, no BioMassters-specific encoder class needed. See the
->>> BRIDGE comments in forward()/_forward_crop() for the one adaptation
-this requires (batch["tasks"] -> batch["queries"] mirroring).
-
 IMPORTANT — sliding window:
-  Same guard as Sen1Floods11: _forward_crop would drop query_token_idx/valid,
-  silently disabling the skip cascade at eval. BioMassters tiles are 256x256
-  (smaller than Sen1Floods11's 512x512), so slide=False should be the
-  natural default anyway -- this just fails loudly if misconfigured.
+  Same guard as Sen1Floods11, extended to cover the temporal path too:
+  _forward_crop would drop query_token_idx/valid (breaks SKIP) AND, for the
+  temporal path, drops time_positions too (breaks RoPE's real-time signal).
+  BioMassters tiles are 256x256 (smaller than Sen1Floods11's 512x512), so
+  slide=False should be the natural default anyway -- this just fails
+  loudly if misconfigured.
 """
 
 import torch
@@ -48,6 +57,8 @@ from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
 
 from training.atomiser.Atomiser_senflood_skip import Atomiser_Senflood_Skip
+# >>> TEMPORAL: per-timestep encoding + RoPE TemporalTransformer aggregation
+from training.atomiser.Atomiser_temporal import AtomiserTemporal
 from training.atomiser.error_supervision import (
     compute_latent_errors,
     compute_error_predictor_loss,
@@ -96,19 +107,28 @@ class Model_BioMassters_Skip(pl.LightningModule):
         self.register_buffer("agb_mean", torch.tensor(float(agb_mean)))
         self.register_buffer("agb_std",  torch.tensor(float(agb_std)))
 
-        # >>> SKIP: refuse to run a silently-invalid configuration.
-        # Sliding-window _forward_crop drops query_token_idx/valid, which would
-        # disable the skip at eval without error. Fail loudly instead.
+        # >>> SKIP / >>> TEMPORAL: refuse to run a silently-invalid
+        # configuration. Sliding-window _forward_crop drops
+        # query_token_idx/valid (breaks the skip cascade) AND, for the
+        # temporal path, drops time_positions too (breaks RoPE's real-time
+        # signal, silently falling back to ordinal positions) -- fail
+        # loudly instead of running a degraded, misleading comparison.
         use_decoder_skip = config["Atomiser"].get("use_decoder_skip", False)
-        if use_decoder_skip and self.use_sliding:
+        self.use_temporal_transformer = config["Atomiser"].get(
+            "use_temporal_transformer", False)
+        if (use_decoder_skip or self.use_temporal_transformer) and self.use_sliding:
             raise ValueError(
-                "use_decoder_skip=True is incompatible with slide=True: the "
-                "sliding-window path drops query_token_idx/valid and would "
-                "silently disable the skip cascade at eval time, invalidating "
-                "the comparison. Set trainer.slide=False for the skip run "
+                "slide=True is incompatible with use_decoder_skip=True and/or "
+                "use_temporal_transformer=True: the sliding-window path "
+                "(_forward_crop) drops query_token_idx/valid, which would "
+                "silently disable the skip cascade at eval time, AND (for "
+                "the temporal path) drops time_positions, which would "
+                "silently fall back to ordinal RoPE positions instead of "
+                "real acquisition time -- either way invalidating the "
+                "comparison. Set trainer.slide=False for these runs "
                 "(BioMassters tiles are 256x256 and decode whole)."
             )
-        # >>> END SKIP
+        # >>> END SKIP / TEMPORAL
 
         # =====================================================================
         # METRICS (regression: RMSE + MAE, the standard BioMassters
@@ -122,10 +142,30 @@ class Model_BioMassters_Skip(pl.LightningModule):
         self.metric_MAE_test   = torchmetrics.MeanAbsoluteError()
 
         # =====================================================================
-        # MODEL
+        # MODEL — encoder selection
+        #   use_temporal_transformer -> AtomiserTemporal (wraps
+        #     Atomiser_Senflood_Skip internally; set use_decoder_skip=True
+        #     too if you want the skip cascade active inside it)
+        #   otherwise -> Atomiser_Senflood_Skip directly (original,
+        #     unconditional behavior of this trainer)
         # =====================================================================
-        self.encoder = Atomiser_Senflood_Skip(
-            config=self.config, lookup_table=self.lookup_table)
+        # >>> TEMPORAL
+        if self.use_temporal_transformer:
+            print("[Trainer] Using AtomiserTemporal "
+                  "(per-timestep Atomiser_Senflood_Skip encoding + "
+                  "RoPE TemporalTransformer aggregation)")
+            if not use_decoder_skip:
+                print("[Trainer] [WARNING] use_temporal_transformer=True but "
+                      "use_decoder_skip=False — the SKIP cascade "
+                      "(query_token_idx/query_token_valid) will be ignored "
+                      "by AtomiserTemporal.forward. Set "
+                      "use_decoder_skip=True if you want it active.")
+            self.encoder = AtomiserTemporal(
+                config=self.config, lookup_table=self.lookup_table)
+        else:
+            self.encoder = Atomiser_Senflood_Skip(
+                config=self.config, lookup_table=self.lookup_table)
+        # >>> END TEMPORAL
 
         # =====================================================================
         # LOSS
@@ -135,6 +175,10 @@ class Model_BioMassters_Skip(pl.LightningModule):
 
         # =====================================================================
         # ERROR PREDICTOR SUPERVISION
+        # Note: this is a no-op with AtomiserTemporal -- its forward() does
+        # not return predicted_errors/topk_indices/topk_dists_sq, so the
+        # block in _compute_loss_and_preds below silently skips adding the
+        # error loss. Leave use_error_predictor: false in temporal configs.
         # =====================================================================
         self.use_error_predictor = config["Atomiser"].get(
             "use_error_predictor", False)
@@ -145,6 +189,9 @@ class Model_BioMassters_Skip(pl.LightningModule):
                 config["Atomiser"].get("error_supervision_warmup_epochs", 0))
             print(f"[Trainer] Error predictor supervision ENABLED "
                   f"(lambda={self.lambda_error}, warmup={self.error_warmup} epochs)")
+            if self.use_temporal_transformer:
+                print("[Trainer] [WARNING] use_error_predictor=True has no "
+                      "effect with AtomiserTemporal (no-op).")
         else:
             print(f"[Trainer] Error predictor supervision DISABLED")
 
@@ -202,11 +249,14 @@ class Model_BioMassters_Skip(pl.LightningModule):
     # =========================================================================
 
     def forward(self, batch, training=False, return_for_error=False):
-        # >>> BRIDGE: Atomiser_Senflood_Skip.forward() reads batch["queries"]/
-        # batch["queries_mask"] directly (Sen1Floods11's flat convention), but
-        # BioMasstersSkipDataset produces batch["tasks"][TASK_NAME]["queries"]
+        # >>> BRIDGE: Atomiser_Senflood_Skip.forward() (and AtomiserTemporal's,
+        # for the temporal path) reads batch["queries"]/batch["queries_mask"]
+        # directly (Sen1Floods11's flat convention), but BioMasstersSkipDataset
+        # / BioMasstersTemporalDataset produce batch["tasks"][TASK_NAME]["queries"]
         # (PASTIS-style). Mirror the task's queries into the top-level keys
         # the reused encoder expects, without mutating the caller's batch dict.
+        # batch["time_positions"] (temporal path only) is already top-level
+        # from biomassters_temporal_collate_fn, so no bridging needed for it.
         # REMOVE this bridge once/if a BioMassters-native encoder that reads
         # batch["tasks"] directly replaces the reused Senflood architecture.
         if "queries" not in batch and "tasks" in batch:
@@ -295,8 +345,10 @@ class Model_BioMassters_Skip(pl.LightningModule):
     # =========================================================================
     # SLIDING WINDOW INFERENCE
     # =========================================================================
-    # NOTE: guarded off for the skip run (see __init__). Kept intact so this
-    # trainer remains a drop-in for the non-skip baseline if skip is disabled.
+    # NOTE: guarded off for BOTH the skip run and the temporal run (see
+    # __init__). Kept intact so this trainer remains a drop-in for the
+    # plain baseline (use_decoder_skip=False, use_temporal_transformer=False)
+    # if sliding-window inference is needed.
 
     def _forward_crop(self, batch, crop_idx):
         crop_queries      = batch["tasks"][self.task_name]["queries"][crop_idx:crop_idx + 1]

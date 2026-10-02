@@ -326,3 +326,5 @@ core-python3-*
 core.*
 *.csv
 *.ply
+
+/core-git-*

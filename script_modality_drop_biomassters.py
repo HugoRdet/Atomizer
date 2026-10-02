@@ -1,6 +1,6 @@
 """
-BioMassters Atomizer — Modality Drop Inference Script
-========================================================
+BioMassters Atomizer — Modality Drop Inference Script (SKIP + optional TEMPORAL)
+===================================================================================
 
 Load a trained Atomizer checkpoint and evaluate on the test split under
 different band configurations (S1-only, S2-only, RGB-only, no-SWIR,
@@ -9,25 +9,51 @@ script_test_biomassters_baseline_modality_drop.py's ablation set and
 output format for direct comparison.
 
 KEY STRUCTURAL DIFFERENCE from the baselines' version: Atomizer's band
-drop is DATASET-driven (BioMasstersSkipDataset reads config
-trainer.bands.drop and masks matching tokens at __getitem__ time via
-padding-token semantics -- zero value + mask=1.0), not a model-forward
-wrapper that zeros input channels. This means:
+drop is DATASET-driven (BioMasstersSkipDataset / BioMasstersTemporalDataset
+read config trainer.bands.drop and mask matching tokens at __getitem__
+time via padding-token semantics -- zero value + mask=1.0), not a model-
+forward wrapper that zeros input channels. This means:
 
   - The MODEL is loaded ONCE per checkpoint and reused across every
     ablation -- no ChannelDropWrapper/RAMENChannelDropWrapper equivalent
     needed, since nothing about the model's forward() changes between
     ablations.
   - What changes per ablation is the TEST DATASET/DATALOADER: each
-    ablation gets its own BioMasstersSkipDataset instance, constructed
-    with config_model["trainer"]["bands"]["drop"] set to that ablation's
-    band list, since BioMasstersSkipDataset reads that config once at
-    __init__ time (see BioMasstersSkipDataset._resolve_drop_indices).
+    ablation gets its own dataset instance, constructed with
+    config_model["trainer"]["bands"]["drop"] set to that ablation's band
+    list, since the dataset reads that config once at __init__ time (see
+    BioMasstersSkipDataset._resolve_drop_indices).
   - Dropped bands become padding tokens (zeroed value + mask=1.0,
     ignored by cross-attention) rather than zeroed input channels --
     this is Atomizer's native missing-modality representation, the
     architectural point of comparison against the baselines' channel-
     zeroing approach.
+
+>>> TEMPORAL: --use_temporal_transformer (or config
+Atomiser.use_temporal_transformer: true) switches BOTH sides in lockstep,
+same pattern as train_biomassters.py:
+  - dataset/collate: BioMasstersTemporalDataset + biomassters_temporal_collate_fn
+    instead of BioMasstersSkipDataset + collate_biomassters_skip (per-timestep
+    [T, N, 8] token groups instead of one flat concatenated pool)
+  - model: Model_BioMassters_Skip's own encoder-selection branch (reads the
+    SAME config["Atomiser"]["use_temporal_transformer"] key this script
+    syncs into config_model) picks AtomiserTemporal instead of
+    Atomiser_Senflood_Skip directly -- no change needed here beyond making
+    sure the flag reaches the config before Model_BioMassters_Skip is
+    constructed.
+  - Band dropping itself is UNCHANGED: BioMasstersTemporalDataset inherits
+    _apply_drop_mask / _zero_and_mask_by_spectral_indices from the base
+    class unmodified (spectral_idx matching doesn't care about the [T,N,8]
+    reshape, since it's applied to the flat pool before
+    BioMasstersTemporalDataset's __getitem__ override permutes it into
+    per-timestep groups -- see that class's docstring).
+  - IMPORTANT: --use_temporal_transformer MUST match how the checkpoint
+    being loaded was actually trained (verify via the missing_keys print
+    below, or grep the checkpoint's state_dict for 'temporal' -- same
+    check used for PASTIS/xView2 checkpoints in this codebase). Loading a
+    temporal-trained checkpoint into the flat architecture (or vice versa)
+    will silently drop/leave-random-init a chunk of parameters rather than
+    raising, since load_state_dict is called with strict=False.
 
 Channel/band names: SAME as the baselines' script (BioMasstersSkipDataset's
 ALL_BAND_NAMES): B02,B03,B04,B05,B06,B07,B08,B8A,B11,B12 (S2, CLP excluded)
@@ -35,10 +61,15 @@ and VV_asc,VH_asc,VV_desc,VH_desc (S1).
 
 Usage
 -----
-    # Single checkpoint, default ablation set
+    # Single checkpoint, default ablation set, flat/SKIP architecture
     python script_test_biomassters_atomizer_modality_drop.py \
         --ckpt ./checkpoints/biomassters/biomassters_run1-last.ckpt \
         --xp_name atomizer_drop_eval
+
+    # Temporal-transformer checkpoint
+    python script_test_biomassters_atomizer_modality_drop.py \
+        --ckpt ./checkpoints/biomassters/biomassters_temporal-last.ckpt \
+        --xp_name atomizer_temporal_drop_eval --use_temporal_transformer
 
     # Custom ablation subset
     python script_test_biomassters_atomizer_modality_drop.py \
@@ -60,6 +91,12 @@ from training.utils.datasets.utils_dataset_biomasters import BioMasstersSkipData
 from training.utils.datasets.collate_biomassters_skip import collate_biomassters_skip
 from training.trainer_biomassters import Model_BioMassters_Skip
 from training.utils.lookup_positional import create_biomassters_bands_info
+
+# >>> TEMPORAL
+from training.utils.datasets.biomassters_temporal_dataset import (
+    BioMasstersTemporalDataset,
+    biomassters_temporal_collate_fn,
+)
 
 
 # =============================================================================
@@ -109,6 +146,17 @@ parser.add_argument("--num_timesteps", type=int, default=None,
                     help="Fixed timesteps per sensor (overrides config). MUST match "
                          "what the checkpoint was trained with.")
 
+# >>> TEMPORAL
+parser.add_argument("--use_temporal_transformer", action="store_true",
+                    help="Load/evaluate the AtomiserTemporal architecture "
+                         "(per-timestep [T,N,8] token groups + RoPE "
+                         "TemporalTransformer aggregation) instead of the "
+                         "flat/SKIP architecture. MUST match how --ckpt was "
+                         "actually trained -- this script cannot verify that "
+                         "for you beyond printing missing_keys/unexpected_keys "
+                         "after loading; check those (or grep the checkpoint "
+                         "for 'temporal' keys) if the counts look off.")
+
 args = parser.parse_args()
 
 
@@ -122,6 +170,18 @@ configs_dataset_path = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 if args.num_timesteps is not None:
     config_model.setdefault("dataset", {})["num_timesteps"] = args.num_timesteps
 
+# >>> TEMPORAL: sync the flag into config so Model_BioMassters_Skip's
+# encoder-selection branch (reads config["Atomiser"]["use_temporal_transformer"])
+# picks the architecture matching what this script's dataset/collate side
+# will produce -- same pattern as train_biomassters.py.
+if "Atomiser" not in config_model:
+    config_model["Atomiser"] = {}
+_use_temporal_transformer = (
+    args.use_temporal_transformer
+    or config_model["Atomiser"].get("use_temporal_transformer", False)
+)
+config_model["Atomiser"]["use_temporal_transformer"] = _use_temporal_transformer
+
 fixed_T = config_model.get("dataset", {}).get("num_timesteps", BioMasstersSkipDataset.N_MONTHS)
 
 lookup_table = Lookup_encoding(
@@ -131,8 +191,14 @@ print(f"\n{'='*60}")
 print(f"  BioMassters Atomizer — Modality Drop Eval")
 print(f"  Checkpoint: {args.ckpt}")
 print(f"  Timesteps:  {fixed_T} (fixed -- MUST match training)")
+print(f"  Temporal transformer: {'ON' if _use_temporal_transformer else 'OFF'}")
 print(f"  Ablations:  {args.ablations}")
 print(f"{'='*60}\n")
+
+# >>> TEMPORAL: dataset/collate selection, shared by the stats probe and
+# every ablation's test loader below.
+_dataset_cls = BioMasstersTemporalDataset if _use_temporal_transformer else BioMasstersSkipDataset
+_collate_fn  = biomassters_temporal_collate_fn if _use_temporal_transformer else collate_biomassters_skip
 
 
 # =============================================================================
@@ -140,12 +206,15 @@ print(f"{'='*60}\n")
 # drop lives in the dataset, not the model). Target normalization stats
 # (agb_mean/std) must match what the checkpoint was trained with -- pulled
 # from a throwaway "all bands" train dataset instance (cheap: reads the
-# cached normalization_stats.pt, doesn't recompute).
+# cached normalization_stats.pt, doesn't recompute). Uses the SAME
+# _dataset_cls as the ablation loaders below, though in practice the stats
+# themselves are identical either way (both classes share the base's
+# normalization machinery unchanged) -- kept consistent for clarity.
 # =============================================================================
 
 _stats_probe_config = {**config_model}
 _stats_probe_config["trainer"] = {**config_model["trainer"], "bands": {"keep": None, "drop": None}}
-_stats_probe_ds = BioMasstersSkipDataset(
+_stats_probe_ds = _dataset_cls(
     root_path=args.data_dir, mode="train",
     config_model=_stats_probe_config, look_up=lookup_table,
 )
@@ -168,6 +237,11 @@ print(f"[Atomizer-Eval] Loaded checkpoint — "
       f"missing: {len(result.missing_keys)}, unexpected: {len(result.unexpected_keys)}")
 if result.missing_keys:
     print(f"[Atomizer-Eval] First 5 missing: {result.missing_keys[:5]}")
+    print(f"[Atomizer-Eval] If this is unexpected, verify "
+          f"--use_temporal_transformer matches how this checkpoint was "
+          f"trained -- e.g. `[k for k in state if 'temporal' in k]` should "
+          f"be non-empty iff the checkpoint was trained with the temporal "
+          f"module.")
 if result.unexpected_keys:
     print(f"[Atomizer-Eval] First 5 unexpected: {result.unexpected_keys[:5]}")
 model.eval()
@@ -184,7 +258,11 @@ if args.wandb and os.environ.get("LOCAL_RANK", "0") == "0":
     wandb.init(
         name=f"{args.xp_name}_atomizer_drop",
         project="BioMassters",
-        config={"ckpt": args.ckpt, "ablations": args.ablations},
+        config={
+            "ckpt": args.ckpt,
+            "ablations": args.ablations,
+            "use_temporal_transformer": _use_temporal_transformer,
+        },
     )
     wandb_logger = WandbLogger(project="BioMassters")
 
@@ -196,17 +274,19 @@ if args.wandb and os.environ.get("LOCAL_RANK", "0") == "0":
 
 def make_test_loader(drop_bands: list):
     """
-    Builds a fresh BioMasstersSkipDataset(mode="test") with
-    trainer.bands.drop set to `drop_bands`, and its DataLoader. A new
-    config dict is used per call (shallow-copied at the "trainer" level)
-    so ablations never leak into each other via shared mutable config.
+    Builds a fresh test dataset (BioMasstersSkipDataset or
+    BioMasstersTemporalDataset, per _dataset_cls) with trainer.bands.drop
+    set to `drop_bands`, and its DataLoader (using the matching
+    _collate_fn). A new config dict is used per call (shallow-copied at
+    the "trainer" level) so ablations never leak into each other via
+    shared mutable config.
     """
     ablation_config = {**config_model}
     ablation_config["trainer"] = {
         **config_model["trainer"],
         "bands": {"keep": None, "drop": drop_bands if drop_bands else None},
     }
-    ds = BioMasstersSkipDataset(
+    ds = _dataset_cls(
         root_path=args.data_dir, mode="test",
         config_model=ablation_config, look_up=lookup_table,
     )
@@ -216,7 +296,7 @@ def make_test_loader(drop_bands: list):
     loader = DataLoader(
         ds, batch_size=config_model["trainer"]["batchsize"],
         shuffle=False, sampler=sampler,
-        num_workers=args.num_workers, collate_fn=collate_biomassters_skip,
+        num_workers=args.num_workers, collate_fn=_collate_fn,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
         prefetch_factor=2 if args.num_workers > 0 else None,
@@ -257,6 +337,7 @@ for ablation_name in args.ablations:
 if all_results:
     print(f"\n\n{'='*80}")
     print(f"  ATOMIZER MODALITY DROP SUMMARY — {args.xp_name}")
+    print(f"  Temporal transformer: {'ON' if _use_temporal_transformer else 'OFF'}")
     print(f"{'='*80}")
 
     sample_metrics = next(m for m in all_results.values() if m)
@@ -283,12 +364,16 @@ if all_results:
 # =============================================================================
 # WRITE RESULTS -- same filename convention as the baselines' script, so a
 # downstream table-builder can glob results_*_modality_drop.txt uniformly.
+# Temporal-transformer runs get a distinct filename suffix so flat/SKIP and
+# temporal results for the same xp_name never silently overwrite each other.
 # =============================================================================
 
-out_path = f"./results_{args.xp_name}_atomizer_modality_drop.txt"
+_suffix = "_temporal" if _use_temporal_transformer else ""
+out_path = f"./results_{args.xp_name}_atomizer{_suffix}_modality_drop.txt"
 with open(out_path, "w") as f:
     f.write(f"Experiment: {args.xp_name}\n")
-    f.write(f"Checkpoint: {args.ckpt}\n\n")
+    f.write(f"Checkpoint: {args.ckpt}\n")
+    f.write(f"Temporal transformer: {_use_temporal_transformer}\n\n")
     f.write(f"{'Ablation':<14} {'Drop':<40} {'test_RMSE':<14} {'test_MAE':<14}\n")
     f.write("─" * 82 + "\n")
     for abl in args.ablations:

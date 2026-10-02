@@ -74,6 +74,21 @@ def cache_fn(f):
         return result
     return cached_fn
 
+class MaxLatentPooling(nn.Module):
+    """
+    Parameter-free classifier pooling: max over the latent (token) axis.
+
+    Like MeanLatentPooling, this has no parameters and cannot overfit a
+    learned readout onto a subset of latents. Unlike mean pooling, which
+    averages signal across all latents (diluting sparse, spatially
+    localized evidence), max pooling picks out whichever latent most
+    strongly activates each feature dimension — potentially better suited
+    to tasks where the class-defining signal is concentrated in a small
+    region rather than spread across the whole scene.
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, D] -> [B, D]
+        return x.max(dim=1).values
 
 class MeanLatentPooling(nn.Module):
     """
@@ -500,6 +515,8 @@ class Atomiser_Senflood(pl.LightningModule):
 
             if pooling_type == "mean":
                 pooling = MeanLatentPooling()
+            elif pooling_type == "max":
+                pooling = MaxLatentPooling()
             elif pooling_type == "attention":
                 pooling = LatentAttentionPooling(
                     self.latent_dim, heads=self.latent_heads,

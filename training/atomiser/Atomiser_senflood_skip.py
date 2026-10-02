@@ -21,6 +21,12 @@ purely by spectral / reflectance / resolution / time.
 
 All skip additions are tagged  # >>> SKIP  and adaptive ones  # >>> ADAPTIVE.
 
+NOTE: subclasses that need per-sample precomputed Voronoi assignment
+(FRACTAL's LIDAR group, DALES) do NOT get that support from this base
+class — they override `_apply_pruning`/`encode`/`forward` themselves and
+swap in their own GeographicPruning in `__init__` (see Atomiser_Dales /
+Atomiser_Fractal). This class stays dataset-agnostic on purpose.
+
 Config additions:
   Atomiser:
     use_decoder_skip: true
@@ -846,11 +852,7 @@ class Atomiser_Senflood_Skip(pl.LightningModule):
             delta_y = selected_coords[..., 1] - query_coords[..., 1].unsqueeze(-1)
 
             B_d, M_d, K_d = delta_x.shape
-            if self.input_processor.use_constant_gsd:
-                cs = self.input_processor.compression_alpha * self.input_processor._constant_gsd
-            else:
-                query_gsd = self.input_processor.geometry.get_token_gsd(query_tokens)
-                cs = self.input_processor.compression_alpha * query_gsd
+            cs = self.input_processor.compression_scale
 
             dx_flat = delta_x.reshape(B_d, M_d * K_d)
             dy_flat = delta_y.reshape(B_d, M_d * K_d)

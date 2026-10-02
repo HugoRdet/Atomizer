@@ -97,14 +97,14 @@ parser.add_argument("--sigma_z_normed",     type=float, default=0.003,
                          "Set 0 to disable Z jitter.")
 
 # Model architecture
-parser.add_argument("--num_latents",         type=int,   default=256)
-parser.add_argument("--latent_dim",          type=int,   default=256)
-parser.add_argument("--depth",               type=int,   default=6)
-parser.add_argument("--cross_heads",         type=int,   default=1)
+parser.add_argument("--num_latents",         type=int,   default=306)
+parser.add_argument("--latent_dim",          type=int,   default=768)
+parser.add_argument("--depth",               type=int,   default=1)
+parser.add_argument("--cross_heads",         type=int,   default=16)
 parser.add_argument("--latent_heads",        type=int,   default=8)
 parser.add_argument("--cross_dim_head",      type=int,   default=64)
 parser.add_argument("--latent_dim_head",     type=int,   default=64)
-parser.add_argument("--self_per_cross_attn", type=int,            default=1)
+parser.add_argument("--self_per_cross_attn", type=int,            default=4)
 parser.add_argument("--weight_tie_layers",   type=str2bool,       default=True,
                     help="Share encoder weights across blocks > 0. "
                          "Pass --weight_tie_layers false to disable.")

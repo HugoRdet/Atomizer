@@ -248,7 +248,15 @@ class DalesDataset(Dataset):
     IGNORE_INDEX = 255
     TIME_IDX_NA  = -1
 
-    MIN_POINTS = 1000
+    MIN_POINTS = 1000   # class-level DEFAULT — overridable via the
+                         # min_points constructor param (see __init__).
+                         # Small boundary patches (a handful of points,
+                         # from grid cells overhanging a scene's true
+                         # extent) get SILENTLY SUBSTITUTED for a
+                         # different patch below this threshold, not
+                         # just skipped — for evaluation completeness
+                         # (every physical point should get scored),
+                         # pass min_points=1 to actually process them.
 
     # Ground-relative Z normalization, same convention as FRACTAL. DALES
     # scenes include taller structures (power line pylons, tall buildings)
@@ -285,6 +293,7 @@ class DalesDataset(Dataset):
         sigma_xy_pixels: float = 0.25,
         sigma_z_normed:  float = 0.003,
         eval_full_scene: bool = False,
+        min_points: int = None,
     ):
         # NOTE on defaults: DALES averages ~49 pts/m^2, so a 50x50m tiled
         # patch (PATCH_SIZE_M) contains ~122,500 points on average.
@@ -307,6 +316,7 @@ class DalesDataset(Dataset):
         self.max_queries      = max_queries
 
         self.eval_full_scene = bool(eval_full_scene)
+        self.min_points = min_points if min_points is not None else self.MIN_POINTS
         if self.eval_full_scene and self.split != "test":
             print(f"[DALES] WARNING: eval_full_scene=True with split="
                   f"'{self.split}' -- full-scene queries only take effect "
@@ -419,7 +429,7 @@ class DalesDataset(Dataset):
         # -- Load LIDAR -----------------------------------------------
         las = laspy.read(row["laz_path"])
         n_points_raw = las.x.shape[0]
-        if n_points_raw < self.MIN_POINTS:
+        if n_points_raw < self.min_points:
             return self.__getitem__((index + 1) % len(self))
 
         # Patch bounds -> patch-local pixel coords (same convention as

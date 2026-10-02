@@ -2,71 +2,56 @@
 FRACTAL Atomizer Dataset (with D4 + LIDAR jitter augmentation)
 ==================================================================
 
-Same as the base utils_dataset_fractal.py but with training-time augmentation:
+Same as the base utils_dataset_fractal.py but with training-time
+augmentation, PLUS two additions matching the proven DalesDataset pattern:
 
-  1. D4 dihedral group (8 rotations/flips) applied consistently to both
-     VHR ortho and LIDAR (x, y) coordinates.
-  2. Gaussian positional jitter applied to LIDAR (x, y, z_norm) before
-     tokenization — simulates sensor noise (~5cm physical XY, ~4.5cm Z).
+  1. token_latent_assignment (NEW):
+     Loads the offline-precomputed per-token nearest-latent assignment
+     (see precompute_fractal_latent_assignment.py) — the shared VHR
+     assignment (loaded once at __init__ as a [16, N_vhr] array, one row
+     per D4 variant — VHR is NOT D4-invariant despite the raster's fixed
+     (row,col)->meters mapping never changing, since apply(ortho, aug)
+     moves pixel content across that grid by the same transform LIDAR
+     points get) plus a per-patch LIDAR sidecar covering ALL 16 D4 variants
+     and the FULL (un-subsampled) point set, gathered by whatever context
+     subsample `sel` this __getitem__ call happens to draw — and
+     concatenates the CURRENT variant's rows in the SAME [vhr, lidar] order
+     as `hires_tokens`. Passed to the model as a single
+     batch["token_latent_assignment"] tensor (FRACTAL has only one
+     resolution group, so no per-res dict is needed — matching
+     DalesDataset's convention exactly).
 
-Augmentation is sampled ONCE per __getitem__ (reproducible via per-
-(worker, index) seed) and applied to both modalities. Val/test always
-get identity transform + no jitter.
+     Because precompute covers every point (not just a subsample), context
+     subsampling is RANDOM PER EPOCH again during training, same as the
+     original dataset — an earlier draft of this pipeline mistakenly
+     required deterministic (patch_id-seeded) subsampling for precompute
+     validity; that constraint no longer applies (see
+     precompute_fractal_latent_assignment.py's module docstring).
 
-Why augment in pixel space:
-  LIDAR (x, y) is already converted to patch-local pixel coordinates in
-  [0, 250) for tokenization, matching the VHR raster's coordinate frame.
-  Applying D4 in this space means we can use D4Augmentation.apply() for
-  the raster and D4Augmentation.apply_to_xy() for points — they share the
-  same patch geometry by construction.
+     variant_idx convention: `n_rot * 4 + int(flip_h) * 2 + int(flip_v)`,
+     matching DalesDataset.__getitem__ exactly.
 
-Why jitter on LIDAR but NOT VHR:
-  - LIDAR sensors have real positional noise (~few cm); jitter simulates
-    this and prevents the model from memorizing exact point positions.
-  - VHR pixels are at fixed geographic positions — there's no physical
-    noise to simulate. Color jitter on VHR (brightness/contrast) is a
-    separate kind of augmentation we deliberately skip for now to keep
-    spectral fidelity for vegetation/soil discrimination.
+  2. query_token_idx / query_token_valid (NEW):
+     For each query (LIDAR point being predicted), the indices of its
+     OWN pixel's VHR band-tokens in the pool (`hires_tokens`), for the
+     decoder pixel-skip cascade in Atomiser_Senflood_Skip._pixel_skip.
+     Unlike DALES (which has no VHR and uses a 1-atom identity/inverse
+     mapping into its own context array), FRACTAL's "own atoms" are the
+     (up to 4) VHR band-tokens co-located at the query's raster pixel.
 
-Default jitter parameters (tunable via constructor):
-  - sigma_xy_pixels:  default 0.25 px @ 0.2m/px = 5cm physical XY noise
-  - sigma_z_normed:   default 0.003 in normalized z units = ~4.5cm physical
-                      (Z_GROUND_REL_SCALE=15m, 0.003 * 15 = 0.045m)
+     ASSUMPTION: VHR token order is band-major, then row-major:
+         index = band * (H*W) + row*W + col
+     (see _vhr_pool_index below). VERIFY this against
+     TokenBuilder.build_tokens before trusting query_token_idx.
 
-==============================================================================
-NEW FLAGS (added for paper experiments):
+     Query subsampling now uses the real
+     token_builder.subsample_queries(..., return_indices=True) — an
+     earlier draft of this file reimplemented subsample_queries inline
+     because that kwarg wasn't known to exist; it does, so the
+     reimplementation is gone.
 
-  eval_full_scene (bool, default False):
-    When True AND split=="test", queries cover ALL LIDAR points in a scene
-    (not just the subsampled context subset). Used for end-of-training
-    full-scene evaluation to match baselines that evaluate on all points.
-    Context tokens are still subsampled to max_lidar_points for GPU memory.
-
-    REQUIRES batch_size=1 at the dataloader level: per-scene query counts
-    vary and cannot be batched together. The flag is silently ignored for
-    train/val splits — those always pad to a fixed size for batching.
-
-  vhr_drop_bands (list[int] | str | None, default None):
-    Modality-dropout at INFERENCE time — mask out a subset of VHR bands
-    without retraining. Tokens for dropped bands are still created (so
-    the model sees the expected token count) but their reflectance value
-    is set to 0 AND they are flagged in the attention mask so they
-    contribute nothing to the latents.
-
-    Options:
-      None / []                -> no masking (default)              all 4 bands
-      [0]                      -> drop NIR              keep [R, G, B] + LIDAR
-      [1, 2, 3]                -> drop RGB              keep [NIR]    + LIDAR
-      [0, 1, 2, 3]             -> drop all VHR          LIDAR only
-      "no_nir" / "rgb_only"    -> [0]
-      "no_rgb" / "nir_only"    -> [1, 2, 3]
-      "lidar_only"             -> [0, 1, 2, 3]
-
-    This matches the Sen1Floods11 modality-dropout protocol: "Dropped
-    bands are replaced by padding tokens (Atomiser) or zeroed channels
-    (baselines)." Allows running the same trained checkpoint under
-    multiple test-time modality configurations.
-==============================================================================
+Everything else (D4 dihedral group augmentation, Gaussian jitter, full-scene
+eval, VHR band-drop modality dropout) is UNCHANGED from the previous version.
 """
 
 import os
@@ -94,6 +79,7 @@ except ImportError:
 from .token_grouping import *
 from .token_builder import TokenBuilder
 from .augmentations import D4Augmentation, D4Transform
+from .fractal_geometry import compute_patch_local_pixel_coords
 
 
 # ============================================================================
@@ -171,9 +157,6 @@ def _resolve_elevation_spectral_idx(lookup) -> int:
 # Helper: resolve VHR drop-bands spec
 # ============================================================================
 
-# Maps name to channel indices into the original 4-band [NIR, R, G, B]
-# ortho. These are the bands to DROP (mask) at inference, not the ones to
-# keep. Empty list / None means no dropping.
 _VHR_DROP_PRESETS = {
     None:           [],
     "none":         [],
@@ -199,7 +182,6 @@ def _resolve_vhr_drop_bands(spec):
                 f"or pass a list of indices in 0..3."
             )
         return list(_VHR_DROP_PRESETS[spec])
-    # List/tuple of indices
     indices = list(spec)
     for i in indices:
         if not (0 <= int(i) < 4):
@@ -216,22 +198,24 @@ def _resolve_vhr_drop_bands(spec):
 
 class FractalDataset(Dataset):
     """
-    FRACTAL semantic segmentation, Atomizer format, with D4 + jitter augs.
+    FRACTAL semantic segmentation, Atomizer format, with D4 + jitter augs,
+    offline-precomputed Voronoi assignment, and pixel-skip query indices.
 
-    Args (most unchanged from base version):
-        use_augmentation:    Master switch for D4 + jitter. Auto-disabled for
-                             val/test regardless. Default True.
-        sigma_xy_pixels:     Std dev of LIDAR XY jitter, in PIXEL units
-                             (0.2m/px). Default 0.25 ≈ 5cm physical noise.
-        sigma_z_normed:      Std dev of LIDAR Z jitter, in NORMALIZED units
-                             (z_norm scale = 15m). Default 0.003 ≈ 4.5cm.
-        eval_full_scene:     If True (test mode only), queries cover ALL
-                             LIDAR points so the metric reflects the full
-                             scene. Context tokens stay subsampled.
-                             REQUIRES batch_size=1.
-        vhr_drop_bands:      Bands to MASK at inference (no retraining).
-                             None / [] = no masking (default). See module
-                             docstring for the full list of options.
+    NEW args (on top of the previous version):
+        vhr_assignment_path:  Path to the shared VHR->latent assignment
+                              (.npy, int32) produced by
+                              precompute_fractal_latent_assignment.py.
+                              Required if use_precomputed_assignment=True.
+        use_precomputed_assignment: Master switch. If False, no
+                              token_latent_assignment is returned and
+                              GeographicPruning falls back to its
+                              shared-batch/patch_id-fallback paths
+                              (INCORRECT for the shared-batch path on the
+                              LIDAR portion — only disable for smoke tests).
+        build_pixel_skip_queries: If True, computes query_token_idx /
+                              query_token_valid for the decoder pixel-skip
+                              cascade. Requires config["Atomiser"]
+                              ["use_decoder_skip"]=True on the model side.
     """
 
     VHR_RESOLUTION  = 0.2
@@ -278,6 +262,9 @@ class FractalDataset(Dataset):
         sigma_z_normed:  float = 0.003,
         eval_full_scene: bool = False,
         vhr_drop_bands=None,
+        vhr_assignment_path: str = None,
+        use_precomputed_assignment: bool = True,
+        build_pixel_skip_queries: bool = True,
     ):
         super().__init__()
         for lib, ok in [("laspy", HAS_LASPY), ("rasterio", HAS_RASTERIO)]:
@@ -292,20 +279,12 @@ class FractalDataset(Dataset):
         self.max_lidar_points = max_lidar_points
         self.max_queries      = max_queries
 
-        # ── Full-scene evaluation flag ──────────────────────────
-        # Only meaningful for test split. For train/val we always pad to
-        # max_lidar_points so DataLoader batching works.
         self.eval_full_scene = bool(eval_full_scene)
         if self.eval_full_scene and self.split != "test":
             print(f"[FRACTAL] WARNING: eval_full_scene=True with split="
                   f"'{self.split}' — full-scene queries only take effect "
                   f"during test evaluation. Ignored for this split.")
 
-        # ── VHR band-drop spec (modality dropout at inference) ──
-        # List of band indices in 0..3 that should be masked. Default is
-        # an empty list (no masking). Resolved here so the tensors built
-        # in _setup_band_indices can be used to identify dropped tokens
-        # in __getitem__.
         self.vhr_drop_bands_spec = vhr_drop_bands
         self.vhr_drop_bands = _resolve_vhr_drop_bands(vhr_drop_bands)
         if self.vhr_drop_bands and self.split == "train":
@@ -314,7 +293,6 @@ class FractalDataset(Dataset):
                   f"during training too. This is usually only desired "
                   f"for test-time modality-dropout evaluation.")
 
-        # ── Augmentation config ─────────────────────────────────
         self.augmenter = D4Augmentation(
             enabled=(use_augmentation and self.split == "train"),
             p_flip_h=0.5,
@@ -330,6 +308,49 @@ class FractalDataset(Dataset):
             print(f"[FRACTAL] Augmentation DISABLED "
                   f"(split={self.split}, use_augmentation={use_augmentation})")
 
+        # ── Load precomputed Voronoi assignment ──────────────────────
+        # LIDAR sidecars are looked up relative to EACH PATCH'S OWN
+        # laz_path (row["laz_path"].parent), not a flat directory passed
+        # in here — FRACTAL's actual layout nests patches under numbered
+        # subdirectories (e.g. val/val/00/, val/val/01/, ...), and a flat
+        # directory param can't account for that (this was a real bug in
+        # an earlier version of this file: sidecars were written correctly
+        # by precompute, next to each patch wherever it actually lives,
+        # but looked up from a fixed flat directory that only matched
+        # patches sitting directly in it). Matches DalesDataset's own
+        # pattern exactly (Path(row["laz_path"]).parent / ...).
+        self.use_precomputed_assignment = bool(use_precomputed_assignment)
+        self._vhr_assignment = None
+        if self.use_precomputed_assignment:
+            if vhr_assignment_path is None:
+                raise ValueError(
+                    "[FRACTAL] use_precomputed_assignment=True requires "
+                    "vhr_assignment_path. Run "
+                    "precompute_fractal_latent_assignment.py first, or "
+                    "pass use_precomputed_assignment=False for smoke tests."
+                )
+            self._vhr_assignment = torch.from_numpy(
+                np.load(vhr_assignment_path)).long()
+            assert self._vhr_assignment.dim() == 2 and self._vhr_assignment.shape[0] == 16, (
+                f"[FRACTAL] vhr_assignment_path={vhr_assignment_path} has "
+                f"shape {tuple(self._vhr_assignment.shape)}, expected "
+                f"[16, N_vhr] — re-run precompute_fractal_latent_assignment.py "
+                f"(older versions of that script saved a flat [N_vhr] array "
+                f"assuming VHR was D4-invariant, which was incorrect)."
+            )
+            print(f"[FRACTAL] Loaded shared VHR assignment (per D4 variant): "
+                  f"shape={tuple(self._vhr_assignment.shape)} "
+                  f"from {vhr_assignment_path}")
+            print(f"[FRACTAL] LIDAR assignment sidecars: looked up per-patch, "
+                  f"relative to each patch's own .laz location.")
+        else:
+            print("[FRACTAL] WARNING: use_precomputed_assignment=False — "
+                  "geo_pruning will use its shared-batch/patch_id-fallback "
+                  "paths, which are INCORRECT for LIDAR's per-sample token "
+                  "ordering. Only use this for quick smoke tests.")
+
+        self.build_pixel_skip_queries = bool(build_pixel_skip_queries)
+
         self.token_builder = TokenBuilder(look_up)
         self.nb_tokens                 = config_model["trainer"]["max_tokens"]
         self.max_tokens_reconstruction = config_model["trainer"].get(
@@ -340,13 +361,6 @@ class FractalDataset(Dataset):
         self._setup_band_indices()
         self._collect_patches(valid_patches_file)
 
-        # ── Build the set of spectral_idx values to mask ─────────
-        # After _setup_band_indices, self.vhr_spectral_indices is a
-        # length-4 tensor mapping band index (0..3) to its spectral_idx
-        # in the lookup table. We translate vhr_drop_bands (band indices)
-        # into the actual spectral_idx values that the tokens will carry.
-        # This buffer is then consulted in __getitem__ to identify which
-        # VHR tokens to mask.
         if self.vhr_drop_bands:
             dropped_spectral_idxs = [
                 int(self.vhr_spectral_indices[bi].item())
@@ -459,38 +473,38 @@ class FractalDataset(Dataset):
 
     def _apply_vhr_band_dropout(self, vhr_tokens: torch.Tensor,
                                  vhr_mask: torch.Tensor) -> tuple:
-        """
-        Identify VHR tokens whose spectral_idx is in self._dropped_spectral_set,
-        zero their reflectance value, and flag them in the attention mask.
-
-        The model still sees the same number of VHR tokens — dropped tokens
-        just contribute nothing through cross-attention (masked) and carry
-        no spectral information (value=0).
-
-        Args:
-            vhr_tokens: [N_vhr, 8] VHR token tensor
-            vhr_mask:   [N_vhr] bool mask (True = masked out of attention)
-
-        Returns:
-            (vhr_tokens, vhr_mask) with dropped-band entries zeroed/masked.
-        """
         if not self._dropped_spectral_set:
             return vhr_tokens, vhr_mask
 
         spectral_idxs = vhr_tokens[:, TOKEN_SPECTRAL_IDX].long()
-        # Build per-token "is this token's band dropped?" mask
         drop = torch.zeros_like(vhr_mask, dtype=torch.bool)
         for sidx in self._dropped_spectral_set:
             drop = drop | (spectral_idxs == sidx)
 
-        # Zero the reflectance value for dropped tokens
         vhr_tokens = vhr_tokens.clone()
         vhr_tokens[drop, TOKEN_VALUE_IDX] = 0.0
-
-        # Flag them in the attention mask (True = excluded)
         vhr_mask = vhr_mask | drop
 
         return vhr_tokens, vhr_mask
+
+    # =========================================================================
+    # Own-pixel VHR pool indices for the decoder pixel-skip cascade
+    # =========================================================================
+
+    def _vhr_pool_index(self, row: np.ndarray, col: np.ndarray) -> np.ndarray:
+        """
+        ASSUMPTION (see module docstring): VHR token order is band-major,
+        then row-major: index = band * (H*W) + row*W + col. VERIFY against
+        TokenBuilder.build_tokens before trusting this.
+
+        Returns shape [N, NUM_VHR_BANDS] — one pool index per band, per
+        query point.
+        """
+        n_pix = self.PATCH_SIZE_PX * self.PATCH_SIZE_PX
+        band_offsets = np.arange(self.NUM_VHR_BANDS, dtype=np.int64)[None, :]      # [1,4]
+        pix_flat = (row.astype(np.int64) * self.PATCH_SIZE_PX
+                    + col.astype(np.int64))[:, None]                              # [N,1]
+        return band_offsets * n_pix + pix_flat                                     # [N,4]
 
     # =========================================================================
     # DATASET INTERFACE
@@ -502,15 +516,10 @@ class FractalDataset(Dataset):
     def __getitem__(self, index):
         row = self.patch_rows[index]
 
-        # ── Sample augmentation ONCE per item ─────────────────────
-        # Same transform applied to both ortho and LIDAR (x, y) → spatial
-        # alignment preserved across modalities by construction.
-        # Identity for val/test (augmenter.enabled is False).
         aug = self.augmenter.sample(index=index)
+        # variant_idx convention matches DalesDataset exactly.
+        variant_idx = aug.n_rot * 4 + int(aug.flip_h) * 2 + int(aug.flip_v)
 
-        # ── Effective full-scene mode for this call ───────────────
-        # Only the test split honors the eval_full_scene flag; train/val
-        # always pad to a fixed query count so DataLoader batching works.
         full_scene_active = (self.eval_full_scene
                              and self.split == "test")
 
@@ -520,25 +529,18 @@ class FractalDataset(Dataset):
         if n_points_raw < self.MIN_POINTS:
             return self.__getitem__((index + 1) % len(self))
 
-        # Patch bounds (Lambert-93) → patch-local pixel coords
         x_min = float(las.x.min())
         y_max = float(las.y.max())
-        lidar_x = (np.asarray(las.x) - x_min) / self.VHR_RESOLUTION
-        lidar_y = (y_max - np.asarray(las.y)) / self.VHR_RESOLUTION
+        lidar_x, lidar_y = compute_patch_local_pixel_coords(
+            las.x, las.y, x_min, y_max, self.VHR_RESOLUTION, self.PATCH_SIZE_PX)
 
-        lidar_x = np.clip(lidar_x, 0.0, self.PATCH_SIZE_PX - 1e-3)
-        lidar_y = np.clip(lidar_y, 0.0, self.PATCH_SIZE_PX - 1e-3)
-
-        # ── Echo info (return_number, number_of_returns) ───────────
         return_number     = np.asarray(las.return_number,     dtype=np.int64)
         number_of_returns = np.asarray(las.number_of_returns, dtype=np.int64)
 
-        # ── Labels (BEFORE z-norm since z-norm uses ground mask) ───
         las_cls = np.asarray(las.classification, dtype=np.int64)
         las_cls = np.clip(las_cls, 0, REMAP_LUT.shape[0] - 1)
         labels  = REMAP_LUT[las_cls]
 
-        # ── Z normalization (ground-relative) ──────────────────────
         z_raw = np.asarray(las.z, dtype=np.float32)
         ground_mask = (labels == 1)
         if ground_mask.sum() >= self.GROUND_MEDIAN_MIN_PTS:
@@ -549,85 +551,77 @@ class FractalDataset(Dataset):
         z_clip = np.clip(z_rel, self.Z_GROUND_REL_LO, self.Z_GROUND_REL_HI)
         z_norm = z_clip / self.Z_GROUND_REL_SCALE
 
-        # ── Apply D4 to LIDAR (x, y) ───────────────────────────────
-        xy_stacked = np.stack([lidar_x, lidar_y], axis=1).astype(np.float32)
-        if not aug.is_identity:
-            xy_stacked = self.augmenter.apply_to_xy(
-                xy_stacked, aug, patch_size_px=self.PATCH_SIZE_PX
+        # ── Load precomputed token->latent assignment (offline) ────────
+        # Covers ALL n_points_raw points, ALL 16 D4 variants — see
+        # precompute_fractal_latent_assignment.py's module docstring for
+        # why this means subsampling below can stay random per epoch.
+        # Sidecar lives NEXT TO the patch's own .laz file (wherever that
+        # actually is — FRACTAL nests patches under numbered subdirs like
+        # val/val/00/, val/val/01/, ...), not in a flat directory.
+        full_assignment = None
+        if self.use_precomputed_assignment:
+            sidecar_path = (Path(row["laz_path"]).parent
+                            / f"{row['patch_id']}_latent_assign.npz")
+            with np.load(sidecar_path) as npz:
+                full_assignment = npz["assignment"][variant_idx]  # [n_points_raw]
+            assert full_assignment.shape[0] == n_points_raw, (
+                f"[FRACTAL] Precomputed assignment for {sidecar_path.name} "
+                f"has {full_assignment.shape[0]} points, but this patch has "
+                f"{n_points_raw} — re-run precompute_fractal_latent_assignment.py "
+                f"(tiling changed, or points changed since precompute ran)."
             )
 
-        # ── Apply jitter (LIDAR only) ──────────────────────────────
-        if self.augmenter.enabled and (self.sigma_xy_pixels > 0
-                                       or self.sigma_z_normed > 0):
-            jitter_seed = (index * 2147483647) ^ 0x9E3779B9
-            xy_stacked, z_norm = self.augmenter.apply_jitter(
-                xy_stacked,
-                z=z_norm,
-                sigma_xy=self.sigma_xy_pixels,
-                sigma_z=self.sigma_z_normed,
-                seed=jitter_seed,
+        # ── Original per-split subsample (RESTORED to random-per-epoch
+        # for train — no longer needs to be deterministic, since precompute
+        # covers every point) ───────────────────────────────────────────
+        if (self.max_lidar_points is not None
+                and n_points_raw > self.max_lidar_points):
+            rng = np.random.default_rng(
+                seed=hash(row["patch_id"]) & 0xFFFFFFFF
+                if self.split != "train" else None
             )
+            sel = rng.choice(n_points_raw, size=self.max_lidar_points,
+                             replace=False)
+        else:
+            sel = None
 
-        # ── Re-clip XY to valid range ──────────────────────────────
-        xy_stacked = np.clip(
-            xy_stacked, 0.0, self.PATCH_SIZE_PX - 1e-3
-        ).astype(np.float32)
-        lidar_x = xy_stacked[:, 0]
-        lidar_y = xy_stacked[:, 1]
-
-        # ═══════════════════════════════════════════════════════════════
-        # CONTEXT vs QUERY SPLIT (full-scene-eval logic)
-        # ═══════════════════════════════════════════════════════════════
+        # ── Full-scene-eval branch keeps ALL points as queries; context
+        # gets the (possibly subsampled) `sel` selection ────────────────
         if full_scene_active:
-            # Full arrays for queries (no subsampling on query side)
             full_lidar_x = lidar_x.copy()
             full_lidar_y = lidar_y.copy()
             full_z_norm  = z_norm.copy()
             full_labels  = labels.copy()
-
-            # Subsample for context only
-            if (self.max_lidar_points is not None
-                    and n_points_raw > self.max_lidar_points):
-                rng = np.random.default_rng(
-                    seed=hash(row["patch_id"]) & 0xFFFFFFFF
-                )
-                sel = rng.choice(n_points_raw, size=self.max_lidar_points,
-                                 replace=False)
+            if sel is not None:
                 ctx_lidar_x = lidar_x[sel]
                 ctx_lidar_y = lidar_y[sel]
                 ctx_z_norm  = z_norm[sel]
                 ctx_labels  = labels[sel]
-                return_number     = return_number[sel]
-                number_of_returns = number_of_returns[sel]
+                ctx_return_number     = return_number[sel]
+                ctx_number_of_returns = number_of_returns[sel]
             else:
                 ctx_lidar_x = lidar_x
                 ctx_lidar_y = lidar_y
                 ctx_z_norm  = z_norm
                 ctx_labels  = labels
-
+                ctx_return_number     = return_number
+                ctx_number_of_returns = number_of_returns
             n_real_lidar_ctx     = ctx_lidar_x.shape[0]
             n_real_lidar_queries = full_lidar_x.shape[0]
         else:
-            # Standard behavior: subsample once, context == queries.
-            if (self.max_lidar_points is not None
-                    and n_points_raw > self.max_lidar_points):
-                rng = np.random.default_rng(
-                    seed=hash(row["patch_id"]) & 0xFFFFFFFF
-                    if self.split != "train" else None
-                )
-                sel = rng.choice(n_points_raw, size=self.max_lidar_points,
-                                 replace=False)
+            if sel is not None:
                 lidar_x = lidar_x[sel]
                 lidar_y = lidar_y[sel]
                 z_norm  = z_norm[sel]
                 labels  = labels[sel]
                 return_number     = return_number[sel]
                 number_of_returns = number_of_returns[sel]
-
             ctx_lidar_x  = lidar_x
             ctx_lidar_y  = lidar_y
             ctx_z_norm   = z_norm
             ctx_labels   = labels
+            ctx_return_number     = return_number
+            ctx_number_of_returns = number_of_returns
             full_lidar_x = lidar_x
             full_lidar_y = lidar_y
             full_z_norm  = z_norm
@@ -635,13 +629,59 @@ class FractalDataset(Dataset):
             n_real_lidar_ctx     = ctx_lidar_x.shape[0]
             n_real_lidar_queries = n_real_lidar_ctx
 
-        # ── Tensors for context tokenization (subsampled set) ──────
+        # ── Gather assignment by the SAME sel used for context ──────────
+        if self.use_precomputed_assignment:
+            ctx_assignment = (full_assignment if sel is None
+                              else full_assignment[sel])
+
+        # ── Apply D4 to LIDAR (x, y) ───────────────────────────────
+        ctx_xy = np.stack([ctx_lidar_x, ctx_lidar_y], axis=1).astype(np.float32)
+        if not aug.is_identity:
+            ctx_xy = self.augmenter.apply_to_xy(
+                ctx_xy, aug, patch_size_px=self.PATCH_SIZE_PX)
+
+        # ── Apply jitter (LIDAR only) ──────────────────────────────
+        if self.augmenter.enabled and (self.sigma_xy_pixels > 0
+                                       or self.sigma_z_normed > 0):
+            jitter_seed = (index * 2147483647) ^ 0x9E3779B9
+            ctx_xy, ctx_z_norm = self.augmenter.apply_jitter(
+                ctx_xy,
+                z=ctx_z_norm,
+                sigma_xy=self.sigma_xy_pixels,
+                sigma_z=self.sigma_z_normed,
+                seed=jitter_seed,
+            )
+
+        ctx_xy = np.clip(
+            ctx_xy, 0.0, self.PATCH_SIZE_PX - 1e-3
+        ).astype(np.float32)
+        ctx_lidar_x = ctx_xy[:, 0]
+        ctx_lidar_y = ctx_xy[:, 1]
+
+        # Query positions. Standard path: query set == context set (same
+        # array throughout, matching the original single-set design) — just
+        # reuse the already-D4'd, already-jittered ctx coordinates. Only
+        # full-scene-eval mode has a genuinely separate (larger, unjittered)
+        # query set that needs its own D4 application.
+        if full_scene_active:
+            full_xy = np.stack([full_lidar_x, full_lidar_y], axis=1).astype(np.float32)
+            if not aug.is_identity:
+                full_xy = self.augmenter.apply_to_xy(
+                    full_xy, aug, patch_size_px=self.PATCH_SIZE_PX)
+            full_xy = np.clip(full_xy, 0.0, self.PATCH_SIZE_PX - 1e-3).astype(np.float32)
+            full_lidar_x = full_xy[:, 0]
+            full_lidar_y = full_xy[:, 1]
+        else:
+            full_lidar_x = ctx_lidar_x
+            full_lidar_y = ctx_lidar_y
+            full_z_norm  = ctx_z_norm
+            full_labels  = ctx_labels
+
         positions_ctx_lidar = torch.from_numpy(
             np.stack([ctx_lidar_x, ctx_lidar_y], axis=1)).float()
         values_ctx_lidar    = torch.from_numpy(ctx_z_norm).float()
         labels_ctx_lidar    = torch.from_numpy(ctx_labels.astype(np.int64))
 
-        # ── Tensors for queries (full set in eval-full-scene mode) ─
         positions_query = torch.from_numpy(
             np.stack([full_lidar_x, full_lidar_y], axis=1)).float()
         values_query    = torch.from_numpy(full_z_norm).float()
@@ -655,23 +695,14 @@ class FractalDataset(Dataset):
         ortho = torch.clamp(ortho, -10, 10)
         ortho = torch.nan_to_num(ortho, nan=0.0, posinf=10.0, neginf=-10.0)
 
-        # ── Apply D4 to ortho (same transform as LIDAR) ─────────────
-        # apply() rotates the last 2 axes of [4, 250, 250].
         if not aug.is_identity:
             ortho = self.augmenter.apply(ortho, aug)
 
-        # Dense label for VHR tokens: all IGNORE (we only supervise on LIDAR)
         dense_label = torch.full(
             (self.PATCH_SIZE_PX, self.PATCH_SIZE_PX),
             self.IGNORE_INDEX, dtype=torch.long,
         )
 
-        # ── Tokenize VHR ────────────────────────────────────────────
-        # Tokenize all 4 bands as usual. If vhr_drop_bands is non-empty,
-        # _apply_vhr_band_dropout below will zero the value and mask the
-        # tokens belonging to dropped bands. The model still sees the
-        # expected number of VHR tokens — only their contribution is
-        # neutralized.
         vhr_tokens = self.token_builder.build_tokens(
             image=ortho,
             label=dense_label,
@@ -681,11 +712,6 @@ class FractalDataset(Dataset):
             time_idx=self.TIME_IDX_NA,
         )
 
-        # ── Tokenize LIDAR (sparse) ─────────────────────────────────
-        # Echo info goes into column 7 (overriding time_idx, which is -1 for
-        # FRACTAL anyway). build_sparse_tokens looks up the echo index via
-        # self.look_up.get_echo_idx(r, t) and writes it per-point.
-        # Uses CONTEXT positions/values (subsampled set in eval-full mode).
         lidar_tokens = self.token_builder.build_sparse_tokens(
             values=values_ctx_lidar,
             positions=positions_ctx_lidar,
@@ -695,11 +721,11 @@ class FractalDataset(Dataset):
             resolution_idx=self.resolution_idx,
             patch_size_px=self.PATCH_SIZE_PX,
             time_idx=self.TIME_IDX_NA,
-            return_number=return_number,
-            number_of_returns=number_of_returns,
+            return_number=ctx_return_number,
+            number_of_returns=ctx_number_of_returns,
         )
 
-        # ── Pad LIDAR context tokens to fixed size ──────────────────
+        # ── Pad LIDAR context tokens (+ assignment) to fixed size ───────
         n_lidar_tokens = lidar_tokens.shape[0]
         if (self.max_lidar_points is not None
                 and n_lidar_tokens < self.max_lidar_points):
@@ -711,17 +737,14 @@ class FractalDataset(Dataset):
                 torch.zeros(n_lidar_tokens, dtype=torch.bool),
                 torch.ones(n_pad, dtype=torch.bool),
             ])
+            if self.use_precomputed_assignment:
+                assign_pad = np.zeros(n_pad, dtype=np.int64)
+                ctx_assignment = np.concatenate([ctx_assignment, assign_pad])
         else:
             lidar_mask = torch.zeros(lidar_tokens.shape[0], dtype=torch.bool)
 
         vhr_mask = torch.zeros(vhr_tokens.shape[0], dtype=torch.bool)
 
-        # ── Apply VHR band dropout (modality dropout at inference) ──
-        # No-op when self.vhr_drop_bands is empty. When non-empty:
-        # zeros the reflectance value AND flags the attention mask for
-        # tokens whose spectral_idx is in the dropped set. The model
-        # still receives every VHR token position; it just sees them as
-        # masked-out padding-equivalents.
         if self._dropped_spectral_set:
             vhr_tokens, vhr_mask = self._apply_vhr_band_dropout(
                 vhr_tokens, vhr_mask)
@@ -737,6 +760,19 @@ class FractalDataset(Dataset):
                            self.PATCH_SIZE_PX, self.PATCH_SIZE_PX),
             }
         }
+
+        # ── Combine VHR (shared, precomputed per-variant) + LIDAR (gathered)
+        # VHR is NOT D4-invariant despite the raster's fixed (row,col)->
+        # meters mapping never changing — apply(ortho, aug) moves pixel
+        # content across that fixed grid by the same D4 transform LIDAR
+        # points get, so it needs the same per-variant indexing. ──────────
+        token_latent_assignment = None
+        if self.use_precomputed_assignment:
+            lidar_assignment = torch.from_numpy(
+                ctx_assignment.astype(np.int64))
+            vhr_assignment_this_variant = self._vhr_assignment[variant_idx]
+            token_latent_assignment = torch.cat(
+                [vhr_assignment_this_variant, lidar_assignment], dim=0)
 
         # ── Build queries from FULL positions/labels ────────────────
         queries = self.token_builder.build_sparse_queries(
@@ -755,14 +791,40 @@ class FractalDataset(Dataset):
         )
         queries[:, 0] = values_query
 
-        # ── Subsample queries during TRAINING only ──────────────────
+        # ── Own-pixel VHR pool indices, tracked through subsampling ─────
+        if self.build_pixel_skip_queries:
+            query_row = np.clip(np.round(full_lidar_y).astype(np.int64),
+                                 0, self.PATCH_SIZE_PX - 1)
+            query_col = np.clip(np.round(full_lidar_x).astype(np.int64),
+                                 0, self.PATCH_SIZE_PX - 1)
+            query_token_idx_pre = torch.from_numpy(
+                self._vhr_pool_index(query_row, query_col)).long()  # [Npts, 4]
+        else:
+            query_token_idx_pre = None
+
+        # ── Subsample queries during TRAINING only — real
+        # subsample_queries(return_indices=True), tracking query_token_idx
+        # in lockstep via the returned kept_indices. ─────────────────────
         if self.split == "train":
-            queries = self.token_builder.subsample_queries(
-                queries,
-                max_queries=self.max_tokens_reconstruction,
-                ignore_index=self.IGNORE_INDEX,
-                prioritize_valid=True,
-            )
+            if self.build_pixel_skip_queries:
+                queries, kept_indices = self.token_builder.subsample_queries(
+                    queries,
+                    max_queries=self.max_tokens_reconstruction,
+                    ignore_index=self.IGNORE_INDEX,
+                    prioritize_valid=True,
+                    return_indices=True,
+                )
+                query_token_idx = query_token_idx_pre[kept_indices]
+            else:
+                queries = self.token_builder.subsample_queries(
+                    queries,
+                    max_queries=self.max_tokens_reconstruction,
+                    ignore_index=self.IGNORE_INDEX,
+                    prioritize_valid=True,
+                )
+                query_token_idx = None
+        else:
+            query_token_idx = query_token_idx_pre
 
         # ═══════════════════════════════════════════════════════════════
         # PADDING LOGIC: full-scene-eval (variable) vs standard (fixed)
@@ -771,6 +833,7 @@ class FractalDataset(Dataset):
             queries_mask  = torch.zeros(queries.shape[0], dtype=torch.bool)
             labels_padded = labels_query
             n_real_lidar_for_return = n_real_lidar_queries
+            query_token_valid = ~queries_mask if query_token_idx is not None else None
         else:
             target_n_queries = (self.max_tokens_reconstruction
                                 if self.split == "train"
@@ -787,9 +850,14 @@ class FractalDataset(Dataset):
                     torch.zeros(n_real_queries, dtype=torch.bool),
                     torch.ones(n_pad, dtype=torch.bool),
                 ])
+                if query_token_idx is not None:
+                    idx_pad = torch.zeros(n_pad, self.NUM_VHR_BANDS, dtype=torch.long)
+                    query_token_idx = torch.cat([query_token_idx, idx_pad], dim=0)
             elif n_real_queries > target_n_queries:
                 queries      = queries[:target_n_queries]
                 queries_mask = torch.zeros(target_n_queries, dtype=torch.bool)
+                if query_token_idx is not None:
+                    query_token_idx = query_token_idx[:target_n_queries]
             else:
                 queries_mask = torch.zeros(target_n_queries, dtype=torch.bool)
 
@@ -801,8 +869,10 @@ class FractalDataset(Dataset):
                                        dtype=torch.long)
                 labels_padded = torch.cat([labels_ctx_lidar, label_pad], dim=0)
             n_real_lidar_for_return = n_real_lidar_ctx
+            query_token_valid = (~queries_mask
+                                 if query_token_idx is not None else None)
 
-        return {
+        out = {
             "groups":            groups,
             "queries":           queries,
             "queries_mask":      queries_mask,
@@ -813,3 +883,9 @@ class FractalDataset(Dataset):
             "image":             ortho,
             "patch_id":          row["patch_id"],
         }
+        if token_latent_assignment is not None:
+            out["token_latent_assignment"] = token_latent_assignment
+        if query_token_idx is not None:
+            out["query_token_idx"]   = query_token_idx
+            out["query_token_valid"] = query_token_valid
+        return out

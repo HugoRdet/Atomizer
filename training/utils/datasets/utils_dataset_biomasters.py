@@ -51,6 +51,16 @@ zero+mask primitive, adapted for:
          spectral_idx doesn't encode which timestep it's from, so matching
          on spectral_idx alone already masks that band in every frame.
 
+  5. TEMPORAL POSITIONS (NEW, additive): __getitem__ also returns
+     "time_positions" -- continuous, S2-anchored day-of-year per fixed_T
+     slot (NOT the categorical time_idx baked into token column 7). This
+     exists for BioMasstersTemporalDataset (the per-timestep [T,N,8] variant
+     for AtomiserTemporal's RoPE temporal module), which needs a continuous
+     scalar per timestep rather than a categorical lookup id. Harmless for
+     the flat/SKIP path: it's just one extra, unused key in the returned
+     dict; collate_biomassters_skip doesn't reference it, so it's dropped
+     during collation same as before.
+
 POOL LAYOUT (matches PASTIS's sat_tokens convention):
     sat_tokens = cat([ S2_f0(c h w), ..., S2_f(T-1),  S1_f0(c h w), ..., S1_f(T-1) ])
   - within a frame: channel-major (c h w)->row => pixel p={p + c*HW} per sub-block
@@ -371,8 +381,8 @@ class BioMasstersSkipDataset(Dataset):
         s2_data_raw, s2_months_raw = self._load_sensor(rec["s2_files"], self.NUM_S2_BANDS, is_s1=False)
         s1_data_raw, s1_months_raw = self._load_sensor(rec["s1_files"], self.NUM_S1_BANDS, is_s1=True)
 
-        s2_data, s2_time_indices, s2_replicated = self._pad_or_subsample(s2_data_raw, s2_months_raw)
-        s1_data, s1_time_indices, s1_replicated = self._pad_or_subsample(s1_data_raw, s1_months_raw)
+        s2_data, s2_time_indices, s2_replicated, s2_months_fixed = self._pad_or_subsample(s2_data_raw, s2_months_raw)
+        s1_data, s1_time_indices, s1_replicated, s1_months_fixed = self._pad_or_subsample(s1_data_raw, s1_months_raw)
 
         agbm_arr = self._load_agbm(rec)
         H, W = s2_data.shape[-2], s2_data.shape[-1]
@@ -451,6 +461,17 @@ class BioMasstersSkipDataset(Dataset):
             "chip_id": rec["chip_id"],
             "query_token_idx":   query_token_idx,
             "query_token_valid": query_token_valid,
+            # Continuous per-timestep time (S2-anchored day-of-year), for
+            # BioMasstersTemporalDataset's RoPE. NOT the same as the
+            # categorical time_idx baked into each token (col 7) -- see
+            # pastis_temporal_dataset.py's docstring for the same
+            # distinction on PASTIS. Harmless additive field for the flat/
+            # SKIP path: collate_biomassters_skip doesn't reference it, so
+            # it's simply dropped during collation, same as before this
+            # field existed.
+            "time_positions": torch.tensor(
+                [self._month_to_doy(m) for m in s2_months_fixed], dtype=torch.float32
+            ),
         }
         if agbm_arr is not None:
             result["label"] = agbm_arr[0]
@@ -468,9 +489,10 @@ class BioMasstersSkipDataset(Dataset):
         if T_present == 0:
             C, H, W = data.shape[1], 256, 256
             data_fixed = torch.zeros(T, C, H, W, dtype=torch.float32)
+            months_fixed = [0] * T
             time_indices = [self.look_up.get_or_register_time_idx(self._month_to_doy(0))] * T
             replicated = [True] * T
-            return data_fixed, time_indices, replicated
+            return data_fixed, time_indices, replicated, months_fixed
 
         if T_present > T:
             data_fixed = data[-T:]
@@ -488,7 +510,7 @@ class BioMasstersSkipDataset(Dataset):
             replicated = [False] * T
 
         time_indices = [self.look_up.get_or_register_time_idx(self._month_to_doy(m)) for m in months_fixed]
-        return data_fixed, time_indices, replicated
+        return data_fixed, time_indices, replicated, months_fixed
 
     def _build_replication_mask(self, s2_replicated: List[bool], s1_replicated: List[bool], H, W):
         HW = H * W

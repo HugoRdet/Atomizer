@@ -143,6 +143,21 @@ Supported models (via --model):
     Pass --test_only <path/to/checkpoint.ckpt> to skip training and run
     test on a saved checkpoint (single GPU, no DDP).
 
+--resume_from mode:
+    Pass --resume_from <path/to/checkpoint.ckpt> to resume training (full
+    trainer state — optimizer, scheduler, epoch count) via
+    Trainer.fit(ckpt_path=...). If the file doesn't exist yet, use
+    --resume_wait_seconds to poll for it instead of failing immediately
+    (useful for chained SLURM jobs where the next job in the chain can
+    start before the previous job's checkpoint write, and any filesystem
+    sync delay, has actually landed) — same pattern as
+    script_train_xview.py / train_biomassters.py. Mutually exclusive with
+    --test_only: --test_only skips training entirely and evaluates a
+    checkpoint; --resume_from continues an interrupted training run. This
+    resumes FULL trainer state, not just weights — for loading only
+    pretrained weights into a fresh training schedule, use a different
+    mechanism (not provided by this flag).
+
 GFLOPs: measured once after testing completes, using the same
 FlopCounterMode-based harness as the xView2 baseline script (counts SDPA
 attention correctly, unlike torch.profiler(with_flops=True) used in the
@@ -216,9 +231,16 @@ Examples:
     python script_train_pastis_baseline.py --xp_name universat_s2 \
         --model universat --multi_temporal 10 \
         --batch_size 4 --lr 1e-4 --epochs 100
+
+    # Resume a chained SLURM job, waiting up to 10 minutes for the checkpoint
+    python script_train_pastis_baseline.py --xp_name universat_s2s1 \
+        --model universat --use_s1 --multi_temporal 10 \
+        --resume_from ./checkpoints/pastis_baselines/bl_universat_s2s1_universat-last.ckpt \
+        --resume_wait_seconds 600
 """
 
 import os
+import time
 import argparse
 
 import torch
@@ -253,6 +275,49 @@ from training.trainer_baselines import BaselineTrainer
 
 
 # =============================================================================
+# RESUME HELPER (ported from train_biomassters.py / script_train_xview.py)
+# =============================================================================
+
+def wait_for_checkpoint(path: str, wait_seconds: int, poll_interval: int = 15) -> str:
+    """
+    Polls for `path` to exist, up to `wait_seconds` total, checking every
+    `poll_interval` seconds. Useful for chained SLURM jobs where the next
+    job in the chain can start before the previous job's checkpoint write
+    (and any filesystem sync delay, common on Lustre) has actually landed.
+
+    wait_seconds=0 means "check once, don't wait" -- fails fast if the
+    file isn't there, matching the old plain os.path.exists() behavior.
+
+    Raises FileNotFoundError if the checkpoint never appears within the
+    timeout, rather than silently falling back to training from scratch --
+    resuming should be an explicit, verified action.
+    """
+    if os.path.exists(path):
+        return path
+
+    if wait_seconds <= 0:
+        raise FileNotFoundError(
+            f"Checkpoint not found: {path} "
+            f"(use --resume_wait_seconds > 0 to poll for it instead of failing immediately)"
+        )
+
+    print(f"[PASTIS-BL] Checkpoint not found yet: {path}")
+    print(f"[PASTIS-BL] Waiting up to {wait_seconds}s (polling every {poll_interval}s)...")
+    waited = 0
+    while waited < wait_seconds:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        if os.path.exists(path):
+            print(f"[PASTIS-BL] Checkpoint appeared after {waited}s: {path}")
+            return path
+        print(f"[PASTIS-BL]   ...still waiting ({waited}/{wait_seconds}s)")
+
+    raise FileNotFoundError(
+        f"Checkpoint still not found after waiting {wait_seconds}s: {path}"
+    )
+
+
+# =============================================================================
 # CONSTANTS
 # =============================================================================
 
@@ -263,11 +328,6 @@ NATIVE_TILE_PX = 128  # PASTIS-HD tiles are fixed-size — no --crop_size knob
 # =============================================================================
 # RAMEN BAND METADATA
 # =============================================================================
-# S2: same continuous-wavelength band names as UniverSat's table below,
-# WITHOUT per-frame suffixing — unlike a channel-stacking integration,
-# RAMEN's own per-modality LTAE handles the temporal axis internally
-# (same mechanism as its xView2 integration), so each band appears once
-# and the tensor's TIME axis (not extra channels) carries the T frames.
 RAMEN_S2_BAND_NAMES = [
     "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12",
 ]
@@ -277,12 +337,6 @@ assert len(RAMEN_S2_BAND_NAMES) == NUM_S2_BANDS == len(S2_WAVELENGTHS), (
 )
 RAMEN_S2_WAVELENGTHS_NM = dict(zip(RAMEN_S2_BAND_NAMES, S2_WAVELENGTHS))
 
-# S1: RAMEN's OWN pol_map convention (CONFIRMED via its Sen1Floods11
-# integration's S1_POLARIZATIONS dict), NOT UniverSat's "VV"/"VH" string
-# codes — these are two different conventions within this codebase. Only
-# the first 2 raw S1 channels (VV, VH) are used; PASTIS's 3rd channel
-# (a derived VV-VH ratio) has no established RAMEN code anywhere in this
-# project, unlike UniverSat's confirmed "Ratio_VV_VH".
 RAMEN_S1_BAND_NAMES = ["VV", "VH"]
 RAMEN_S1_POL_MAP = {"VV": "asc_vv", "VH": "asc_vh"}
 
@@ -290,11 +344,6 @@ RAMEN_S1_POL_MAP = {"VV": "asc_vv", "VH": "asc_vh"}
 # =============================================================================
 # UNIVERSAT BAND METADATA
 # =============================================================================
-# S2: continuous wavelengths (nm), same 10-band set the dataset already
-# reports in each sample's metadata (S2_WAVELENGTHS/S2_BANDWIDTHS from
-# utils_dataset_PASTIS). Band "names" here are only dict keys — UniverSat's
-# optical path goes through continuous-wavelength MP-Fourier encoding, no
-# registry membership required (same as the Sen1Floods11 integration).
 UNIVERSAT_S2_BAND_NAMES = [
     "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12",
 ]
@@ -304,22 +353,8 @@ assert len(UNIVERSAT_S2_BAND_NAMES) == NUM_S2_BANDS == len(S2_WAVELENGTHS), (
 )
 UNIVERSAT_S2_WAVELENGTHS_NM = dict(zip(UNIVERSAT_S2_BAND_NAMES, S2_WAVELENGTHS))
 
-# S1: PASTIS gives 3 raw channels [VV, VH, VV-VH] (see PastisBaselineDataset
-# docstring/_load_s1), where the 3rd is a DERIVED RATIO, not a raw
-# polarization. UniverSat's supported SAR/elevation channel codes are
-# given directly in universat_augmenter.py's UniverSatSegmenter docstring:
-# "VV", "VH", "HH", "HV", "Ratio_VV_VH", "Ratio_HH_HV", "DSM", "nDEM" --
-# looked up as learned Encoding_<code> embeddings in the UPE. So the ratio
-# band's code is CONFIRMED to be "Ratio_VV_VH" (not the dataset's own
-# "VV-VH" naming) -- by default only the first 2 channels (VV, VH) are
-# fed to UniverSat; --universat_use_s1_ratio additionally feeds channel 3
-# under "Ratio_VV_VH".
 UNIVERSAT_S1_BAND_NAMES_BASE = ["VV", "VH"]
 UNIVERSAT_S1_BAND_NAMES_WITH_RATIO = ["VV", "VH", "Ratio_VV_VH"]
-# The codes ARE the names, same convention as the Sen1Floods11 integration
-# (UNIVERSAT_WAVELENGTHS["sar"] = S1_BAND_NAMES there) -- wavelengths for
-# string codes pass through UniverSatSegmenter.__init__ untouched (only
-# numeric values >100 get the nm->µm conversion applied).
 
 
 # =============================================================================
@@ -495,20 +530,6 @@ class PrithviAdapter(nn.Module):
 # =============================================================================
 # FLOPs MEASUREMENT — FlopCounterMode (counts SDPA attention)
 # =============================================================================
-# Same convention, same methodology, and the SAME counting tool as the
-# xView2 baseline script (script_train_xview_baselines.py) and Atomiser's
-# xView2 / Sen1Floods11 scripts (script_train_xview.py /
-# script_test_senflood_density_skip.py): torch.utils.flop_counter.
-# FlopCounterMode (SDPA attention counted), one warmup pass discarded, mean
-# over the remaining counted passes, GFLOPs = total_flops / 1e9, measured
-# under torch.no_grad() via the module-tracker no-op patch below (the
-# per-module attribution hook otherwise asserts under no_grad; the overall
-# total, which is all we use here, is unaffected -- see that hook's
-# docstring in the other scripts for the full explanation). This is the
-# SAME counter/methodology across every script in this codebase now that
-# the Sen1Floods11 density script has also been switched off
-# torch.profiler(with_flops=True) -- numbers from this script ARE directly
-# comparable to those.
 
 def _patch_module_tracker_for_no_grad():
     import torch.utils.module_tracker as _mt
@@ -619,8 +640,6 @@ def build_model(model_name, in_channels, num_classes, args):
         )
 
     elif model_name == "vit_upernet_mt":
-        # ViT + UPerNet with channel-concat early fusion (TimeMerge DoubleConv).
-        # Mirror of resnet_upernet_mt for the ViT family.
         return build_vit_upernet_mt(
             in_channels=in_channels,
             num_classes=num_classes,
@@ -635,10 +654,6 @@ def build_model(model_name, in_channels, num_classes, args):
         )
 
     elif model_name in ("resnet_upernet_mt", "resnet_upernet_ltae"):
-        # Channel-concat early fusion via TimeMerge DoubleConv (PANGAEA-style).
-        # The legacy 'resnet_upernet_ltae' name is kept as an alias for
-        # back-compat, but it now refers to early-fusion MT (LTAE variant
-        # was removed when we switched to PANGAEA-style temporal handling).
         if model_name == "resnet_upernet_ltae":
             print("[WARN] 'resnet_upernet_ltae' is now an alias for "
                   "'resnet_upernet_mt' (channel-concat early fusion). "
@@ -681,18 +696,11 @@ def build_model(model_name, in_channels, num_classes, args):
         return PrithviAdapter(prithvi)
 
     elif model_name == "ramen":
-        # in_channels is unused here (like the UniverSat branch below) —
-        # RAMEN derives channel count from the band-name dicts. Temporal
-        # fusion is RAMEN's OWN per-modality LTAE (real per-frame dates,
-        # via RAMENPastisAdapter), not channel-stacking or TimeMerge.
-        # >>> KEY_RENAME_FIX: dict keys MUST be "optical"/"sar" (RAMEN
-        # branches on the literal string "sar" internally), NOT "s2"/"s1"
-        # -- see RAMENPastisAdapter's docstring for the crash this fixes.
         input_bands = {"optical": RAMEN_S2_BAND_NAMES}
         wavelengths = {"optical": RAMEN_S2_WAVELENGTHS_NM}
         if args.use_s1:
             input_bands["sar"] = RAMEN_S1_BAND_NAMES
-            wavelengths["sar"] = RAMEN_S1_POL_MAP   # RAMEN's own pol_map codes
+            wavelengths["sar"] = RAMEN_S1_POL_MAP
 
         base = build_ramen_upernet(
             input_bands=input_bands,
@@ -710,11 +718,6 @@ def build_model(model_name, in_channels, num_classes, args):
         return RAMENPastisAdapter(base, use_s1=args.use_s1)
 
     elif model_name == "universat":
-        # Random init, no pretrained weights. in_channels is unused here
-        # (channel count/identity comes from the band-name dicts below).
-        # No window baked at construction — same weights handle the fixed
-        # 128x128 PASTIS-HD tile size, and would handle any other tile
-        # size too since the latent grid is recomputed per input.
         input_bands = {"s2": UNIVERSAT_S2_BAND_NAMES}
         wavelengths = {"s2": UNIVERSAT_S2_WAVELENGTHS_NM}
         input_res = {"s2": PASTIS_GSD_M}
@@ -723,7 +726,7 @@ def build_model(model_name, in_channels, num_classes, args):
                         if args.universat_use_s1_ratio
                         else UNIVERSAT_S1_BAND_NAMES_BASE)
             input_bands["s1"] = s1_names
-            wavelengths["s1"] = s1_names   # codes ARE the names (Sen1Floods11 convention)
+            wavelengths["s1"] = s1_names
             input_res["s1"] = PASTIS_GSD_M
 
         return build_universat_segmenter(
@@ -763,6 +766,21 @@ parser.add_argument("--data_dir",   type=str, default="./data/PASTIS-HD")
 # Test-only mode
 parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a .ckpt file. Skip training, test directly.")
+
+# Resume-training mode (ported from train_biomassters.py / script_train_xview.py)
+parser.add_argument("--resume_from", type=str, default=None,
+                    help="Path to a checkpoint to resume TRAINING from "
+                         "(full trainer state via Trainer.fit(ckpt_path=...)). "
+                         "If the file doesn't exist yet, use "
+                         "--resume_wait_seconds to poll for it instead of "
+                         "failing immediately (useful for chained SLURM "
+                         "jobs). Mutually exclusive with --test_only.")
+parser.add_argument("--resume_wait_seconds", type=int, default=0,
+                    help="How long to poll for --resume_from to appear "
+                         "before giving up (0 = check once, fail "
+                         "immediately if missing).")
+parser.add_argument("--resume_poll_interval", type=int, default=15,
+                    help="Seconds between polls while waiting for the checkpoint.")
 
 # Modality
 parser.add_argument("--use_s1",     action="store_true",
@@ -825,10 +843,10 @@ parser.add_argument("--ramen_window_size", type=int, default=None,
                          "PASTIS-HD's fixed 128x128 tile size — RAMEN "
                          "tokenizes per-pixel and this script does no "
                          "sliding-window tiling for it (unlike the xView2 "
-                         "integration's evaluate_sliding_window), so a "
-                         "mismatch would silently resample rather than "
-                         "tile. Defaults to 128 (NATIVE_TILE_PX) if unset "
-                         "— only override if you know what you're doing.")
+                         "integration), so a mismatch would silently "
+                         "resample rather than tile. Defaults to 128 "
+                         "(NATIVE_TILE_PX) if unset — only override if "
+                         "you know what you're doing.")
 
 # UniverSat (from scratch)
 parser.add_argument("--universat_size", type=str, default="small",
@@ -836,7 +854,7 @@ parser.add_argument("--universat_size", type=str, default="small",
                     help="'small' (384-d, 12 SA blocks, heads=6) is ~36.1M "
                          "total -- parameter-matched to the ViT-S / RAMEN "
                          "~34M budget. 'tiny' ~6.2M; 'base' ~201M.")
-parser.add_argument("--universat_patch_m", type=float, default=160.0,
+parser.add_argument("--universat_patch_m", type=float, default=40,
                     help="Patch size in METRES. 160 m = 16 px at PASTIS's "
                          "10 m GSD -- the email-convention default "
                          "(patch size (px)=16 in the authors' table). "
@@ -882,6 +900,13 @@ parser.add_argument("--flops_n", type=int, default=3,
                          "script prior to the UniverSat integration).")
 
 args = parser.parse_args()
+
+if args.test_only is not None and args.resume_from is not None:
+    raise ValueError(
+        "--test_only and --resume_from are mutually exclusive: --test_only "
+        "skips training entirely (loads weights, runs test), --resume_from "
+        "continues training from a checkpoint. Pick one."
+    )
 
 
 # =============================================================================
@@ -930,9 +955,6 @@ if args.model == "universat":
     _lcm = _math.lcm(universat_patch_px, args.universat_output_stride)
     _lcm = _math.lcm(_lcm, args.universat_subpatch_px)
 
-    # PASTIS-HD tiles are a FIXED 128x128 — no --crop_size knob on this
-    # dataset (unlike xView2/Sen1Floods11), so the one geometry check is
-    # against NATIVE_TILE_PX directly.
     if NATIVE_TILE_PX % _lcm:
         raise ValueError(
             f"PASTIS-HD's fixed {NATIVE_TILE_PX}x{NATIVE_TILE_PX} tile size "
@@ -962,9 +984,6 @@ if args.use_s1:
 modality_str = "+".join(modalities)
 temporal_str = f"{args.multi_temporal} frames ({'last' if args.temporal_last else 'uniform'})"
 
-# Models that accept 5D [B, T, C, H, W] input directly (with their own
-# internal temporal handling — LTAE, 3D conv, TimeMerge DoubleConv, or
-# (for universat/ramen) their own dict-based temporal-axis handling).
 is_temporal_model = args.model in (
     "unet_ltae", "vit_ltae", "vit_upernet_ltae", "vit_upernet_mt",
     "prithvi", "resnet_upernet_mt", "resnet_upernet_ltae",
@@ -980,6 +999,9 @@ else:
 # Print summary
 if args.test_only:
     print(f"\n[Train] Test-only mode: {args.test_only}\n")
+if args.resume_from:
+    print(f"[Train] Resume requested: {args.resume_from} "
+          f"(wait up to {args.resume_wait_seconds}s if not found yet)")
 
 print(f"\n{'='*60}")
 print(f"  PASTIS-HD Baseline Training")
@@ -1052,8 +1074,6 @@ print(f"  Test:  {len(test_ds)} patches")
 if args.model in ("universat", "ramen"):
     print(f"[PASTIS-BL] {args.model}: dedicated collate embedding real "
           f"per-modality dates as '<mod>_dates' keys")
-    # RAMEN never gets the S1 ratio band (no established RAMEN code for
-    # it) regardless of --universat_use_s1_ratio, which is UniverSat-only.
     collate_fn = make_universat_pastis_collate(
         use_s1=args.use_s1,
         use_s1_ratio=(args.universat_use_s1_ratio
@@ -1102,10 +1122,6 @@ model = build_model(
 
 trainer_module = BaselineTrainer(
     model=model,
-    # UniverSat/RAMEN both consume the full {"s2":..., "s2_dates":...,
-    # ["s1":..., "s1_dates":...]} dict directly (expects_full_image_dict-
-    # style) — "modality" is unused in that case, only shown in the
-    # startup print, same as senflood's "optical+sar" placeholder.
     modality=("s2" if args.model not in ("universat", "ramen")
               else "s2+s1" if args.use_s1 else "s2"),
     temporal=is_temporal_model,
@@ -1173,11 +1189,6 @@ if args.test_only is None:
         LearningRateMonitor(logging_interval="step"),
     ]
 
-    # universat/ramen both have structurally inert params (universat: SAR/
-    # DEM channel codes, single-modality fusion attention, S1-axis block
-    # at subpatch_px=1; ramen: RadarProjector polarization params when
-    # --use_s1 is off) — same find_unused_parameters requirement as every
-    # other RAMEN/UniverSat integration in this codebase.
     needs_unused = args.model in ("universat", "ramen") or True  # was unconditional already
 
     trainer = Trainer(
@@ -1198,9 +1209,20 @@ if args.test_only is None:
     print(f"  Starting: {args.model} — {modality_str}")
     print(f"  Temporal: {temporal_str}")
     print(f"  Train: folds 1,2,3 → Val: fold 4 → Test: fold 5")
+    if args.resume_from is not None:
+        print(f"  RESUMING from: {args.resume_from}")
     print(f"{'='*60}\n")
 
-    trainer.fit(trainer_module, train_loader, val_loader)
+    # Resolve --resume_from (with polling) right before fit -- dataset/model/
+    # wandb setup above happens regardless of whether we're resuming, so
+    # only the actual fit() call blocks waiting for the checkpoint.
+    fit_ckpt_path = None
+    if args.resume_from is not None:
+        fit_ckpt_path = wait_for_checkpoint(
+            args.resume_from, args.resume_wait_seconds, args.resume_poll_interval)
+        print(f"[PASTIS-BL] RESUMING from: {fit_ckpt_path}")
+
+    trainer.fit(trainer_module, train_loader, val_loader, ckpt_path=fit_ckpt_path)
 
     best_ckpt = trainer.checkpoint_callback.best_model_path
 
@@ -1252,10 +1274,6 @@ test_trainer.test(trainer_module, test_loader, ckpt_path=best_ckpt)
 # =============================================================================
 # GFLOPs (universat/ramen only for now; rank-zero, after best-checkpoint load)
 # =============================================================================
-# Measured at bs=1 via a DEDICATED DataLoader, never the args.batch_size
-# `test_loader` above -- see module docstring for the bug this fixes (an
-# earlier version forwarded full args.batch_size batches through the FLOPs
-# harness while still labeling the result "bs=1").
 
 if (args.model in ("universat", "ramen") and args.flops_n > 0
         and os.environ.get("LOCAL_RANK", "0") == "0"):
@@ -1266,12 +1284,6 @@ if (args.model in ("universat", "ramen") and args.flops_n > 0
     device = "cuda" if torch.cuda.is_available() else "cpu"
     eval_model = trainer_module.model.to(device).eval()
 
-    # Dedicated bs=1 loader for FLOPs -- reuses the SAME collate_fn (so the
-    # per-sample dict shape the model expects is unchanged), just at
-    # batch_size=1 instead of args.batch_size, matching every other GFLOPs
-    # harness in this codebase (script_universat_sweep_senflood.py /
-    # _burnscars.py's make_loader, the xView2 baseline script's
-    # _build_tile_batch, script_train_xview.py's measure_test_gflops).
     flops_loader = DataLoader(
         test_ds,
         batch_size=1,

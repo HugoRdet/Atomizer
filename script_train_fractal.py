@@ -14,8 +14,21 @@ learns the fusion. No colorization preprocessing (RandLa-Net baseline projects
 VHR onto LIDAR points before training; we skip this and let the model learn
 the fusion).
 
-The architecture is identical to FLAIR-HUB Atomizer. Only the dataset, trainer,
-and class count change.
+The architecture is identical to FLAIR-HUB Atomizer, EXCEPT the model class
+is Atomiser_Fractal (not the base Atomiser_Senflood_Skip): it swaps in the
+precompute-capable GeographicPruning (reused from geographic_pruning_dales.py)
+and adds the decoder pixel-skip + z-aware query cascade. Only the dataset,
+trainer, and class count otherwise change.
+
+REQUIRES precompute_fractal_latent_assignment.py to have been run for EVERY
+split (train/val/test) before this script — see "PRECOMPUTED VORONOI
+ASSIGNMENT" below. --tokens_per_latent used there MUST exactly match this
+run's config_model["latent_grid"]["train_sampling"]/["val_sampling"], which
+must each resolve to a SINGLE (tokens_per_latent, cross_k) pair — a mismatch
+isn't caught until the first forward pass (GeographicPruning's L_spatial
+assertion), not at startup (this script adds an explicit early check for
+that specific case — see below — but a value mismatch that's still single-
+valued on both sides won't be caught until the first forward pass).
 
 Optional cross-task transfer:
     --ckpt_path <flairhub_checkpoint.ckpt>
@@ -46,6 +59,12 @@ Examples
     python script_train_fractal.py --xp_name fractal_v1_test \\
         --ckpt_path ./checkpoints/fractal/atomiser_fractal_v1-best.ckpt \\
         --test_only
+
+    # Smoke test without precomputed assignment (INCORRECT geo_pruning for
+    # LIDAR — shared-batch path — only for quick sanity checks, never for
+    # a real training run)
+    python script_train_fractal.py --xp_name smoke_test \\
+        --use_precomputed_assignment false --epochs 1
 """
 
 # =============================================================================
@@ -132,29 +151,63 @@ parser.add_argument("--xp_name",      type=str, required=True)
 parser.add_argument("--config_model", type=str,
                     default="config_test-FRACTAL.yaml",
                     help="Atomizer config YAML. Use the same config family "
-                         "as FLAIR-HUB for encoder-architecture reuse.")
+                         "as FLAIR-HUB for encoder-architecture reuse. "
+                         "MUST set config_model['latent_grid']"
+                         "['train_sampling']/['val_sampling'] to a SINGLE "
+                         "(tokens_per_latent, cross_k) pair matching "
+                         "whatever --tokens_per_latent was used with "
+                         "precompute_fractal_latent_assignment.py.")
 parser.add_argument("--dataset_name", type=str, default="u_regular")
 parser.add_argument("--num_workers",  type=int, default=4)
 parser.add_argument("--epochs",       type=int, default=100)
 parser.add_argument("--batch_size",   type=int, default=None,
                     help="Override config's batchsize")
+parser.add_argument("--precision",    type=str, default="bf16-mixed",
+                    choices=["32-true", "bf16-mixed", "16-mixed"],
+                    help="Lightning precision mode. bf16-mixed (default) "
+                         "is the standard choice on H100 — full bf16 "
+                         "hardware support, and bf16's fp32-width exponent "
+                         "range avoids the gradient-scaler/overflow "
+                         "handling that 16-mixed (fp16) needs. Use 32-true "
+                         "only if you're debugging a numerics issue and "
+                         "want to rule precision out as the cause.")
 
 # FRACTAL-specific dataset args
 parser.add_argument("--root_path",          type=str, default="./data",
                     help="Parent dir containing FRACTAL/ and FRACTAL-IRGB/.")
 parser.add_argument("--max_lidar_points",   type=int, default=16_000,
                     help="Max LIDAR points per patch (subsampled if exceeded). "
-                         "Also the padding target for batching.")
+                         "Also the padding target for batching. MUST match "
+                         "the --max_lidar_points used when running "
+                         "precompute_fractal_latent_assignment.py, since it "
+                         "feeds into that script's grid-sizing (total_tokens) "
+                         "— see that script's docs for why.")
 parser.add_argument("--valid_patches_file", type=str, default=None,
                     help="Optional precomputed JSON listing valid patch IDs "
                          "per split.")
+
+# Precomputed Voronoi assignment (see precompute_fractal_latent_assignment.py)
+parser.add_argument("--use_precomputed_assignment", type=str2bool, default=True,
+                    help="Requires precompute_fractal_latent_assignment.py "
+                         "to have been run for EVERY split first (writes "
+                         "<root_path>/FRACTAL/data/<split>/vhr_assignment.npy "
+                         "and <patch>_latent_assign.npz sidecars alongside "
+                         "each split's .laz files). False falls back to "
+                         "GeographicPruning's shared-batch path, which is "
+                         "INCORRECT for LIDAR's per-sample token ordering — "
+                         "only ever use False for quick smoke tests, never "
+                         "for a real training run.")
+parser.add_argument("--build_pixel_skip_queries", type=str2bool, default=True,
+                    help="Computes query_token_idx/query_token_valid for the "
+                         "decoder pixel-skip cascade. Only has an effect if "
+                         "config_model['Atomiser']['use_decoder_skip'] is "
+                         "also true — otherwise this is computed but unused "
+                         "(harmless, just wasted per-item work).")
 
 # Loss / training options
 parser.add_argument("--ignore_index", type=int, default=255,
                     help="Class to ignore. Default 255 matches FractalDataset's "
                          "padding label.")
-parser.add_argument("--class_weighting", type=str, default="auto",
-                    choices=["auto", "none"])
 
 # Resume / test
 parser.add_argument("--ckpt_path",    type=str, default=None,
@@ -203,6 +256,34 @@ else:
 
 # ── Override epochs in the config (cosine schedule reads from this) ──
 config_model["trainer"]["epochs"] = args.epochs
+
+# ── Sanity check: latent_grid sampling must be single-valued when using
+# precomputed assignment (see module docstring) — fail fast at startup
+# rather than after the first forward pass. ────────────────────────────
+if args.use_precomputed_assignment:
+    latent_cfg = config_model.get("latent_grid", {})
+    for key in ("train_sampling", "val_sampling"):
+        sampling = latent_cfg.get(key, [[8192, 1024]])
+        if len(sampling) != 1:
+            raise ValueError(
+                f"[FRACTAL] --use_precomputed_assignment=True requires "
+                f"config_model['latent_grid']['{key}'] to resolve to a "
+                f"SINGLE (tokens_per_latent, cross_k) pair — got "
+                f"{sampling}. The offline Voronoi precompute assumes a "
+                f"fixed latent grid; sampling between multiple "
+                f"tokens_per_latent values per step would make the "
+                f"precomputed assignment invalid on whichever steps don't "
+                f"draw the value it was built for. Either fix the config "
+                f"to a single pair, or pass "
+                f"--use_precomputed_assignment false (not recommended for "
+                f"real training — see that flag's help text)."
+            )
+    print(f"[FRACTAL] latent_grid sampling confirmed single-valued: "
+          f"train={latent_cfg.get('train_sampling')}, "
+          f"val={latent_cfg.get('val_sampling')} — make sure the "
+          f"tokens_per_latent value there matches whatever "
+          f"--tokens_per_latent was passed to "
+          f"precompute_fractal_latent_assignment.py.")
 
 
 # =============================================================================
@@ -261,9 +342,11 @@ print(f"  Max LIDAR pts:   {args.max_lidar_points}")
 print(f"  Batch size:      {batch_size}")
 print(f"  Epochs:          {args.epochs}")
 print(f"  Config:          {args.config_model}")
+print(f"  Precision:       {args.precision}")
 print(f"  Lookup tbl:      {len(lookup_table.table_wave)} spectral entries")
 print(f"  Ignore idx:      {args.ignore_index}")
-print(f"  Class weights:   {args.class_weighting}")
+print(f"  Precomputed Voronoi assignment: {args.use_precomputed_assignment}")
+print(f"  Decoder pixel-skip queries:     {args.build_pixel_skip_queries}")
 if args.ckpt_path is not None:
     if args.test_only:
         print(f"  Mode:            TEST ONLY (ckpt: {args.ckpt_path})")
@@ -304,10 +387,12 @@ wandb_logger = WandbLogger(
         "max_lidar_points": args.max_lidar_points,
         "batch_size":       batch_size,
         "epochs":           args.epochs,
+        "precision":        args.precision,
         "ignore_index":     args.ignore_index,
-        "class_weighting":  args.class_weighting,
         "init_ckpt":        args.ckpt_path,
         "auto_resume_ckpt": auto_resume_ckpt,
+        "use_precomputed_assignment": args.use_precomputed_assignment,
+        "build_pixel_skip_queries":   args.build_pixel_skip_queries,
     },
     id=wandb_resume_id,
     resume="must" if wandb_resume_id is not None else None,
@@ -317,8 +402,36 @@ wandb_logger = WandbLogger(
 # =============================================================================
 # DATASETS + DATALOADERS
 # =============================================================================
+# Precomputed-assignment file layout (see precompute_fractal_latent_
+# assignment.py): for split `mode`, each LIDAR sidecar
+# (<patch_id>_latent_assign.npz) lives NEXT TO its own .laz file, wherever
+# that actually is on disk — FRACTAL nests patches under numbered
+# subdirectories (e.g. val/val/00/, val/val/01/, ...), so FractalDataset
+# looks each sidecar up relative to row["laz_path"].parent per-patch,
+# not from a flat directory passed in here (an earlier version of this
+# script/dataset assumed a flat layout and silently failed on every patch
+# not sitting directly in val/val/). The shared VHR assignment, by
+# contrast, IS one single file — one level up from the split's .laz root:
+#     <root_path>/FRACTAL/data/<mode>/vhr_assignment.npy
+# i.e. laz_root.parent in the precompute script's own terms (laz_root
+# there being root_path/FRACTAL/data/<mode>/<mode>, since SPLIT_DIRS
+# values are nested like "train/train").
 
 def build_dataset(mode: str):
+    split_dir = FractalDataset.SPLIT_DIRS[mode]
+    laz_dir   = os.path.join(args.root_path, "FRACTAL", "data", split_dir)
+    vhr_assignment_path = os.path.join(
+        os.path.dirname(laz_dir.rstrip("/")), "vhr_assignment.npy")
+
+    if args.use_precomputed_assignment:
+        if not os.path.exists(vhr_assignment_path):
+            raise FileNotFoundError(
+                f"[FRACTAL] use_precomputed_assignment=True but "
+                f"{vhr_assignment_path} doesn't exist. Run "
+                f"precompute_fractal_latent_assignment.py --split {mode} "
+                f"first, or pass --use_precomputed_assignment false."
+            )
+
     return FractalDataset(
         root_path=args.root_path,
         mode=mode,
@@ -327,6 +440,9 @@ def build_dataset(mode: str):
         look_up=lookup_table,
         max_lidar_points=args.max_lidar_points,
         valid_patches_file=args.valid_patches_file,
+        vhr_assignment_path=vhr_assignment_path,
+        use_precomputed_assignment=args.use_precomputed_assignment,
+        build_pixel_skip_queries=args.build_pixel_skip_queries,
     )
 
 
@@ -381,8 +497,6 @@ data_module = FractalDataModule()
 # =============================================================================
 # MODEL
 # =============================================================================
-class_weights_arg = "auto" if args.class_weighting == "auto" else None
-
 model = Model_Fractal(
     config=config_model,
     wand=wandb_logger is not None,
@@ -390,7 +504,6 @@ model = Model_Fractal(
     transform=None,
     lookup_table=lookup_table,
     ignore_index=args.ignore_index,
-    class_weights=class_weights_arg,
 )
 
 
@@ -400,7 +513,7 @@ model = Model_Fractal(
 callbacks = [
     ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename=f"precision32_{args.xp_name}-{{epoch:02d}}-"
+        filename=f"{args.precision.replace('-', '')}_{args.xp_name}-{{epoch:02d}}-"
                  f"{{val_mIoU:.4f}}",
         monitor="val_mIoU",
         mode="max",
@@ -424,7 +537,7 @@ trainer = Trainer(
     devices=-1,
     max_epochs=args.epochs,
     accelerator="gpu",
-    precision="32-true",
+    precision=args.precision,
     logger=wandb_logger,
     accumulate_grad_batches=1,
     log_every_n_steps=10,

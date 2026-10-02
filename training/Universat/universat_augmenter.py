@@ -17,6 +17,24 @@ BaselineTrainer already bilinearly upsamples logits to the target's
 spatial size when they differ, so G < H is fine (and is the default:
 G = H // output_stride, with a pixel-level G = H available via
 output_stride=1 thanks to the subpatch factor of 1).
+
+TRUE MODALITY REMOVAL: the inner UniverSat.forward() (UniverSat.py)
+already filters `wavelengths.keys() & x.keys()` internally, so it has
+always correctly handled a genuinely-absent modality key on its own.
+BUT both UniverSatSegmenter.forward() and UniverSatClassifier.forward()
+below previously hardcoded `ref = self.modalities[0]` — the FIRST
+constructed modality, unconditionally — to read B/H/W for the geometry
+call, rather than checking what's actually present in x. This raises a
+KeyError the moment that specific modality (e.g. "optical", if it's
+index 0) is the one genuinely omitted from a true-removal batch, even
+though the inner encoder call right after it would have handled the
+missing key just fine. Both forward() methods below now pick the first
+PRESENT modality instead — same fix pattern as RAMENUPerNet.forward()'s
+equivalent bug (ramen_upernet.py), but simpler here: since the
+segmentation head operates on the fixed-size output_grid (not a
+per-modality channel concatenation like RAMEN's decoder), no
+zero-padding is needed — an absent modality just contributes nothing,
+full stop.
 """
 
 from functools import partial
@@ -114,11 +132,12 @@ class UniverSatSegmenter(nn.Module):
     Geometry (per modality m):
         patch_px    = patch_size_m / input_res[m]   (pixels per patch side)
         latent side = H / patch_px                  (trunk grid)
-        output side = H / output_stride             (CA_Sub grid)
+        output side = H / output_stride              (CA_Sub grid)
     Both divisions must be exact for every H the model will see
     (train crop AND eval window) — asserted at forward time. Grids are
-    derived from the FIRST modality in input_bands; with mixed-GSD
-    modalities UniverSat aligns them internally via input_res.
+    derived from the FIRST PRESENT modality in x (see forward() below);
+    with mixed-GSD modalities UniverSat aligns them internally via
+    input_res.
     """
 
     expects_full_image_dict = True
@@ -209,7 +228,22 @@ class UniverSatSegmenter(nn.Module):
 
     # ------------------------------------------------------------------
     def forward(self, x: dict):
-        ref = self.modalities[0]
+        # Pick the first PRESENT modality (not self.modalities[0]
+        # unconditionally) -- fixes a KeyError when the FIRST constructed
+        # modality happens to be the one genuinely absent from x under
+        # true modality removal. The inner encoder call below already
+        # handles missing modalities correctly on its own (it filters
+        # wavelengths.keys() & x.keys() internally); this was purely a
+        # bug in how THIS wrapper read B/H/W before that call.
+        ref = next((m for m in self.modalities if m in x), None)
+        if ref is None:
+            raise ValueError(
+                "UniverSatSegmenter.forward(): no modality in "
+                f"self.modalities ({self.modalities}) is present in the "
+                f"input dict (got keys: {list(x.keys())}). At least one "
+                f"modality must be present."
+            )
+
         # Snapshot modalities: (B, C, H, W). Time-series modalities:
         # (B, T, C, H, W) with a companion x[f"{mod}_dates"] (B, T) key —
         # the caller injects the dates (see e.g. the xView2 adapter);
@@ -236,6 +270,93 @@ class UniverSatSegmenter(nn.Module):
 
 def build_universat_segmenter(**kwargs) -> UniverSatSegmenter:
     return UniverSatSegmenter(**kwargs)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# CLASSIFIER — mirrors the repo's own classification protocol (LP_eval.py)
+# ═════════════════════════════════════════════════════════════════════════
+
+class UniverSatClassifier(UniverSatSegmenter):
+    """
+    Scene classification on the UniverSat encoder, from scratch.
+
+    Mirrors the repo's published classification protocol (src/LP_eval.py):
+    encoder tokens -> strip the prepended registers -> POOL patch tokens
+    (mean by default, max optional) -> LayerNorm + Linear head (their
+    "CAPI-style probe", here trained end-to-end with the encoder rather
+    than probed on frozen SSL features). The alternative register-as-CLS
+    convention found in src/models/networks/MonoModal.py (`classif=True`
+    keeps token 0) is exposed via pooling="cls" — but note that file is
+    stale against the current encoder (its forward mis-handles the
+    (tokens, out) tuple return), so LP_eval's mean-pool is the maintained
+    convention and the default here.
+
+    Classification never uses the sub-patch skip (LP_eval runs
+    keep_subpatch=False): only the trunk's patch tokens are pooled, so
+    there is NO CA_Sub cost and `output_stride` is irrelevant — the
+    encoder is still called with an output grid (its API requires one);
+    we pass the latent grid itself, making Bilinear_out the identity
+    resample and the decode term as small as the API allows.
+
+    Inherits all of UniverSatSegmenter's conventions: wavelength dict/nm
+    handling, SAR string codes, patch-size sanity checks, temporal 5D
+    inputs with <mod>_dates, size presets. Also inherits the same
+    first-PRESENT-modality fix in forward() below (mirrors
+    UniverSatSegmenter.forward()'s fix — this class previously had the
+    identical `ref = self.modalities[0]` bug, unfixed until now).
+    """
+
+    def __init__(self, *args, pooling: str = "mean", **kwargs):
+        super().__init__(*args, **kwargs)
+        if pooling not in ("mean", "max", "cls"):
+            raise ValueError(f"pooling must be 'mean', 'max' or 'cls', got {pooling}")
+        self.pooling = pooling
+        # Replace the segmentation 1x1-conv head with the LP-style head:
+        # LayerNorm + Linear on the pooled embedding.
+        num_classes = self.head.out_channels
+        embed_dim = self.encoder.embed_dim
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, num_classes),
+        )
+        print(f"[UniverSatCls] pooling={pooling}, LN+Linear head "
+              f"({embed_dim} -> {num_classes})")
+
+    def forward(self, x: dict):
+        ref = next((m for m in self.modalities if m in x), None)
+        if ref is None:
+            raise ValueError(
+                "UniverSatClassifier.forward(): no modality in "
+                f"self.modalities ({self.modalities}) is present in the "
+                f"input dict (got keys: {list(x.keys())}). At least one "
+                f"modality must be present."
+            )
+
+        B = x[ref].shape[0]
+        H, W = x[ref].shape[-2], x[ref].shape[-1]
+        latent_grid, _ = self._grids(H, W, ref)
+
+        tokens, _ = self.encoder(
+            x,
+            wavelengths=self.wavelengths,
+            input_res=self.input_res,
+            scale=self.scale,
+            latent_grid=latent_grid,
+            output_grid=latent_grid,     # identity resample; no finer decode
+            subpatches=self.subpatches,
+            dataset="",                  # skip SSL projector heads
+        )
+        if self.pooling == "cls":
+            pooled = tokens[:, 0]                                # first register
+        else:
+            patch_tokens = tokens[:, self.encoder.n_registers:]  # registers PREPENDED
+            pooled = (patch_tokens.mean(dim=1) if self.pooling == "mean"
+                      else patch_tokens.max(dim=1).values)
+        return self.head(pooled)                                 # [B, K]
+
+
+def build_universat_classifier(**kwargs) -> UniverSatClassifier:
+    return UniverSatClassifier(**kwargs)
 
 
 # ── Smoke test ───────────────────────────────────────────────────────────
@@ -292,3 +413,28 @@ if __name__ == "__main__":
     vv = dict(mm.named_parameters())["encoder.spatial_encoder.Encoding_VV"]
     print(f"multimodal logits {tuple(logits.shape)}, loss={loss.item():.3f}, "
           f"Encoding_VV grad: {'yes' if vv.grad is not None else 'NO'}")
+
+    # 3) TRUE modality removal smoke test — omit "sar" entirely (not
+    #    zero-masked) and confirm forward() no longer crashes on the
+    #    first-PRESENT-modality lookup (previously KeyError'd on "optical"
+    #    only when it happened to be the constructed modalities[0] AND
+    #    genuinely absent -- here we drop "sar" instead to also confirm
+    #    the inner encoder path, which never had this bug, still works).
+    with torch.no_grad():
+        logits_optical_only = mm({"optical": torch.randn(1, 13, 64, 64)})
+    print("optical-only (sar omitted) logits:",
+          tuple(logits_optical_only.shape))  # expect (1, 2, 16, 16)
+
+    # Classifier true-removal smoke test too.
+    clf = build_universat_classifier(
+        input_bands={"optical": S2, "sar": ["VV", "VH"]},
+        wavelengths={"optical": S2_NM, "sar": ["VV", "VH"]},
+        num_classes=5,
+        input_res={"optical": 10.0, "sar": 10.0},
+        patch_size_m=80.0,
+        size="tiny",
+        pooling="mean",
+    )
+    with torch.no_grad():
+        cls_logits = clf({"sar": torch.randn(1, 2, 64, 64)})  # optical omitted
+    print("classifier, optical omitted, logits:", tuple(cls_logits.shape))  # expect (1, 5)
