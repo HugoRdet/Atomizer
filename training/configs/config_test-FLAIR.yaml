@@ -1,0 +1,188 @@
+# =============================================================================
+# All dead/conflicting parameters removed.
+# All implicit defaults pinned explicitly.
+# =============================================================================
+
+encoder: ATOMIZER
+
+optimizer:
+    name: ADAMW
+
+# -----------------------------------------------------------------------------
+# RoPE — read by _init_encoder_layers() via config["RoPE"]
+# -----------------------------------------------------------------------------
+RoPE:
+    base: 100.0
+    self_compression_scale: 52.5
+    cross_compression_scale: 2
+    learnable_scale: true
+
+# -----------------------------------------------------------------------------
+# Latent grid + stochastic sampling
+# read by Atomiser_Senflood via config["latent_grid"]
+# -----------------------------------------------------------------------------
+latent_grid:
+    sigma_factor: 1.5
+    hexagonal: true
+    train_sampling:
+        - [2000, 1000]
+    val_sampling:
+        - [2000, 2000]
+
+# -----------------------------------------------------------------------------
+# Trainer
+# -----------------------------------------------------------------------------
+trainer:
+    batchsize: 3
+    train_batch_size: 3
+    val_batch_size: 1
+    test_batch_size: 1
+    mode: "segmentation"
+    max_tokens: 262144
+    max_tokens_reconstruction: 100_000
+    lr: 1e-4
+    dropout: 0.05
+    epochs: 30
+    logging_step: 10
+    num_classes: 19
+    weight_decay: 1e-3
+    accumulate_grad_batches: 1
+    multi_modal: True
+    #checkpoint_path: "./checkpoints/pastis/pastis_pastis_e2e_ltae-epoch=21-val_mIoU=0.4640.ckpt"
+    refinement_warmup: False # freeze encoder, only train refinement path
+
+# -----------------------------------------------------------------------------
+# Architecture
+# -----------------------------------------------------------------------------
+Atomiser:
+    use_ltae: False
+    ltae:
+        n_head: 16
+        d_k: 4
+        d_model: 768
+        dropout: 0.2
+        num_freq_bands: 24
+        cycle_period: 365.0
+        positional_encoding: true
+
+    # --- Core dims ---
+    latent_dim: 768
+    depth: 1
+    self_per_cross_attn: 4
+    resolution_compression_scale: 10
+
+    # --- Attention heads ---
+    cross_heads: 16
+    cross_dim_head: 64
+    latent_heads: 8
+    latent_dim_head: 64
+
+    # --- Dropout ---
+    attn_dropout: 0.05
+    ff_dropout: 0.1
+
+    # --- Weight sharing ---
+    weight_tie_layers: False
+
+    # --- Global latents ---
+    global_latents: 128
+
+    # --- Decoder ---
+    decoder_k_spatial: 4
+    final_classifier_head: true
+
+    # --- TokenProcessor MLP ---
+    tokenizer_hidden_size: 768
+    tokenizer_nb_layers: 2
+    tokenizer_out_dim: 128 # transformer token dim = 128
+
+    # --- Positional encoding (Fourier on delta_x, delta_y) ---
+    pos_encoding: FF
+    pos_max_freq: 32
+    pos_num_freq_bands: 32 # out_dim = 128*2*2 = 512
+
+    # --- Reflectance encoding (Fourier on band value) ---
+    bandvalue_encoding: FF
+    bandvalue_max_freq: 16
+    bandvalue_num_freq_bands: 16 # out_dim = 8*2 = 16
+
+    # --- Resolution encoding (pinned — were implicit code defaults) ---
+    resolution_num_bands: 1 # out_dim = 16*2+1 = 33
+    resolution_max_freq: 1
+
+    # --- Time encoding (pinned — were implicit code defaults) ---
+    time_num_freq_bands: 24
+    time_cycle_period: 365.0
+
+    # --- GSD (pinned — was implicit default in SensorGeometry) ---
+    gsd: 10.0
+
+    # --- Compression ---
+    compression_alpha: 10.0
+
+    # --- Constant GSD mode (pinned — was implicit default True) ---
+    use_constant_gsd: True
+
+    # --- RoPE / RPE ---
+    rope_learnable_scale: True
+    RPE:
+        encoder_use_rpe: False # no RoPE in cross-attention
+        selfattn_use_rpe: True # RoPE in self-attention
+        decoder_use_rpe: False
+
+    # --- Gradient checkpointing ---
+    gradient_checkpointing: true
+
+    use_error_predictor: False
+    use_refinement: False
+    lambda_error: 0.1
+    error_supervision_warmup_epochs: 0
+
+    use_targeted_depth2: false
+    targeted_depth2:
+        k: 100 # top-k high-error latents
+        cross_k: 2000 # full geo pool — no subsampling
+        self_attn: 3 # self-attn passes after update
+
+    refinement:
+        k_refine: 50 # was 50  — more boundary zones covered
+        grid_size: 2 # 2×2 = 4 mini-latents per parent
+        tokens_per_latent: 500
+        cross_k: 500 # was 500 — richer token signal per mini-latent
+        self_attn_local: 2
+        self_attn_global: 2 # was 2  — stronger signal propagation
+        offset_factor: 0.5 # was 0.25 — more spatial coverage per mini-latent
+        latent_spacing_estimate: 120
+
+# -----------------------------------------------------------------------------
+# Spectral encoding — 19 Gaussians (active encoder mode)
+# read by build_spectral_encoder() via config["wavelengths_encoding"]
+# out_dim = 19 (L2-normalized RBF activations)
+# -----------------------------------------------------------------------------
+wavelengths_encoding:
+    gauss_1: { mean: 380, std: 15 }
+    gauss_2: { mean: 424, std: 15 }
+    gauss_3: { mean: 468, std: 15 }
+    gauss_4: { mean: 513, std: 15 }
+    gauss_5: { mean: 557, std: 15 }
+    gauss_6: { mean: 602, std: 15 }
+    gauss_7: { mean: 646, std: 15 }
+    gauss_8: { mean: 691, std: 15 }
+    gauss_9: { mean: 735, std: 15 }
+    gauss_10: { mean: 780, std: 15 }
+    gauss_11: { mean: 850, std: 15 }
+    gauss_12: { mean: 940, std: 15 }
+    gauss_13: { mean: 1200, std: 80 }
+    gauss_14: { mean: 1400, std: 30 }
+    gauss_15: { mean: 1600, std: 40 }
+    gauss_16: { mean: 1750, std: 40 }
+    gauss_17: { mean: 1950, std: 40 }
+    gauss_18: { mean: 2100, std: 80 }
+    gauss_19: { mean: 2215, std: 80 }
+
+# -----------------------------------------------------------------------------
+# Debug / visualization
+# -----------------------------------------------------------------------------
+debug:
+    viz_every_n_epochs: 1
+    idxs_to_viz: [0, 1, 4, 5]
