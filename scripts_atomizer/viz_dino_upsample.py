@@ -19,6 +19,10 @@ Scores (printed, saved to dino_upsample_scores.txt), each variant average-pooled
     ... border / inside  the same, split into the outer ring of native tokens and the rest (edge effects)
     detail               std of the variant inside each native cell / std across native cells (0 = no sub-patch detail)
 
+Larger tiles: --crop 512 uses the full FLAIR-HUB patch (native grid 32 x 32); --context_crop 256 then also compares the
+tokens of the centred 256 x 256 crop (what training sees) with the 512 tile's tokens over the same area, ring by ring from
+the crop edge: if the edge rings agree much less than the centre, DINOv3's own features change near image borders.
+
 Setup (Jean Zay compute nodes have no internet: run the first line once on a login node, from the repo root):
     python -c "import torch; torch.hub.set_dir('./checkpoints/anyup'); torch.hub.load('wimmerth/anyup', 'anyup')"
     # -> code in ./checkpoints/anyup/wimmerth_anyup_main/, weights in ./checkpoints/anyup/checkpoints/
@@ -178,6 +182,11 @@ def main():
                     help="cache for AnyUp code + weights (fill it once on a node with internet, see the docstring)")
     ap.add_argument("--anyup_model", default="anyup", help="hub entry point (e.g. anyup_multi_backbone)")
     ap.add_argument("--q_chunk", type=int, default=256, help="AnyUp query chunk (memory)")
+    ap.add_argument("--crop", type=int, default=None,
+                    help="FLAIR crop side (default: distill.flair_crop). 512 = the full FLAIR-HUB patch (val crops are centred)")
+    ap.add_argument("--context_crop", type=int, default=None,
+                    help="also run the teacher on the centred context_crop x context_crop part of each tile and compare "
+                         "with the full tile's tokens over the same area (how much the extra context changes them)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="./viz_pca/dino_upsample")
     ap.add_argument("--configs_dataset", default="./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml")
@@ -188,6 +197,8 @@ def main():
     torch.manual_seed(args.seed)
     config = read_yaml(args.config)
     dc = config["distill"]
+    if args.crop:
+        dc["flair_crop"] = int(args.crop)
     bands = read_yaml(args.bands_yaml)
     lookup = Lookup_encoding(read_yaml(args.configs_dataset), bands, config)
     dm = DistillDataModule(config, lookup, bands)
@@ -199,6 +210,10 @@ def main():
     for f in args.input_up:
         if 16 % f:
             raise ValueError(f"--input_up {f}: 16 / {f} is not an integer patch")
+    cc = args.context_crop
+    if cc and (cc >= crop or cc % 16 or (crop - cc) % 32):
+        raise ValueError(f"--context_crop {cc}: needs < {crop}, a multiple of 16, centred on the token grid")
+    ctx = []                                                                             # [B, gc, gc] cosines
     up = load_anyup(args.anyup_src, args.anyup_model, args.anyup_dir).to(dev) if args.anyup_from else None
     if up is not None and (args.anyup_size > crop or args.anyup_size % (crop // 16)):
         raise ValueError(f"--anyup_size must be <= {crop} and a multiple of the native grid {crop // 16}")
@@ -217,6 +232,11 @@ def main():
                 raise ValueError(f"--anyup_from {src}: not a computed variant ({list(maps)})")
             maps[f"anyup_from_{src}"] = run_anyup(up, rgb, maps[src], args.anyup_size, args.q_chunk)
         names = list(maps)
+        if cc:
+            c0, gc, t0 = (crop - cc) // 2, cc // 16, (crop - cc) // 32
+            small = run_dino(teacher, rgb[..., c0:c0 + cc, c0:c0 + cc], 1, dev)          # [B, gc, gc, D]
+            big = maps["native"][:, t0:t0 + gc, t0:t0 + gc]
+            ctx.append(F.cosine_similarity(small, big, dim=-1).cpu())
         for k in names[1:]:
             for key, v in scores(maps["native"], maps[k]).items():
                 acc.setdefault(k, {}).setdefault(key, []).append((v, rgb.shape[0]))
@@ -230,16 +250,25 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     img = torch.cat(imgs)
     keep = {k: torch.cat(v) for k, v in keep.items()}
-    path = os.path.join(args.out, "dino_upsample_flair.png")
+    path = os.path.join(args.out, f"dino_upsample_flair_{crop}.png")
     render(img, keep, names, path, f"DINOv3 on FLAIR {crop}x{crop} | PCA basis: native tokens")
     lines = [f"{'variant':22s} {'grid':>9s} {'cos to native':>14s} {'border':>8s} {'inside':>8s} {'detail':>8s}"]
     for k in names[1:]:
         m = {key: sum(v * w for v, w in vals) / sum(w for _, w in vals) for key, vals in acc[k].items()}
         s = keep[k].shape[1]
         lines.append(f"{k:22s} {f'{s}x{s}':>9s} {m['cos']:14.3f} {m['border']:8.3f} {m['inside']:8.3f} {m['detail']:8.3f}")
+    if cc:
+        c = torch.cat(ctx)                                                              # [N, gc, gc]
+        gc = c.shape[1]
+        ii = torch.arange(gc)
+        ring = torch.minimum(torch.minimum(ii[:, None], ii[None, :]),
+                             torch.minimum(gc - 1 - ii[:, None], gc - 1 - ii[None, :]))  # distance to the crop edge
+        prof = " ".join(f"{float(c[:, ring == r].mean()):.3f}" for r in range(int(ring.max()) + 1))
+        lines += ["", f"context: DINOv3 on the centred {cc}x{cc} crop vs the {crop}x{crop} tile over the same area",
+                  f"  cos mean {float(c.mean()):.3f} | by token ring from the crop edge (0 = edge, inward): {prof}"]
     txt = "\n".join(lines)
     print(txt)
-    with open(os.path.join(args.out, "dino_upsample_scores.txt"), "w") as f:
+    with open(os.path.join(args.out, f"dino_upsample_scores_{crop}.txt"), "w") as f:
         f.write(f"{len(idx)} FLAIR val tiles, crop {crop}, seed {args.seed}\n{txt}\n")
     print(f"[dino_upsample] figure -> {path}")
 
