@@ -196,7 +196,8 @@ def main():
     ap.add_argument("--input_up", type=int, nargs="*", default=[2, 4], help="input upsampling factors (16 must divide)")
     ap.add_argument("--anyup_from", nargs="*", default=["native", "input_x2"],
                     help="variants AnyUp upsamples ('native', 'input_x2', ...); empty list = no AnyUp")
-    ap.add_argument("--anyup_size", type=int, default=128, help="AnyUp output side (<= crop)")
+    ap.add_argument("--anyup_size", type=int, nargs="+", default=[128],
+                    help="AnyUp output side(s) (<= crop, multiples of the native grid), e.g. --anyup_size 32 64 128")
     ap.add_argument("--anyup_src", default="wimmerth/anyup", help="torch.hub repo or local clone of it")
     ap.add_argument("--anyup_dir", default="./checkpoints/anyup",
                     help="cache for AnyUp code + weights (fill it once on a node with internet, see the docstring)")
@@ -244,8 +245,9 @@ def main():
         raise ValueError(f"--context_crop {cc}: needs < {crop}, a multiple of 16, centred on the token grid")
     ctx = []                                                                             # [B, gc, gc] cosines
     up = load_anyup(args.anyup_src, args.anyup_model, args.anyup_dir).to(dev) if args.anyup_from else None
-    if up is not None and (args.anyup_size > crop or args.anyup_size % (crop // 16)):
-        raise ValueError(f"--anyup_size must be <= {crop} and a multiple of the native grid {crop // 16}")
+    for sz in (args.anyup_size if up is not None else []):
+        if sz > crop or sz % (crop // 16):
+            raise ValueError(f"--anyup_size {sz}: must be <= {crop} and a multiple of the native grid {crop // 16}")
 
     rng = np.random.default_rng(args.seed)
     idx = rng.choice(len(ds), size=min(max(args.tiles, args.n), len(ds)), replace=False).tolist()
@@ -263,9 +265,10 @@ def main():
         for src in args.anyup_from:
             if src not in maps:
                 raise ValueError(f"--anyup_from {src}: not a computed variant ({list(maps)})")
-            k = f"anyup_from_{src}"
-            maps[k], m, t = measured(lambda: run_anyup(up, rgb, maps[src], args.anyup_size, args.q_chunk), dev)
-            cost[k] = (m, t, src)
+            for sz in args.anyup_size:
+                k = f"anyup_{sz}_from_{src}"
+                maps[k], m, t = measured(lambda: run_anyup(up, rgb, maps[src], sz, args.q_chunk), dev)
+                cost[k] = (m, t, src)
         names = list(maps)
         if s0 > 0 or len(idx) <= args.batch:                          # first batch = warm-up (kernels, allocator)
             for k, (m, t, src) in cost.items():
