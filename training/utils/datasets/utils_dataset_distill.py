@@ -20,6 +20,10 @@ with statistics computed once by check_distill_data.py --compute-stats (clamped 
 Augmentation (train): random flips/rotations (and a random crop for FLAIR), applied to the pixels BEFORE both the atoms and
 the teacher input, so student and teacher always see the same image. Positions never change (they come from pixel indices).
 
+Band dropping (distill.band_drop, train only): with probability p a tile loses k whole bands (k uniform in
+1..max_drop, taken among `bands`, at least min_keep bands kept): their tokens are masked (mask True, value 0), so the
+student's per-pixel attention ignores them. The teacher input is never changed (the teacher always sees every band).
+
 FLAIR views (distill.flair_views): a FLAIR item can be requested as dataset[(i, crop, up)]: a `crop` x `crop` patch whose
 teacher input is upsampled `up` times (DINOv3 token = 16/up pixels of the crop). MixedViewBatchSampler draws one view per
 FLAIR batch (the same on every rank) and yields keys for DistillConcat; FixedView pins one view (validation).
@@ -141,13 +145,43 @@ class _AtomDataset(Dataset):
     def _zscore(self, x):
         return ((x - self.mean) / self.std).clamp(-10, 10)
 
+    def _init_band_drop(self, cfg, C):
+        """cfg: None or dict(p, bands=[channel indices] (default all), max_drop (default all candidates), min_keep=1)."""
+        self.band_drop = None
+        if not cfg or float(cfg.get("p", 0.0)) <= 0.0:
+            return
+        bands = [int(b) for b in cfg.get("bands", range(C))]
+        if not bands or any(not 0 <= b < C for b in bands):
+            raise ValueError(f"[{self.name}] band_drop.bands {bands} out of 0..{C - 1}")
+        min_keep = int(cfg.get("min_keep", 1))
+        max_drop = min(int(cfg.get("max_drop", len(bands))), len(bands), C - min_keep)
+        if max_drop < 1:
+            raise ValueError(f"[{self.name}] band_drop leaves nothing to drop (min_keep {min_keep}, C {C})")
+        self.band_drop = dict(p=float(cfg["p"]), bands=np.array(bands), max_drop=max_drop)
+        print(f"[{self.name}] band drop (train): p={self.band_drop['p']}, 1..{max_drop} of channels {bands}")
+
+    def _drop_bands(self, tokens, mask, C):
+        """Mask whole bands of one tile (channel-major tokens: band c owns rows c*HW .. (c+1)*HW)."""
+        bd = self.band_drop
+        if bd is None or not self.aug or self._rng.random() >= bd["p"]:
+            return tokens, mask
+        k = int(self._rng.integers(1, bd["max_drop"] + 1))
+        drop = self._rng.choice(bd["bands"], size=k, replace=False)
+        HW = tokens.shape[0] // C
+        mask = mask.clone().view(C, HW)
+        mask[torch.from_numpy(drop)] = True
+        mask = mask.view(-1)
+        tokens[mask, 0] = 0.0                                   # tokens is a fresh copy (AtomTemplate.fill)
+        return tokens, mask
+
 
 # ---------------------------------------------------------------------------------------------------------
 class OlmoSentinelAtoms(_AtomDataset):
     name, resolution, HW = "olmo", 10.0, 128
 
     def __init__(self, index_csv, tar_dir, split, look_up, dataset_config, aug, stats_path,
-                 s2_section="bands_mmearth_s2", s1_section="bands_mmearth_s1", val_mod=200, stats_required=True):
+                 s2_section="bands_mmearth_s2", s1_section="bands_mmearth_s1", val_mod=200, stats_required=True,
+                 band_drop=None):
         import pandas as pd
         assert split in ("train", "val")
         df = pd.read_csv(index_csv, usecols=["tar", "offset", "size", "sid", "s2_mask", "s1_mask", "error"], dtype=str)
@@ -164,6 +198,7 @@ class OlmoSentinelAtoms(_AtomDataset):
         self.spectral_idx = spectral_indices(look_up, dataset_config, pairs)
         self.template = AtomTemplate(TokenBuilder(look_up), look_up, 14, self.HW, self.HW, self.resolution, self.spectral_idx)
         self._init_stats(stats_path, 14, stats_required)
+        self._init_band_drop(band_drop if aug else None, 14)
         print(f"[olmo {split}] {int(keep.sum())} tiles | spectral idx {dict(zip(OLMO_S2 + OLMO_S1, self.spectral_idx.tolist()))}")
 
     def __len__(self):
@@ -205,8 +240,8 @@ class OlmoSentinelAtoms(_AtomDataset):
     def __getitem__(self, i):
         s2n, s1n, ts = self._load(i, self.aug)
         x = torch.from_numpy(np.concatenate([s2n[:, :, 0, :], s1n[:, :, 0, :]], -1)).permute(2, 0, 1).contiguous()
-        tokens = self.template.fill(self._zscore(x))
-        return {"groups": {self.resolution: {"tokens": tokens, "mask": self.template.mask, "shape": self.template.shape}},
+        tokens, mask = self._drop_bands(self.template.fill(self._zscore(x)), self.template.mask, 14)
+        return {"groups": {self.resolution: {"tokens": tokens, "mask": mask, "shape": self.template.shape}},
                 "teacher": {"s2n": torch.from_numpy(s2n), "s1n": torch.from_numpy(s1n), "ts": torch.from_numpy(ts)},
                 "dataset_name": self.name}
 
@@ -217,7 +252,7 @@ class FlairAtoms(_AtomDataset):
 
     def __init__(self, index_csv, root, split, crop, look_up, dataset_config, aug, stats_path,
                  aerial_section="bands_flairhub_aerial", aerial_names=("RED", "GREEN", "BLUE", "NIR"),
-                 share_s2=False, s2_section="bands_mmearth_s2", stats_required=True, crops=None):
+                 share_s2=False, s2_section="bands_mmearth_s2", stats_required=True, crops=None, band_drop=None):
         """crop: default crop side; crops: every crop side that may be requested (one token template each)."""
         import pandas as pd
         assert split in ("train", "val")
@@ -239,6 +274,7 @@ class FlairAtoms(_AtomDataset):
                           for c in sorted(set([int(crop)] + [int(c) for c in (crops or [])]))}
         self.template = self.templates[int(crop)]
         self._init_stats(stats_path, 4, stats_required)
+        self._init_band_drop(band_drop if aug else None, 4)
         print(f"[flair {split}] {len(df)} patches, crops {sorted(self.templates)} (default {crop}) | spectral idx R,G,B,NIR = {self.spectral_idx.tolist()} "
               f"({'shared with S2' if share_s2 else aerial_section})")
 
@@ -293,9 +329,9 @@ class FlairAtoms(_AtomDataset):
         tpl = self.templates[crop]
         a = self._load(int(i), self.aug, crop)
         x = torch.from_numpy(a.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
-        tokens = tpl.fill(self._zscore(x))
+        tokens, mask = self._drop_bands(tpl.fill(self._zscore(x)), tpl.mask, 4)
         rgb = torch.from_numpy(np.ascontiguousarray(a[..., :3].transpose(2, 0, 1)))                # uint8 [3, H, W]
-        return {"groups": {self.resolution: {"tokens": tokens, "mask": tpl.mask, "shape": tpl.shape}},
+        return {"groups": {self.resolution: {"tokens": tokens, "mask": mask, "shape": tpl.shape}},
                 "teacher": {"rgb": rgb}, "dataset_name": self.name, "view": (crop, up)}
 
 

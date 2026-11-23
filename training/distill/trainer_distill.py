@@ -398,13 +398,16 @@ class DistillDataModule(pl.LightningDataModule):
         sr = self.stats_required
         self.views = parse_flair_views(dc)
         crops = sorted({v["crop"] for v in self.views})
+        bd = dc.get("band_drop") or {}
         for split, aug in (("train", True), ("val", False)):
             setattr(self, f"olmo_{split}", OlmoSentinelAtoms(dc["olmo_index"], dc["olmo_tar_dir"], split, aug=aug,
-                                                             stats_path=dc["olmo_stats"], stats_required=sr, **common))
+                                                             stats_path=dc["olmo_stats"], stats_required=sr,
+                                                             band_drop=bd.get("olmo"), **common))
             setattr(self, f"flair_{split}", FlairAtoms(dc["flair_index"], dc["flair_root"], split, int(dc["flair_crop"]), aug=aug,
                                                        stats_path=dc["flair_stats"], stats_required=sr,
                                                        aerial_section=dc.get("aerial_section", "bands_flairhub_aerial"),
-                                                       share_s2=bool(dc.get("share_s2", False)), crops=crops, **common))
+                                                       share_s2=bool(dc.get("share_s2", False)), crops=crops,
+                                                       band_drop=bd.get("flair"), **common))
         self._ready = True
 
     def _loader(self, ds, **kw):
