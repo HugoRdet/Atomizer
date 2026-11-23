@@ -19,6 +19,10 @@ Scores (printed, saved to dino_upsample_scores.txt), each variant average-pooled
     ... border / inside  the same, split into the outer ring of native tokens and the rest (edge effects)
     detail               std of the variant inside each native cell / std across native cells (0 = no sub-patch detail)
 
+Cost table: peak GPU memory above what is already allocated (weights, inputs) and time per tile, for each variant
+alone and, for AnyUp, including the teacher pass it upsamples ("total"). The first batch is excluded as warm-up.
+Peak memory grows with --batch (and for AnyUp with --q_chunk), so compare variants at the same batch.
+
 Larger tiles: --crop 512 uses the full FLAIR-HUB patch (native grid 32 x 32); --context_crop 256 then also compares the
 tokens of the centred 256 x 256 crop (what training sees) with the 512 tile's tokens over the same area, ring by ring from
 the crop edge: if the edge rings agree much less than the centre, DINOv3's own features change near image borders.
@@ -33,6 +37,7 @@ Setup (Jean Zay compute nodes have no internet: run the first line once on a log
 import argparse
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -86,6 +91,21 @@ def run_dino(teacher, rgb, factor, dev):
     with amp:
         out = teacher({"rgb": rgb})
     return out.float()                                                                   # [B, g, g, D]
+
+
+def measured(fn, dev):
+    """Run fn(); return (output, peak GPU memory above the memory in use before the call [bytes], seconds)."""
+    if dev.type != "cuda":
+        t = time.perf_counter()
+        out = fn()
+        return out, float("nan"), time.perf_counter() - t
+    torch.cuda.synchronize(dev)
+    base = torch.cuda.memory_allocated(dev)
+    torch.cuda.reset_peak_memory_stats(dev)
+    t = time.perf_counter()
+    out = fn()
+    torch.cuda.synchronize(dev)
+    return out, float(torch.cuda.max_memory_allocated(dev) - base), time.perf_counter() - t
 
 
 # ----------------------------------------------------------------------------------------------- analysis
@@ -229,18 +249,28 @@ def main():
 
     rng = np.random.default_rng(args.seed)
     idx = rng.choice(len(ds), size=min(max(args.tiles, args.n), len(ds)), replace=False).tolist()
-    keep, acc, imgs, names = {}, {}, [], None
+    keep, acc, imgs, names, perf = {}, {}, [], None, {}
     for s0 in range(0, len(idx), args.batch):
         batch = collate_distill([ds[i] for i in idx[s0:s0 + args.batch]])
         rgb = batch["teacher"]["rgb"].to(dev)
-        maps = {"native": run_dino(teacher, rgb, 1, dev)}
+        B = rgb.shape[0]
+        maps, cost = {}, {}                                           # cost[k] = (own peak, own s, source or None)
+        maps["native"], m, t = measured(lambda: run_dino(teacher, rgb, 1, dev), dev)
+        cost["native"] = (m, t, None)
         for f in args.input_up:
-            maps[f"input_x{f}"] = run_dino(teacher, rgb, f, dev)
+            maps[f"input_x{f}"], m, t = measured(lambda: run_dino(teacher, rgb, f, dev), dev)
+            cost[f"input_x{f}"] = (m, t, None)
         for src in args.anyup_from:
             if src not in maps:
                 raise ValueError(f"--anyup_from {src}: not a computed variant ({list(maps)})")
-            maps[f"anyup_from_{src}"] = run_anyup(up, rgb, maps[src], args.anyup_size, args.q_chunk)
+            k = f"anyup_from_{src}"
+            maps[k], m, t = measured(lambda: run_anyup(up, rgb, maps[src], args.anyup_size, args.q_chunk), dev)
+            cost[k] = (m, t, src)
         names = list(maps)
+        if s0 > 0 or len(idx) <= args.batch:                          # first batch = warm-up (kernels, allocator)
+            for k, (m, t, src) in cost.items():
+                c = perf.setdefault(k, dict(mem=0.0, t=0.0, n=0, src=src))
+                c["mem"] = max(c["mem"], m); c["t"] += t; c["n"] += B
         if cc:
             c0, gc, t0 = (crop - cc) // 2, cc // 16, (crop - cc) // 32
             small = run_dino(teacher, rgb[..., c0:c0 + cc, c0:c0 + cc], 1, dev)          # [B, gc, gc, D]
@@ -266,6 +296,22 @@ def main():
         m = {key: sum(v * w for v, w in vals) / sum(w for _, w in vals) for key, vals in acc[k].items()}
         s = keep[k].shape[1]
         lines.append(f"{k:22s} {f'{s}x{s}':>9s} {m['cos']:14.3f} {m['border']:8.3f} {m['inside']:8.3f} {m['detail']:8.3f}")
+    gb = 1024 ** 3
+    lines += ["", f"cost (GPU, batch {args.batch}; first batch excluded as warm-up; AnyUp q_chunk {args.q_chunk})",
+              f"{'variant':22s} {'peak GB':>8s} {'ms/tile':>8s} {'total peak GB':>14s} {'total ms/tile':>14s} "
+              f"{'target MB/tile':>15s}"]
+    for k in names:
+        c = perf.get(k)
+        if not c or not c["n"]:
+            continue
+        ms = 1000 * c["t"] / c["n"]
+        tot_m, tot_ms = c["mem"], ms
+        if c["src"] is not None:                                      # AnyUp: + the teacher pass it upsamples
+            p = perf[c["src"]]
+            tot_m, tot_ms = max(c["mem"], p["mem"]), ms + 1000 * p["t"] / p["n"]
+        s = keep[k].shape[1]
+        tgt_mb = s * s * keep[k].shape[-1] * 4 / 1024 ** 2            # fp32 target map of one tile
+        lines.append(f"{k:22s} {c['mem'] / gb:8.2f} {ms:8.1f} {tot_m / gb:14.2f} {tot_ms:14.1f} {tgt_mb:15.1f}")
     if cc:
         c = torch.cat(ctx)                                                              # [N, gc, gc]
         gc = c.shape[1]
