@@ -15,18 +15,35 @@ recommendation (trainer.slide=False, decode whole image) holds.
 FLAG — class imbalance: BurnScars is a heavily imbalanced binary task (burn
 scars are a small minority of pixels). This port keeps the loss/metrics
 exactly as in Sen1Floods11Skip (plain CrossEntropyLoss, macro-averaged
-IoU/accuracy with ignore_index=255) since no prior BurnScars trainer was
-available to diff against. If your old BurnScars runs used a weighted
-CrossEntropyLoss, Dice loss, or focal loss to handle the imbalance, that
-logic is NOT present here — flagging explicitly so it isn't silently lost.
-Macro IoU on a 2-class problem will heavily penalize a model that ignores
-the minority (burn) class, so it's a reasonable default metric even without
-loss reweighting, but you may still want to add class weights to self.loss
-if training collapses to majority-class prediction.
+IoU/accuracy with ignore_index=255).
 
-All changes vs Model_SenFlood_Skip are tagged  # >>> RENAME (cosmetic) or
-# >>> FLAG (behavioral, needs your confirmation).
+INTRA-LOOP SELF-DISTILLATION (ILSD, optional; config trainer.ilsd) — after the
+Elastic Looped Transformer (ELT). Every training step runs the encoder ONCE and
+decodes twice:
+    teacher  the full model
+    student  decoded from a random intermediate level l (levels above l unused:
+             exactly the ablation's keep_L0-l / no_coarse), on a random subset of
+             the pixels
+    loss = CE(teacher) + weight * [ lambda * CE(student)
+                                    + (1 - lambda) * KL(teacher.detach() || student) ]
+with lambda decaying linearly from lambda_start (1) to lambda_end (0) over training.
+Validation also reports val_mIoU_depth{l} (the model decoded from level l), so the
+usability of every depth can be followed during training; checkpoint selection
+stays on val_mIoU (the full model).
+
+    trainer:
+        ilsd:
+            enabled: true
+            levels: [0, 1, 2]       # student depths (default: every level below the bottleneck)
+            query_fraction: 0.25    # pixels supervised in the student path
+            weight: 1.0
+            lambda_start: 1.0
+            lambda_end: 0.0
+            temperature: 1.0
+            val_depths: true        # val_mIoU_depth{l} every epoch
 """
+
+import random
 
 import torch
 import torch.nn as nn
@@ -36,8 +53,7 @@ import torchmetrics
 from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
 
-# >>> RENAME: same encoder class, shared across tasks
-from training.atomiser.Atomiser_senflood_skip import Atomiser_Senflood_Skip
+from training.atomiser.Atomiser_unet import Atomiser_Unet
 from training.atomiser.error_supervision import (
     compute_latent_errors,
     compute_error_predictor_loss,
@@ -60,9 +76,6 @@ class Model_BurnScars_Skip(pl.LightningModule):
         self.ignore_index = 255
         self.use_sliding  = config["trainer"].get("slide", False)
 
-        # Guard unchanged from Sen1Floods11: BurnScars is also 512x512
-        # (see BurnScarsSkipDataset.IMG_SIZE), so _forward_crop dropping
-        # query_token_idx/valid is the same silent-disable risk.
         use_decoder_skip = config["Atomiser"].get("use_decoder_skip", False)
         if use_decoder_skip and self.use_sliding:
             raise ValueError(
@@ -82,60 +95,72 @@ class Model_BurnScars_Skip(pl.LightningModule):
         # =====================================================================
         # METRICS
         # =====================================================================
-        self.metric_IoU_train = torchmetrics.JaccardIndex(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_IoU_val = torchmetrics.JaccardIndex(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_IoU_test = torchmetrics.JaccardIndex(
-            task="multiclass", num_classes=self.num_classes,
-            average=None, ignore_index=self.ignore_index,
-        )
-        self.metric_acc_train = torchmetrics.Accuracy(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_acc_val = torchmetrics.Accuracy(
-            task="multiclass", num_classes=self.num_classes,
-            average="macro", ignore_index=self.ignore_index,
-        )
-        self.metric_acc_test = torchmetrics.Accuracy(
-            task="multiclass", num_classes=self.num_classes,
-            average=None, ignore_index=self.ignore_index,
-        )
+        def jaccard(avg):
+            return torchmetrics.JaccardIndex(task="multiclass", num_classes=self.num_classes,
+                                             average=avg, ignore_index=self.ignore_index)
+
+        def accuracy(avg):
+            return torchmetrics.Accuracy(task="multiclass", num_classes=self.num_classes,
+                                         average=avg, ignore_index=self.ignore_index)
+
+        self.metric_IoU_train = jaccard("macro")
+        self.metric_IoU_val   = jaccard("macro")
+        self.metric_IoU_test  = jaccard(None)
+        self.metric_acc_train = accuracy("macro")
+        self.metric_acc_val   = accuracy("macro")
+        self.metric_acc_test  = accuracy(None)
 
         # =====================================================================
         # MODEL
         # =====================================================================
-        self.encoder = Atomiser_Senflood_Skip(
-            config=self.config, lookup_table=self.lookup_table)
+        self.encoder = Atomiser_Unet(config=self.config, lookup_table=self.lookup_table)
 
         # =====================================================================
         # LOSS
         # =====================================================================
-        # >>> FLAG: plain CE, no class weighting. See module docstring.
         self.loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
         # =====================================================================
         # ERROR PREDICTOR SUPERVISION
         # =====================================================================
-        self.use_error_predictor = config["Atomiser"].get(
-            "use_error_predictor", False)
+        self.use_error_predictor = config["Atomiser"].get("use_error_predictor", False)
         if self.use_error_predictor:
-            self.lambda_error = float(
-                config["Atomiser"].get("lambda_error", 0.1))
-            self.error_warmup = int(
-                config["Atomiser"].get("error_supervision_warmup_epochs", 0))
+            self.lambda_error = float(config["Atomiser"].get("lambda_error", 0.1))
+            self.error_warmup = int(config["Atomiser"].get("error_supervision_warmup_epochs", 0))
             print(f"[Trainer] Error predictor supervision ENABLED "
                   f"(lambda={self.lambda_error}, warmup={self.error_warmup} epochs)")
         else:
             print(f"[Trainer] Error predictor supervision DISABLED")
 
+        # =====================================================================
+        # INTRA-LOOP SELF-DISTILLATION (optional)
+        # =====================================================================
+        il = config["trainer"].get("ilsd", {}) or {}
+        self.ilsd = bool(il.get("enabled", False))
+        S = self.encoder.unet.S
+        if self.ilsd:
+            if self.use_error_predictor:
+                raise ValueError("ILSD and the error predictor cannot be combined")
+            if self.use_sliding:
+                raise ValueError("ILSD needs whole-image decoding (trainer.slide: false)")
+            self.ilsd_levels = [int(x) for x in il.get("levels", list(range(S - 1)))]
+            bad = [l for l in self.ilsd_levels if not 0 <= l < S - 1]
+            if bad:
+                raise ValueError(f"trainer.ilsd.levels {bad}: must be in 0..{S - 2}")
+            self.ilsd_frac   = float(il.get("query_fraction", 0.25))
+            self.ilsd_weight = float(il.get("weight", 1.0))
+            self.ilsd_lam0   = float(il.get("lambda_start", 1.0))
+            self.ilsd_lam1   = float(il.get("lambda_end", 0.0))
+            self.ilsd_tau    = float(il.get("temperature", 1.0))
+            print(f"[Trainer] ILSD ENABLED: student levels {self.ilsd_levels}, "
+                  f"{100 * self.ilsd_frac:.0f}% of pixels, weight {self.ilsd_weight}, "
+                  f"lambda {self.ilsd_lam0} -> {self.ilsd_lam1}, T={self.ilsd_tau}")
+        self.val_depths = (list(range(S - 1)) if self.ilsd and il.get("val_depths", True) else [])
+        self.metric_IoU_val_depth = nn.ModuleList(jaccard("macro") for _ in self.val_depths)
+
         self.lr           = float(config["trainer"]["lr"])
         self.weight_decay = float(config["trainer"]["weight_decay"])
+        self._total_steps = None
 
     # =========================================================================
     # HELPERS
@@ -145,23 +170,53 @@ class Model_BurnScars_Skip(pl.LightningModule):
         return (self.use_error_predictor
                 and self.current_epoch >= self.error_warmup)
 
+    def _ilsd_lambda(self) -> float:
+        total = self._total_steps or 1
+        prog = min(1.0, self.global_step / max(1, total))
+        return self.ilsd_lam0 + (self.ilsd_lam1 - self.ilsd_lam0) * prog
+
     # =========================================================================
     # FORWARD
     # =========================================================================
 
     def forward(self, batch, training=False, return_for_error=False):
-        return self.encoder(
-            batch, training=training, return_for_error=return_for_error)
+        return self.encoder(batch, training=training, return_for_error=return_for_error)
 
     # =========================================================================
     # SHARED STEP LOGIC
     # =========================================================================
 
+    def _ilsd_step(self, batch):
+        """Teacher + student losses for one training batch."""
+        labels = batch["queries"][:, :, 4].long()
+        M = labels.shape[1]
+        n_s = max(1, int(round(self.ilsd_frac * M)))
+        idx = torch.randperm(M, device=labels.device)[:n_s]
+        level = random.choice(self.ilsd_levels)
+        out = self.encoder.forward_ilsd(batch, level, query_idx=idx)
+        y_hat, y_s = out["predictions"], out["student_predictions"]
+        seg_loss = self.loss(rearrange(y_hat, "b m c -> (b m) c"), rearrange(labels, "b m -> (b m)"))
+        lab_s = labels[:, idx]
+        ce_s = self.loss(rearrange(y_s, "b m c -> (b m) c"), rearrange(lab_s, "b m -> (b m)"))
+        T = self.ilsd_tau
+        p_t = F.softmax(y_hat[:, idx].detach().float() / T, dim=-1)
+        logp_s = F.log_softmax(y_s.float() / T, dim=-1)
+        kl = (p_t * (torch.log(p_t.clamp_min(1e-8)) - logp_s)).sum(-1) * (T * T)    # [B, M_s]
+        valid = lab_s != self.ignore_index
+        dist = kl[valid].mean() if valid.any() else kl.mean() * 0.0
+        lam = self._ilsd_lambda()
+        total = seg_loss + self.ilsd_weight * (lam * ce_s + (1.0 - lam) * dist)
+        self.log("train_ilsd_student_ce", ce_s, on_step=False, on_epoch=True, logger=True)
+        self.log("train_ilsd_distill", dist, on_step=False, on_epoch=True, logger=True)
+        self.log("ilsd_lambda", lam, on_step=True, on_epoch=False, logger=True)
+        return total, seg_loss, torch.argmax(y_hat, dim=-1), labels
+
     def _compute_loss_and_preds(self, batch, training=False):
+        if training and self.ilsd:
+            return self._ilsd_step(batch)
         supervise_error = training and self._should_supervise_error()
 
-        result = self.forward(
-            batch, training=training, return_for_error=supervise_error)
+        result = self.forward(batch, training=training, return_for_error=supervise_error)
 
         y_hat  = result["predictions"] if isinstance(result, dict) else result
         labels = batch["queries"][:, :, 4].long()
@@ -205,8 +260,6 @@ class Model_BurnScars_Skip(pl.LightningModule):
     # =========================================================================
     # SLIDING WINDOW INFERENCE
     # =========================================================================
-    # Kept intact (guarded off when use_decoder_skip=True, see __init__), so
-    # this trainer remains a drop-in for the non-skip BurnScars baseline too.
 
     def _forward_crop(self, batch, crop_idx):
         mini_batch = {
@@ -249,8 +302,7 @@ class Model_BurnScars_Skip(pl.LightningModule):
     # =========================================================================
 
     def training_step(self, batch, batch_idx):
-        total_loss, seg_loss, preds, labels = self._compute_loss_and_preds(
-            batch, training=True)
+        total_loss, seg_loss, preds, labels = self._compute_loss_and_preds(batch, training=True)
 
         self.metric_IoU_train.update(preds, labels)
         self.metric_acc_train.update(preds, labels)
@@ -273,10 +325,12 @@ class Model_BurnScars_Skip(pl.LightningModule):
                      prog_bar=True, logger=True)
             return loss
 
-        _, seg_loss, preds, labels = self._compute_loss_and_preds(
-            batch, training=False)
+        _, seg_loss, preds, labels = self._compute_loss_and_preds(batch, training=False)
         self.metric_IoU_val.update(preds, labels)
         self.metric_acc_val.update(preds, labels)
+        for metric, level in zip(self.metric_IoU_val_depth, self.val_depths):   # ILSD: every depth
+            p = self.encoder.predict_at_depth(batch, level).argmax(-1)
+            metric.update(p, labels)
         self.log("val_loss", seg_loss, on_step=False, on_epoch=True,
                  prog_bar=True, logger=True)
         return seg_loss
@@ -292,8 +346,7 @@ class Model_BurnScars_Skip(pl.LightningModule):
             self.log("test_loss", loss, on_step=False, on_epoch=True, logger=True)
             return loss
 
-        _, seg_loss, preds, labels = self._compute_loss_and_preds(
-            batch, training=False)
+        _, seg_loss, preds, labels = self._compute_loss_and_preds(batch, training=False)
         self.metric_IoU_test.update(preds, labels)
         self.metric_acc_test.update(preds, labels)
         self.log("test_loss", seg_loss, on_step=False, on_epoch=True, logger=True)
@@ -318,6 +371,10 @@ class Model_BurnScars_Skip(pl.LightningModule):
                  on_epoch=True, prog_bar=True, logger=True)
         self.metric_IoU_val.reset()
         self.metric_acc_val.reset()
+        for metric, level in zip(self.metric_IoU_val_depth, self.val_depths):
+            if metric.update_count:
+                self.log(f"val_mIoU_depth{level}", metric.compute(), on_epoch=True, logger=True)
+            metric.reset()
 
     def on_test_epoch_end(self):
         test_iou = self.metric_IoU_test.compute()
@@ -353,13 +410,13 @@ class Model_BurnScars_Skip(pl.LightningModule):
         suffix    = f"_{name}" if name else ""
         file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
         torch.save(self.encoder.state_dict(), file_path)
-        print(f"[BurnScars] Model saved to {file_path}")  # >>> RENAME
+        print(f"[BurnScars] Model saved to {file_path}")
 
     def load_model(self, name=None):
         suffix    = f"_{name}" if name else ""
         file_path = f"./pth_files/{self.config['encoder']}_{self.name}{suffix}.pth"
         self.encoder.load_state_dict(torch.load(file_path, weights_only=True))
-        print(f"[BurnScars] Model loaded from {file_path}")  # >>> RENAME
+        print(f"[BurnScars] Model loaded from {file_path}")
 
     # =========================================================================
     # OPTIMIZER
@@ -393,6 +450,7 @@ class Model_BurnScars_Skip(pl.LightningModule):
         )
 
         total_steps  = self._compute_total_steps()
+        self._total_steps = total_steps                 # also drives the ILSD lambda schedule
         warmup_steps = self.config.get("optimizer", {}).get(
             "warmup_steps", max(1, int(0.05 * total_steps))
         )

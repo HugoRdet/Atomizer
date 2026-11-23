@@ -51,13 +51,37 @@ Single-temporal — no LTAE needed. Supports:
              512 is divisible by 8 and 4, so full-image eval needs no
              adjustment. Logits come out at H/output_stride per side;
              BaselineTrainer bilinearly upsamples them to the target.
+  - ptv3   : Point Transformer V3 trained FROM SCRATCH (random init, no
+             pretrained weights) on the raster as a PIXELS-AS-POINTS point
+             cloud, via training.PTv3.model_ptv3_seg.PTv3Segmenter.
+
+             Each pixel becomes one point (x, y, 0) (metres = pixel index
+             * 30 m HLS GSD) whose feature is its 6 band values. The
+             wrapper maps [B, 6, H, W] -> [B, 2, H, W] on the plain
+             "hls" tensor, so collate / BaselineTrainer work unchanged.
+
+             PTv3 is size-agnostic (any point count per sample), so like
+             UNet/ResNet it trains on the random crops (224x224 = 50k
+             points) and evaluates on the FULL 512x512 image (262k points)
+             in a SINGLE dense forward — no sliding window
+             (window_size=None). The sparse conv / attention kernels are
+             pure PyTorch + Triton: NO spconv / torch_scatter / flash-attn.
+
+             Uses the standalone `point_transformer_v3` package
+             (github.com/Pointcept/PointTransformerV3); make it importable:
+                 export PYTHONPATH=/path/to/PointTransformerV3/src:$PYTHONPATH
+
+             NOTE on GFLOPs: FlopCounterMode may not see the Triton
+             sparse-conv / varlen-attention kernels, so ptv3's GFLOPs can
+             be an UNDER-ESTIMATE and may not be comparable to the other
+             models. Treat as indicative only.
 
 Same protocol as Sen1Floods11 baseline:
   - Same splits as PANGAEA (90/10 stratified train/val from training/, validation/ for test)
   - Same normalization (loaded from normalization_stats.pt or computed on train)
   - Same D4 augmentation
-  - Train: 256×256 random crops; Eval: full 512×512 (UNet/ResNet/UniverSat via
-    a single dense forward; RAMEN/ViT via sliding window)
+  - Train: 256×256 random crops; Eval: full 512×512 (UNet/ResNet/UniverSat/PTv3
+    via a single dense forward; RAMEN/ViT via sliding window)
   - ViT: train+eval at the same fixed size (--crop_size == --img_size)
 
 # >>> FLOPS_METHOD: GFLOPs is now measured with
@@ -116,6 +140,12 @@ Examples:
         --model universat --universat_output_stride 1 \
         --universat_window_size 256 --universat_stride 192 \
         --batch_size 1 --grad_accum 2 --lr 1e-4 --epochs 100
+
+    # PTv3 from scratch, pixels-as-points (train on crops, full-image eval)
+    python script_train_burnscars_baselines.py --xp_name ptv3_pixels \
+        --model ptv3 --ptv3_patch 1024 \
+        --ptv3_enc_channels 32 64 128 256 384 \
+        --batch_size 2 --lr 1e-4 --epochs 100
 """
 import os
 import sys
@@ -148,6 +178,7 @@ from training.VIT.model_vit_upernet import ViTUPerNet
 from training.ResNet.model_resnet_upernet import build_resnet_upernet
 from training.RAMEN.ramen_upernet import build_ramen_upernet  # adjust import path
 from training.Universat.universat_augmenter import build_universat_segmenter
+from training.PTv3.model_ptv3_seg import PTv3Segmenter
 from training.sliding_window import sliding_window_inference  # adjust import path
 from training.trainer_baselines import BaselineTrainer
 
@@ -161,7 +192,8 @@ IGNORE_INDEX = BurnScarsBaselineDataset.IGNORE_INDEX      # 255
 NUM_CHANNELS = BurnScarsBaselineDataset.NUM_CHANNELS      # 6
 MODALITY_KEY = "hls"
 HLS_GSD_M = 30.0   # HLS common grid — shared by RAMEN (--ramen_input_res
-                   # default) and UniverSat (patch_px = patch_m / GSD)
+                   # default), UniverSat (patch_px = patch_m / GSD) and
+                   # PTv3 (pixel index * GSD = metric coordinates)
 
 
 # =============================================================================
@@ -307,10 +339,33 @@ def build_model(model_name: str, in_channels: int, num_classes: int, args):
             size=args.universat_size,
         )
 
+    elif model_name == "ptv3":
+        # Random init, pixels-as-points. Takes the plain [B, 6, H, W]
+        # tensor (no expects_full_image_dict), size-agnostic: trains on
+        # crops, evaluates on the full 512x512 image in one forward.
+        ptv3_kwargs = {}
+        if args.ptv3_enc_channels is not None:
+            ptv3_kwargs["enc_channels"] = tuple(args.ptv3_enc_channels)
+        if args.ptv3_enc_depths is not None:
+            ptv3_kwargs["enc_depths"] = tuple(args.ptv3_enc_depths)
+        if args.ptv3_dec_channels is not None:
+            ptv3_kwargs["dec_channels"] = tuple(args.ptv3_dec_channels)
+        if args.ptv3_dec_depths is not None:
+            ptv3_kwargs["dec_depths"] = tuple(args.ptv3_dec_depths)
+        return PTv3Segmenter(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            gsd=HLS_GSD_M,
+            patch_size=args.ptv3_patch,
+            head_dim=args.ptv3_head_dim,
+            drop_path=args.ptv3_drop_path,
+            **ptv3_kwargs,
+        )
+
     else:
         raise ValueError(
             f"Unknown model: {model_name}. Available: 'unet', 'vit', "
-            f"'resnet', 'ramen', 'universat'"
+            f"'resnet', 'ramen', 'universat', 'ptv3'"
         )
 
 
@@ -421,7 +476,8 @@ def measure_gflops_forward(forward_fn, batches, device, n_warmup=1):
 parser = argparse.ArgumentParser(description="HLS BurnScars Baseline Training")
 parser.add_argument("--xp_name",   type=str, required=True)
 parser.add_argument("--model",     type=str, default="resnet",
-                    choices=["unet", "vit", "resnet", "ramen", "universat"])
+                    choices=["unet", "vit", "resnet", "ramen", "universat",
+                             "ptv3"])
 parser.add_argument("--data_dir",  type=str, default="./data/hls_burn_scars")
 
 parser.add_argument("--test_only", type=str, default=None,
@@ -430,9 +486,10 @@ parser.add_argument("--test_only", type=str, default=None,
                          "(also used for the GFLOPs measurement below). "
                          "You must still pass the same --model / "
                          "--resnet_variant / --vit_* / --ramen_* / "
-                         "--universat_* flags used when the checkpoint was "
-                         "trained, since the architecture is rebuilt from "
-                         "these flags, not from the checkpoint.")
+                         "--universat_* / --ptv3_* flags used when the "
+                         "checkpoint was trained, since the architecture is "
+                         "rebuilt from these flags, not from the "
+                         "checkpoint.")
 
 # Training
 parser.add_argument("--batch_size",   type=int, default=2)
@@ -457,7 +514,8 @@ parser.add_argument("--crop_size", type=int, default=224,
                          "parameter count/capacity, not window size. "
                          "UniverSat needs the crop divisible by its patch "
                          "size in px AND by --universat_output_stride; the "
-                         "default 224 is auto-rounded up to 256 for it.")
+                         "default 224 is auto-rounded up to 256 for it. "
+                         "PTv3 has no size constraint.")
 parser.add_argument("--img_size",  type=int, default=224,
                     help="ViT positional embedding size (ignored by UNet/ResNet). "
                          "Tiled via sliding-window over the full native image at "
@@ -465,9 +523,10 @@ parser.add_argument("--img_size",  type=int, default=224,
                          "directly (that was this repo's earlier, buggy behavior).")
 parser.add_argument("--eval_size", type=int, default=None,
                     help="Eval crop size. None = full image (UNet/ResNet/RAMEN/"
-                         "UniverSat — RAMEN tiles the full image via sliding-"
-                         "window inference; UniverSat runs a single dense "
-                         "forward unless --universat_window_size is set). "
+                         "UniverSat/PTv3 — RAMEN tiles the full image via "
+                         "sliding-window inference; UniverSat runs a single "
+                         "dense forward unless --universat_window_size is "
+                         "set; PTv3 always runs a single dense forward). "
                          "ViT auto-forces this to --img_size.")
 
 # UNet
@@ -557,6 +616,35 @@ parser.add_argument("--universat_window_size", type=int, default=None,
 parser.add_argument("--universat_stride", type=int, default=192,
                     help="Sliding-window stride for UniverSat eval; only "
                          "used when --universat_window_size is set.")
+
+# PTv3 (pixels-as-points, from scratch)
+parser.add_argument("--ptv3_patch", type=int, default=1024,
+                    help="PTv3 serialized-attention patch size (points per "
+                         "attention window), used at every stage. Attention "
+                         "uses torch's varlen kernel, so the default 1024 "
+                         "should be fine; if you hit memory errors on the "
+                         "512x512 eval image (262k points), try 256-512.")
+parser.add_argument("--ptv3_enc_channels", type=int, nargs=5, default=None,
+                    help="Override PTv3 encoder channels (5 values), e.g. "
+                         "32 64 128 256 384 to shrink the model. Default: "
+                         "32 64 128 256 512 (~46M params). Each value must "
+                         "be divisible by --ptv3_head_dim.")
+parser.add_argument("--ptv3_enc_depths", type=int, nargs=5, default=None,
+                    help="Override PTv3 encoder depths (5 values). "
+                         "Default: 2 2 2 6 2.")
+parser.add_argument("--ptv3_dec_channels", type=int, nargs=4, default=None,
+                    help="Override PTv3 decoder channels (4 values). The "
+                         "first value sets the linear head's input width. "
+                         "Default: 64 64 128 256.")
+parser.add_argument("--ptv3_dec_depths", type=int, nargs=4, default=None,
+                    help="Override PTv3 decoder depths (4 values). "
+                         "Default: 2 2 2 2.")
+parser.add_argument("--ptv3_head_dim", type=int, default=16,
+                    help="Channels per attention head (number of heads = "
+                         "channels / head_dim at every stage). Default 16, "
+                         "as in the reference recipe.")
+parser.add_argument("--ptv3_drop_path", type=float, default=0.3,
+                    help="Largest DropPath rate (reference recipe: 0.3).")
 
 # GFLOPs
 parser.add_argument("--flops", action="store_true", default=True,
@@ -662,6 +750,21 @@ if args.model == "universat":
     # (BaselineTrainer skips tiling when window_size=None); setting
     # --universat_window_size opts back into the sliding-window path.
 
+if args.model == "ptv3":
+    _enc = args.ptv3_enc_channels or [32, 64, 128, 256, 512]
+    _dec = args.ptv3_dec_channels or [64, 64, 128, 256]
+    _bad = [c for c in (*_enc, *_dec) if c % args.ptv3_head_dim]
+    if _bad:
+        raise ValueError(
+            f"PTv3 channel widths {_bad} are not divisible by "
+            f"--ptv3_head_dim ({args.ptv3_head_dim})."
+        )
+    # No geometric constraint on crop or eval size: each pixel is a point
+    # and PTv3 handles any point count per sample (via `offset`). Leaving
+    # args.eval_size None => val/test return the full 512x512 image, run
+    # as ONE dense forward (window_size=None below, so BaselineTrainer
+    # does not tile).
+
 
 # =============================================================================
 # SUMMARY
@@ -686,6 +789,19 @@ if args.model == "universat":
     print(f"  Out stride:  {args.universat_output_stride} "
           f"(logits at H/{args.universat_output_stride}, "
           f"upsampled by trainer)")
+if args.model == "ptv3":
+    print(f"  Mode:        pixels-as-points (1 pixel = 1 point), from scratch")
+    print(f"  Patch size:  {args.ptv3_patch} points")
+    print(f"  Head dim:    {args.ptv3_head_dim}")
+    print(f"  Drop path:   {args.ptv3_drop_path}")
+    if args.ptv3_enc_channels is not None:
+        print(f"  Enc ch:      {tuple(args.ptv3_enc_channels)}")
+    if args.ptv3_enc_depths is not None:
+        print(f"  Enc depths:  {tuple(args.ptv3_enc_depths)}")
+    if args.ptv3_dec_channels is not None:
+        print(f"  Dec ch:      {tuple(args.ptv3_dec_channels)}")
+    if args.ptv3_dec_depths is not None:
+        print(f"  Dec depths:  {tuple(args.ptv3_dec_depths)}")
 print(f"  Channels:    {NUM_CHANNELS} (HLS optical)")
 print(f"  Train crop:  {args.crop_size}×{args.crop_size}")
 if args.model in ("vit", "ramen"):
@@ -780,7 +896,7 @@ trainer_module = BaselineTrainer(
     window_size=(args.ramen_window_size if args.model == "ramen"
                  else args.img_size if args.model == "vit"
                  else args.universat_window_size if args.model == "universat"
-                 else None),
+                 else None),                      # ptv3 -> None (dense forward)
     window_stride=(args.ramen_stride if args.model == "ramen"
                    else args.vit_eval_stride if args.model == "vit"
                    else args.universat_stride if args.model == "universat"
@@ -802,6 +918,8 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         if args.model == "universat":
             run_name += (f"_{args.universat_size}"
                          f"_os{args.universat_output_stride}")
+        if args.model == "ptv3":
+            run_name += f"_p{args.ptv3_patch}"
         wandb.init(
             name=run_name,
             project="Atomizer_BurnScars_Baselines",
@@ -860,6 +978,7 @@ if args.test_only is None:
 # (Bi_ACA_in fusion attention with one modality, the UPE's S1-axis block
 # at subpatch_px=1, the T-axis block at T=1, SAR/DEM channel codes —
 # ~1.28M of the ~36.1M total) and never receive gradients.
+# Harmless for unet/vit/resnet/ptv3.
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
     devices=-1,
@@ -963,6 +1082,16 @@ if args.flops and os.environ.get("LOCAL_RANK", "0") == "0":
                 def fwd(b, m=eval_model):
                     return m(b["image"])
                 size_note = "full image, single dense forward"
+        elif args.model == "ptv3":
+            def fwd(b, m=eval_model):
+                return m(b["image"][MODALITY_KEY])
+            size_note = ("full image, single dense forward; possible "
+                         "UNDER-ESTIMATE: Triton sparse-conv / "
+                         "varlen-attention kernels may not be counted by "
+                         "FlopCounterMode")
+            print("[FLOPs] WARNING: PTv3 GFLOPs may exclude Triton "
+                  "sparse-conv / attention kernels and may not be "
+                  "comparable to the other models.")
         else:
             def fwd(b, m=eval_model):
                 return m(b["image"][MODALITY_KEY])

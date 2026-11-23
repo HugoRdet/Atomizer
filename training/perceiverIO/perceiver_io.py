@@ -89,8 +89,11 @@ class PerceiverEncoder(nn.Module):
         weight_tie_layers=False,
         attn_dropout=0.0,
         ff_dropout=0.0,
+        residual=True,
     ):
         super().__init__()
+        # residual=False -> ablation: drop all skip connections in the encoder
+        self.residual = residual
 
         # Learnable latent array
         self.latents = nn.Parameter(torch.randn(num_latents, latent_dim))
@@ -160,15 +163,16 @@ class PerceiverEncoder(nn.Module):
         x = repeat(self.latents, 'n d -> b n d', b=B)
 
         for cross_attn, cross_ff, self_attns in self.encoder_layers:
+            r = self.residual
             with record_function("Encoder Cross Attention"):
-                x = cross_attn(x, context=data, mask=mask) + x
-                x = cross_ff(x) + x
+                x = cross_attn(x, context=data, mask=mask) + (x if r else 0)
+                x = cross_ff(x) + (x if r else 0)
 
             with record_function("Self Attention"):
 
                 for self_attn, self_ff in self_attns:
-                    x = self_attn(x) + x
-                    x = self_ff(x) + x
+                    x = self_attn(x) + (x if r else 0)
+                    x = self_ff(x) + (x if r else 0)
 
         return x
 
@@ -210,8 +214,10 @@ class PerceiverDecoder(nn.Module):
         attn_dropout=0.0,
         ff_dropout=0.0,
         decoder_ff=False,
+        residual=True,
     ):
         super().__init__()
+        self.residual = residual
 
         self.decoder_cross_attn = PreNorm(
             query_dim,
@@ -240,7 +246,7 @@ class PerceiverDecoder(nn.Module):
         with record_function("Decoder"):
             out = self.decoder_cross_attn(queries, context=latents)
             if self.decoder_ff is not None:
-                out = out + self.decoder_ff(out)
+                out = (out if self.residual else 0) + self.decoder_ff(out)
             return self.to_logits(out)
 
 
@@ -289,6 +295,7 @@ class PerceiverIO(nn.Module):
         attn_dropout=0.0,
         ff_dropout=0.0,
         decoder_ff=False,
+        residual=True,
     ):
         super().__init__()
 
@@ -305,6 +312,7 @@ class PerceiverIO(nn.Module):
             weight_tie_layers=weight_tie_layers,
             attn_dropout=attn_dropout,
             ff_dropout=ff_dropout,
+            residual=residual,
         )
         self.decoder = PerceiverDecoder(
             query_dim=query_dim,
@@ -315,6 +323,7 @@ class PerceiverIO(nn.Module):
             attn_dropout=attn_dropout,
             ff_dropout=ff_dropout,
             decoder_ff=decoder_ff,
+            residual=residual,
         )
 
     # ── Backward-compat: keep .latents and .encoder_layers reachable ──

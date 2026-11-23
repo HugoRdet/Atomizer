@@ -154,7 +154,9 @@ class UnifiedDataModule(pl.LightningDataModule):
                                 'BioMasstersTemporalDataset',
                                 'FractalDataset',
                                 'DalesDataset',
-                                'EurosatDataset'
+                                'EurosatDataset',
+                                'PlanteurDataset',
+                                'DalesPointDataset'
 
                                 }
 

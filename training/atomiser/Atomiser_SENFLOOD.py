@@ -917,7 +917,7 @@ class Atomiser_Senflood(pl.LightningModule):
         # ── Relative positional encoding ──────────────────────────────
         B_d, M_d, K_d = delta_x.shape
         if self.input_processor.use_constant_gsd:
-            cs = self.input_processor.compression_alpha * self.input_processor._constant_gsd
+            cs = self.input_processor.compression_scale
         else:
             query_gsd = self.input_processor.geometry.get_token_gsd(query_tokens)
             cs = self.input_processor.compression_alpha * query_gsd

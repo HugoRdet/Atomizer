@@ -2,28 +2,34 @@
 PASTIS Crop Segmentation Trainer
 ==================================
 
-PyTorch Lightning module for training Atomizer (± LTAE ± decoder skip ±
-temporal transformer) on PASTIS-HD for multi-temporal crop type segmentation.
+PyTorch Lightning module for training Atomizer (± decoder skip ± temporal
+transformer, or the Atomiser U-Net) on PASTIS-HD for multi-temporal crop type
+segmentation.
 
 Encoder selection (priority order):
-    1. config["Atomiser"]["use_temporal_transformer"] == True
+    1. Atomiser_Unet when config["encoder"] contains "unet" or
+       config["Atomiser"]["unet_task"] is set                          # >>> UNET
+         (joint temporal encoding: all dates' atoms in one set, acquisition
+          time as atom metadata; ignores query_token_idx/valid)
+    2. config["Atomiser"]["use_temporal_transformer"] == True
          -> AtomiserTemporal   (per-timestep Atomiser_Senflood_Skip encoding
-                                 + TemporalTransformer aggregation; internally
-                                 wraps Atomiser_Senflood_Skip, so set
+                                 + TemporalTransformer aggregation; set
                                  use_decoder_skip: True too if you want the
                                  pixel-skip cascade active)
-    2. config["Atomiser"]["use_decoder_skip"] == True
+    3. config["Atomiser"]["use_decoder_skip"] == True
          -> Atomiser_Senflood_Skip   (decoder pixel-skip cascade)
-    3. config["Atomiser"]["use_ltae"] == True
-         -> AtomiserLTAE             (per-timestamp encoding + LTAE)
     4. otherwise
          -> Atomiser_Senflood        (no temporal reasoning; the 0.38 baseline)
+    (The LTAE variant has been removed.)
 
-Metric convention:
-    mIoU is averaged over crop classes 1..18 (excluding background class 0).
+Metric convention (unchanged):
+    mIoU is averaged over crop classes 1..18 (excluding background class 0),
+    for every encoder, so U-Net and baseline numbers are directly comparable.
 
 Token format (8 columns):
     [value, x, y, spectral_idx, label, query_flag, resolution_idx, time_idx]
+
+Changes vs the previous trainer are tagged  # >>> UNET.
 """
 
 import torch
@@ -33,9 +39,7 @@ import torchmetrics
 from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
 
-from training.atomiser import Atomiser_Senflood
-from training.atomiser.atomiser_ltae_wrapper import AtomiserLTAE
-# >>> SKIP: decoder pixel-skip variant (adjust path if the class lives elsewhere)
+# >>> SKIP: decoder pixel-skip variant
 from training.atomiser.Atomiser_senflood_skip import Atomiser_Senflood_Skip
 # >>> TEMPORAL: per-timestep encoding + TemporalTransformer aggregation
 from training.atomiser.Atomiser_temporal import AtomiserTemporal
@@ -46,6 +50,13 @@ from training.atomiser.error_supervision import (
 
 
 TASK_NAME = "pastis_segmentation"
+
+
+# >>> UNET
+def _use_unet(config: dict) -> bool:
+    enc = str(config.get("encoder", ""))
+    return "unet" in enc.lower() or "unet_task" in config.get("Atomiser", {})
+# >>> END UNET
 
 
 class PASTISTrainer(pl.LightningModule):
@@ -100,14 +111,26 @@ class PASTISTrainer(pl.LightningModule):
 
         # =====================================================================
         # MODEL — encoder selection
-        #   use_temporal_transformer > use_decoder_skip > use_ltae > base
+        #   U-Net > use_temporal_transformer > use_decoder_skip > base
         # =====================================================================
-        self.use_temporal_transformer = config["Atomiser"].get(
-            "use_temporal_transformer", False)
-        self.use_decoder_skip = config["Atomiser"].get("use_decoder_skip", False)
-        self.use_ltae         = config["Atomiser"].get("use_ltae", True)
+        a = config["Atomiser"]
+        self.use_unet                 = _use_unet(config)                # >>> UNET
+        self.use_temporal_transformer = a.get("use_temporal_transformer", False)
+        self.use_decoder_skip         = a.get("use_decoder_skip", False)
 
-        if self.use_temporal_transformer:
+        if self.use_unet:
+            # >>> UNET
+            if self.use_temporal_transformer:
+                raise ValueError("Atomiser_Unet uses joint temporal encoding: set "
+                                 "Atomiser.use_temporal_transformer=False.")
+            if config["trainer"].get("slide", False):
+                raise ValueError("Atomiser_Unet: set trainer.slide=False (whole-image decoding).")
+            from training.atomiser.Atomiser_unet import Atomiser_Unet
+            print("[PASTIS] Using Atomiser_Unet (joint temporal encoding)")
+            self.encoder = Atomiser_Unet(
+                config=self.config, lookup_table=self.lookup_table)
+            # >>> END UNET
+        elif self.use_temporal_transformer:
             print("[PASTIS] Using AtomiserTemporal "
                   "(per-timestep Atomiser_Senflood_Skip encoding + "
                   "TemporalTransformer aggregation)")
@@ -124,12 +147,8 @@ class PASTISTrainer(pl.LightningModule):
                   "(decoder pixel-skip cascade)")
             self.encoder = Atomiser_Senflood_Skip(
                 config=self.config, lookup_table=self.lookup_table)
-        elif self.use_ltae:
-            print("[PASTIS] Using AtomiserLTAE "
-                  "(per-timestamp encoding + LTAE)")
-            self.encoder = AtomiserLTAE(
-                config=self.config, lookup_table=self.lookup_table)
         else:
+            from training.atomiser.Atomiser_SENFLOOD import Atomiser_Senflood
             print("[PASTIS] Using Atomiser_Senflood (no temporal reasoning)")
             self.encoder = Atomiser_Senflood(
                 config=self.config, lookup_table=self.lookup_table)
@@ -144,18 +163,16 @@ class PASTISTrainer(pl.LightningModule):
 
         # =====================================================================
         # ERROR PREDICTOR SUPERVISION (zone-CE, same setup as Sen1Floods11)
-        # Note: this is a no-op with AtomiserTemporal — its forward() does not
-        # return predicted_errors/topk_indices/topk_dists_sq, so the block in
-        # _compute_loss_and_preds below silently skips adding the error loss.
-        # Leave use_error_predictor: false in temporal-transformer configs.
+        # No-op with AtomiserTemporal; not supported by Atomiser_Unet.
         # =====================================================================
-        self.use_error_predictor = config["Atomiser"].get(
-            "use_error_predictor", False)
+        self.use_error_predictor = a.get("use_error_predictor", False)
+        if self.use_error_predictor and self.use_unet:                   # >>> UNET
+            print("[PASTIS] [WARNING] use_error_predictor=True is not supported by "
+                  "Atomiser_Unet — disabling it.")
+            self.use_error_predictor = False
         if self.use_error_predictor:
-            self.lambda_error = float(
-                config["Atomiser"].get("lambda_error", 0.1))
-            self.error_warmup = int(
-                config["Atomiser"].get("error_supervision_warmup_epochs", 0))
+            self.lambda_error = float(a.get("lambda_error", 0.1))
+            self.error_warmup = int(a.get("error_supervision_warmup_epochs", 0))
             print(f"[PASTIS] Error predictor supervision ENABLED "
                   f"(lambda={self.lambda_error}, warmup={self.error_warmup} epochs)")
             if self.use_temporal_transformer:
@@ -174,9 +191,7 @@ class PASTISTrainer(pl.LightningModule):
 
     def _ensure_flat_batch(self, batch):
         """Lift queries/queries_mask from batch['tasks'] to the top level.
-        Preserves all other top-level keys (incl. query_token_idx /
-        query_token_valid for the skip, and time_indices for the temporal
-        transformer) via the shallow dict() copy."""
+        Preserves all other top-level keys via the shallow dict() copy."""
         if "queries" in batch and batch["queries"] is not None:
             return batch
         if "tasks" in batch and isinstance(batch["tasks"], dict) and len(batch["tasks"]) > 0:
@@ -217,7 +232,7 @@ class PASTISTrainer(pl.LightningModule):
 
         y_hat_flat  = rearrange(y_hat,  "b m c -> (b m) c")
         labels_flat = rearrange(labels, "b m   -> (b m)")
-        class_loss  = self.loss(y_hat_flat, labels_flat)
+        class_loss  = self.loss(y_hat_flat.float(), labels_flat)        # >>> UNET: fp32 loss
 
         total_loss = class_loss
 
@@ -266,6 +281,12 @@ class PASTISTrainer(pl.LightningModule):
                  prog_bar=True, logger=True)
         self.log("train_class_loss", class_loss, on_step=False, on_epoch=True,
                  logger=True)
+        # >>> UNET: skip-gate statistics (with unet_fusion: gate)
+        if self.use_unet and hasattr(self.encoder, "gate_stats"):
+            for k, v in self.encoder.gate_stats().items():
+                if v is not None:
+                    self.log(f"unet_{k}", v, on_step=False, on_epoch=True, logger=True)
+        # >>> END UNET
         return total_loss
 
     def validation_step(self, batch, batch_idx):

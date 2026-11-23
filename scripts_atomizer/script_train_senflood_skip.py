@@ -1,14 +1,24 @@
 """
-Sen1Floods11 Training Script (SKIP variant) — with --test_only mode
+Sen1Floods11 Training Script (SKIP / U-Net variant) — with --test_only mode
 
-# >>> MULTI_SEED_TEST: --test_only now runs N_TEST_RUNS repeats, each with a
-# different seed (list hardcoded below), and reports mean/max/min/std across
-# runs for test_mIoU and test_accuracy. This matters because test-time
-# forward passes are NOT fully deterministic across seeds: the spatial
-# sampler draws a random subset S_ell^(t) of size min(m, |V_ell|) from each
-# latent's Voronoi cell (see Appendix "Per-step random subsampling"), so a
-# single test() call only sees one such draw. Repeating under different
-# seeds captures that sampling variance.
+Runs the baseline (Atomiser_Senflood_Skip) or Atomiser_Unet, chosen by the
+trainer from the config (encoder name containing "unet", or Atomiser.unet_task).
+Changes vs the previous script are tagged  # >>> UNET:
+    * --config argument (default: config_test-SENFLOOD.yaml)
+    * U-Net safety overrides: slide / error predictor / temporal off, distinct
+      encoder name (checkpoints and wandb never collide with the baseline)
+    * pre-flight check: token positions identical across samples (the U-Net's
+      hierarchy geometry is shared by every sample)
+    * DDP always find_unused_parameters=True (the old line switched to "auto"
+      for a U-Net, which crashes: some parameters get no gradient at step 1)
+    * --test_only reports missing / unexpected checkpoint keys
+    * unused TokenAssignmentCallbackSenFlood removed
+
+# >>> MULTI_SEED_TEST: --test_only runs N_TEST_RUNS repeats with different
+# seeds and reports mean/max/min/std. This matters for the baseline, whose
+# spatial sampler draws a random subset per latent at test time. The U-Net's
+# evaluation is deterministic (fixed atom order per leaf cell at eval), so its
+# repeats give identical numbers; the summary is kept for a uniform protocol.
 """
 
 import os
@@ -21,7 +31,6 @@ import statistics
 import torch
 import numpy as np
 from collections import defaultdict
-from training.utils.callbacks.stability_monitor import StabilityMonitor
 
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.loggers import WandbLogger
@@ -34,15 +43,16 @@ from pytorch_lightning.callbacks import (
 seed_everything(42, workers=True)
 
 from training.utils import read_yaml
-from training.utils import Lookup_encoding
+from training.utils.Lookup_positional import Lookup_encoding          # >>> UNET: direct import
 
 from training.trainer_SENFLOOD_skip import Model_SenFlood_Skip
 from training.utils.datasets.utils_dataset_senflood_skip import Sen1Floods11SkipDataset
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.collate_grouped_skip import collate_grouped_skip
 
-from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSenFlood
 from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCallback
+
+IS_RANK0 = os.environ.get("LOCAL_RANK", "0") == "0"
 
 # =============================================================================
 # >>> MULTI_SEED_TEST: config for the repeated test-only runs
@@ -53,7 +63,7 @@ TEST_SEEDS = list(range(1, N_TEST_RUNS + 1))  # seed == run number (1, 2, 3, ...
 # =============================================================================
 # ARGS
 # =============================================================================
-parser = argparse.ArgumentParser(description="Training script (skip variant)")
+parser = argparse.ArgumentParser(description="Training script (skip / U-Net variant)")
 parser.add_argument("--xp_name",      type=str, required=True, help="Experiment name")
 parser.add_argument("--dataset_name", type=str, help="Name of the dataset used")
 parser.add_argument("--clipping",     action="store_true",     help="Enable gradient clipping at 1.0")
@@ -61,21 +71,45 @@ parser.add_argument("--resume",        type=str, default=None,
                     help="Path to checkpoint to resume training from")
 parser.add_argument("--deterministic", action="store_true",
                     help="Force deterministic CUDA ops")
-# >>> TEST_ONLY
 parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a checkpoint: load it and run ONLY trainer.test "
                          "(skips fit and the complexity block). Runs N_TEST_RUNS "
                          "repeats under different seeds and reports summary stats.")
-# >>> END TEST_ONLY
+# >>> UNET
+parser.add_argument("--config", type=str, default="./training/configs/config_test-SENFLOOD.yaml",
+                    help="Model config YAML")
+parser.add_argument("--skip_preflight", action="store_true",
+                    help="Skip the token-layout sanity check (U-Net only)")
+# >>> END UNET
 args = parser.parse_args()
 
 xp_name = args.xp_name
-config_model = read_yaml("./training/configs/config_test-SENFLOOD.yaml")
+config_model = read_yaml(args.config)
 configs_dataset = f"./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 bands_yaml = "./data/bands_info/bands.yaml"
 
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    print(f"[Train] Gradient clipping: {'ON (val=1.0)' if args.clipping else 'OFF'}")
+# =============================================================================
+# >>> UNET: detection + safety overrides
+# =============================================================================
+a_cfg = config_model.setdefault("Atomiser", {})
+is_unet = ("unet" in str(config_model.get("encoder", "")).lower() or "unet_task" in a_cfg)
+if is_unet:
+    if a_cfg.get("unet_task", "segmentation") != "segmentation":
+        raise ValueError("Sen1Floods11 is segmentation: set Atomiser.unet_task: segmentation")
+    a_cfg["unet_task"] = "segmentation"
+    a_cfg["use_error_predictor"] = False
+    a_cfg["use_temporal_transformer"] = False
+    config_model["trainer"]["slide"] = False
+    if config_model["trainer"].get("mode", "segmentation") != "segmentation":
+        raise ValueError("Atomiser_Unet supports trainer.mode: segmentation only")
+    if "unet" not in str(config_model.get("encoder", "")).lower():
+        config_model["encoder"] = f"{config_model.get('encoder', 'ATOMIZER')}_Unet"
+# >>> END UNET
+
+if IS_RANK0:
+    print(f"[Train] Config: {args.config}")
+    print(f"[Train] Encoder: {config_model['encoder']} ({'U-Net' if is_unet else 'baseline'})")
+    print(f"[Train] Gradient clipping: ON (val=1.0, fixed in Trainer)")
     print(f"[Train] Deterministic ops: {'ON' if args.deterministic else 'OFF'}")
     if args.resume:
         print(f"[Train] RESUMING from: {args.resume}")
@@ -83,38 +117,14 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
         print(f"[Train] TEST-ONLY mode, loading: {args.test_only}")
         print(f"[Train] TEST-ONLY will run {N_TEST_RUNS} repeats "
               f"with seeds {TEST_SEEDS}")
-    _skip_on = config_model.get("Atomiser", {}).get("use_decoder_skip", False)
-    print(f"[Train] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
+    if not is_unet:
+        _skip_on = a_cfg.get("use_decoder_skip", False)
+        print(f"[Train] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
 
 # =============================================================================
 # LOOKUP TABLE
 # =============================================================================
 lookup_table = Lookup_encoding(read_yaml(configs_dataset), read_yaml(bands_yaml), config_model)
-
-# =============================================================================
-# WANDB  (skip in test-only mode)
-# =============================================================================
-wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0" and args.test_only is None:
-    import wandb
-    wandb.init(name=config_model["encoder"], project="SenFlood", config=config_model)
-    wandb_logger = WandbLogger(project="SenFlood")
-    wandb.define_metric("train_loss", step_metric="trainer/global_step")
-    wandb.define_metric("val_loss", step_metric="trainer/global_step")
-
-# =============================================================================
-# MODEL  (load ckpt if test-only, else fresh)
-# =============================================================================
-is_unet = False
-if args.test_only is not None:
-    model = Model_SenFlood_Skip.load_from_checkpoint(
-        args.test_only, strict=False, config=config_model, wand=False,
-        name=xp_name, transform=None, lookup_table=lookup_table)
-    model.eval()
-else:
-    model = Model_SenFlood_Skip(
-        config=config_model, wand=True, name=xp_name,
-        transform=None, lookup_table=lookup_table)
 
 # =============================================================================
 # DATA MODULE
@@ -134,6 +144,69 @@ data_module = UnifiedDataModule(
 )
 
 # =============================================================================
+# >>> UNET: PRE-FLIGHT — shared token layout across samples
+# =============================================================================
+def preflight_token_layout(dm):
+    dm.setup("fit")
+    ds = dm.train_dataset
+    batch = collate_grouped_skip([ds[0], ds[1 % len(ds)]])
+    for res, grp in batch["groups"].items():
+        t = grp["tokens"]
+        assert t.dim() == 3 and t.shape[-1] >= 8, \
+            f"group {res}: expected tokens [B, N, 8], got {tuple(t.shape)}"
+        if not torch.equal(t[0, :, 1:3], t[1, :, 1:3]):
+            raise RuntimeError(
+                f"[Preflight] group {res}: token positions differ between samples. "
+                "The U-Net's hierarchy geometry needs a fixed token layout.")
+        print(f"[Preflight] group {res}: tokens {tuple(t.shape)}, "
+              f"positions identical across samples ✓")
+    print(f"[Preflight] queries {tuple(batch['queries'].shape)} ✓")
+
+
+if is_unet and IS_RANK0 and not args.skip_preflight and args.test_only is None:
+    preflight_token_layout(data_module)
+
+# =============================================================================
+# WANDB  (skip in test-only mode)
+# =============================================================================
+wandb_logger = None
+if IS_RANK0 and args.test_only is None:
+    import wandb
+    wandb.init(name=config_model["encoder"], project="SenFlood", config=config_model)
+    wandb_logger = WandbLogger(project="SenFlood")
+    wandb.define_metric("train_loss", step_metric="trainer/global_step")
+    wandb.define_metric("val_loss", step_metric="trainer/global_step")
+
+# =============================================================================
+# MODEL  (load ckpt if test-only, else fresh)
+# =============================================================================
+if args.test_only is not None:
+    model = Model_SenFlood_Skip.load_from_checkpoint(
+        args.test_only, strict=False, config=config_model, wand=False,
+        name=xp_name, transform=None, lookup_table=lookup_table)
+    model.eval()
+    # >>> UNET: strict=False silently ignores mismatches — report them.
+    if IS_RANK0:
+        ckpt_keys = set(torch.load(args.test_only, map_location="cpu",
+                                   weights_only=False)["state_dict"].keys())
+        model_keys = set(model.state_dict().keys())
+        missing = sorted(model_keys - ckpt_keys)
+        unexpected = sorted(ckpt_keys - model_keys)
+        print(f"[TestOnly] missing keys: {len(missing)} | unexpected keys: {len(unexpected)}")
+        for k in missing[:20]:
+            print(f"  missing:    {k}")
+        for k in unexpected[:20]:
+            print(f"  unexpected: {k}")
+        if missing:
+            raise RuntimeError("[TestOnly] checkpoint does not match the model built from "
+                               "--config (missing weights). Use the training config.")
+    # >>> END UNET
+else:
+    model = Model_SenFlood_Skip(
+        config=config_model, wand=True, name=xp_name,
+        transform=None, lookup_table=lookup_table)
+
+# =============================================================================
 # CALLBACKS
 # =============================================================================
 lr_monitor   = LearningRateMonitor(logging_interval="step")
@@ -148,21 +221,17 @@ checkpoint_val = ModelCheckpoint(
     verbose=True,
 )
 
-token_assign = TokenAssignmentCallbackSenFlood(
-    log_every_n_epochs=1, sample_indices=[0],
-    save_dir="./viz_token_assignment", use_wandb=True)
-
 viz_callback = SegmentationVizCallback(
     sample_indices=[0, 1, 2], log_every_n_epochs=1, use_wandb=True)
 
-callbacks = [accumulator, checkpoint_val, lr_monitor, viz_callback,
-             StabilityMonitor(log_every_n_steps=1)]
+callbacks = [accumulator, checkpoint_val, lr_monitor, viz_callback]
 
 # =============================================================================
 # TRAINER
 # =============================================================================
 trainer = Trainer(
-    strategy="ddp_find_unused_parameters_true" if not is_unet else "auto",
+    # >>> UNET: always find unused parameters (both encoders need it)
+    strategy="ddp_find_unused_parameters_true",
     devices=-1,
     max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu",
@@ -176,26 +245,20 @@ trainer = Trainer(
 )
 
 # =============================================================================
-# TEST-ONLY EARLY EXIT  (>>> MULTI_SEED_TEST: now N repeats + summary stats)
+# TEST-ONLY EARLY EXIT  (>>> MULTI_SEED_TEST: N repeats + summary stats)
 # =============================================================================
 if args.test_only is not None:
     miou_runs, acc_runs = [], []
 
     for run_idx, seed in enumerate(TEST_SEEDS, 1):
-        # Reseed before each run so the spatial sampler's random subsampling
-        # (and anything else stochastic at eval time) draws a fresh sample
-        # per run rather than repeating the same draw N times.
         seed_everything(seed, workers=True)
 
-        if os.environ.get("LOCAL_RANK", "0") == "0":
+        if IS_RANK0:
             print(f"\n[Train][TEST-ONLY] Run {run_idx}/{N_TEST_RUNS} "
                   f"(seed={seed})")
 
-        # Fresh Trainer per run: avoids any state (e.g. logged metrics,
-        # internal loop counters) carrying over between repeated .test()
-        # calls on the same Trainer instance.
         run_trainer = Trainer(
-            strategy="ddp_find_unused_parameters_true" if not is_unet else "auto",
+            strategy="ddp_find_unused_parameters_true",
             devices=-1,
             accelerator="gpu",
             precision="bf16-mixed",
@@ -206,7 +269,7 @@ if args.test_only is not None:
         )
         results = run_trainer.test(model, datamodule=data_module, verbose=True)
 
-        if os.environ.get("LOCAL_RANK", "0") == "0":
+        if IS_RANK0:
             metrics = results[0] if results else {}
             miou = metrics.get("test_mIoU", float("nan"))
             acc  = metrics.get("test_accuracy", float("nan"))
@@ -215,7 +278,7 @@ if args.test_only is not None:
             print(f"RESULT test_only ckpt={args.test_only} run={run_idx} "
                   f"seed={seed} test_mIoU={miou:.6f} test_accuracy={acc:.6f}")
 
-    if os.environ.get("LOCAL_RANK", "0") == "0":
+    if IS_RANK0:
         def _stats(vals):
             vals = [v for v in vals if v == v]  # drop nan
             if not vals:
@@ -244,7 +307,6 @@ if args.test_only is not None:
               f"std={acc_stats['std']:.6f}  (n={acc_stats['n']})")
         print("=" * 78)
 
-        # Single parseable summary line, in addition to the per-run RESULT lines above.
         print(f"RESULT_SUMMARY test_only ckpt={args.test_only} "
               f"n_runs={miou_stats['n']} "
               f"test_mIoU_mean={miou_stats['mean']:.6f} "
@@ -256,7 +318,6 @@ if args.test_only is not None:
               f"test_accuracy_min={acc_stats['min']:.6f} "
               f"test_accuracy_std={acc_stats['std']:.6f}")
 
-    import sys
     sys.exit(0)
 
 # =============================================================================
@@ -281,7 +342,7 @@ def _batch_to_device(batch: dict, device) -> dict:
     return out
 
 
-if os.environ.get("LOCAL_RANK", "0") == "0":
+if IS_RANK0:
     from fvcore.nn import FlopCountAnalysis
 
     print("\n" + "=" * 80)
@@ -309,6 +370,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
         batch_1 = collate_grouped_skip([samples[1]])
         batch_1 = _batch_to_device(batch_1, device)
+        # >>> UNET: tracing may fail on data-dependent indexing; timing still runs.
         try:
             with torch.no_grad():
                 flops = FlopCountAnalysis(model, (batch_1,))
@@ -358,7 +420,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # =============================================================================
 # SAVE WANDB RUN ID
 # =============================================================================
-if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
+if wandb_logger and IS_RANK0:
     run_id = wandb.run.id
     print("WANDB_RUN_ID:", run_id)
     os.makedirs("training/wandb_runs", exist_ok=True)

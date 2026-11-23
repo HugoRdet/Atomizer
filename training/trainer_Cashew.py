@@ -1,30 +1,35 @@
 """
-Cashew Trainer (SKIP variant) for Atomiser
-===========================================
+Cashew Trainer (SKIP / U-NET variant) for Atomiser
+===================================================
 
-Mirrors Model_SenFlood_Skip exactly, retargeted at Cashew:
+Mirrors Model_SenFlood_Skip, retargeted at Cashew:
   - instantiates Atomiser_Senflood_Skip (same skip-cascade encoder class —
     it's the decoder pixel-skip mechanism that's shared, not anything
-    Sen1Floods11-specific; the encoder is generic over "groups" +
-    "query_token_idx/valid" regardless of which dataset produced them)
+    Sen1Floods11-specific), OR Atomiser_Unet when config["encoder"] contains
+    "unet" or config["Atomiser"]["unet_task"] is set               # >>> UNET
   - same guard against silent skip-disable under sliding-window inference
   - num_classes / ignore_index / class_names come from config, so no
     Cashew-specific constants are hardcoded beyond the trainer name
 
 The skip cascade reads query_token_idx / query_token_valid from the batch
-(provided by CashewSkipDataset + your grouped-skip collate fn). Those flow
-straight through to the encoder, so the loss/label path is unchanged from
-Model_SenFlood_Skip.
+(provided by CashewSkipDataset + your grouped-skip collate fn). Atomiser_Unet
+ignores them: its query decoder finds each query's own atoms through the
+hierarchy geometry.                                                 # >>> UNET
 
 IMPORTANT — sliding window:
-  Cashew patches are 256x256 (vs. Sen1Floods11's 512x512), decoded whole
-  either way. _forward_crop still drops query_token_idx/valid and would
-  silently fall back to the global_query path (skip disabled) at eval time
-  if slide were enabled, so the same guard applies: __init__ raises if
-  use_decoder_skip and slide are both true. Run with
-  config["trainer"]["slide"] = False.
+  Cashew patches are 256x256, decoded whole. _forward_crop drops
+  query_token_idx/valid and would silently fall back to the global_query
+  path (skip disabled) at eval time if slide were enabled, so __init__
+  raises if use_decoder_skip and slide are both true. The U-Net also
+  requires slide=False. Run with config["trainer"]["slide"] = False.
 
-All changes vs. Model_SenFlood_Skip are tagged  # >>> CASHEW.
+Changes vs. Model_SenFlood_Skip are tagged  # >>> CASHEW, U-Net changes
+# >>> UNET, PTv3 changes # >>> PTV3.
+
+PTv3 (# >>> PTV3): set PTv3.enabled: true (or put "ptv3" in config["encoder"])
+to use AtomizerPTv3 — Atomizer's per-pixel tokenizer feeding a PTv3 backbone.
+Same dataset, collate, loss and metrics; the error predictor and sliding
+window are not supported (disabled / rejected).
 """
 
 import torch
@@ -34,13 +39,28 @@ import pytorch_lightning as pl
 import torchmetrics
 from einops import rearrange
 from transformers import get_cosine_schedule_with_warmup
-
+from training.atomiser.atomizer_ptv3 import AtomizerPTv3
 from training.atomiser.Atomiser_senflood_skip import Atomiser_Senflood_Skip
 from training.atomiser.error_supervision import (
     compute_latent_errors,
     compute_error_predictor_loss,
 )
 from training.utils.datasets.sliding_window import stitch_predictions
+
+
+# >>> UNET
+def _use_unet(config: dict) -> bool:
+    enc = str(config.get("encoder", ""))
+    return "unet" in enc.lower() or "unet_task" in config.get("Atomiser", {})
+# >>> END UNET
+
+
+# >>> PTV3: Atomizer per-pixel tokenizer + PTv3 backbone (training.atomiser.atomizer_ptv3)
+def _use_ptv3(config: dict) -> bool:
+    """PTv3.enabled: true in the config, or 'ptv3' in the encoder name."""
+    enc = str(config.get("encoder", ""))
+    return "ptv3" in enc.lower() or bool((config.get("PTv3") or {}).get("enabled", False))
+# >>> END PTV3
 
 
 class Model_Cashew_Skip(pl.LightningModule):
@@ -59,6 +79,12 @@ class Model_Cashew_Skip(pl.LightningModule):
         self.num_classes  = config["trainer"]["num_classes"]
         self.ignore_index = 255
         self.use_sliding  = config["trainer"].get("slide", False)
+        self.use_unet     = _use_unet(config)                           # >>> UNET
+        self.use_ptv3     = _use_ptv3(config)                           # >>> PTV3
+        if self.use_ptv3 and self.use_unet:
+            raise ValueError("Both PTv3 and U-Net selected: pick one encoder.")
+        if self.use_ptv3 and self.use_sliding:
+            raise ValueError("AtomizerPTv3 embeds the whole 256x256 tile: set trainer.slide=False.")
 
         use_decoder_skip = config["Atomiser"].get("use_decoder_skip", False)
         if use_decoder_skip and self.use_sliding:
@@ -69,13 +95,14 @@ class Model_Cashew_Skip(pl.LightningModule):
                 "the comparison. Set trainer.slide=False for the skip run "
                 "(Cashew is 256x256 and decodes whole)."
             )
+        # >>> UNET
+        if self.use_unet and self.use_sliding:
+            raise ValueError("Atomiser_Unet: set trainer.slide=False (whole-image decoding).")
+        # >>> END UNET
 
         # >>> CASHEW: default class names for m-cashew-plant's 7 classes if
-        # not supplied by config/caller. Adjust to your actual GeoBench
-        # label ordering if these don't match — the mask's 7 integer
-        # classes weren't enumerated in what I inspected, so verify before
-        # trusting these logged names (metrics themselves are unaffected,
-        # only the printed/logged labels).
+        # not supplied by config/caller (metrics are unaffected, only the
+        # printed/logged labels).
         self.class_names = (
             class_names
             or config["trainer"].get("class_names", None)
@@ -113,8 +140,22 @@ class Model_Cashew_Skip(pl.LightningModule):
         # =====================================================================
         # MODEL
         # =====================================================================
-        self.encoder = Atomiser_Senflood_Skip(
-            config=self.config, lookup_table=self.lookup_table)
+        if self.use_ptv3:
+            # >>> PTV3
+            print("[Trainer] Using AtomizerPTv3 (Atomizer pixel tokenizer + PTv3)")
+            self.encoder = AtomizerPTv3(
+                config=self.config, lookup_table=self.lookup_table)
+            # >>> END PTV3
+        elif self.use_unet:
+            # >>> UNET
+            from training.atomiser.Atomiser_unet import Atomiser_Unet
+            print("[Trainer] Using Atomiser_Unet")
+            self.encoder = Atomiser_Unet(
+                config=self.config, lookup_table=self.lookup_table)
+            # >>> END UNET
+        else:
+            self.encoder = Atomiser_Senflood_Skip(
+                config=self.config, lookup_table=self.lookup_table)
 
         # =====================================================================
         # LOSS
@@ -122,10 +163,14 @@ class Model_Cashew_Skip(pl.LightningModule):
         self.loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
         # =====================================================================
-        # ERROR PREDICTOR SUPERVISION
+        # ERROR PREDICTOR SUPERVISION (not supported by Atomiser_Unet)
         # =====================================================================
         self.use_error_predictor = config["Atomiser"].get(
             "use_error_predictor", False)
+        if self.use_error_predictor and (self.use_unet or self.use_ptv3):  # >>> UNET / PTV3
+            print("[Trainer] [WARNING] use_error_predictor=True is not supported by "
+                  f"{'AtomizerPTv3' if self.use_ptv3 else 'Atomiser_Unet'} — disabling it.")
+            self.use_error_predictor = False
         if self.use_error_predictor:
             self.lambda_error = float(
                 config["Atomiser"].get("lambda_error", 0.1))
@@ -170,7 +215,7 @@ class Model_Cashew_Skip(pl.LightningModule):
 
         y_hat_flat  = rearrange(y_hat,  "b m c -> (b m) c")
         labels_flat = rearrange(labels, "b m   -> (b m)")
-        seg_loss    = self.loss(y_hat_flat, labels_flat)
+        seg_loss    = self.loss(y_hat_flat.float(), labels_flat)       # >>> UNET: fp32 loss
 
         total_loss = seg_loss
 
@@ -205,11 +250,8 @@ class Model_Cashew_Skip(pl.LightningModule):
         return total_loss, seg_loss, preds, labels
 
     # =========================================================================
-    # SLIDING WINDOW INFERENCE
+    # SLIDING WINDOW INFERENCE (guarded off for skip / U-Net runs)
     # =========================================================================
-    # NOTE: guarded off (see __init__). Kept intact so this trainer remains a
-    # drop-in for a non-skip Cashew baseline if skip is disabled and slide
-    # is ever needed (e.g. if crop_size is set below the native 256).
 
     def _forward_crop(self, batch, crop_idx):
         mini_batch = {
@@ -262,6 +304,12 @@ class Model_Cashew_Skip(pl.LightningModule):
                  prog_bar=True, logger=True)
         self.log("train_class_loss", seg_loss,   on_step=False, on_epoch=True,
                  logger=True)
+        # >>> UNET: skip-gate statistics (only with gated fusion)
+        if self.use_unet and hasattr(self.encoder, "gate_stats"):
+            for k, v in self.encoder.gate_stats().items():
+                if v is not None:
+                    self.log(f"unet_{k}", v, on_step=False, on_epoch=True, logger=True)
+        # >>> END UNET
         return total_loss
 
     def validation_step(self, batch, batch_idx):
@@ -326,8 +374,20 @@ class Model_Cashew_Skip(pl.LightningModule):
         test_iou = self.metric_IoU_test.compute()
         test_acc = self.metric_acc_test.compute()
 
-        self.log("test_mIoU",     test_iou.mean(), on_epoch=True, logger=True)
-        self.log("test_accuracy", test_acc.mean(), on_epoch=True, logger=True)
+        # Classes present in the test labels (rows of the confusion matrix).
+        # sync_context gathers the matrix over all GPUs under DDP (no-op on one GPU).
+        with self.metric_IoU_test.sync_context():
+            confmat = self.metric_IoU_test.confmat.clone()
+        present = confmat.sum(dim=1) > 0
+
+        miou = test_iou[present].mean()
+        macc = test_acc[present].mean()
+
+        self.log("test_mIoU",     miou, on_epoch=True, logger=True)
+        self.log("test_accuracy", macc, on_epoch=True, logger=True)
+        # previous definition (mean over all classes, absent ones counted as 0)
+        self.log("test_mIoU_all_classes",     test_iou.mean(), on_epoch=True, logger=True)
+        self.log("test_accuracy_all_classes", test_acc.mean(), on_epoch=True, logger=True)
 
         for i, name in enumerate(self.class_names):
             if i < len(test_iou):
@@ -335,14 +395,21 @@ class Model_Cashew_Skip(pl.LightningModule):
             if i < len(test_acc):
                 self.log(f"test_acc_{name}", test_acc[i], on_epoch=True, logger=True)
 
+        absent = [self.class_names[i] for i in range(len(present))
+                    if not present[i] and i < len(self.class_names)]
+
         print(f"\n{'='*60}")
         print(f"TEST RESULTS")
         print(f"{'='*60}")
-        print(f"  mIoU:     {test_iou.mean():.4f}")
-        print(f"  Accuracy: {test_acc.mean():.4f}")
+        print(f"  mIoU:     {miou:.4f}  (over {int(present.sum())} classes present in the labels)")
+        print(f"  Accuracy: {macc:.4f}")
+        print(f"  mIoU, all {len(test_iou)} classes: {test_iou.mean():.4f}")
+        if absent:
+            print(f"  Absent from test labels: {absent}")
         for i, name in enumerate(self.class_names):
             if i < len(test_iou):
-                print(f"  IoU {name}: {test_iou[i]:.4f}")
+                tag = "" if present[i] else "  (absent)"
+                print(f"  IoU {name}: {test_iou[i]:.4f}{tag}")
         print(f"{'='*60}\n")
 
         self.metric_IoU_test.reset()

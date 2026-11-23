@@ -1,19 +1,22 @@
 """
-Sen1Floods11 / xView2 Trainer (SKIP + optional TEMPORAL variant) for Atomizer
-==============================================================================
+Sen1Floods11 / xView2 Trainer (SKIP + optional TEMPORAL + U-NET variant) for Atomizer
+=====================================================================================
 
 Identical to the original Model_SenFlood EXCEPT:
   - instantiates Atomiser_Senflood_Skip (decoder pixel-skip cascade) by
     default, OR AtomiserTemporal (per-timestep Atomiser_Senflood_Skip
     encoding + RoPE TemporalTransformer aggregation) when
-    config["Atomiser"]["use_temporal_transformer"] is True
+    config["Atomiser"]["use_temporal_transformer"] is True,
+    OR Atomiser_Unet when config["encoder"] contains "unet" or
+    config["Atomiser"]["unet_task"] is set                      # >>> UNET
   - guards against silent skip/temporal disable under sliding-window inference
 
 The skip cascade reads query_token_idx / query_token_valid from the batch
 (provided by *SkipDataset + collate_grouped_skip, or by
 XView2TemporalDataset + xview2_temporal_collate_fn for the temporal path).
 Those flow straight through to the encoder, so the loss/label path here is
-unchanged.
+unchanged. Atomiser_Unet ignores them: its query decoder finds each query's
+own atoms through the hierarchy geometry.                       # >>> UNET
 
 IMPORTANT — sliding window:
   _forward_crop builds a mini_batch WITHOUT query_token_idx/valid (and,
@@ -26,7 +29,7 @@ IMPORTANT — sliding window:
   experiments with config["trainer"]["slide"] = False (Sen1Floods11 is
   512x512 and decodes whole; xView2 crops are handled the same way).
 
-All changes vs the original (skip-only) trainer are tagged  # >>> TEMPORAL.
+All changes vs the previous trainer are tagged  # >>> UNET.
 """
 
 import torch
@@ -48,6 +51,13 @@ from training.atomiser.error_supervision import (
 from training.utils.datasets.sliding_window import stitch_predictions
 
 
+# >>> UNET
+def _use_unet(config: dict) -> bool:
+    enc = str(config.get("encoder", ""))
+    return "unet" in enc.lower() or "unet_task" in config.get("Atomiser", {})
+# >>> END UNET
+
+
 class Model_SenFlood_Skip(pl.LightningModule):
     def __init__(self, config, wand, name, transform, lookup_table,
                  class_names=None):
@@ -62,6 +72,10 @@ class Model_SenFlood_Skip(pl.LightningModule):
         self.num_classes  = config["trainer"]["num_classes"]
         self.ignore_index = 255
         self.use_sliding  = config["trainer"].get("slide", False)
+
+        # >>> UNET
+        self.use_unet = _use_unet(config)
+        # >>> END UNET
 
         # >>> SKIP / >>> TEMPORAL: refuse to run a silently-invalid
         # configuration. Sliding-window _forward_crop drops
@@ -85,7 +99,14 @@ class Model_SenFlood_Skip(pl.LightningModule):
                 "(Sen1Floods11 is 512x512 and decodes whole; xView2 crops "
                 "are handled the same way)."
             )
-        # >>> END SKIP / TEMPORAL
+        # >>> UNET: the U-Net decodes whole images; sliding windows would build a
+        # new geometry per crop size and are not needed at 512x512.
+        if self.use_unet and self.use_sliding:
+            raise ValueError("Atomiser_Unet: set trainer.slide=False (whole-image decoding).")
+        if self.use_unet and self.use_temporal_transformer:
+            raise ValueError("Atomiser_Unet is single-timestep: set "
+                             "Atomiser.use_temporal_transformer=False.")
+        # >>> END SKIP / TEMPORAL / UNET
 
         self.class_names = (
             class_names
@@ -123,14 +144,21 @@ class Model_SenFlood_Skip(pl.LightningModule):
 
         # =====================================================================
         # MODEL — encoder selection
-        #   use_temporal_transformer -> AtomiserTemporal (wraps
+        #   U-Net config               -> Atomiser_Unet              # >>> UNET
+        #   use_temporal_transformer   -> AtomiserTemporal (wraps
         #     Atomiser_Senflood_Skip internally; set use_decoder_skip=True
         #     too if you want the skip cascade active inside it)
         #   otherwise -> Atomiser_Senflood_Skip directly (original,
         #     unconditional behavior of this trainer)
         # =====================================================================
-        # >>> TEMPORAL
-        if self.use_temporal_transformer:
+        if self.use_unet:
+            # >>> UNET
+            from training.atomiser.Atomiser_unet import Atomiser_Unet
+            print("[Trainer] Using Atomiser_Unet")
+            self.encoder = Atomiser_Unet(
+                config=self.config, lookup_table=self.lookup_table)
+            # >>> END UNET
+        elif self.use_temporal_transformer:
             print("[Trainer] Using AtomiserTemporal "
                   "(per-timestep Atomiser_Senflood_Skip encoding + "
                   "RoPE TemporalTransformer aggregation)")
@@ -146,7 +174,6 @@ class Model_SenFlood_Skip(pl.LightningModule):
             # >>> SKIP: build the skip-variant encoder (original behavior)
             self.encoder = Atomiser_Senflood_Skip(
                 config=self.config, lookup_table=self.lookup_table)
-        # >>> END TEMPORAL
 
         # =====================================================================
         # LOSS
@@ -155,13 +182,15 @@ class Model_SenFlood_Skip(pl.LightningModule):
 
         # =====================================================================
         # ERROR PREDICTOR SUPERVISION
-        # Note: this is a no-op with AtomiserTemporal — its forward() does
-        # not return predicted_errors/topk_indices/topk_dists_sq, so the
-        # block in _compute_loss_and_preds below silently skips adding the
-        # error loss. Leave use_error_predictor: false in temporal configs.
+        # No-op with AtomiserTemporal and Atomiser_Unet (neither returns
+        # predicted_errors/topk_indices/topk_dists_sq).
         # =====================================================================
         self.use_error_predictor = config["Atomiser"].get(
             "use_error_predictor", False)
+        if self.use_error_predictor and self.use_unet:                 # >>> UNET
+            print("[Trainer] [WARNING] use_error_predictor=True is not supported by "
+                  "Atomiser_Unet — disabling it.")
+            self.use_error_predictor = False
         if self.use_error_predictor:
             self.lambda_error = float(
                 config["Atomiser"].get("lambda_error", 0.1))
@@ -209,7 +238,7 @@ class Model_SenFlood_Skip(pl.LightningModule):
 
         y_hat_flat  = rearrange(y_hat,  "b m c -> (b m) c")
         labels_flat = rearrange(labels, "b m   -> (b m)")
-        seg_loss    = self.loss(y_hat_flat, labels_flat)
+        seg_loss    = self.loss(y_hat_flat.float(), labels_flat)       # >>> UNET: fp32 loss
 
         total_loss = seg_loss
 
@@ -246,10 +275,8 @@ class Model_SenFlood_Skip(pl.LightningModule):
     # =========================================================================
     # SLIDING WINDOW INFERENCE
     # =========================================================================
-    # NOTE: guarded off for BOTH the skip run and the temporal run (see
-    # __init__). Kept intact so this trainer remains a drop-in for the
-    # plain baseline (use_decoder_skip=False, use_temporal_transformer=False)
-    # if sliding-window inference is needed.
+    # NOTE: guarded off for the skip, temporal and U-Net runs (see __init__).
+    # Kept intact so this trainer remains a drop-in for the plain baseline.
 
     def _forward_crop(self, batch, crop_idx):
         mini_batch = {
@@ -302,6 +329,12 @@ class Model_SenFlood_Skip(pl.LightningModule):
                  prog_bar=True, logger=True)
         self.log("train_class_loss", seg_loss,   on_step=False, on_epoch=True,
                  logger=True)
+        # >>> UNET: skip-gate statistics (only with unet_decoder: attn / fusion: gate)
+        if self.use_unet and hasattr(self.encoder, "gate_stats"):
+            for k, v in self.encoder.gate_stats().items():
+                if v is not None:
+                    self.log(f"unet_{k}", v, on_step=False, on_epoch=True, logger=True)
+        # >>> END UNET
         return total_loss
 
     def validation_step(self, batch, batch_idx):

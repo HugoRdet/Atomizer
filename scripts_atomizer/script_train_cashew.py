@@ -1,21 +1,28 @@
 """
-Cashew Training Script (SKIP variant)
+Cashew Training Script (SKIP / U-Net variant)
 
 Mirrors the Sen1Floods11 skip launcher, retargeted at Cashew:
   - Model_Cashew_Skip / CashewSkipDataset instead of the SenFlood versions
   - dataset root -> ./data/geo-bench-1.0/segmentation_v1.0/m-cashew-plant
   - wandb project "Cashew"
   - complexity measurement uses input_size=256 (Cashew's native patch size)
-    instead of 512
+  - single seeded --test_only run, no multi-seed aggregation
 
-Per your note, this version does NOT do multi-seed --test_only repeats —
-a single seeded test run instead, no summary-stats aggregation.
+PTv3 changes are tagged  # >>> PTV3: AtomizerPTv3 (Atomizer per-pixel tokenizer +
+PTv3 backbone) is selected by PTv3.enabled: true or "ptv3" in the encoder name; it
+clears the U-Net switches, turns slide / error predictor off and gives the run a
+distinct encoder name. Needs point_transformer_v3 on PYTHONPATH.
 
-Assumes collate_grouped_skip is generic over the "groups"/"queries"/
-"query_token_idx"/"query_token_valid" dict shape (it is, for Sen1Floods11Skip)
-and needs no Cashew-specific changes. If your collate fn hardcodes anything
-Sen1Floods11-specific (band counts, resolution keys), flag it — none of what
-I've seen so far suggests it does.
+U-Net changes are tagged  # >>> UNET:
+    * --config argument (default: config_test-CASHEW.yaml)
+    * U-Net safety overrides: slide / error predictor off, segmentation only,
+      distinct encoder name (checkpoints and wandb never collide with the
+      baseline)
+    * pre-flight check: token positions identical across samples
+    * DDP always find_unused_parameters=True (the old line switched to "auto"
+      for a U-Net, which crashes: some parameters get no gradient at step 1)
+    * --test_only reports missing / unexpected checkpoint keys
+    * unused TokenAssignmentCallbackSenFlood removed
 """
 
 import os
@@ -37,21 +44,20 @@ from pytorch_lightning.callbacks import (
 seed_everything(42, workers=True)
 
 from training.utils import read_yaml
-from training.utils import Lookup_encoding
+from training.utils.Lookup_positional import Lookup_encoding          # >>> UNET: direct import
 
 from training.trainer_Cashew import Model_Cashew_Skip
 from training.utils.datasets.utils_dataset_cashew import CashewSkipDataset
 from training.utils.datasets.dataloaders import UnifiedDataModule
 from training.utils.datasets.collate_grouped_skip import collate_grouped_skip
 
-from training.utils.callbacks.stability_monitor import StabilityMonitor
-from training.utils.callbacks.token_assignement import TokenAssignmentCallbackSenFlood
 
+IS_RANK0 = os.environ.get("LOCAL_RANK", "0") == "0"
 
 # =============================================================================
 # ARGS
 # =============================================================================
-parser = argparse.ArgumentParser(description="Cashew training script (skip variant)")
+parser = argparse.ArgumentParser(description="Cashew training script (skip / U-Net variant)")
 parser.add_argument("--xp_name",      type=str, required=True, help="Experiment name")
 parser.add_argument("--dataset_name", type=str, help="Name of the dataset used")
 parser.add_argument("--clipping",     action="store_true",     help="Enable gradient clipping at 1.0")
@@ -61,58 +67,84 @@ parser.add_argument("--deterministic", action="store_true",
                     help="Force deterministic CUDA ops")
 parser.add_argument("--test_only", type=str, default=None,
                     help="Path to a checkpoint: load it and run ONLY trainer.test "
-                         "(skips fit and the complexity block). Single run, no "
-                         "multi-seed aggregation.")
+                         "(skips fit and the complexity block). Single run.")
+# >>> UNET
+parser.add_argument("--config", type=str, default="./training/configs/config_test_cashew_unet.yaml",
+                    help="Model config YAML")
+parser.add_argument("--skip_preflight", action="store_true",
+                    help="Skip the token-layout sanity check (U-Net only)")
+# >>> END UNET
 args = parser.parse_args()
 
 xp_name = args.xp_name
-# NOTE: this config file doesn't exist yet in what I've seen — create
-# ./training/configs/config_test-CASHEW.yaml (copy config_test-SENFLOOD.yaml
-# and set trainer.num_classes=7, plus any Cashew-specific max_tokens/crop
-# settings) before running this script.
-config_model = read_yaml("./training/configs/config_test-CASHEW.yaml")
-
+config_model = read_yaml(args.config)
 bands_yaml = "./data/bands_info/bands.yaml"
 
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    print(f"[Train] Gradient clipping: {'ON (val=1.0)' if args.clipping else 'OFF'}")
+# =============================================================================
+# >>> UNET: detection + safety overrides
+# =============================================================================
+a_cfg = config_model.setdefault("Atomiser", {})
+
+# >>> PTV3: detect first, and clear the U-Net switches so a PTv3 config copied
+# from the U-Net one does not select both encoders.
+is_ptv3 = ("ptv3" in str(config_model.get("encoder", "")).lower()
+           or bool((config_model.get("PTv3") or {}).get("enabled", False)))
+if is_ptv3:
+    config_model.setdefault("PTv3", {})["enabled"] = True
+    a_cfg.pop("unet_task", None)
+    a_cfg["use_error_predictor"] = False
+    config_model["trainer"]["slide"] = False
+    if config_model["trainer"].get("mode", "segmentation") != "segmentation":
+        raise ValueError("AtomizerPTv3 supports trainer.mode: segmentation only")
+    enc_name = str(config_model.get("encoder", "ATOMIZER"))
+    enc_name = enc_name.replace("_Unet", "").replace("_unet", "")
+    if "ptv3" not in enc_name.lower():
+        enc_name = f"{enc_name}_PTv3"
+    config_model["encoder"] = enc_name           # checkpoints / wandb never collide
+    try:
+        import point_transformer_v3  # noqa: F401
+    except ImportError as e:
+        raise ImportError("point_transformer_v3 not importable: "
+                          "export PYTHONPATH=/path/to/PointTransformerV3/src:$PYTHONPATH") from e
+# >>> END PTV3
+
+is_unet = (not is_ptv3) and ("unet" in str(config_model.get("encoder", "")).lower()
+                             or "unet_task" in a_cfg)
+if is_unet:
+    if a_cfg.get("unet_task", "segmentation") != "segmentation":
+        raise ValueError("Cashew is segmentation: set Atomiser.unet_task: segmentation")
+    a_cfg["unet_task"] = "segmentation"
+    a_cfg["use_error_predictor"] = False
+    config_model["trainer"]["slide"] = False
+    if config_model["trainer"].get("mode", "segmentation") != "segmentation":
+        raise ValueError("Atomiser_Unet supports trainer.mode: segmentation only")
+    if "unet" not in str(config_model.get("encoder", "")).lower():
+        config_model["encoder"] = f"{config_model.get('encoder', 'ATOMIZER')}_Unet"
+# >>> END UNET
+
+if IS_RANK0:
+    print(f"[Train] Config: {args.config}")
+    _kind = "AtomizerPTv3" if is_ptv3 else ("U-Net" if is_unet else "baseline")   # >>> PTV3
+    print(f"[Train] Encoder: {config_model['encoder']} ({_kind})")
+    if is_ptv3:
+        print(f"[Train] PTv3 section: {config_model['PTv3']}")
+        print(f"[Train] train queries per tile: "
+              f"{config_model['trainer'].get('max_tokens_reconstruction', 'max_tokens')} "
+              f"(65536 = all pixels, as the PTv3 baseline)")
+    print(f"[Train] Gradient clipping: ON (val=1.0, fixed in Trainer)")
     print(f"[Train] Deterministic ops: {'ON' if args.deterministic else 'OFF'}")
     if args.resume:
         print(f"[Train] RESUMING from: {args.resume}")
     if args.test_only:
         print(f"[Train] TEST-ONLY mode, loading: {args.test_only}")
-    _skip_on = config_model.get("Atomiser", {}).get("use_decoder_skip", False)
-    print(f"[Train] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
+    if not is_unet and not is_ptv3:
+        _skip_on = a_cfg.get("use_decoder_skip", False)
+        print(f"[Train] Decoder pixel-skip: {'ON' if _skip_on else 'OFF (baseline)'}")
 
 # =============================================================================
 # LOOKUP TABLE
 # =============================================================================
 lookup_table = Lookup_encoding(None, read_yaml(bands_yaml), config_model)
-
-# =============================================================================
-# WANDB  (skip in test-only mode)
-# =============================================================================
-wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0" and args.test_only is None:
-    import wandb
-    wandb.init(name=config_model["encoder"], project="Cashew", config=config_model)
-    wandb_logger = WandbLogger(project="Cashew")
-    wandb.define_metric("train_loss", step_metric="trainer/global_step")
-    wandb.define_metric("val_loss", step_metric="trainer/global_step")
-
-# =============================================================================
-# MODEL  (load ckpt if test-only, else fresh)
-# =============================================================================
-is_unet = False
-if args.test_only is not None:
-    model = Model_Cashew_Skip.load_from_checkpoint(
-        args.test_only, strict=False, config=config_model, wand=False,
-        name=xp_name, transform=None, lookup_table=lookup_table)
-    model.eval()
-else:
-    model = Model_Cashew_Skip(
-        config=config_model, wand=True, name=xp_name,
-        transform=None, lookup_table=lookup_table)
 
 # =============================================================================
 # DATA MODULE
@@ -132,6 +164,69 @@ data_module = UnifiedDataModule(
 )
 
 # =============================================================================
+# >>> UNET: PRE-FLIGHT — shared token layout across samples
+# =============================================================================
+def preflight_token_layout(dm):
+    dm.setup("fit")
+    ds = dm.train_dataset
+    batch = collate_grouped_skip([ds[0], ds[1 % len(ds)]])
+    for res, grp in batch["groups"].items():
+        t = grp["tokens"]
+        assert t.dim() == 3 and t.shape[-1] >= 8, \
+            f"group {res}: expected tokens [B, N, 8], got {tuple(t.shape)}"
+        if not torch.equal(t[0, :, 1:3], t[1, :, 1:3]):
+            raise RuntimeError(
+                f"[Preflight] group {res}: token positions differ between samples. "
+                "The U-Net's hierarchy geometry needs a fixed token layout.")
+        print(f"[Preflight] group {res}: tokens {tuple(t.shape)}, "
+              f"positions identical across samples ✓")
+    print(f"[Preflight] queries {tuple(batch['queries'].shape)} ✓")
+
+
+if is_unet and IS_RANK0 and not args.skip_preflight and args.test_only is None:
+    preflight_token_layout(data_module)
+
+# =============================================================================
+# WANDB  (skip in test-only mode)
+# =============================================================================
+wandb_logger = None
+if IS_RANK0 and args.test_only is None:
+    import wandb
+    wandb.init(name=config_model["encoder"], project="Cashew", config=config_model)
+    wandb_logger = WandbLogger(project="Cashew")
+    wandb.define_metric("train_loss", step_metric="trainer/global_step")
+    wandb.define_metric("val_loss", step_metric="trainer/global_step")
+
+# =============================================================================
+# MODEL  (load ckpt if test-only, else fresh)
+# =============================================================================
+if args.test_only is not None:
+    model = Model_Cashew_Skip.load_from_checkpoint(
+        args.test_only, strict=False, config=config_model, wand=False,
+        name=xp_name, transform=None, lookup_table=lookup_table)
+    model.eval()
+    # >>> UNET: strict=False silently ignores mismatches — report them.
+    if IS_RANK0:
+        ckpt_keys = set(torch.load(args.test_only, map_location="cpu",
+                                   weights_only=False)["state_dict"].keys())
+        model_keys = set(model.state_dict().keys())
+        missing = sorted(model_keys - ckpt_keys)
+        unexpected = sorted(ckpt_keys - model_keys)
+        print(f"[TestOnly] missing keys: {len(missing)} | unexpected keys: {len(unexpected)}")
+        for k in missing[:20]:
+            print(f"  missing:    {k}")
+        for k in unexpected[:20]:
+            print(f"  unexpected: {k}")
+        if missing:
+            raise RuntimeError("[TestOnly] checkpoint does not match the model built from "
+                               "--config (missing weights). Use the training config.")
+    # >>> END UNET
+else:
+    model = Model_Cashew_Skip(
+        config=config_model, wand=True, name=xp_name,
+        transform=None, lookup_table=lookup_table)
+
+# =============================================================================
 # CALLBACKS
 # =============================================================================
 lr_monitor   = LearningRateMonitor(logging_interval="step")
@@ -146,24 +241,14 @@ checkpoint_val = ModelCheckpoint(
     verbose=True,
 )
 
-# NOTE: TokenAssignmentCallbackSenFlood is reused as-is — it's presumably
-# generic over the batch/groups format rather than Sen1Floods11-specific.
-# If it hardcodes SenFlood band counts/names for its visualization, it'll
-# need a Cashew-specific variant; nothing I've seen so far suggests it does.
-token_assign = TokenAssignmentCallbackSenFlood(
-    log_every_n_epochs=1, sample_indices=[0],
-    save_dir="./viz_token_assignment", use_wandb=True)
-
-
-
-callbacks = [accumulator, checkpoint_val, lr_monitor,
-             StabilityMonitor(log_every_n_steps=1)]
+callbacks = [accumulator, checkpoint_val, lr_monitor]
 
 # =============================================================================
 # TRAINER
 # =============================================================================
 trainer = Trainer(
-    strategy="ddp_find_unused_parameters_true" if not is_unet else "auto",
+    # >>> UNET: always find unused parameters (both encoders need it)
+    strategy="ddp_find_unused_parameters_true",
     devices=-1,
     max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu",
@@ -182,14 +267,13 @@ trainer = Trainer(
 if args.test_only is not None:
     results = trainer.test(model, datamodule=data_module, verbose=True)
 
-    if os.environ.get("LOCAL_RANK", "0") == "0":
+    if IS_RANK0:
         metrics = results[0] if results else {}
         miou = metrics.get("test_mIoU", float("nan"))
         acc  = metrics.get("test_accuracy", float("nan"))
         print(f"RESULT test_only ckpt={args.test_only} "
               f"test_mIoU={miou:.6f} test_accuracy={acc:.6f}")
 
-    import sys
     sys.exit(0)
 
 # =============================================================================
@@ -214,7 +298,7 @@ def _batch_to_device(batch: dict, device) -> dict:
     return out
 
 
-if os.environ.get("LOCAL_RANK", "0") == "0":
+if IS_RANK0:
     from fvcore.nn import FlopCountAnalysis
 
     print("\n" + "=" * 80)
@@ -233,7 +317,6 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
     results = []
 
-    # Cashew's native patch size is 256x256 (vs. Sen1Floods11's 512x512).
     for input_size in [256]:
         print(f"\nTesting input size: {input_size}x{input_size}")
         batch_0 = collate_grouped_skip([samples[0]])
@@ -243,6 +326,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 
         batch_1 = collate_grouped_skip([samples[1]])
         batch_1 = _batch_to_device(batch_1, device)
+        # >>> UNET: tracing may fail on data-dependent indexing; timing still runs.
         try:
             with torch.no_grad():
                 flops = FlopCountAnalysis(model, (batch_1,))
@@ -292,7 +376,7 @@ if os.environ.get("LOCAL_RANK", "0") == "0":
 # =============================================================================
 # SAVE WANDB RUN ID
 # =============================================================================
-if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
+if wandb_logger and IS_RANK0:
     run_id = wandb.run.id
     print("WANDB_RUN_ID:", run_id)
     os.makedirs("training/wandb_runs", exist_ok=True)

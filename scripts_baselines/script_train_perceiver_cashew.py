@@ -40,6 +40,10 @@ Examples:
     python script_train_cashew_perceiver.py --xp_name perceiver_cashew \
         --batch_size 8 --lr 1e-4 --epochs 80
 
+    # Ablation: no skip connections
+    python script_train_cashew_perceiver.py --xp_name perceiver_cashew_nores \
+        --no_residual
+
     # Test-only mode
     python script_train_cashew_perceiver.py --xp_name perceiver_cashew \
         --test_only ./checkpoints/cashew_perceiver/bl_perceiver_cashew-best.ckpt
@@ -149,6 +153,8 @@ parser.add_argument("--num_freq_bands",     type=int, default=16)
 parser.add_argument("--max_freq",           type=float, default=16.0)
 parser.add_argument("--attn_dropout",       type=float, default=0.0)
 parser.add_argument("--ff_dropout",         type=float, default=0.0)
+parser.add_argument("--no_residual",        action="store_true",
+                    help="Ablation: remove all skip connections in Perceiver-IO.")
 
 args = parser.parse_args()
 
@@ -184,6 +190,7 @@ print(f"  Tokens:       {args.img_size ** 2:,} per sample")
 print(f"  Queries:      {args.img_size ** 2:,} per sample")
 print(f"  Latents:      {args.num_latents} x {args.latent_dim}")
 print(f"  Depth:        {args.depth}")
+print(f"  Residual:     {not args.no_residual}")
 print(f"  Classes:      {NUM_CLASSES}")
 print(f"  Ignore index: {IGNORE_INDEX}")
 print(f"  Epochs:       {args.epochs}")
@@ -239,6 +246,7 @@ model = PerceiverSeg(
     max_freq=args.max_freq,
     attn_dropout=args.attn_dropout,
     ff_dropout=args.ff_dropout,
+    residual=(not args.no_residual),
 )
 
 
@@ -266,7 +274,7 @@ wandb_logger = None
 if os.environ.get("LOCAL_RANK", "0") == "0":
     try:
         import wandb
-        run_name = f"BL_{args.xp_name}_perceiver"
+        run_name = f"BL_{args.xp_name}_perceiver{'_nores' if args.no_residual else ''}"
         wandb.init(
             name=run_name,
             project="Atomizer_Cashew_Baselines",

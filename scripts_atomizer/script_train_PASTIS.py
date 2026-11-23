@@ -1,68 +1,54 @@
 """
-PASTIS-HD Training Script — Multi-temporal Crop Segmentation (SKIP variant)
-=============================================================================
+PASTIS-HD Training Script — Multi-temporal Crop Segmentation (SKIP / U-Net variant)
+====================================================================================
 
 Train Atomiser-IO on PASTIS-HD for crop type segmentation, with support for
 the decoder pixel-skip cascade (Atomiser_Senflood_Skip), selected via
 config["Atomiser"]["use_decoder_skip"]. PASTISTrainer already branches on
-that flag, so this script does not need a separate "Skip" trainer class --
-PASTISTrainer + a skip-enabled config + the skip dataset/collate is enough.
+that flag, so this script does not need a separate "Skip" trainer class.
+
+>>> UNET: when the config is an Atomiser_Unet config (encoder name contains
+"unet", or Atomiser.unet_task is set), PASTISTrainer builds Atomiser_Unet;
+the PASTIS metric (crop mIoU over classes 1-18) is the same for every
+encoder. The U-Net uses JOINT temporal encoding: all
+dates' atoms go into one set, acquisition time is atom metadata, and every
+pixel is one site with T x C atoms. Constraints enforced below:
+    * no --use_temporal_transformer (the U-Net is single-pass)
+    * no --use_spot (a 1 m group would dominate the hierarchy geometry)
+    * a fixed token layout across samples (pre-flight check)
 
 >>> TEMPORAL: also supports config["Atomiser"]["use_temporal_transformer"]
 (or --use_temporal_transformer), which swaps the dataset/collate pair to
-PastisHDTemporalDataset + pastis_temporal_collate_fn. That dataset builds
-per-timestep [T, N, 8] token groups (S2 anchor, S1 nearest-calendar-date
-matched) instead of one flat concatenated pool, required by AtomiserTemporal
-(training/atomiser/Atomiser_temporal.py). It ALWAYS requires S1 (raises if
-use_s1=False) and NEVER uses SPOT (forces use_spot=False internally,
-regardless of --use_spot). PASTISTrainer's encoder-selection branches on the
-same config flag, so setting use_temporal_transformer: true in the config
-(or passing --use_temporal_transformer) is sufficient for both sides to
-switch in lockstep.
+PastisHDTemporalDataset + pastis_temporal_collate_fn (per-timestep groups,
+required by AtomiserTemporal). It ALWAYS requires S1 and NEVER uses SPOT.
 
-Dataset (utils_dataset_PASTIS.PastisHDDataset) now emits, on every sample:
+Dataset (utils_dataset_PASTIS.PastisHDDataset) emits, on every sample:
     "query_token_idx":   [N_q, Ts2*C2 + Ts1*C1] long
     "query_token_valid": [N_q] bool
 which index into groups[10.0]["tokens"] (the SAT group only -- NOT SPOT).
-
-Collate (token_grouping.collate_multitask) is already skip-aware: it pads
-query_token_idx/query_token_valid in lockstep with queries and generalizes
-over however many resolution groups a sample has (SAT@10m, optionally
-SPOT@1m). No PASTIS-specific collate changes were needed.
-
-  - S2 (10 bands, multi-temporal) — always enabled
-  - S1A (3 bands, multi-temporal) — optional via --use_s1 (REQUIRED if
-    --use_temporal_transformer is set)
-  - SPOT6 (3 bands, single frame) — optional via --use_spot (ignored if
-    --use_temporal_transformer is set)
+Atomiser_Unet ignores them.
 
 Splits (fold-based):
   - Train: folds 1, 2, 3
   - Val:   fold 4
   - Test:  fold 5
 
-# >>> MULTI_SEED_TEST: --test_only now runs N_TEST_RUNS repeats, each with a
-# different seed (list hardcoded below), and reports mean/max/min/std across
-# runs for test_mIoU and test_accuracy. Mirrors the SenFlood skip script:
-# test-time forward passes are not fully deterministic across seeds because
-# of per-step random subsampling in the spatial sampler, so repeating under
-# different seeds captures that sampling variance.
+# >>> MULTI_SEED_TEST: --test_only runs N_TEST_RUNS repeats with different
+# seeds and reports mean/max/min/std. (The U-Net's evaluation is
+# deterministic, so its repeats give identical numbers.)
 
 Examples:
-    # S2-only, from scratch
-    python train_pastis.py --xp_name pastis_s2only
+    # U-Net, S2 + S1, per-date encoding + per-level temporal aggregation
+    python train_pastis.py --xp_name pastis_unet_temporal --use_s1 \
+        --config_model config_test-PASTIS-unet-legacy-temporal.yaml
 
-    # S2 + S1 + SPOT, full temporal (flat token, no TemporalTransformer)
-    python train_pastis.py --xp_name pastis_full \
-        --use_s1 --use_spot --multi_temporal 10
+    # U-Net, S2 + S1, joint temporal encoding
+    python train_pastis.py --xp_name pastis_unet --use_s1 \
+        --config_model config_test-PASTIS-unet.yaml
 
-    # S2 + S1, TemporalTransformer aggregation (per-timestep groups)
+    # Baseline, S2 + S1, TemporalTransformer aggregation
     python train_pastis.py --xp_name pastis_temporal \
         --use_s1 --use_temporal_transformer --multi_temporal 6
-
-    # Test-only, N_TEST_RUNS repeats with summary stats
-    python train_pastis.py --xp_name pastis_full --test_only \
-        --ckpt_path ./checkpoints/pastis/pastis_full-last-epoch=42.ckpt
 """
 
 # =============================================================================
@@ -72,7 +58,6 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import sys
 import time
 import argparse
 import statistics
@@ -91,7 +76,7 @@ import torch.distributed as dist
 seed_everything(42, workers=True)
 
 from training.utils import read_yaml, Lookup_encoding
-from training.trainer_PASTIS import PASTISTrainer
+from training.trainer_PASTIS import PASTISTrainer          # builds Atomiser_Unet for U-Net configs
 from training.utils.datasets.utils_dataset_PASTIS import PastisHDDataset
 from training.utils.datasets.token_grouping import collate_multitask
 from training.utils.datasets.token_builder import TokenBuilder
@@ -103,6 +88,8 @@ from training.utils.datasets.pastis_temporal_dataset import (
 )
 
 from training.utils.callbacks.segmentation_viz_callback import SegmentationVizCallback
+
+IS_RANK0 = os.environ.get("LOCAL_RANK", "0") == "0"
 
 # =============================================================================
 # KNOWN RESOLUTIONS
@@ -124,7 +111,7 @@ def register_all_resolutions(lookup_table):
 # MULTI-SEED TEST CONFIG
 # =============================================================================
 N_TEST_RUNS = 2
-TEST_SEEDS = list(range(1, N_TEST_RUNS + 1))  # seed == run number (1, 2, 3, ...)
+TEST_SEEDS = list(range(1, N_TEST_RUNS + 1))
 
 
 # =============================================================================
@@ -169,11 +156,6 @@ def load_pretrained_encoder(model, ckpt_path):
 
 # =============================================================================
 # COLLATE (flat/SKIP variant — used when NOT use_temporal_transformer)
-#
-# >>> SKIP: collate_multitask (token_grouping.py) already pads
-# query_token_idx / query_token_valid in lockstep with queries and puts them
-# at the TOP LEVEL of the returned dict (not nested under "tasks"), so no
-# extra handling is needed here beyond the pre-existing queries lift.
 # =============================================================================
 
 def pastis_collate(samples):
@@ -187,12 +169,6 @@ def pastis_collate(samples):
 
 # =============================================================================
 # DATAMODULE
-#
-# >>> TEMPORAL: dataset_cls / collate_fn are now parameters instead of being
-# hardcoded, so the SAME datamodule class serves both the flat/SKIP path and
-# the per-timestep TemporalTransformer path. Which pair gets used is decided
-# once, in the __main__ block below, from --use_temporal_transformer /
-# config["Atomiser"]["use_temporal_transformer"].
 # =============================================================================
 
 class PastisDataModule(pl.LightningDataModule):
@@ -278,7 +254,7 @@ class PastisDataModule(pl.LightningDataModule):
 # =============================================================================
 # ARGS
 # =============================================================================
-parser = argparse.ArgumentParser(description="PASTIS-HD Training (skip variant)")
+parser = argparse.ArgumentParser(description="PASTIS-HD Training (skip / U-Net variant)")
 parser.add_argument("--xp_name",        type=str, required=True)
 parser.add_argument("--config_model",   type=str,
                     default="config_test-PASTIS.yaml")
@@ -292,37 +268,23 @@ parser.add_argument("--num_workers",    type=int, default=4)
 parser.add_argument("--grad_accum",     type=int, default=1)
 parser.add_argument("--deterministic",  action="store_true",
                     help="Force deterministic CUDA ops")
-
-# Wandb resume
 parser.add_argument("--wandb_run_id",   type=str, default=None,
                     help="Wandb run ID to resume logging into (use with --ckpt_path)")
-
-# Test-only mode
 parser.add_argument("--test_only",      action="store_true",
-                    help="Skip training, load checkpoint from config trainer.checkpoint_path "
-                         "(or --ckpt_path) and run test split only. "
-                         f"Runs {N_TEST_RUNS} repeats under different seeds "
-                         "and reports mean/max/min/std, same as the SenFlood "
-                         "skip script.")
-
-# Modality toggles
+                    help="Skip training, load checkpoint (--ckpt_path or config "
+                         f"trainer.checkpoint_path) and run test only, {N_TEST_RUNS} repeats.")
 parser.add_argument("--use_s1",         action="store_true",
                     help="Enable S1A SAR data (default: S2-only)")
 parser.add_argument("--use_spot",       action="store_true",
-                    help="Enable SPOT6 RGB data (default: S2-only; ignored "
-                         "if --use_temporal_transformer is set)")
-
-# >>> TEMPORAL
+                    help="Enable SPOT6 RGB data (not supported by the U-Net)")
 parser.add_argument("--use_temporal_transformer", action="store_true",
-                    help="Use AtomiserTemporal: per-timestep "
-                         "Atomiser_Senflood_Skip encoding + TemporalTransformer "
-                         "aggregation, with S2/S1 aligned via nearest-calendar-"
-                         "date matching (PastisHDTemporalDataset). Requires "
-                         "--use_s1. SPOT is not supported in this mode.")
-
-# Temporal config
+                    help="Use AtomiserTemporal (baseline only; requires --use_s1)")
 parser.add_argument("--multi_temporal", type=int, default=None,
                     help="Number of temporal frames (overrides config)")
+# >>> UNET
+parser.add_argument("--skip_preflight", action="store_true",
+                    help="Skip the token-layout sanity check (U-Net only)")
+# >>> END UNET
 
 args = parser.parse_args()
 
@@ -333,19 +295,10 @@ config_model         = read_yaml("./training/configs/" + args.config_model)
 bands_yaml_path      = "./data/bands_info/bands.yaml"
 configs_dataset_path = "./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml"
 
-# Override multi_temporal in config if specified via CLI
 if args.multi_temporal is not None:
-    if "dataset" not in config_model:
-        config_model["dataset"] = {}
-    config_model["dataset"]["multi_temporal"] = args.multi_temporal
+    config_model.setdefault("dataset", {})["multi_temporal"] = args.multi_temporal
 
-# >>> TEMPORAL: CLI flag wins, but keep the config value in sync so
-# PASTISTrainer's encoder-selection branch (which reads
-# config["Atomiser"]["use_temporal_transformer"]) matches what this script
-# actually wires up on the data side. Also validate the S1/SPOT constraints
-# up front rather than letting PastisHDTemporalDataset raise mid-__init__.
-if "Atomiser" not in config_model:
-    config_model["Atomiser"] = {}
+config_model.setdefault("Atomiser", {})
 
 _use_temporal_transformer = (
     args.use_temporal_transformer
@@ -353,58 +306,58 @@ _use_temporal_transformer = (
 )
 config_model["Atomiser"]["use_temporal_transformer"] = _use_temporal_transformer
 
+# >>> UNET: detection + constraints
+a_cfg = config_model["Atomiser"]
+is_unet = ("unet" in str(config_model.get("encoder", "")).lower() or "unet_task" in a_cfg)
+unet_temporal = is_unet and a_cfg.get("unet_temporal", "none") == "per_level"
+if is_unet:
+    if _use_temporal_transformer:
+        raise ValueError("Atomiser_Unet: drop --use_temporal_transformer / "
+                         "Atomiser.use_temporal_transformer (for per-date encoding set "
+                         "Atomiser.unet_temporal: per_level instead).")
+    if unet_temporal and not args.use_s1:
+        raise ValueError("unet_temporal: per_level uses PastisHDTemporalDataset, which "
+                         "requires --use_s1.")
+    if args.use_spot:
+        raise ValueError("Atomiser_Unet on PASTIS: SPOT is not supported (a 1 m group "
+                         "would dominate the hierarchy geometry). Drop --use_spot.")
+    if a_cfg.get("unet_task", "segmentation") != "segmentation":
+        raise ValueError("PASTIS is segmentation: set Atomiser.unet_task: segmentation")
+    a_cfg["unet_task"] = "segmentation"
+    a_cfg["use_error_predictor"] = False
+    config_model["trainer"]["slide"] = False
+    if "unet" not in str(config_model.get("encoder", "")).lower():
+        config_model["encoder"] = f"{config_model.get('encoder', 'ATOMIZER')}_Unet"
+# >>> END UNET
+
 if _use_temporal_transformer:
     if not args.use_s1:
-        raise ValueError(
-            "--use_temporal_transformer requires --use_s1: "
-            "PastisHDTemporalDataset always pairs S2 with S1 via "
-            "nearest-calendar-date matching."
-        )
+        raise ValueError("--use_temporal_transformer requires --use_s1.")
     if args.use_spot:
-        print("[PASTIS] [WARNING] --use_spot is ignored with "
-              "--use_temporal_transformer (SPOT is out of scope for "
-              "PastisHDTemporalDataset).")
+        print("[PASTIS] [WARNING] --use_spot is ignored with --use_temporal_transformer.")
 
-# >>> SKIP: sanity check -- the skip gather index built by PastisHDDataset is
-# only useful (and only matches what Atomiser_Senflood_Skip expects) if the
-# skip encoder is actually selected. Warn loudly rather than silently
-# training/testing with the base encoder while paying the extra dataset cost.
-_use_decoder_skip = config_model.get("Atomiser", {}).get("use_decoder_skip", False)
-if os.environ.get("LOCAL_RANK", "0") == "0":
-    if _use_temporal_transformer:
-        print(f"[PASTIS] Temporal transformer: ON "
-              f"(AtomiserTemporal, PastisHDTemporalDataset, S2-anchored "
-              f"nearest-date S1 matching)")
-        if _use_decoder_skip:
-            print(f"[PASTIS] Decoder pixel-skip: ON (active inside AtomiserTemporal)")
-        else:
-            print(f"[PASTIS] Decoder pixel-skip: OFF "
-                  f"(query_token_idx/query_token_valid computed and collated "
-                  f"but ignored by AtomiserTemporal.forward)")
+_use_decoder_skip = a_cfg.get("use_decoder_skip", False)
+if IS_RANK0:
+    if is_unet:
+        print(f"[PASTIS] Encoder: Atomiser_Unet "
+              f"({'per-level temporal aggregation' if unet_temporal else 'joint temporal encoding'})")
+    elif _use_temporal_transformer:
+        print(f"[PASTIS] Temporal transformer: ON (AtomiserTemporal)")
     elif _use_decoder_skip:
-        print(f"[PASTIS] Decoder pixel-skip: ON "
-              f"(Atomiser_Senflood_Skip, via config['Atomiser']['use_decoder_skip'])")
+        print(f"[PASTIS] Decoder pixel-skip: ON (Atomiser_Senflood_Skip)")
     else:
-        print(f"[PASTIS] Decoder pixel-skip: OFF -- "
-              f"query_token_idx/query_token_valid will be computed by the "
-              f"dataset and collated, but PASTISTrainer will NOT use them "
-              f"(falls back to AtomiserLTAE or Atomiser_Senflood). Set "
-              f"config['Atomiser']['use_decoder_skip'] = true to enable the skip cascade.")
+        print(f"[PASTIS] Decoder pixel-skip: OFF (PASTISTrainer default encoder)")
     print(f"[PASTIS] Deterministic ops: {'ON' if args.deterministic else 'OFF'}")
     if args.test_only:
-        print(f"[PASTIS] TEST-ONLY mode")
-        print(f"[PASTIS] TEST-ONLY will run {N_TEST_RUNS} repeats "
-              f"with seeds {TEST_SEEDS}")
+        print(f"[PASTIS] TEST-ONLY mode, {N_TEST_RUNS} repeats with seeds {TEST_SEEDS}")
 
 lookup_table = Lookup_encoding(
     read_yaml(configs_dataset_path), read_yaml(bands_yaml_path), config_model)
 register_all_resolutions(lookup_table)
 
-# Register VV-VH SAR channel (not in bands.yaml, needed for S1 3rd band)
 if args.use_s1:
     lookup_table.register_abstract_channel("VV_VH")
 
-# Build modality description for logging
 modalities = ["S2"]
 if args.use_s1:
     modalities.append("S1")
@@ -420,10 +373,10 @@ print(f"[PASTIS] Modalities:   {modality_str}")
 print(f"[PASTIS] Temporal:     {multi_temporal} frames (uniform via linspace)")
 
 # =============================================================================
-# WANDB  (skip in test-only mode, same convention as the SenFlood skip script)
+# WANDB
 # =============================================================================
 wandb_logger = None
-if os.environ.get("LOCAL_RANK", "0") == "0" and not args.test_only:
+if IS_RANK0 and not args.test_only:
     import wandb
     pretrain_tag = "pretrained" if args.pretrained_encoder else "scratch"
     run_name = f"PASTIS_{args.xp_name}_{modality_str}_{pretrain_tag}"
@@ -440,11 +393,9 @@ if os.environ.get("LOCAL_RANK", "0") == "0" and not args.test_only:
             "multi_temporal":           multi_temporal,
         },
     )
-
-    # Resume an existing wandb run if requested
     if args.wandb_run_id is not None:
-        wandb_init_kwargs["id"]      = args.wandb_run_id
-        wandb_init_kwargs["resume"]  = "must"        # fail if run doesn't exist
+        wandb_init_kwargs["id"]     = args.wandb_run_id
+        wandb_init_kwargs["resume"] = "must"
         print(f"[PASTIS] Resuming wandb run: {args.wandb_run_id}")
     else:
         print(f"[PASTIS] Starting new wandb run: {run_name}")
@@ -454,12 +405,11 @@ if os.environ.get("LOCAL_RANK", "0") == "0" and not args.test_only:
 
 # =============================================================================
 # DATA MODULE
-#
-# >>> TEMPORAL: dataset_cls / collate_fn swapped based on
-# use_temporal_transformer. Everything else about the datamodule is shared.
 # =============================================================================
-_dataset_cls = PastisHDTemporalDataset if _use_temporal_transformer else PastisHDDataset
-_collate_fn  = pastis_temporal_collate_fn if _use_temporal_transformer else pastis_collate
+# >>> UNET: per-date tokens for unet_temporal: per_level too
+_per_date = _use_temporal_transformer or unet_temporal
+_dataset_cls = PastisHDTemporalDataset if _per_date else PastisHDDataset
+_collate_fn  = pastis_temporal_collate_fn if _per_date else pastis_collate
 
 data_module = PastisDataModule(
     root_path=args.data_dir,
@@ -478,21 +428,63 @@ print(f"[PASTIS] Lookup table: {len(lookup_table.table_wave)} entries")
 # =============================================================================
 # MODEL
 # =============================================================================
+# >>> UNET: PASTISTrainer builds Atomiser_Unet for U-Net configs and keeps the
+# PASTIS metric (crop mIoU over classes 1-18) for every encoder
 model = PASTISTrainer(
     config=config_model, wand=(not args.test_only), name=args.xp_name,
     transform=None, lookup_table=lookup_table,
 )
+# >>> END UNET
 
 if args.pretrained_encoder:
     model = load_pretrained_encoder(model, args.pretrained_encoder)
+
+
+# =============================================================================
+# >>> UNET: PRE-FLIGHT — shared token layout across samples
+# (built AFTER the model, so the lookup table already holds every day of year)
+# =============================================================================
+def preflight_token_layout(dm):
+    ds = dm.train_dataset
+    s0, s1 = ds[0], ds[1 % len(ds)]
+    batch = _collate_fn([s0, s1])
+    for res, grp in batch["groups"].items():
+        t = grp["tokens"]
+        if t.dim() == 4:                                    # [B, T, N, 8]: per-date tokens
+            same_dates = all(torch.equal(t[0, 0, :, 1:3], t[0, d, :, 1:3]) for d in range(t.shape[1]))
+            if not same_dates:
+                raise RuntimeError(f"[Preflight] group {res}: token positions differ between "
+                                   "dates; the per-date U-Net needs one layout for all dates.")
+            print(f"[Preflight] group {res}: {t.shape[1]} dates x {t.shape[2]} atoms, "
+                  f"positions identical across dates ✓")
+            t = t[:, 0]
+        if not torch.equal(t[0, :, 1:3], t[1, :, 1:3]):
+            raise RuntimeError(
+                f"[Preflight] group {res}: token positions differ between samples "
+                f"(e.g. a series shorter than multi_temporal={multi_temporal}). "
+                "The U-Net's hierarchy geometry needs a fixed token layout.")
+        n_dates = int(torch.unique(grp["tokens"][0][..., 7]).numel())
+        print(f"[Preflight] group {res}: tokens {tuple(grp['tokens'].shape)}, positions identical "
+              f"across samples ✓  ({n_dates} distinct time indices in sample 0)")
+    if unet_temporal:
+        tp = batch.get("time_positions", batch.get("time_indices"))
+        print(f"[Preflight] time positions for the temporal transformers: "
+              f"{'missing (ordinal fallback)' if tp is None else tuple(tp.shape)}")
+    if len(batch["groups"]) > 1:
+        raise RuntimeError("[Preflight] more than one resolution group (SPOT?) — "
+                           "not supported by the U-Net here.")
+    print(f"[Preflight] queries {tuple(batch['queries'].shape)} ✓")
+
+
+if is_unet and IS_RANK0 and not args.skip_preflight and not args.test_only:
+    preflight_token_layout(data_module)
+# >>> END UNET
 
 # =============================================================================
 # CALLBACKS & TRAINER
 # =============================================================================
 ckpt_dir = f"./checkpoints/pastis/"
 os.makedirs(ckpt_dir, exist_ok=True)
-
-
 
 callbacks = [
     ModelCheckpoint(
@@ -507,17 +499,14 @@ callbacks = [
         every_n_epochs=1, save_top_k=1, save_last=True, verbose=True,
     ),
     LearningRateMonitor(logging_interval="step"),
-
 ]
-
-
 
 num_nodes = int(os.environ.get("SLURM_NNODES", 1))
 
 trainer = Trainer(
     strategy=DDPStrategy(find_unused_parameters=True),
     use_distributed_sampler=False,
-    devices=-1,num_nodes=num_nodes, max_epochs=config_model["trainer"]["epochs"],
+    devices=-1, num_nodes=num_nodes, max_epochs=config_model["trainer"]["epochs"],
     accelerator="gpu", precision="bf16-mixed",
     logger=wandb_logger, log_every_n_steps=5,
     callbacks=callbacks, default_root_dir=ckpt_dir,
@@ -526,7 +515,7 @@ trainer = Trainer(
 )
 
 # =============================================================================
-# TEST-ONLY EARLY EXIT  (>>> MULTI_SEED_TEST: N repeats + summary stats)
+# TEST-ONLY EARLY EXIT
 # =============================================================================
 if args.test_only:
     ckpt_to_load = (
@@ -534,12 +523,9 @@ if args.test_only:
         or config_model.get("trainer", {}).get("checkpoint_path")
     )
     if ckpt_to_load is None:
-        raise ValueError(
-            "--test_only requires a checkpoint. Either pass --ckpt_path "
-            "or set trainer.checkpoint_path in the config YAML."
-        )
+        raise ValueError("--test_only requires --ckpt_path or trainer.checkpoint_path.")
 
-    if os.environ.get("LOCAL_RANK", "0") == "0":
+    if IS_RANK0:
         print(f"\n{'='*60}")
         print(f"  PASTIS-HD — TEST ONLY")
         print(f"  Checkpoint: {ckpt_to_load}")
@@ -547,13 +533,10 @@ if args.test_only:
         print(f"  Temporal:   {multi_temporal} frames")
         print(f"{'='*60}\n")
 
-    # Load weights into the already-constructed model once, up front --
-    # each repeat reuses these weights, only the seed (and therefore the
-    # stochastic spatial sampling at eval time) changes.
     ckpt = torch.load(ckpt_to_load, map_location="cpu", weights_only=False)
     state = ckpt.get("state_dict", ckpt)
     result = model.load_state_dict(state, strict=False)
-    if os.environ.get("LOCAL_RANK", "0") == "0":
+    if IS_RANK0:
         print(f"[PASTIS] Loaded checkpoint — "
               f"missing: {len(result.missing_keys)}, "
               f"unexpected: {len(result.unexpected_keys)}")
@@ -561,23 +544,19 @@ if args.test_only:
             print(f"[PASTIS] First 5 missing: {result.missing_keys[:5]}")
         if result.unexpected_keys:
             print(f"[PASTIS] First 5 unexpected: {result.unexpected_keys[:5]}")
+    # >>> UNET: a partially loaded model gives meaningless numbers
+    if result.missing_keys:
+        raise RuntimeError("[PASTIS] checkpoint does not match the model built from "
+                           "--config_model (missing weights).")
     model.eval()
 
     miou_runs, acc_runs = [], []
 
     for run_idx, seed in enumerate(TEST_SEEDS, 1):
-        # Reseed before each run so any stochastic eval-time behavior (e.g.
-        # spatial sampler subsampling) draws a fresh sample per run rather
-        # than repeating the same draw N times.
         seed_everything(seed, workers=True)
+        if IS_RANK0:
+            print(f"\n[PASTIS][TEST-ONLY] Run {run_idx}/{N_TEST_RUNS} (seed={seed})")
 
-        if os.environ.get("LOCAL_RANK", "0") == "0":
-            print(f"\n[PASTIS][TEST-ONLY] Run {run_idx}/{N_TEST_RUNS} "
-                  f"(seed={seed})")
-
-        # Fresh Trainer per run: avoids any state (e.g. logged metrics,
-        # internal loop counters) carrying over between repeated .test()
-        # calls on the same Trainer instance.
         run_trainer = Trainer(
             strategy=DDPStrategy(find_unused_parameters=True),
             use_distributed_sampler=False,
@@ -591,7 +570,7 @@ if args.test_only:
         )
         results = run_trainer.test(model, datamodule=data_module, verbose=True)
 
-        if os.environ.get("LOCAL_RANK", "0") == "0":
+        if IS_RANK0:
             metrics = results[0] if results else {}
             miou = metrics.get("test_mIoU", float("nan"))
             acc  = metrics.get("test_accuracy", float("nan"))
@@ -600,19 +579,14 @@ if args.test_only:
             print(f"RESULT test_only ckpt={ckpt_to_load} run={run_idx} "
                   f"seed={seed} test_mIoU={miou:.6f} test_accuracy={acc:.6f}")
 
-    if os.environ.get("LOCAL_RANK", "0") == "0":
+    if IS_RANK0:
         def _stats(vals):
-            vals = [v for v in vals if v == v]  # drop nan
+            vals = [v for v in vals if v == v]
             if not vals:
                 return dict(mean=float("nan"), max=float("nan"),
                             min=float("nan"), std=float("nan"), n=0)
-            return dict(
-                mean=statistics.mean(vals),
-                max=max(vals),
-                min=min(vals),
-                std=statistics.stdev(vals) if len(vals) > 1 else 0.0,
-                n=len(vals),
-            )
+            return dict(mean=statistics.mean(vals), max=max(vals), min=min(vals),
+                        std=statistics.stdev(vals) if len(vals) > 1 else 0.0, n=len(vals))
 
         miou_stats = _stats(miou_runs)
         acc_stats  = _stats(acc_runs)
@@ -628,7 +602,6 @@ if args.test_only:
               f"max={acc_stats['max']:.6f}  min={acc_stats['min']:.6f}  "
               f"std={acc_stats['std']:.6f}  (n={acc_stats['n']})")
         print("=" * 78)
-
         print(f"RESULT_SUMMARY test_only ckpt={ckpt_to_load} "
               f"n_runs={miou_stats['n']} "
               f"test_mIoU_mean={miou_stats['mean']:.6f} "
@@ -658,7 +631,7 @@ print(f"{'='*60}\n")
 trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
 trainer.test(model, datamodule=data_module)
 
-if wandb_logger and os.environ.get("LOCAL_RANK", "0") == "0":
+if wandb_logger and IS_RANK0:
     import wandb
     os.makedirs("training/wandb_runs", exist_ok=True)
     with open(f"training/wandb_runs/pastis_{args.xp_name}.txt", "w") as f:

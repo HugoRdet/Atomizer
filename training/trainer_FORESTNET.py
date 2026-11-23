@@ -1,15 +1,14 @@
 """
-Atomiser Multi-Task Trainer (ForestNet — classification only for now)
-======================================================================
+Atomiser Multi-Task Trainer (ForestNet / EuroSAT — classification only for now)
+================================================================================
 
 Reads batch["task"] (set by the dataset, propagated by the collate) and
 dispatches to the appropriate forward + loss + metric path.
 
 Currently handles:
-    "classification" — uses Atomiser's task="classification" path
-                       returns [B, num_classes] logits
+    "classification" — returns [B, num_classes] logits
                        CE loss on [B] scalar targets
-                       metrics: top-1, top-5, macro-F1
+                       metrics: top-1, top-5, macro-accuracy, macro-F1
 
 Designed to extend with "segmentation" and "reconstruction" branches
 when multi-task training is added.
@@ -17,6 +16,16 @@ when multi-task training is added.
 Round-robin assumption:
     All samples in a batch have the same task. We read the task from the
     batch dict (set by the collate) and branch a single time per step.
+
+Changes vs the original Model_ForestNet are tagged  # >>> UNET:
+    * The encoder is chosen from the config: Atomiser_Unet when
+      config["encoder"] contains "unet" (case-insensitive) or when
+      config["Atomiser"]["unet_task"] is set; Atomiser_Senflood otherwise.
+      The same trainer therefore runs both the baseline and the U-Net.
+    * The encoder output is unwrapped: Atomiser_Unet returns
+      {"predictions": logits, ...}, Atomiser_Senflood returns logits.
+    * The task the batch asks for is checked against the encoder's task
+      (Atomiser_Unet raises if they differ).
 """
 
 import torch
@@ -27,6 +36,27 @@ from torchmetrics.classification import (
     MulticlassAccuracy,
     MulticlassF1Score,
 )
+
+
+# >>> UNET: encoder selection
+def _use_unet(config: dict) -> bool:
+    enc = str(config.get("encoder", ""))
+    return "unet" in enc.lower() or "unet_task" in config.get("Atomiser", {})
+
+
+def _build_encoder(config: dict, lookup_table):
+    if _use_unet(config):
+        from training.atomiser.Atomiser_unet import Atomiser_Unet
+        print("[Trainer] Encoder: Atomiser_Unet")
+        return Atomiser_Unet(config=config, lookup_table=lookup_table)
+    from training.atomiser.Atomiser_SENFLOOD import Atomiser_Senflood
+    print("[Trainer] Encoder: Atomiser_Senflood (baseline)")
+    return Atomiser_Senflood(config=config, lookup_table=lookup_table)
+
+
+def _unwrap_logits(out):
+    """Atomiser_Unet returns a dict, the baseline a tensor."""
+    return out["predictions"] if isinstance(out, dict) else out
 
 
 class Model_ForestNet(pl.LightningModule):
@@ -49,12 +79,8 @@ class Model_ForestNet(pl.LightningModule):
         self.name   = name
         self.wand   = wand
 
-        # Build Atomiser
-        from training.atomiser.Atomiser_SENFLOOD import Atomiser_Senflood
-        self.model = Atomiser_Senflood(
-            config=config,
-            lookup_table=lookup_table,
-        )
+        # >>> UNET: Atomiser_Unet or the baseline, chosen from the config
+        self.model = _build_encoder(config, lookup_table)
 
         self.num_classes     = config["trainer"]["num_classes"]
         self.label_smoothing = label_smoothing
@@ -68,6 +94,8 @@ class Model_ForestNet(pl.LightningModule):
         trainer_cfg          = config["trainer"]
         self.lr              = float(trainer_cfg.get("lr", 1e-4))
         self.weight_decay    = float(trainer_cfg.get("weight_decay", 1e-2))
+        if "weight_decay" not in trainer_cfg:
+            print(f"[Trainer] WARNING: trainer.weight_decay not set, using default {self.weight_decay}")
 
         # Classification metrics — pass Metric objects so Lightning auto-syncs
         def _make_cls_metrics(prefix: str):
@@ -92,15 +120,26 @@ class Model_ForestNet(pl.LightningModule):
     # =========================================================================
 
     def forward(self, batch, training: bool = True):
-        task = batch.get("task", "classification")
-        return self.model(batch, training=training, task=task)
+        task = self._batch_task(batch)
+        # >>> UNET: always return the logits tensor, whichever encoder is used
+        return _unwrap_logits(self.model(batch, training=training, task=task))
 
     # =========================================================================
     # SHARED STEP (dispatches on task)
     # =========================================================================
 
-    def _shared_step(self, batch, stage: str):
+    @staticmethod
+    def _batch_task(batch):
+        # >>> UNET: the collate may give a string or a per-sample list of strings
         task = batch.get("task", "classification")
+        if isinstance(task, (list, tuple)):
+            if len(set(task)) != 1:
+                raise ValueError(f"Mixed tasks in one batch: {set(task)}")
+            task = task[0]
+        return task
+
+    def _shared_step(self, batch, stage: str):
+        task = self._batch_task(batch)
 
         if task == "classification":
             return self._classification_step(batch, stage)
@@ -125,12 +164,16 @@ class Model_ForestNet(pl.LightningModule):
             target = target.long()
         bs = target.shape[0]
 
-        # Atomiser's task="classification" path:
-        # encode → spatial latents → self.classify(latents_per_res)
-        # → LatentAttentionPooling → LayerNorm → Linear → [B, num_classes]
-        logits = self.model(batch, training=is_train, task="classification")
+        # >>> UNET: unwrap {"predictions": ...} from Atomiser_Unet
+        logits = _unwrap_logits(
+            self.model(batch, training=is_train, task="classification"))
 
         # Defensive checks — fail loud rather than CUDA-assert.
+        if logits.dim() != 2 or logits.shape[0] != bs:
+            raise RuntimeError(
+                f"[Model_ForestNet] Expected logits [B={bs}, num_classes], "
+                f"got {tuple(logits.shape)}. Is unet_task set to 'classification'?"
+            )
         if logits.shape[-1] != self.num_classes:
             raise RuntimeError(
                 f"[Model_ForestNet] Logits last dim {logits.shape[-1]} != "
@@ -146,7 +189,7 @@ class Model_ForestNet(pl.LightningModule):
                 )
 
         loss = F.cross_entropy(
-            logits,
+            logits.float(),
             target,
             weight=self.class_weights,
             label_smoothing=self.label_smoothing,
@@ -156,7 +199,7 @@ class Model_ForestNet(pl.LightningModule):
         cls_metrics = getattr(self, f"{stage}_cls_metrics")
         with torch.no_grad():
             for name, metric in cls_metrics.items():
-                metric.update(logits, target)
+                metric.update(logits.float(), target)
 
         on_step = is_train
         self.log(

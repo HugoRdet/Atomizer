@@ -1,0 +1,197 @@
+"""
+PASTIS Baseline Dataset (dense tensors, temporal)
+=================================================
+
+Plain tensor version of PastisHDDataset for baseline models
+(BaselineTrainer with temporal=True): PTv3-Temporal, U-TAE, ...
+
+Same patches, folds, label handling, normalization statistics and
+temporal sampling as PastisHDDataset:
+  - folds 1-3 train, 4 val, 5 test
+  - labels: <0, 19 (void) and >=20 -> 255; classes 0..18 kept (19 classes)
+  - normalization_stats.pt from the dataset root (computed on train if missing)
+  - `multi_temporal` evenly spaced frames (torch.linspace, PANGAEA convention)
+
+Output (one sample):
+    {
+        "image":  {"s2": [T, 10, 128, 128]},          padded to T frames
+        "dates":  {"s2": [T]},  days since 2018-09-01, -1 = padded frame
+        "target": [128, 128] long, 255 = ignore,
+        "metadata": {...},
+    }
+
+Dates are DAYS SINCE THE REFERENCE DATE, not day-of-year: the PASTIS series
+runs from September 2018 to November 2019, so day-of-year would wrap and
+give two different acquisitions the same date.
+
+S2 only. S1 has different acquisition dates, so its frames are not aligned
+in time with S2; it would need its own temporal branch.
+"""
+
+import json
+import os
+import random
+from datetime import datetime
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+try:
+    import pandas as pd
+    import geopandas as gpd
+    HAS_GEOPANDAS = True
+except ImportError:
+    HAS_GEOPANDAS = False
+
+
+class PastisBaselineDataset(Dataset):
+
+    NUM_S2_BANDS = 10
+    NUM_CLASSES  = 19            # 0..18; label 19 (void) is ignored
+    IGNORE_INDEX = 255
+    REFERENCE_DATE = datetime(2018, 9, 1)
+
+    FOLDS = {"train": [1, 2, 3], "validation": [4], "test": [5]}
+
+    def __init__(
+        self,
+        root_path: str = "./data/PASTIS-HD",
+        mode: str = "train",
+        multi_temporal: int = 10,
+        max_temporal_samples: int = 50,
+        augment: bool = True,
+    ):
+        super().__init__()
+        if not HAS_GEOPANDAS:
+            raise ImportError("geopandas is required for PASTIS.")
+        assert mode in self.FOLDS, f"Unknown split: {mode}"
+
+        self.root_path            = root_path
+        self.split                = mode
+        self.T                    = int(multi_temporal)
+        self.max_temporal_samples = int(max_temporal_samples)
+        self.augment              = augment and mode == "train"
+
+        meta = gpd.read_file(os.path.join(root_path, "metadata.geojson"))
+        self.metadata = pd.concat(
+            [meta[meta["Fold"] == f] for f in self.FOLDS[mode]]
+        ).reset_index(drop=True)
+
+        stats = self._load_or_compute_stats()
+        self.mean = stats["s2_mean"].view(1, -1, 1, 1).float()
+        self.std  = stats["s2_std"].view(1, -1, 1, 1).float().clamp(min=1e-6)
+
+        print(f"[PASTIS-BL] split={mode}, patches={len(self.metadata)}, "
+              f"T={self.T} frames (S2 only), D4 augment="
+              f"{'ON' if self.augment else 'OFF'}")
+
+    # -------------------------------------------------------------------------
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, index):
+        row = self.metadata.iloc[index]
+        pid = row["ID_PATCH"]
+
+        s2 = np.load(os.path.join(self.root_path, "DATA_S2", f"S2_{pid}.npy"))
+        s2 = torch.from_numpy(s2.astype(np.float32))           # [T0, 10, H, W]
+        dates = self._parse_dates(row, "dates-S2", s2.shape[0])
+
+        # same two-step evenly spaced sampling as PastisHDDataset
+        for n in (self.max_temporal_samples, self.T):
+            if s2.shape[0] > n:
+                idx = torch.linspace(0, s2.shape[0] - 1, n, dtype=torch.long)
+                s2 = s2[idx]
+                dates = [dates[i] for i in idx.tolist()]
+
+        s2 = torch.nan_to_num(s2, nan=0.0, posinf=0.0, neginf=0.0)
+        s2 = ((s2 - self.mean) / self.std).clamp(-10, 10)
+        days = torch.tensor([self._days(d) for d in dates], dtype=torch.float32)
+
+        label = self._load_label(pid)
+
+        if self.augment:
+            k = random.randint(0, 3)
+            if k:
+                s2    = torch.rot90(s2,    k, dims=(-2, -1))
+                label = torch.rot90(label, k, dims=(-2, -1))
+            if random.random() > 0.5:
+                s2    = torch.flip(s2,    dims=(-1,))
+                label = torch.flip(label, dims=(-1,))
+
+        # pad to exactly T frames (padded frames: zeros, date -1)
+        t = s2.shape[0]
+        if t < self.T:
+            s2 = torch.cat([s2, s2.new_zeros(self.T - t, *s2.shape[1:])])
+            days = torch.cat([days, days.new_full((self.T - t,), -1.0)])
+
+        H, W = s2.shape[-2:]
+        return {
+            "image":  {"s2": s2.contiguous()},
+            "dates":  {"s2": days},
+            "target": label.contiguous(),
+            "metadata": {"H": H, "W": W, "n_frames": t, "sample_name": str(pid)},
+        }
+
+    # -------------------------------------------------------------------------
+
+    def _days(self, date):
+        date = int(date)
+        d = datetime(date // 10000, (date % 10000) // 100, date % 100)
+        return float((d - self.REFERENCE_DATE).days)
+
+    @staticmethod
+    def _parse_dates(row, key, n):
+        if key in row:
+            d = row[key]
+            if isinstance(d, str):
+                d = json.loads(d)
+            return pd.DataFrame.from_dict(d, orient="index")[0].tolist()
+        raise KeyError(f"'{key}' missing in metadata for patch {row['ID_PATCH']}")
+
+    def _load_label(self, pid):
+        lab = np.load(os.path.join(self.root_path, "ANNOTATIONS", f"TARGET_{pid}.npy"))[0]
+        lab = torch.from_numpy(lab.astype(np.int64))
+        lab[(lab < 0) | (lab >= self.NUM_CLASSES)] = self.IGNORE_INDEX   # includes void (19)
+        return lab
+
+    def _load_or_compute_stats(self):
+        shared = os.path.join(self.root_path, "normalization_stats.pt")   # PastisHDDataset's
+        if os.path.exists(shared):
+            return torch.load(shared, weights_only=True)
+        path = os.path.join(self.root_path, "normalization_stats_s2_baseline.pt")
+        if os.path.exists(path):
+            return torch.load(path, weights_only=True)
+        if self.split != "train":
+            raise FileNotFoundError(
+                f"{path} not found. Build the train dataset first so the "
+                f"statistics are computed on the training folds.")
+        print("[PASTIS-BL] computing S2 normalization stats on train folds...")
+        s = torch.zeros(self.NUM_S2_BANDS, dtype=torch.float64)
+        sq = torch.zeros_like(s)
+        n = torch.zeros_like(s)
+        for pid in self.metadata["ID_PATCH"]:
+            a = np.nan_to_num(np.load(
+                os.path.join(self.root_path, "DATA_S2", f"S2_{pid}.npy")).astype(np.float64))
+            for c in range(self.NUM_S2_BANDS):
+                v = a[:, c].ravel()
+                v = v[v != 0]
+                s[c] += v.sum(); sq[c] += (v ** 2).sum(); n[c] += v.size
+        mean = s / n.clamp(min=1)
+        std = (sq / n.clamp(min=1) - mean ** 2).clamp(min=0).sqrt()
+        # same computation as PastisHDDataset (non-zero values, train folds),
+        # saved under a separate name so PastisHDDataset's file is not shadowed
+        stats = {"s2_mean": mean.float(), "s2_std": std.float()}
+        torch.save(stats, path)
+        return stats
+
+
+def pastis_collate(batch):
+    return {
+        "image":  {"s2": torch.stack([b["image"]["s2"] for b in batch])},   # [B,T,C,H,W]
+        "dates":  {"s2": torch.stack([b["dates"]["s2"] for b in batch])},   # [B,T]
+        "target": torch.stack([b["target"] for b in batch]),                 # [B,H,W]
+        "metadata": [b["metadata"] for b in batch],
+    }

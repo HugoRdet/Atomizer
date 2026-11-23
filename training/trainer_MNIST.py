@@ -30,7 +30,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics
 from transformers import get_cosine_schedule_with_warmup
-from training.atomiser import Atomiser_Senflood
+from training.atomiser import Atomiser_SENFLOOD
 
 
 class Model_MNIST(pl.LightningModule):
