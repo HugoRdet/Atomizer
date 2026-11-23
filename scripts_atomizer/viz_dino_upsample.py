@@ -61,7 +61,7 @@ def load_anyup(src, name, hub_dir):
     if os.path.isdir(src):
         m = torch.hub.load(src, name, source="local")
     else:
-        m = torch.hub.load(src, name)
+        m = torch.hub.load(src, name, trust_repo=True)
     return m.eval()
 
 

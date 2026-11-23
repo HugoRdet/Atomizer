@@ -48,6 +48,25 @@ S2_NM = {"B01": 443, "B02": 490, "B03": 560, "B04": 665, "B05": 705, "B06": 740,
 AERIAL_NM = [664, 559, 493, 842]                       # R, G, B, NIR (Sentinel-2-like centres)
 
 
+# ----------------------------------------------------------------------------------------------- model
+def load_panopticon(hub_dir):
+    """Offline when possible: Panopticon's hubconf.panopticon_vitb14 re-downloads its weights on EVERY call (no
+    existence check), which fails on nodes without internet. If the cached repo and the weights are both in hub_dir
+    (filled once by torch.hub.load on a login node), build the model with the repo's own constructor and load them."""
+    repo = os.path.join(hub_dir, "Panopticon-FM_panopticon_main")
+    ckpt = os.path.join(hub_dir, "panopticon_vitb14_teacher.pth")
+    if os.path.isdir(repo) and os.path.isfile(ckpt):
+        sys.path.insert(0, repo)                         # hubconf imports dinov2.* from the repo root
+        import hubconf
+        model = hubconf._panopticon_vitb14()
+        model.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=True)
+        print(f"[panopticon] loaded offline: {ckpt}")
+        return model
+    print(f"[panopticon] {repo} or {ckpt} missing: downloading through torch.hub (needs internet)")
+    torch.hub.set_dir(hub_dir)
+    return torch.hub.load("Panopticon-FM/panopticon", "panopticon_vitb14", trust_repo=True)
+
+
 # ----------------------------------------------------------------------------------------------- inputs
 def band_values(batch):
     """Student values -> [B, C, H, W] (z-scored per band; channel-major tokens)."""
@@ -169,8 +188,7 @@ def main():
     dm.setup()
 
     os.makedirs(args.hub_dir, exist_ok=True)
-    torch.hub.set_dir(os.path.abspath(args.hub_dir))
-    pano = torch.hub.load("Panopticon-FM/panopticon", "panopticon_vitb14", trust_repo=True).to(dev).eval()
+    pano = load_panopticon(os.path.abspath(args.hub_dir)).to(dev).eval()
     up = load_anyup("wimmerth/anyup", "anyup", args.anyup_dir).to(dev) if args.anyup_size else None
     os.makedirs(args.out, exist_ok=True)
     lines = []
