@@ -151,7 +151,8 @@ def main():
     ap.add_argument("--with_s1", action="store_true", help="also give VV, VH (if the spectrum specs have them)")
     ap.add_argument("--pano_size", type=int, default=224, help="Panopticon input side (0: no Panopticon column)")
     ap.add_argument("--pano_dir", default="./checkpoints/panopticon")
-    ap.add_argument("--anyup_size", type=int, default=0, help="AnyUp(SMARTIES) output side (0: none)")
+    ap.add_argument("--anyup_size", type=int, nargs="+", default=[0],
+                    help="AnyUp(SMARTIES) output side(s), e.g. 64 128 (128 = one token per 10 m pixel); 0: none")
     ap.add_argument("--anyup_dir", default="./checkpoints/anyup")
     ap.add_argument("--q_chunk", type=int, default=256)
     ap.add_argument("--pca", default="column", choices=["column", "model"])
@@ -187,7 +188,8 @@ def main():
     print(f"[smarties] all bands: {names_all} | RGB: {names_rgb}")
     teacher = OlmoEarthTeacher(dc["olmo_ckpt"], int(dc["olmo_patch"])).to(dev).eval()
     pano = load_panopticon(os.path.abspath(args.pano_dir)).to(dev).eval() if args.pano_size else None
-    up = load_anyup("wimmerth/anyup", "anyup", args.anyup_dir).to(dev) if args.anyup_size else None
+    sizes = [s for s in args.anyup_size if s > 0]
+    up = load_anyup("wimmerth/anyup", "anyup", args.anyup_dir).to(dev) if sizes else None
 
     rng = np.random.default_rng(args.seed)
     idx = rng.choice(len(ds), size=min(max(args.tiles, args.n), len(ds)), replace=False).tolist()
@@ -206,16 +208,17 @@ def main():
         maps["SMARTIES all"] = run_smarties(sm, x[:, keep_all], names_all, img, patch, dev)
         maps["SMARTIES RGB"] = run_smarties(sm, x[:, keep_rgb], names_rgb, img, patch, dev)
         guide = rgb_uint8(x, rgb_idx).to(dev)
-        if up is not None:
-            maps["AnyUp(SMARTIES)"] = run_anyup(up, guide, maps["SMARTIES all"], args.anyup_size, args.q_chunk)
+        for sz in sizes:
+            maps[f"AnyUp(SMARTIES) {sz}"] = run_anyup(up, guide, maps["SMARTIES all"], sz, args.q_chunk)
         for k, v in maps.items():
             if k != "OlmoEarth":
                 acc.setdefault(f"CKA({k}, OlmoEarth)", []).append(cka(v, ref))
         a, r = maps["SMARTIES all"], maps["SMARTIES RGB"]
         acc.setdefault("cos(SMARTIES all, RGB)", []).append(float(F.cosine_similarity(a, r, dim=-1).mean()))
         acc.setdefault("CKA(SMARTIES all, RGB)", []).append(cka(a, r))
-        if up is not None:
-            acc.setdefault("detail AnyUp(SMARTIES)", []).append(detail(maps["AnyUp(SMARTIES)"], a.shape[1]))
+        for sz in sizes:
+            if sz % a.shape[1] == 0:
+                acc.setdefault(f"detail AnyUp(SMARTIES) {sz}", []).append(detail(maps[f"AnyUp(SMARTIES) {sz}"], a.shape[1]))
         need = args.n - sum(t.shape[0] for t in imgs)
         if need > 0:
             imgs.append(guide[:need].cpu())
