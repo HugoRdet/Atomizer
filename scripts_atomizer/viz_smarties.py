@@ -92,9 +92,29 @@ def load_smarties(path, dev):
     return model, img, patch, list(specs)
 
 
-def match_bands(ours, spec_names):
+S2_ORDER = ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"]   # Sentinel-2 without B10
+
+
+def s2_table(model):
+    """SMARTIES names its bands by spectral region (blue_1, red_2, ...). Its sensor group 'S2' lists 12 of them: Sentinel-2
+    in the standard order without B10 (cirrus). Map our band names to them by position."""
+    groups = getattr(model.config, "sensor_band_specs", None) or getattr(model, "sensor_band_specs", None) or {}
+    s2 = list(groups.get("S2", []))
+    if len(s2) != len(S2_ORDER):
+        print(f"[smarties] S2 group has {len(s2)} bands, expected 12: positional mapping skipped")
+        return {}
+    table = dict(zip(S2_ORDER, s2))
+    s1 = list(groups.get("S1", []))
+    if len(s1) == 2:
+        table.update({"VV": s1[0], "VH": s1[1]})
+    print("[smarties] band mapping: " + ", ".join(f"{k}->{v}" for k, v in table.items()))
+    return table
+
+
+def match_bands(ours, spec_names, s2map=None):
     """Our channel names -> SMARTIES spec names (same order); channels without a match are left out."""
     table = {_norm_name(s): s for s in spec_names}
+    table.update(s2map or {})
     keep, names = [], []
     for c, n in enumerate(ours):
         s = table.get(_norm_name(n))
@@ -157,9 +177,10 @@ def main():
 
     sm, img, patch, spec_names = load_smarties(args.smarties, dev)
     ours = OLMO_S2 + (OLMO_S1 if args.with_s1 else [])
-    keep_all, names_all = match_bands(ours, spec_names)
+    s2map = s2_table(sm)
+    keep_all, names_all = match_bands(ours, spec_names, s2map)
     rgb_idx = [OLMO_S2.index("B04"), OLMO_S2.index("B03"), OLMO_S2.index("B02")]
-    keep_rgb, names_rgb = match_bands([ours[c] for c in rgb_idx], spec_names)
+    keep_rgb, names_rgb = match_bands([ours[c] for c in rgb_idx], spec_names, s2map)
     keep_rgb = [rgb_idx[k] for k in keep_rgb]
     if len(keep_rgb) != 3:
         raise SystemExit(f"[smarties] RGB bands not all found in the spectrum specs {spec_names}")
