@@ -123,7 +123,8 @@ class PanopticonTeacher(nn.Module):
     """
     IMAGENET = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-    def __init__(self, pano_dir, stats_path, wavelengths=(664, 559, 493, 842), anyup_dir=None, q_chunk=256):
+    def __init__(self, pano_dir, stats_path, wavelengths=(664, 559, 493, 842), anyup_dir=None, q_chunk=256,
+                 anyup_batch=2):
         super().__init__()
         import os
         import sys
@@ -146,7 +147,7 @@ class PanopticonTeacher(nn.Module):
         self.register_buffer("ids", torch.tensor([int(w) for w in wavelengths]).view(1, -1), persistent=False)
         self.register_buffer("im_mean", torch.tensor(self.IMAGENET[0]).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("im_std", torch.tensor(self.IMAGENET[1]).view(1, 3, 1, 1), persistent=False)
-        self.q_chunk = int(q_chunk)
+        self.q_chunk, self.anyup_batch = int(q_chunk), int(anyup_batch)
         self.anyup = None
         if anyup_dir:
             anyup_dir = os.path.abspath(anyup_dir)
@@ -187,17 +188,7 @@ class PanopticonTeacher(nn.Module):
             return tok
         if self.anyup is None or S < g:
             raise ValueError(f"Panopticon grid {g} -> {S} needs AnyUp (pano_anyup_dir) and S >= {g}")
-        guide = F.interpolate(rgb.float() / 255.0, size=(S, S), mode="bilinear", antialias=True, align_corners=False)
-        guide = (guide - self.im_mean) / self.im_std
-        lr = tok.permute(0, 3, 1, 2).contiguous()
-        with torch.autocast(x.device.type, enabled=False):
-            try:
-                hr = self.anyup(guide, lr, output_size=(S, S), q_chunk_size=self.q_chunk)
-            except TypeError:
-                hr = self.anyup(guide, lr, output_size=(S, S))
-        if hasattr(hr, "last_hidden_state"):
-            hr = hr.last_hidden_state
-        return hr.float().permute(0, 2, 3, 1)                                    # [B, S, S, 768]
+        return anyup_upsample(self.anyup, rgb.float() / 255.0, tok, S, self.q_chunk, self.anyup_batch)   # [B, S, S, 768]
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -214,8 +205,13 @@ def load_anyup_offline(anyup_dir):
     return torch.hub.load(arepo, "anyup", source="local", trust_repo=True).eval()
 
 
-def anyup_upsample(anyup, guide01, tok, S, q_chunk=256):
-    """guide01 [B, 3, H, W] RGB in [0, 1]; tok [B, g, g, D] -> [B, S, S, D] (AnyUp, fp32, ImageNet-normalized guide)."""
+def anyup_upsample(anyup, guide01, tok, S, q_chunk=256, batch=2):
+    """guide01 [B, 3, H, W] RGB in [0, 1]; tok [B, g, g, D] -> [B, S, S, D] (AnyUp, fp32, ImageNet-normalized guide).
+    Runs `batch` tiles at a time: AnyUp's feature-unification layer filters every channel separately, and for many
+    tiles x 768 channels x a 32 x 32 grid its output passes 2^31 elements, the limit of one conv call (32-bit indexing)."""
+    if tok.shape[0] > batch:
+        return torch.cat([anyup_upsample(anyup, guide01[i:i + batch], tok[i:i + batch], S, q_chunk, batch)
+                          for i in range(0, tok.shape[0], batch)], 0)
     mean = torch.tensor([0.485, 0.456, 0.406], device=tok.device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=tok.device).view(1, 3, 1, 1)
     guide = F.interpolate(guide01.float(), size=(S, S), mode="bilinear", antialias=True, align_corners=False)
@@ -243,7 +239,7 @@ class SmartiesTeacher(nn.Module):
     S2_ORDER = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
     OLMO_S2 = ["B02", "B03", "B04", "B08", "B05", "B06", "B07", "B8A", "B11", "B12", "B01", "B09"]
 
-    def __init__(self, path, stats_path, anyup_dir=None, q_chunk=256):
+    def __init__(self, path, stats_path, anyup_dir=None, q_chunk=256, anyup_batch=2):
         super().__init__()
         import os
         from transformers import AutoConfig
@@ -273,7 +269,7 @@ class SmartiesTeacher(nn.Module):
         self.register_buffer("mean", st["mean"].reshape(-1)[:12].view(1, 12, 1, 1).float(), persistent=False)
         self.register_buffer("std", st["std"].reshape(-1)[:12].view(1, 12, 1, 1).float(), persistent=False)
         self.rgb_idx = [self.OLMO_S2.index(b) for b in ("B04", "B03", "B02")]
-        self.q_chunk = int(q_chunk)
+        self.q_chunk, self.anyup_batch = int(q_chunk), int(anyup_batch)
         self.anyup = load_anyup_offline(anyup_dir) if anyup_dir else None
         for q in self.parameters():
             q.requires_grad_(False)
@@ -304,4 +300,4 @@ class SmartiesTeacher(nn.Module):
         v = x[:, self.rgb_idx]
         lo = torch.quantile(v.flatten(1), 0.02, dim=1).view(-1, 1, 1, 1)
         hi = torch.quantile(v.flatten(1), 0.98, dim=1).view(-1, 1, 1, 1)
-        return anyup_upsample(self.anyup, ((v - lo) / (hi - lo + 1e-6)).clamp(0, 1), tok, S, self.q_chunk)
+        return anyup_upsample(self.anyup, ((v - lo) / (hi - lo + 1e-6)).clamp(0, 1), tok, S, self.q_chunk, self.anyup_batch)

@@ -143,11 +143,12 @@ class Model_Distill(pl.LightningModule):
             elif key == "smarties":              # SMARTIES on the 12 S2 bands, AnyUp to the smarties_patch grid
                 t = SmartiesTeacher(dc.get("smarties_dir", "./checkpoints/smarties/SMARTIES-v1-ViT-B"), dc["olmo_stats"],
                                     dc.get("smarties_anyup_dir", dc.get("pano_anyup_dir", "./checkpoints/anyup")),
-                                    int(dc.get("smarties_q_chunk", 256)))
+                                    int(dc.get("smarties_q_chunk", 256)), int(dc.get("smarties_anyup_batch", 2)))
             elif key == "pano":                  # Panopticon on R, G, B, NIR, AnyUp to the pano_patch grid
                 t = PanopticonTeacher(dc.get("pano_dir", "./checkpoints/panopticon"), dc["flair_stats"],
                                       dc.get("pano_wavelengths", [664, 559, 493, 842]),
-                                      dc.get("pano_anyup_dir", "./checkpoints/anyup"), int(dc.get("pano_q_chunk", 256)))
+                                      dc.get("pano_anyup_dir", "./checkpoints/anyup"), int(dc.get("pano_q_chunk", 256)),
+                                      int(dc.get("pano_anyup_batch", 2)))
             else:                                # DINOv3 teacher: <key>_ckpt / <key>_norm; default view's upsampling
                 t = DinoV3Teacher(dc[f"{key}_ckpt"], dc.get(f"{key}_norm", "auto"),
                                   student_patch=int(dc.get("flair_patch", DINO_PATCH)))
