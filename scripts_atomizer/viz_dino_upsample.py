@@ -19,8 +19,9 @@ Scores (printed, saved to dino_upsample_scores.txt), each variant average-pooled
     ... border / inside  the same, split into the outer ring of native tokens and the rest (edge effects)
     detail               std of the variant inside each native cell / std across native cells (0 = no sub-patch detail)
 
-Setup (Jean Zay compute nodes have no internet: run the first line on a login node once):
-    python -c "import torch; torch.hub.load('wimmerth/anyup', 'anyup')"       # caches code + weights in ~/.cache/torch/hub
+Setup (Jean Zay compute nodes have no internet: run the first line once on a login node, from the repo root):
+    python -c "import torch; torch.hub.set_dir('./checkpoints/anyup'); torch.hub.load('wimmerth/anyup', 'anyup')"
+    # -> code in ./checkpoints/anyup/wimmerth_anyup_main/, weights in ./checkpoints/anyup/checkpoints/
     python scripts_atomizer/viz_dino_upsample.py --config training/configs/config_distill_ptv3.yaml \
         --n 6 --tiles 32 --input_up 2 4 --anyup_from native input_x2 --anyup_size 128 --out ./viz_pca/dino_upsample
 --anyup_src may also be a local clone of the repo (loaded with source="local").
@@ -44,7 +45,10 @@ IMAGENET = (torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), torch.tensor([
 
 
 # ----------------------------------------------------------------------------------------------- models
-def load_anyup(src, name):
+def load_anyup(src, name, hub_dir):
+    """Code and weights are cached in hub_dir (weights in hub_dir/checkpoints); downloaded on the first call only."""
+    os.makedirs(hub_dir, exist_ok=True)
+    torch.hub.set_dir(os.path.abspath(hub_dir))
     if os.path.isdir(src):
         m = torch.hub.load(src, name, source="local")
     else:
@@ -170,6 +174,8 @@ def main():
                     help="variants AnyUp upsamples ('native', 'input_x2', ...); empty list = no AnyUp")
     ap.add_argument("--anyup_size", type=int, default=128, help="AnyUp output side (<= crop)")
     ap.add_argument("--anyup_src", default="wimmerth/anyup", help="torch.hub repo or local clone of it")
+    ap.add_argument("--anyup_dir", default="./checkpoints/anyup",
+                    help="cache for AnyUp code + weights (fill it once on a node with internet, see the docstring)")
     ap.add_argument("--anyup_model", default="anyup", help="hub entry point (e.g. anyup_multi_backbone)")
     ap.add_argument("--q_chunk", type=int, default=256, help="AnyUp query chunk (memory)")
     ap.add_argument("--seed", type=int, default=0)
@@ -193,7 +199,7 @@ def main():
     for f in args.input_up:
         if 16 % f:
             raise ValueError(f"--input_up {f}: 16 / {f} is not an integer patch")
-    up = load_anyup(args.anyup_src, args.anyup_model).to(dev) if args.anyup_from else None
+    up = load_anyup(args.anyup_src, args.anyup_model, args.anyup_dir).to(dev) if args.anyup_from else None
     if up is not None and (args.anyup_size > crop or args.anyup_size % (crop // 16)):
         raise ValueError(f"--anyup_size must be <= {crop} and a multiple of the native grid {crop // 16}")
 
