@@ -445,8 +445,9 @@ class FlairAtoms(_AtomDataset):
             tokens[bad, 0] = 0.0
         tokens, mask = self._drop_bands(tokens, mask, self.C)
         rgb = torch.from_numpy(np.ascontiguousarray(a[..., :3].transpose(2, 0, 1)))                # uint8 [3, H, W]
+        nir = torch.from_numpy(np.ascontiguousarray(a[..., 3:4].transpose(2, 0, 1)))               # uint8 [1, H, W]
         return {"groups": {self.resolution: {"tokens": tokens, "mask": mask, "shape": tpl.shape}},
-                "teacher": {"rgb": rgb}, "dataset_name": self.name, "view": (crop, up)}
+                "teacher": {"rgb": rgb, "nir": nir}, "dataset_name": self.name, "view": (crop, up)}
 
 
 def collate_distill(samples):

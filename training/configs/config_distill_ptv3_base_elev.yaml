@@ -6,7 +6,7 @@
 # New in this config (vs config_distill_ptv3.yaml):
 #   * PTv3 base-size student (linear stem, LayerNorm, RoPE 2d + CPE, dec_channels[0] = 128)
 #   * FLAIR views: crops 256 / 512, DINOv3 input upsampling x1 / x2  (flair_views)
-#   * second FLAIR teacher: DINOv3 trained on web images             (flair_teachers, dino_web_*)
+#   * second FLAIR teacher: Panopticon on R, G, B, NIR, AnyUp-upsampled to 2 x 2-px tokens (flair_teachers, pano_*)
 #   * FLAIR elevation (nDSM from DEM_ELEV, quality masks) as a 5th atom (flair_elevation, flair_images_dem.csv)
 #   * band dropping: random bands on Sentinel, 4 band sets on FLAIR  (band_drop)
 #
@@ -149,11 +149,14 @@ distill:
     # ---- teachers ----
     olmo_ckpt: ./checkpoints/olmo/OlmoEarth-v1_2-Base
     olmo_patch: 2                           # 128 / 2 = 64 x 64 teacher tokens of 2 x 2 pixels
-    flair_teachers: [dino, dino_web]        # every FLAIR batch is supervised by both; loss = their mean
+    flair_teachers: [dino, pano]            # every FLAIR batch is supervised by both; loss = their mean
     dino_ckpt: ./checkpoints/dinov3/dinov3-vitl16-pretrain-sat493m
     dino_norm: auto                         # auto -> SAT-493M statistics
-    dino_web_ckpt: ./checkpoints/dinov3/dinov3-vitl16-pretrain-lvd1689m
-    dino_web_norm: auto                     # auto -> ImageNet statistics
+    pano_dir: ./checkpoints/panopticon      # Panopticon-FM_panopticon_main + panopticon_vitb14_teacher.pth
+    pano_anyup_dir: ./checkpoints/anyup     # wimmerth_anyup_main + its weights
+    pano_patch: 2                           # one Panopticon target per 2 x 2 crop px (256 crop -> 128 x 128 grid)
+    pano_wavelengths: [664, 559, 493, 842]  # R, G, B, NIR (nm), Panopticon channel ids
+    pano_q_chunk: 256                       # AnyUp query chunk (memory)
     teacher_fp32: false
 
     # ---- Atomiser_Unet leaf sizes: required by Model_Distill, ignored by the PTv3 student ----

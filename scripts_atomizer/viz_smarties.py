@@ -48,9 +48,39 @@ def _norm_name(n):
     return f"B{m.group(1)}{m.group(2)}" if m else n
 
 
+def _build_smarties(path):
+    """SMARTIESHF built from its own remote class + weights loaded by hand. AutoModel.from_pretrained fails with recent
+    transformers ('SMARTIESHF' object has no attribute 'all_tied_weights_keys': the remote code predates that API)."""
+    from transformers import AutoConfig
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
+    ref = (getattr(cfg, "auto_map", None) or {}).get("AutoModel")
+    if ref is None:
+        raise RuntimeError(f"{path}: config has no auto_map['AutoModel'] (cannot find the SMARTIES class)")
+    cls = get_class_from_dynamic_module(ref, path)
+    model = cls(cfg)
+    st = os.path.join(path, "model.safetensors")
+    if os.path.isfile(st):
+        from safetensors.torch import load_file
+        sd = load_file(st)
+    else:
+        sd = torch.load(os.path.join(path, "pytorch_model.bin"), map_location="cpu")
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    print(f"[smarties] built {ref} from {path}: {len(sd)} tensors, missing {len(missing)} {missing[:5]}, "
+          f"unexpected {len(unexpected)} {unexpected[:5]}")
+    if len(missing) > 0.05 * max(1, len(list(model.state_dict()))):
+        raise RuntimeError("too many missing SMARTIES weights: check the checkpoint folder")
+    return model
+
+
 def load_smarties(path, dev):
-    from transformers import AutoModel
-    model = AutoModel.from_pretrained(path, trust_remote_code=True).to(dev).eval()
+    try:
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(path, trust_remote_code=True)
+    except AttributeError as e:                       # recent transformers vs the model's remote code
+        print(f"[smarties] AutoModel.from_pretrained failed ({e}); building the model by hand")
+        model = _build_smarties(path)
+    model = model.to(dev).eval()
     cfg = model.config
     specs = getattr(cfg, "spectrum_specs", None) or getattr(model, "spectrum_specs", None) or {}
     img = int(getattr(cfg, "img_size", 224))

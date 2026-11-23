@@ -79,16 +79,14 @@ class PTv3DistillStudent(nn.Module):
               f"(discarded) | read: decoder level-0 output ({dim} ch), {pools}")
 
     # ------------------------------------------------------------------ full U-Net, pooled per teacher token
-    def _features(self, tokens, mask, chw, patch):
-        """tokens [B, N, 8] (dense, channel-major) -> [B, (H/patch) * (W/patch), C] row-major over the teacher grid."""
+    def _features(self, tokens, mask, chw):
+        """tokens [B, N, 8] (dense, channel-major) -> per-pixel decoder level-0 features [B, H, W, C]."""
         net = self.net
         C, H, W = chw
         B, N, Dt = tokens.shape
         HW = H * W
         if N != C * HW:
             raise RuntimeError(f"[PTv3DistillStudent] {N} tokens != C*H*W = {C}*{H}*{W}")
-        if H % patch or W % patch:
-            raise RuntimeError(f"{H}x{W} is not divisible by the teacher patch {patch}")
         tok = tokens.view(B, C, HW, Dt).transpose(1, 2)                                 # [B, HW, C, 8]
         msk = (mask if mask.dtype == torch.bool else mask > 0.5).view(B, C, HW).transpose(1, 2)
         feat = net._embed_pixels(tok, msk, self.training)                               # [B, HW, pixel_dim]
@@ -99,27 +97,39 @@ class PTv3DistillStudent(nn.Module):
             raise RuntimeError("PTv3 output rows are not in input order")
         if not self.training:                    # for the validation figure: per-pixel features, before pooling
             self.last_dense = out["feat"].detach().view(B, H, W, -1)[:self.dense_keep]
-        x = out["feat"].view(B, H // patch, patch, W // patch, patch, -1).mean(dim=(2, 4))
-        return x.reshape(B, (H // patch) * (W // patch), -1)
+        return out["feat"].view(B, H, W, -1)
+
+    @staticmethod
+    def _pool(dense, patch):
+        """[B, H, W, C] -> [B, (H/patch) * (W/patch), C], mean over each patch, row-major over the teacher grid."""
+        B, H, W, C = dense.shape
+        if H % patch or W % patch:
+            raise RuntimeError(f"{H}x{W} is not divisible by the teacher patch {patch}")
+        x = dense.view(B, H // patch, patch, W // patch, patch, C).mean(dim=(2, 4))
+        return x.reshape(B, (H // patch) * (W // patch), C)
 
     # ------------------------------------------------------------------ DistillStudent interface
     def encode(self, batch, k=None, m=None):
-        """k, m: Atomiser_Unet leaf sizes, unused. Pools over batch["patch"] pixels when given (set by Model_Distill
-        for every batch; FLAIR views change it), else the dataset teacher's default patch. Returns
-        ((patch, features [B, g*g, C]), geom)."""
+        """k, m: Atomiser_Unet leaf sizes, unused. Runs the U-Net ONCE per batch; returns (dense [B, H, W, C], geom).
+        Pooling happens in predict, per teacher (teachers of one batch may have different grids)."""
         res = next(iter(batch["groups"]))
         grp = batch["groups"][res]
-        teacher = self.dataset_teacher[batch["dataset_name"]]
-        patch = int(batch.get("patch") or self.patches[teacher])     # per-batch teacher patch (FLAIR views)
-        chw = self.net._chw(grp["shape"])
-        feats = self._features(grp["tokens"], grp["mask"], chw, patch)
-        return (patch, feats), {"patch": patch}
+        dense = self._features(grp["tokens"], grp["mask"], self.net._chw(grp["shape"]))
+        return dense, {"dataset": batch["dataset_name"]}
 
     def predict(self, teacher: str, d0, geom, pq):
-        _, feats = d0                       # one pooling per batch, shared by every teacher of that batch
-        if pq is not None and pq.shape[1] != feats.shape[1]:
-            raise RuntimeError(f"{teacher}: {pq.shape[1]} teacher tokens but {feats.shape[1]} student cells")
-        return self.heads[teacher](feats)
+        """Pools the dense features over this teacher's patch: g = sqrt(number of teacher tokens) (pq [B, g*g, 2],
+        from token_centers_from_tokens), patch = H / g; without pq, the teacher's default patch."""
+        dense = d0
+        H = dense.shape[1]
+        if pq is not None:
+            g = int(round(pq.shape[1] ** 0.5))
+            if g * g != pq.shape[1] or H % g:
+                raise RuntimeError(f"{teacher}: {pq.shape[1]} teacher tokens do not tile a {H}x{H} crop")
+            patch = H // g
+        else:
+            patch = self.patches[teacher]
+        return self.heads[teacher](self._pool(dense, patch))
 
     def encoder_state_dict(self):
         """The student to keep: AtomizerPTv3 without its segmentation head (projector heads excluded)."""

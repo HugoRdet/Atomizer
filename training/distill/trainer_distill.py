@@ -17,7 +17,8 @@ FLAIR views and teachers (distill.flair_views, distill.flair_teachers):
   * every FLAIR batch takes one view {crop, up} drawn with its weight (same on all ranks): a crop x crop patch, whose
     DINOv3 input is upsampled `up` times, so one teacher token covers 16/up crop pixels (grid crop*up/16); each view
     may set its own batch size (`batch`, default batch_per_dataset);
-  * every FLAIR batch is supervised by EVERY teacher of flair_teachers (e.g. dino = SAT-493M, dino_web = LVD-1689M),
+  * every FLAIR batch is supervised by EVERY teacher of flair_teachers (e.g. dino = SAT-493M, pano = Panopticon on
+    R, G, B, NIR upsampled by AnyUp to one token per pano_patch x pano_patch crop pixels; dino_web = LVD-1689M),
     each with its own standardizer and projector head; the batch loss is their mean. A DINOv3 teacher `<key>` reads
     distill.<key>_ckpt and distill.<key>_norm (`dino` keeps dino_ckpt / dino_norm);
   * validation: one FLAIR loader per view; logs val_loss_<tag> (tag flair_c<crop>_x<up>) and, with several teachers,
@@ -43,7 +44,7 @@ from training.distill.distill_heads import DistillStudent, token_centers_from_to
 from training.distill.distill_losses import PatchStandardizer, distill_loss_per_image, resid_corr
 from training.distill.distill_optim import clip_per_parameter, make_optimizer, set_lr_wd
 from training.distill.distill_schedule import cosine_scheduler, dune_lr_schedule, tnorm_momentum_schedule
-from training.distill.teachers import DinoV3Teacher, OlmoEarthTeacher
+from training.distill.teachers import DinoV3Teacher, OlmoEarthTeacher, PanopticonTeacher
 from training.utils.datasets.token_grouping import RoundRobinDistributedBatchSampler
 from training.utils.datasets.utils_dataset_distill import (DistillConcat, FixedView, FlairAtoms, MixedViewBatchSampler,
                                                            OlmoSentinelAtoms, collate_distill)
@@ -78,6 +79,7 @@ def parse_flair_views(dc):
 
 class Model_Distill(pl.LightningModule):
     TEACHER_DIMS = {"olmo": 768, "dino": 1024}
+    PANO_DIM = 768
 
     def __init__(self, config, lookup_table, name="distill"):
         super().__init__()
@@ -87,9 +89,17 @@ class Model_Distill(pl.LightningModule):
         self.views = parse_flair_views(dc)
         self.view_by_key = {(v["crop"], v["up"]): v for v in self.views}
         self.flair_teachers = [str(t) for t in dc.get("flair_teachers", ["dino"])]
-        if not self.flair_teachers or any(not t.startswith("dino") for t in self.flair_teachers):
-            raise ValueError(f"flair_teachers must be DINOv3 keys starting with 'dino', got {self.flair_teachers}")
-        self.teacher_dims = {"olmo": self.TEACHER_DIMS["olmo"], **{t: self.TEACHER_DIMS["dino"] for t in self.flair_teachers}}
+        if not self.flair_teachers or any(not (t.startswith("dino") or t == "pano") for t in self.flair_teachers):
+            raise ValueError(f"flair_teachers: DINOv3 keys 'dino*' and/or 'pano', got {self.flair_teachers}")
+        self.teacher_dims = {"olmo": self.TEACHER_DIMS["olmo"],
+                             **{t: (self.PANO_DIM if t == "pano" else self.TEACHER_DIMS["dino"]) for t in self.flair_teachers}}
+        self.pano_patch = int(dc.get("pano_patch", DINO_PATCH))           # crop pixels per (upsampled) Panopticon token
+        if "pano" in self.flair_teachers:
+            for v in self.views:
+                if v["crop"] % self.pano_patch or (v["crop"] * v["up"]) % DINO_PATCH:
+                    raise ValueError(f"view {v['tag']}: crop not divisible by pano_patch {self.pano_patch}")
+                if v["crop"] // self.pano_patch < v["crop"] * v["up"] // DINO_PATCH:
+                    raise ValueError(f"view {v['tag']}: pano_patch {self.pano_patch} coarser than Panopticon's own grid")
         self.layout = {
             "olmo": dict(teacher="olmo", k=int(dc["k_olmo"]), patch=int(dc["olmo_patch"]), hw=128),
             "flair": dict(teacher="dino", k=int(dc["k_flair"]), patch=int(dc.get("flair_patch", 16)), hw=int(dc["flair_crop"])),
@@ -120,6 +130,10 @@ class Model_Distill(pl.LightningModule):
             dc = self.dc
             if key == "olmo":
                 t = OlmoEarthTeacher(dc["olmo_ckpt"], int(dc["olmo_patch"]))
+            elif key == "pano":                  # Panopticon on R, G, B, NIR, AnyUp to the pano_patch grid
+                t = PanopticonTeacher(dc.get("pano_dir", "./checkpoints/panopticon"), dc["flair_stats"],
+                                      dc.get("pano_wavelengths", [664, 559, 493, 842]),
+                                      dc.get("pano_anyup_dir", "./checkpoints/anyup"), int(dc.get("pano_q_chunk", 256)))
             else:                                # DINOv3 teacher: <key>_ckpt / <key>_norm; default view's upsampling
                 t = DinoV3Teacher(dc[f"{key}_ckpt"], dc.get(f"{key}_norm", "auto"),
                                   student_patch=int(dc.get("flair_patch", DINO_PATCH)))
@@ -151,17 +165,21 @@ class Model_Distill(pl.LightningModule):
             teachers, hw, patch, tag = [L["teacher"]], L["hw"], L["patch"], name
         if tokens.shape[1] % (hw * hw):
             raise RuntimeError(f"{tag}: {tokens.shape[1]} tokens do not match a {hw}x{hw} tile")
-        g = hw // patch
-        batch["patch"] = patch                                                    # pooling footprint of the student
+        batch["patch"] = patch                                                    # default pooling footprint
         m = int(float(self.dc.get("m_factor", 1.3)) * L["k"])
-        d0, geom = self.student.encode(batch, L["k"], m)
-        q = token_centers_from_tokens(tokens, hw, hw, patch)                      # [B, g*g, 2]
+        d0, geom = self.student.encode(batch, L["k"], m)                          # student runs once per batch
+        qs = {}
         mom = float(self.tnorm_sched[min(int(self.global_step), len(self.tnorm_sched) - 1)]) if train else 0.0
         no_amp = torch.autocast(self.device.type, enabled=False) if self.dc.get("teacher_fp32", False) else contextlib.nullcontext()
         per_t, losses, last = {}, [], {}
         for t in teachers:
+            pt = self.pano_patch if t == "pano" else patch                        # this teacher's footprint (crop px)
+            g = hw // pt
+            if pt not in qs:
+                qs[pt] = token_centers_from_tokens(tokens, hw, hw, pt)            # [B, g*g, 2]
+            q = qs[pt]
             with torch.no_grad(), no_amp:
-                tgt = self._teacher(t)(tin)                                       # [B, g, g, D]
+                tgt = self._teacher(t)(dict(tin, out_side=g) if t == "pano" else tin)   # [B, g, g, D]
             assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}/{tag}: teacher grid {tuple(tgt.shape[1:3])} != expected {g}"
             tgt = self.tnorm[t](tgt.flatten(1, 2), mom)                           # standardized [B, g*g, D]
             pred = self.student.predict(t, d0, geom, q)
