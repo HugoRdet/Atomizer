@@ -11,14 +11,18 @@ student on a few validation tiles of each dataset, and writes one figure per dat
         --ckpt ./checkpoints/distill/ptv3_distill_s42/last.ckpt --n 6 --out ./viz_pca/ptv3_s42
 
 Figure columns, one row per tile:
-    input | teacher PCA | student PCA (teacher scale) | student PCA (own scale) | 1 - cos [| student pixels PCA]
+    input | teacher PCA | student PCA (teacher scale) | student PCA (own scale) | 1 - cos
+          [| student pixels PCA (shared) | student pixels PCA (per image)]
   * the PCA basis is fitted on the (standardized) teacher tokens of the figure and applied to the student's predictions,
     which live in the same space: same axes, so the hues are comparable;
   * "teacher scale" stretches the student with the teacher's 1-99 % range (shows how much of the teacher's amplitude it
     reproduces), "own scale" with its own range (shows its pattern even when the amplitude is still small);
   * 1 - cos per teacher token, with a colour bar (0 = identical direction, 1 = unrelated);
-  * PTv3 student: its per-pixel level-0 features (before the average over each teacher patch), own PCA basis,
-    rank-equalized colours.
+  * PTv3 student: its per-pixel level-0 features (before the average over each teacher patch), rank-equalized colours,
+    (shared) one PCA basis fitted on the pixels of all shown tiles, so colours are comparable across rows;
+    (per image) a PCA basis fitted on each tile alone: shows the tile's own dominant variations, including any pattern
+    tied to position (grid, stripes, window or patch borders) that the shared basis can hide. The label gives the
+    fraction of that tile's feature variance carried by its 3 components.
 
 Scores (printed and saved to scores.txt), per dataset, over the figure's tiles:
     cos(student, teacher)     mean cosine between student prediction and teacher token
@@ -77,6 +81,13 @@ def pca3(X, n_fit=100000):
     mu = sub.mean(0)
     _, V = torch.linalg.eigh((sub - mu).T @ (sub - mu))
     return mu, V[:, -3:].flip(-1)
+
+
+def pca3_var(X):
+    """X [P, D] -> mean, top-3 axes [D, 3], fraction of the total variance they carry."""
+    mu = X.mean(0)
+    ev, V = torch.linalg.eigh((X - mu).T @ (X - mu))
+    return mu, V[:, -3:].flip(-1), float(ev[-3:].sum() / ev.clamp_min(0).sum().clamp_min(1e-12))
 
 
 def stretch(z, ref):
@@ -177,10 +188,16 @@ def render(name, r, sc, path, title):
         Xd = dense.reshape(-1, dense.shape[-1])
         mud, Vd = pca3(Xd)
         cd = equalize((Xd - mud) @ Vd).reshape(*dense.shape[:3], 3)
+        cdi, fvi = [], []                                                          # per-image PCA
+        for x in dense:
+            Xi = x.reshape(-1, x.shape[-1])
+            mui, Vi, fv = pca3_var(Xi)
+            cdi.append(equalize((Xi - mui) @ Vi).reshape(*x.shape[:2], 3))
+            fvi.append(fv)
 
     cols = ["input", "teacher PCA", "student PCA\n(teacher scale)", "student PCA\n(own scale)", "1 - cos"]
     if cd is not None:
-        cols.append("student pixels PCA")
+        cols += ["student pixels PCA\n(shared)", "student pixels PCA\n(per image)"]
     fig, ax = plt.subplots(n, len(cols), figsize=(2.3 * len(cols), 2.3 * n + 0.6), squeeze=False)
     for i in range(n):
         ax[i, 0].imshow(img[i].numpy())
@@ -190,6 +207,8 @@ def render(name, r, sc, path, title):
         im = ax[i, 4].imshow(err[i].numpy(), cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
         if cd is not None:
             ax[i, 5].imshow(cd[i].numpy(), interpolation="nearest")
+            ax[i, 6].imshow(cdi[i].numpy(), interpolation="nearest")
+            ax[i, 6].set_xlabel(f"top-3 var {fvi[i]:.0%}", fontsize=7)
         ax[i, 0].set_ylabel(f"#{r['idx'][i]}\ncos {sc['cos_per_image'][i]:.2f} | base {sc['base_per_image'][i]:.2f}",
                             fontsize=7)
         for a in ax[i]:
