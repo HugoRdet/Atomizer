@@ -1,39 +1,92 @@
 """
-EuroSAT Classification Dataset for Atomiser
-=============================================
+EuroSAT Dataset for Atomiser (Classification)
+================================================
 
-10-class land cover classification on geo-bench m-eurosat.
-13 Sentinel-2 bands at 10m resolution, 64×64 patches.
+Single-temporal classification dataset in the grouped-token format,
+following the same pattern as ForestNetDataset (dummy queries, scalar
+label, task="classification").
 
 Source files (geo-bench-1.0/classification_v1.0/m-eurosat/):
-    band_stats.json         — per-band mean/std/percentiles
+    band_stats.json         — per-band mean/std (13 keys + 'label', same
+                               schema as Cashew's band_stats.json)
     default_partition.json  — {"train": [...], "valid": [...], "test": [...]}
-    {sample_id}.hdf5        — 13 bands, [64, 64] int16 each + label in attrs['pickle']
+                               sample names match HDF5 filenames directly,
+                               e.g. "id_12886" -> "id_12886.hdf5"
+    1.00x_train_partition.json — limited-label partition file (same
+                               PANGAEA-style scheme ForestNet supports).
+                               NOT wired up here per current requirements
+                               (default_partition.json only) — see
+                               ForestNetDataset's _load_train_fraction_partition
+                               if this needs adding later.
+    {sample_name}.hdf5      — 13 band datasets, [64, 64] int16 each (raw
+                               Sentinel-2 digital numbers, NOT pre-
+                               normalized float32 like Cashew/MADOS).
+                               NO 'label' dataset key and NO separate
+                               label_map.json — the class label is a
+                               plain Python int embedded in the HDF5's
+                               top-level 'pickle' attribute, itself a
+                               pickled dict: {'label': <int 0..9>, '01 -
+                               Coastal aerosol': {...band metadata...}, ...}.
 
-Classes (EuroSAT standard, 0-indexed):
-    0=AnnualCrop, 1=Forest, 2=HerbaceousVegetation, 3=Highway, 4=Industrial,
-    5=Pasture, 6=PermanentCrop, 7=Residential, 8=River, 9=SeaLake
+Label extraction: f.attrs["pickle"] is stored as the STRING repr of a
+bytes literal (e.g. "b'\\x80\\x04...'"), not raw bytes — ast.literal_eval
+recovers the actual bytes, which then unpickle to the metadata dict. The
+pickled band-metadata entries reference geobench.dataset.Sentinel2, which
+this codebase does not depend on and should not need to import just to
+read a label int — _PermissiveUnpickler substitutes a harmless stub class
+for anything it can't import, so unpickling completes regardless. Every
+band's [64,64] array itself is read directly via h5py as normal (this
+custom unpickling is ONLY for the label attribute).
 
-Output format (compatible with Model_ForestNet — classification):
+Band <-> Sentinel-2 code mapping (all 13 optical S2 bands, INCLUDING B10
+cirrus — unlike Cashew, which dropped it). Reuses bands_senflood for
+wavelength/bandwidth metadata, same as CashewSkipDataset, since these are
+the same physical Sentinel-2 bands under GeoBench's descriptive names.
+
+    EuroSAT HDF5 prefix                 -> Sentinel-2 code (bands_senflood key)
+    "01 - Coastal aerosol"              -> "B01"
+    "02 - Blue"                         -> "B02"
+    "03 - Green"                        -> "B03"
+    "04 - Red"                          -> "B04"
+    "05 - Vegetation Red Edge"          -> "B05"
+    "06 - Vegetation Red Edge"          -> "B06"
+    "07 - Vegetation Red Edge"          -> "B07"
+    "08 - NIR"                          -> "B08"
+    "08A - Vegetation Red Edge"         -> "B08A"
+    "09 - Water vapour"                 -> "B09"
+    "10 - SWIR - Cirrus"                -> "B10"
+    "11 - SWIR"                         -> "B11"
+    "12 - SWIR"                         -> "B12"
+
+Native size: 64x64 at 10m (standard EuroSAT patch size) — every band
+already arrives at the same [64, 64] shape, no per-band upscaling needed
+(unlike MADOS's mixed 10/20/60m native resolutions).
+
+Output format (identical shape to ForestNetDataset's):
     {
         "groups": {
             10.0: {
                 "tokens": [N, 8],
                 "mask":   [N],
-                "shape":  (13, 64, 64),
+                "shape":  (13, H, W),
             },
         },
-        "queries":           [1, 8]   (single CLS query at center)
+        "queries":           [1, 8],          # dummy — unused for classification
         "queries_mask":      [1],
-        "label":             scalar long (0..9),
+        "label":             0-d long tensor (class index in [0, 10)),
         "task":              "classification",
         "target_resolution": 10.0,
-        "image":             [13, 64, 64],
+        "image":             [13, H, W],
     }
 
-Augmentations (training only): D4 group on image (label is scalar).
+Augmentations (training only):
+    D4 group: 4 rotations x 2 flips = 8 transforms (image-only, same as
+    ForestNetDataset — classification has no spatial label to keep in
+    sync).
 """
 
+import ast
+import io
 import json
 import os
 import pickle
@@ -47,107 +100,51 @@ from .token_grouping import *
 from .token_builder import TokenBuilder
 
 
-def _decode_pickle_attr(attr_value):
+class _PermissiveUnpickler(pickle.Unpickler):
     """
-    Decode the pickle attribute robustly across h5py versions.
-
-    h5py may return the attribute as: bytes, np.bytes_, np.void,
-    np.ndarray of bytes, or (most surprising) a Python str containing
-    the LITERAL repr of a bytes object — e.g. the string "b'\\x80\\x04...'"
-    rather than the bytes b"\\x80\\x04...".
-
-    Try multiple decoding paths in order. On total failure, raises
-    RuntimeError with the first 60 chars of the input for diagnosis.
+    Substitutes a harmless stub class for anything it can't import (e.g.
+    geobench.dataset.Sentinel2, which this codebase doesn't depend on),
+    so the pickle can still be fully reconstructed. We only ever read the
+    plain-int 'label' field out of the result — the band-metadata entries
+    (which are what actually reference geobench classes) are read from
+    them but never touched.
     """
-    import codecs
-
-    errors = []
-
-    # Path 1: direct pickle.loads (handles bytes, np.bytes_)
-    try:
-        return pickle.loads(attr_value)
-    except Exception as e:
-        errors.append(f"direct: {type(e).__name__}: {e}")
-
-    # Path 2: .tobytes() — handles np.void, np.ndarray
-    if hasattr(attr_value, "tobytes"):
+    def find_class(self, module, name):
         try:
-            return pickle.loads(attr_value.tobytes())
-        except Exception as e:
-            errors.append(f"tobytes: {type(e).__name__}: {e}")
-
-    # Path 3: ndarray of bytes; pick first element
-    if isinstance(attr_value, np.ndarray) and attr_value.size > 0:
-        elem = attr_value.flat[0]
-        try:
-            return pickle.loads(elem)
-        except Exception as e:
-            errors.append(f"ndarray[0]: {type(e).__name__}: {e}")
-
-    # Path 4: str that's the printed repr of a bytes literal
-    # e.g. "b'\\x80\\x04...'" — common geo-bench format
-    if isinstance(attr_value, str):
-        # Strip b' / b" prefix and trailing quote
-        if attr_value.startswith("b'") and attr_value.endswith("'"):
-            inner = attr_value[2:-1]
-        elif attr_value.startswith('b"') and attr_value.endswith('"'):
-            inner = attr_value[2:-1]
-        else:
-            inner = None
-
-        if inner is not None:
-            # Use codecs.escape_decode — more permissive than ast.literal_eval.
-            # Decodes \x.., \n, \t, etc. — bytes escapes — without requiring
-            # full Python-literal syntax.
-            try:
-                inner_bytes = inner.encode("latin-1")
-                raw, _ = codecs.escape_decode(inner_bytes)
-                return pickle.loads(raw)
-            except Exception as e:
-                errors.append(f"escape_decode: {type(e).__name__}: {e}")
-
-        # Path 5: latin-1 round-trip (last resort)
-        try:
-            return pickle.loads(attr_value.encode("latin-1"))
-        except Exception as e:
-            errors.append(f"latin-1: {type(e).__name__}: {e}")
-
-    raise RuntimeError(
-        f"Could not decode HDF5 pickle attribute. "
-        f"Type: {type(attr_value).__name__}, "
-        f"length: {len(attr_value) if hasattr(attr_value, '__len__') else 'N/A'}, "
-        f"first 60: {repr(attr_value[:60]) if hasattr(attr_value, '__getitem__') else '?'}\n"
-        f"Errors: {errors}"
-    )
+            return super().find_class(module, name)
+        except (ImportError, AttributeError):
+            return type(name, (), {})
 
 
-class EuroSATDataset(Dataset):
-    """EuroSAT (geo-bench m-eurosat) 10-class classification dataset for Atomiser."""
+class EurosatDataset(Dataset):
+    """EuroSAT (geo-bench m-eurosat) classification dataset for Atomiser."""
 
-    OPTICAL_RESOLUTION = 10.0
+    SENTINEL2_RESOLUTION = 10.0
     NUM_BANDS = 13
     NUM_CLASSES = 10
     IGNORE_INDEX = 255
     TIME_IDX_NA = -1
-    PATCH_SIZE = 64
+    PATCH_SIZE_NATIVE = 64
     TASK_NAME = "classification"
 
-    # Exact HDF5 keys (13 S2 bands; geo-bench keeps all including B10 Cirrus)
-    BAND_KEYS = [
-        "02 - Blue",
-        "03 - Green",
-        "04 - Red",
-        "08 - NIR",
-        "05 - Vegetation Red Edge",
-        "06 - Vegetation Red Edge",
-        "07 - Vegetation Red Edge",
-        "08A - Vegetation Red Edge",
-        "11 - SWIR",
-        "12 - SWIR",
-        "01 - Coastal aerosol",
-        "09 - Water vapour",
-        "10 - SWIR - Cirrus",
-    ]
+    # HDF5 key prefix -> Sentinel-2 band code (key into bands_senflood).
+    # Order here defines channel order in the output image tensor.
+    BAND_PREFIX_TO_S2_CODE = {
+        "01 - Coastal aerosol":       "B01",
+        "02 - Blue":                  "B02",
+        "03 - Green":                 "B03",
+        "04 - Red":                   "B04",
+        "05 - Vegetation Red Edge":   "B05",
+        "06 - Vegetation Red Edge":   "B06",
+        "07 - Vegetation Red Edge":   "B07",
+        "08 - NIR":                   "B08",
+        "08A - Vegetation Red Edge":  "B08A",
+        "09 - Water vapour":          "B09",
+        "10 - SWIR - Cirrus":         "B10",
+        "11 - SWIR":                  "B11",
+        "12 - SWIR":                  "B12",
+    }
+    BAND_PREFIXES = list(BAND_PREFIX_TO_S2_CODE.keys())
 
     SPLIT_MAPPING = {
         "train":      "train",
@@ -165,97 +162,128 @@ class EuroSATDataset(Dataset):
         dataset_config: dict = None,
         config_model: dict = None,
         look_up=None,
+        crop_size: int = PATCH_SIZE_NATIVE,
     ):
         super().__init__()
         assert mode in self.SPLIT_MAPPING, f"Unknown split: {mode}"
+        assert crop_size <= self.PATCH_SIZE_NATIVE
 
         self.root_path     = root_path
-        self.split         = mode
-        self.look_up       = look_up
-        self.config_model  = config_model
-        self.dataset_config = dataset_config
+        self.split          = mode
+        self.crop_size       = crop_size
+        self.look_up          = look_up
+        self.config_model     = config_model
+        self.dataset_config   = dataset_config
 
         self.token_builder = TokenBuilder(look_up)
-
-        self.nb_tokens                  = config_model["trainer"]["max_tokens"]
-        self.max_tokens_reconstruction  = config_model["trainer"]["max_tokens_reconstruction"]
+        self.nb_tokens = config_model["trainer"]["max_tokens"]
 
         # ── Load JSON metadata ──────────────────────────────
+        # Per instructions: default_partition.json only, the
+        # 1.00x_train_partition.json limited-label scheme is not wired up
+        # here.
         with open(os.path.join(root_path, "default_partition.json")) as f:
-            partition = json.load(f)
+            default_partition = json.load(f)
         with open(os.path.join(root_path, "band_stats.json")) as f:
             self.band_stats = json.load(f)
 
         split_key = self.SPLIT_MAPPING[mode]
-        self.sample_names = list(partition[split_key])
+        self.sample_names = list(default_partition[split_key])
 
-        # ── Build name → label mapping (decode pickle attrs once, cache) ──
-        cache_path = os.path.join(root_path, f"_label_cache_{split_key}.json")
-        if os.path.exists(cache_path):
-            with open(cache_path) as f:
-                self.name_to_label = {k: int(v) for k, v in json.load(f).items()}
-        else:
-            print(f"[EuroSAT] Building label cache for split '{mode}' "
-                  f"({len(self.sample_names)} files)...")
-            self.name_to_label = {}
-            for name in self.sample_names:
-                path = os.path.join(root_path, f"{name}.hdf5")
-                with h5py.File(path, "r") as f:
-                    meta = _decode_pickle_attr(f.attrs["pickle"])
-                    self.name_to_label[name] = int(meta["label"])
-            try:
-                with open(cache_path, "w") as f:
-                    json.dump(self.name_to_label, f)
-                print(f"[EuroSAT] Saved label cache to {cache_path}")
-            except Exception as e:
-                print(f"[EuroSAT] WARN: could not save label cache: {e}")
-
-        # ── Build per-band normalization tensors ──────────────
+        # ── Normalization tensors ───────────────────────────
         means, stds = [], []
-        for key in self.BAND_KEYS:
-            if key not in self.band_stats:
+        for prefix in self.BAND_PREFIXES:
+            if prefix not in self.band_stats:
                 raise KeyError(
-                    f"[EuroSAT] Band '{key}' not in band_stats.json. "
+                    f"[EuroSAT] Band '{prefix}' not in band_stats.json. "
                     f"Available: {list(self.band_stats.keys())}"
                 )
-            means.append(self.band_stats[key]["mean"])
-            stds.append(self.band_stats[key]["std"])
+            means.append(self.band_stats[prefix]["mean"])
+            stds.append(self.band_stats[prefix]["std"])
         self.norm_mean = torch.tensor(means, dtype=torch.float32).view(-1, 1, 1)
         self.norm_std  = torch.tensor(stds, dtype=torch.float32).view(-1, 1, 1).clamp(min=1e-6)
 
         # ── Band metadata + spectral indices ────────────────
-        self.bands_info = dataset_config["bands_eurosat"]
+        # Reuse bands_senflood (Sentinel-2 wavelength/bandwidth by B0X
+        # code) rather than duplicating values — same trick as
+        # CashewSkipDataset, but EuroSAT keeps B10 (cirrus), which
+        # Cashew dropped.
+        self.bands_info = dataset_config["bands_senflood"]
         self.bandwidths, self.wavelengths, self.band_names = self._parse_bands_info()
         self.spectral_indices = self._build_spectral_indices()
 
-        self.resolution_idx = self.look_up.get_resolution_idx(self.OPTICAL_RESOLUTION)
+        self.resolution_idx = self.look_up.get_resolution_idx(self.SENTINEL2_RESOLUTION)
 
-        # ── Class distribution ──────────────────────────────
-        from collections import Counter
-        label_counts = Counter(self.name_to_label[n] for n in self.sample_names)
-
-        print(f"[EuroSAT] task={self.TASK_NAME}, split={mode} → "
+        print(f"[EuroSAT] task={self.TASK_NAME}, split={mode} -> "
               f"{len(self.sample_names)} samples")
-        print(f"[EuroSAT] bands ({self.NUM_BANDS}): all S2 (including B01/B09/B10)")
-        print(f"[EuroSAT] patch size: {self.PATCH_SIZE}×{self.PATCH_SIZE}")
-        print(f"[EuroSAT] num_classes: {self.NUM_CLASSES}")
+        print(f"[EuroSAT] bands ({self.NUM_BANDS}): "
+              f"{[self.BAND_PREFIX_TO_S2_CODE[p] for p in self.BAND_PREFIXES]}")
+        print(f"[EuroSAT] center crop: {crop_size}x{crop_size}")
+        print(f"[EuroSAT] resolution idx: {self.resolution_idx}")
         print(f"[EuroSAT] D4 augment: {'ON' if mode == 'train' else 'OFF'}")
-        print(f"[EuroSAT] class distribution: "
-              f"{dict(sorted(label_counts.items()))}")
 
     # ─────────────────────────────────────────────────────────────────────
-    # AUGMENTATION
+    # LABEL EXTRACTION (pickle-embedded, see module docstring)
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_label(h5_file: h5py.File) -> int:
+        raw = h5_file.attrs["pickle"]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        raw_bytes = ast.literal_eval(raw)
+        meta = _PermissiveUnpickler(io.BytesIO(raw_bytes)).load()
+        return int(meta["label"])
+
+    # ─────────────────────────────────────────────────────────────────────
+    # AUGMENTATION (image-only — classification has no spatial label)
     # ─────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _d4_augment(image: torch.Tensor):
-        """Image-only D4 (label is scalar for classification)."""
         if torch.rand(1).item() < 0.5:
             image = torch.flip(image, dims=[2])
         k = torch.randint(0, 4, (1,)).item()
         if k > 0:
             image = torch.rot90(image, k, dims=[1, 2])
         return image
+
+    @staticmethod
+    def _center_crop(image: torch.Tensor, size: int) -> torch.Tensor:
+        C, H, W = image.shape
+        if H == size and W == size:
+            return image
+        top  = (H - size) // 2
+        left = (W - size) // 2
+        return image[:, top:top + size, left:left + size]
+
+    # ─────────────────────────────────────────────────────────────────────
+    # LOADING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _load_sample(self, name):
+        path = os.path.join(self.root_path, f"{name}.hdf5")
+        bands = []
+        with h5py.File(path, "r") as f:
+            keys = list(f.keys())
+            for prefix in self.BAND_PREFIXES:
+                matches = [k for k in keys if k.startswith(prefix)]
+                if not matches:
+                    raise KeyError(
+                        f"[EuroSAT] No key with prefix '{prefix}' in {path}"
+                    )
+                # Raw digital numbers are int16 -- cast to float32 before
+                # any arithmetic (normalization below).
+                bands.append(np.asarray(f[matches[0]], dtype=np.float32))
+            label = self._extract_label(f)
+
+        image = torch.from_numpy(np.stack(bands, axis=0))
+        image = self._center_crop(image, self.crop_size)
+
+        image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+        image = (image - self.norm_mean) / self.norm_std
+
+        return image, label
 
     # ─────────────────────────────────────────────────────────────────────
     # DATASET INTERFACE
@@ -266,135 +294,88 @@ class EuroSATDataset(Dataset):
 
     def __getitem__(self, index):
         name = self.sample_names[index]
-        path = os.path.join(self.root_path, f"{name}.hdf5")
+        image, cls_idx = self._load_sample(name)
 
-        # ── Load 13 bands (int16 → float32) ────────────────
-        bands = []
-        with h5py.File(path, "r") as f:
-            for key in self.BAND_KEYS:
-                if key not in f:
-                    raise KeyError(
-                        f"[EuroSAT] Key '{key}' not in {path}. "
-                        f"Available: {list(f.keys())}"
-                    )
-                bands.append(np.asarray(f[key], dtype=np.float32))
-
-        image = torch.from_numpy(np.stack(bands, axis=0))   # [13, 64, 64]
-        label = torch.tensor(self.name_to_label[name], dtype=torch.long)
-
-        # ── NaN cleanup, normalize ──────────────────────────
-        image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
-        image = (image - self.norm_mean) / self.norm_std
-
-        # ── D4 augmentation (training only) ─────────────────
         if self.split == "train":
             image = self._d4_augment(image)
 
         C, H, W = image.shape
 
-        # ── Build per-pixel-per-band tokens ─────────────────
-        # token_builder needs a per-pixel label tensor; for classification
-        # we use IGNORE — the actual class is carried in the query.
+        # Classification doesn't use per-pixel labels -- dummy
+        # IGNORE_INDEX label, same pattern as ForestNetDataset.
         dummy_label = torch.full((H, W), self.IGNORE_INDEX, dtype=torch.long)
 
         image_tokens = self.token_builder.build_tokens(
             image=image,
             label=dummy_label,
-            resolution=self.OPTICAL_RESOLUTION,
+            resolution=self.SENTINEL2_RESOLUTION,
             spectral_indices=self.spectral_indices,
             resolution_idx=self.resolution_idx,
             time_idx=self.TIME_IDX_NA,
         )
 
-        # ── Build classification query (single CLS token at center) ─
-        first_spectral_idx = int(self.spectral_indices[0].item())
-        query = torch.tensor([[
-            0.0,                  # value (unused for query)
-            (W - 1) / 2.0,        # x — center
-            (H - 1) / 2.0,        # y — center
-            first_spectral_idx,   # spectral_idx (placeholder)
-            int(label.item()),    # label (scalar class)
-            0,                    # query_idx
-            self.resolution_idx,  # resolution_idx
-            self.TIME_IDX_NA,     # time_idx
-        ]], dtype=torch.float32)
-
-        # ── Subsample image tokens if too many ──────────────
         N = image_tokens.shape[0]
         if N > self.nb_tokens:
             perm = torch.randperm(N)[:self.nb_tokens]
             image_tokens = image_tokens[perm]
 
+        dummy_query      = torch.zeros(1, 8, dtype=image_tokens.dtype)
+        dummy_query_mask = torch.zeros(1, dtype=torch.float32)
+
         attention_mask = torch.zeros(image_tokens.shape[0])
-        queries_mask   = torch.zeros(query.shape[0])
 
         return {
             "groups": {
-                self.OPTICAL_RESOLUTION: {
+                self.SENTINEL2_RESOLUTION: {
                     "tokens": image_tokens,
                     "mask":   attention_mask,
                     "shape":  tuple(image.shape),
                 },
             },
-            "queries":           query,
-            "queries_mask":      queries_mask,
-            "label":             label,
+            "queries":           dummy_query,
+            "queries_mask":      dummy_query_mask,
+            "label":             torch.tensor(cls_idx, dtype=torch.long),
             "task":              self.TASK_NAME,
-            "target_resolution": self.OPTICAL_RESOLUTION,
+            "target_resolution": self.SENTINEL2_RESOLUTION,
             "image":             image,
         }
 
     # ─────────────────────────────────────────────────────────────────────
-    # VIZ SAMPLE (no augmentation)
+    # VIZ SAMPLE
     # ─────────────────────────────────────────────────────────────────────
 
     def get_viz_sample(self, index: int) -> dict:
         name = self.sample_names[index]
-        path = os.path.join(self.root_path, f"{name}.hdf5")
-
-        bands = []
-        with h5py.File(path, "r") as f:
-            for key in self.BAND_KEYS:
-                bands.append(np.asarray(f[key], dtype=np.float32))
-
-        image = torch.from_numpy(np.stack(bands, axis=0))
-        label = torch.tensor(self.name_to_label[name], dtype=torch.long)
-        image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
-        image = (image - self.norm_mean) / self.norm_std
+        image, cls_idx = self._load_sample(name)
 
         C, H, W = image.shape
         dummy_label = torch.full((H, W), self.IGNORE_INDEX, dtype=torch.long)
 
         image_tokens = self.token_builder.build_tokens(
             image=image, label=dummy_label,
-            resolution=self.OPTICAL_RESOLUTION,
+            resolution=self.SENTINEL2_RESOLUTION,
             spectral_indices=self.spectral_indices,
             resolution_idx=self.resolution_idx,
             time_idx=self.TIME_IDX_NA,
         )
-        first_spectral_idx = int(self.spectral_indices[0].item())
-        query = torch.tensor([[
-            0.0, (W - 1) / 2.0, (H - 1) / 2.0,
-            first_spectral_idx, int(label.item()), 0,
-            self.resolution_idx, self.TIME_IDX_NA,
-        ]], dtype=torch.float32)
 
-        attention_mask = torch.zeros(image_tokens.shape[0])
-        queries_mask   = torch.zeros(query.shape[0])
+        attention_mask   = torch.zeros(image_tokens.shape[0])
+        dummy_query      = torch.zeros(1, 8, dtype=image_tokens.dtype)
+        dummy_query_mask = torch.zeros(1, dtype=torch.float32)
 
         return {
             "groups": {
-                self.OPTICAL_RESOLUTION: {
+                self.SENTINEL2_RESOLUTION: {
                     "tokens": image_tokens,
                     "mask":   attention_mask,
                     "shape":  (C, H, W),
                 },
             },
-            "queries":           query,
-            "queries_mask":      queries_mask,
-            "label":             label,
+            "queries":           dummy_query,
+            "queries_mask":      dummy_query_mask,
+            "label":             torch.tensor(cls_idx, dtype=torch.long),
             "task":              self.TASK_NAME,
-            "target_resolution": self.OPTICAL_RESOLUTION,
+            "target_resolution": self.SENTINEL2_RESOLUTION,
             "image":             image,
         }
 
@@ -403,25 +384,31 @@ class EuroSATDataset(Dataset):
     # ─────────────────────────────────────────────────────────────────────
 
     def _parse_bands_info(self):
-        all_bands = []
-        for name, data in self.bands_info.items():
-            if "bandwidth" in data and "central_wavelength" in data and "idx" in data:
-                all_bands.append({
-                    "idx": data["idx"],
-                    "bandwidth": int(data["bandwidth"]),
-                    "central_wavelength": int(data["central_wavelength"]),
-                    "name": name,
-                })
-        all_bands.sort(key=lambda b: b["idx"])
+        bw_list, wl_list, names = [], [], []
+        for prefix in self.BAND_PREFIXES:
+            code = self.BAND_PREFIX_TO_S2_CODE[prefix]
+            if code not in self.bands_info:
+                raise KeyError(
+                    f"[EuroSAT] Sentinel-2 code '{code}' (for band "
+                    f"'{prefix}') not found in dataset_config['bands_senflood']. "
+                    f"Available: {list(self.bands_info.keys())}"
+                )
+            data = self.bands_info[code]
+            if not ("bandwidth" in data and "central_wavelength" in data):
+                raise KeyError(
+                    f"[EuroSAT] bands_senflood['{code}'] missing "
+                    f"bandwidth/central_wavelength: {data}"
+                )
+            bw_list.append(int(data["bandwidth"]))
+            wl_list.append(int(data["central_wavelength"]))
+            names.append(code)
 
-        bw    = torch.tensor([b["bandwidth"] for b in all_bands], dtype=torch.float32)
-        wl    = torch.tensor([b["central_wavelength"] for b in all_bands], dtype=torch.float32)
-        names = [b["name"] for b in all_bands]
+        bw = torch.tensor(bw_list, dtype=torch.float32)
+        wl = torch.tensor(wl_list, dtype=torch.float32)
 
         print(f"[EuroSAT] Band order:")
-        for b in all_bands:
-            print(f"  idx={b['idx']:2d}: {b['name']:25s} → "
-                  f"bw={b['bandwidth']:4d}, wl={b['central_wavelength']:4d}")
+        for prefix, code, b, w in zip(self.BAND_PREFIXES, names, bw_list, wl_list):
+            print(f"  {prefix:28s} -> {code:5s}  bw={b:4d}, wl={w:4d}")
 
         return bw, wl, names
 
