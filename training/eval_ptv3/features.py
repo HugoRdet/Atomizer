@@ -29,8 +29,13 @@ def build_net(distill_cfg: dict, lookup, num_classes: int, ckpt: str | None):
         raise NotImplementedError("distilled students are pixel mode only")
     net = AtomizerPTv3(config=cfg, lookup_table=lookup)
     if ckpt is not None:
-        sd = torch.load(ckpt, map_location="cpu", weights_only=True)
-        sd = sd.get("state_dict", sd)
+        sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+        if "state_dict" in sd:                     # full Lightning checkpoint (step*.ckpt, last.ckpt, timelimit.ckpt)
+            prefix = "student.net."
+            sd = {k[len(prefix):]: v for k, v in sd["state_dict"].items() if k.startswith(prefix)}
+            if not sd:
+                raise RuntimeError(f"no '{prefix}*' weights in {ckpt}")
+            print(f"[eval] Lightning checkpoint: kept {len(sd)} '{prefix}*' tensors (projectors / optimizer dropped)")
         missing, unexpected = net.load_state_dict(sd, strict=False)
         missing = [k for k in missing if not k.startswith("head.")]
         print(f"[eval] loaded {ckpt}\n[eval]   missing (excl. head.*): {missing}\n[eval]   unexpected: {unexpected}")
