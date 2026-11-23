@@ -36,6 +36,12 @@ def build_net(distill_cfg: dict, lookup, num_classes: int, ckpt: str | None):
             if not sd:
                 raise RuntimeError(f"no '{prefix}*' weights in {ckpt}")
             print(f"[eval] Lightning checkpoint: kept {len(sd)} '{prefix}*' tensors (projectors / optimizer dropped)")
+        # Lazily built, non-learned buffers derived from the lookup table: rebuilt from the current lookup on first use.
+        lazy = [k for k in sd if k.endswith("time_encoder.time_values")]
+        for k in lazy:
+            sd.pop(k)
+        if lazy:
+            print(f"[eval]   dropped lazy buffers (rebuilt from the lookup table): {lazy}")
         missing, unexpected = net.load_state_dict(sd, strict=False)
         missing = [k for k in missing if not k.startswith("head.")]
         print(f"[eval] loaded {ckpt}\n[eval]   missing (excl. head.*): {missing}\n[eval]   unexpected: {unexpected}")
