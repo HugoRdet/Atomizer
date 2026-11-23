@@ -13,6 +13,17 @@ Training step (DUNE 'no data sharing', 'own_data' teacher assignment):
     PER-PARAMETER gradient clipping.
 Termination is by optimizer steps (DUNE's pseudo-epoch: epoch_size images), through StopAtIters.
 
+FLAIR views and teachers (distill.flair_views, distill.flair_teachers):
+  * every FLAIR batch takes one view {crop, up} drawn with its weight (same on all ranks): a crop x crop patch, whose
+    DINOv3 input is upsampled `up` times, so one teacher token covers 16/up crop pixels (grid crop*up/16); each view
+    may set its own batch size (`batch`, default batch_per_dataset);
+  * every FLAIR batch is supervised by EVERY teacher of flair_teachers (e.g. dino = SAT-493M, dino_web = LVD-1689M),
+    each with its own standardizer and projector head; the batch loss is their mean. A DINOv3 teacher `<key>` reads
+    distill.<key>_ckpt and distill.<key>_norm (`dino` keeps dino_ckpt / dino_norm);
+  * validation: one FLAIR loader per view; logs val_loss_<tag> (tag flair_c<crop>_x<up>) and, with several teachers,
+    val_loss_<tag>_<teacher>.
+Without flair_views, the single view is (flair_crop, 16 / flair_patch): the previous behaviour.
+
 Student: Atomiser_Unet (DistillStudent) by default; with PTv3.enabled: true in the config, the AtomizerPTv3 student of
 distill_heads_ptv3.py (full U-Net, decoder level-0 features averaged over each teacher patch).
 """
@@ -34,7 +45,35 @@ from training.distill.distill_optim import clip_per_parameter, make_optimizer, s
 from training.distill.distill_schedule import cosine_scheduler, dune_lr_schedule, tnorm_momentum_schedule
 from training.distill.teachers import DinoV3Teacher, OlmoEarthTeacher
 from training.utils.datasets.token_grouping import RoundRobinDistributedBatchSampler
-from training.utils.datasets.utils_dataset_distill import FlairAtoms, OlmoSentinelAtoms, collate_distill
+from training.utils.datasets.utils_dataset_distill import (DistillConcat, FixedView, FlairAtoms, MixedViewBatchSampler,
+                                                           OlmoSentinelAtoms, collate_distill)
+
+DINO_PATCH = 16
+
+
+def parse_flair_views(dc):
+    """distill.flair_views -> [dict(crop, up, patch, weight, batch, tag)]; default: one view (flair_crop, 16/flair_patch)."""
+    bpd = int(dc["batch_per_dataset"])
+    raw = dc.get("flair_views")
+    if not raw:
+        patch = int(dc.get("flair_patch", DINO_PATCH))
+        if DINO_PATCH % patch:
+            raise ValueError(f"flair_patch {patch} must divide {DINO_PATCH}")
+        raw = [dict(crop=int(dc["flair_crop"]), up=DINO_PATCH // patch)]
+    views = []
+    for v in raw:
+        crop, up = int(v["crop"]), int(v.get("up", 1))
+        if up < 1 or DINO_PATCH % up:
+            raise ValueError(f"flair view {v}: up must divide {DINO_PATCH}")
+        patch = DINO_PATCH // up
+        if crop % patch:
+            raise ValueError(f"flair view {v}: crop {crop} not divisible by the teacher patch {patch}")
+        views.append(dict(crop=crop, up=up, patch=patch, weight=float(v.get("weight", 1.0)),
+                          batch=int(v.get("batch", bpd)), tag=f"flair_c{crop}_x{up}"))
+    tags = [v["tag"] for v in views]
+    if len(set(tags)) != len(tags):
+        raise ValueError(f"duplicate flair views {tags}")
+    return views
 
 
 class Model_Distill(pl.LightningModule):
@@ -45,6 +84,12 @@ class Model_Distill(pl.LightningModule):
         self.strict_loading = False
         self.config, self.lookup_table, self.name = config, lookup_table, name
         dc = self.dc = config["distill"]
+        self.views = parse_flair_views(dc)
+        self.view_by_key = {(v["crop"], v["up"]): v for v in self.views}
+        self.flair_teachers = [str(t) for t in dc.get("flair_teachers", ["dino"])]
+        if not self.flair_teachers or any(not t.startswith("dino") for t in self.flair_teachers):
+            raise ValueError(f"flair_teachers must be DINOv3 keys starting with 'dino', got {self.flair_teachers}")
+        self.teacher_dims = {"olmo": self.TEACHER_DIMS["olmo"], **{t: self.TEACHER_DIMS["dino"] for t in self.flair_teachers}}
         self.layout = {
             "olmo": dict(teacher="olmo", k=int(dc["k_olmo"]), patch=int(dc["olmo_patch"]), hw=128),
             "flair": dict(teacher="dino", k=int(dc["k_flair"]), patch=int(dc.get("flair_patch", 16)), hw=int(dc["flair_crop"])),
@@ -52,12 +97,15 @@ class Model_Distill(pl.LightningModule):
         if (config.get("PTv3") or {}).get("enabled", False):           # AtomizerPTv3 student (distill_heads_ptv3.py)
             from training.distill.distill_heads_ptv3 import PTv3DistillStudent
             self.student = PTv3DistillStudent(
-                config, lookup_table, self.TEACHER_DIMS,
+                config, lookup_table, self.teacher_dims,
                 teacher_patches={L["teacher"]: L["patch"] for L in self.layout.values()},
                 dataset_teacher={name: L["teacher"] for name, L in self.layout.items()})
         else:
-            self.student = DistillStudent(config, lookup_table, self.TEACHER_DIMS, n_pre=int(dc.get("n_pre", 1)))
-        self.tnorm = nn.ModuleDict({k: PatchStandardizer(d) for k, d in self.TEACHER_DIMS.items()})
+            self.student = DistillStudent(config, lookup_table, self.teacher_dims, n_pre=int(dc.get("n_pre", 1)))
+        self.tnorm = nn.ModuleDict({k: PatchStandardizer(d) for k, d in self.teacher_dims.items()})
+        print(f"[Distill] FLAIR teachers {self.flair_teachers} | views "
+              + ", ".join(f"{v['tag']} (grid {v['crop'] * v['up'] // DINO_PATCH}, batch {v['batch']}, w {v['weight']:g})"
+                          for v in self.views))
         self._teachers = {}                      # plain dict: teachers are NOT registered (not in state_dict, not in DDP)
         self.lr_sched = self.tnorm_sched = None
         self.iters = None
@@ -70,8 +118,12 @@ class Model_Distill(pl.LightningModule):
     def _teacher(self, key):
         if key not in self._teachers:
             dc = self.dc
-            t = (OlmoEarthTeacher(dc["olmo_ckpt"], int(dc["olmo_patch"])) if key == "olmo"
-                 else DinoV3Teacher(dc["dino_ckpt"], dc.get("dino_norm", "auto"), student_patch=int(dc.get("flair_patch", 16))))
+            if key == "olmo":
+                t = OlmoEarthTeacher(dc["olmo_ckpt"], int(dc["olmo_patch"]))
+            else:                                # DINOv3 teacher: <key>_ckpt / <key>_norm; default view's upsampling
+                t = DinoV3Teacher(dc[f"{key}_ckpt"], dc.get(f"{key}_norm", "auto"),
+                                  student_patch=int(dc.get("flair_patch", DINO_PATCH)))
+                print(f"[Distill] teacher {key}: {dc[f'{key}_ckpt']}")
             t.eval()
             for p in t.parameters():
                 p.requires_grad_(False)
@@ -83,39 +135,64 @@ class Model_Distill(pl.LightningModule):
 
     # ------------------------------------------------------------------ one micro-batch
     def _step(self, batch, train):
+        """Returns (loss, metrics averaged over teachers, dataset name, view tag, {teacher: (loss, metrics)})."""
         name = batch["dataset_name"]
         L = self.layout[name]
-        t = L["teacher"]
         tokens = batch["groups"][next(iter(batch["groups"]))]["tokens"]
-        hw, patch = L["hw"], L["patch"]
-        no_amp = torch.autocast(self.device.type, enabled=False) if self.dc.get("teacher_fp32", False) else contextlib.nullcontext()
-        with torch.no_grad(), no_amp:
-            tgt = self._teacher(t)(batch["teacher"])                              # [B, g, g, D]
+        tin = batch["teacher"]
+        if name == "flair":
+            key = tuple(int(x) for x in batch.get("view", (L["hw"], DINO_PATCH // L["patch"])))
+            v = self.view_by_key.get(key)
+            if v is None:
+                raise RuntimeError(f"FLAIR batch view {key} is not in flair_views {list(self.view_by_key)}")
+            teachers, hw, patch, tag = self.flair_teachers, v["crop"], v["patch"], v["tag"]
+            tin = dict(tin, up=float(v["up"]))
+        else:
+            teachers, hw, patch, tag = [L["teacher"]], L["hw"], L["patch"], name
+        if tokens.shape[1] % (hw * hw):
+            raise RuntimeError(f"{tag}: {tokens.shape[1]} tokens do not match a {hw}x{hw} tile")
         g = hw // patch
-        assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}: teacher grid {tuple(tgt.shape[1:3])} != expected {g}"
-        mom = float(self.tnorm_sched[min(int(self.global_step), len(self.tnorm_sched) - 1)]) if train else 0.0
-        tgt = self.tnorm[t](tgt.flatten(1, 2), mom)                               # standardized [B, g*g, D]
+        batch["patch"] = patch                                                    # pooling footprint of the student
         m = int(float(self.dc.get("m_factor", 1.3)) * L["k"])
         d0, geom = self.student.encode(batch, L["k"], m)
         q = token_centers_from_tokens(tokens, hw, hw, patch)                      # [B, g*g, 2]
-        pred = self.student.predict(t, d0, geom, q)
-        loss_i, mets = distill_loss_per_image(pred, tgt)
-        if not train and self.trainer.is_global_zero:
-            self._last = (tgt.detach(), pred.detach(), g)
-        return loss_i.mean(), mets, name
+        mom = float(self.tnorm_sched[min(int(self.global_step), len(self.tnorm_sched) - 1)]) if train else 0.0
+        no_amp = torch.autocast(self.device.type, enabled=False) if self.dc.get("teacher_fp32", False) else contextlib.nullcontext()
+        per_t, losses, last = {}, [], {}
+        for t in teachers:
+            with torch.no_grad(), no_amp:
+                tgt = self._teacher(t)(tin)                                       # [B, g, g, D]
+            assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}/{tag}: teacher grid {tuple(tgt.shape[1:3])} != expected {g}"
+            tgt = self.tnorm[t](tgt.flatten(1, 2), mom)                           # standardized [B, g*g, D]
+            pred = self.student.predict(t, d0, geom, q)
+            loss_i, mets = distill_loss_per_image(pred, tgt)
+            losses.append(loss_i.mean())
+            per_t[t] = (losses[-1].detach(), mets)
+            if not train and self.trainer.is_global_zero:
+                last[t] = (tgt.detach(), pred.detach(), g)
+        if not train:
+            self._last = last
+        mets = {k: torch.stack([m[k] for _, m in per_t.values()]).mean() for k in next(iter(per_t.values()))[1]}
+        return torch.stack(losses).mean(), mets, name, tag, per_t
 
     @staticmethod
     def _bs(batch):
         return int(next(iter(batch["groups"].values()))["tokens"].shape[0])
 
     def training_step(self, batch, batch_idx):
-        loss, mets, name = self._step(batch, True)
+        loss, mets, name, tag, per_t = self._step(batch, True)
         bs = self._bs(batch)
         self._hist[name].append(float(loss.detach()))
         kw = dict(on_step=True, on_epoch=False, logger=True, batch_size=bs)
         self.log(f"train_loss_{name}", loss, prog_bar=True, **kw)
         self.log(f"train_cos_{name}", mets["cos"], **kw)
         self.log(f"train_fid_{name}", mets["fidelity"], **kw)
+        if tag != name:                                                           # FLAIR view
+            self.log(f"train_loss_{tag}", loss, **kw)
+        if len(per_t) > 1:                                                        # several teachers on this batch
+            for t, (lt, mt) in per_t.items():
+                self.log(f"train_loss_{name}_{t}", lt, **kw)
+                self.log(f"train_cos_{name}_{t}", mt["cos"], **kw)
         if name == "flair" and self.global_step % int(self.dc.get("log_every", 10)) == 0:
             c = resid_corr(self._hist["olmo"], self._hist["flair"])
             if c == c:                                                            # not NaN
@@ -126,16 +203,21 @@ class Model_Distill(pl.LightningModule):
         self._val_acc, self._viz = [], {}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        loss, mets, name = self._step(batch, False)
+        loss, mets, name, tag, per_t = self._step(batch, False)
         bs = self._bs(batch)
-        # per-dataset keys are logged by ONE loader each; the combined val_loss is logged once, in on_validation_epoch_end
+        # per-view keys are logged by ONE loader each; the combined val_loss is logged once, in on_validation_epoch_end
         # (Lightning forbids logging the same key from two dataloaders with different metadata)
         kw = dict(on_step=False, on_epoch=True, logger=True, sync_dist=True, add_dataloader_idx=False, batch_size=bs)
-        self.log(f"val_loss_{name}", loss, **kw)
-        self.log(f"val_fid_{name}", mets["fidelity"], **kw)
+        self.log(f"val_loss_{tag}", loss, **kw)
+        self.log(f"val_fid_{tag}", mets["fidelity"], **kw)
+        if len(per_t) > 1:
+            for t, (lt, mt) in per_t.items():
+                self.log(f"val_loss_{tag}_{t}", lt, **kw)
+                self.log(f"val_fid_{tag}_{t}", mt["fidelity"], **kw)
         self._val_acc.append(loss.detach())
         if batch_idx == 0 and self.trainer.is_global_zero:
-            self._stash_viz(name, batch)
+            for t in per_t:
+                self._stash_viz(tag if len(per_t) == 1 else f"{tag}_{t}", batch, t)
         return loss
 
     def on_validation_epoch_end(self):
@@ -151,7 +233,9 @@ class Model_Distill(pl.LightningModule):
         dc = self.dc
         world = int(getattr(self.trainer, "world_size", 1))
         accum = int(dc.get("grad_accum", 1))
-        bs_global = 2 * accum * int(dc["batch_per_dataset"]) * world               # images per optimizer step (both datasets)
+        w = sum(v["weight"] for v in self.views)
+        flair_b = sum(v["weight"] * v["batch"] for v in self.views) / w             # expected FLAIR batch (views)
+        bs_global = int(round(accum * (int(dc["batch_per_dataset"]) + flair_b) * world))   # images per optimizer step
         self.bs_global = bs_global
         min_lr, wfrac = float(dc.get("min_lr", 1e-6)), float(dc.get("warmup_frac", 0.2))
         peak = float(dc["lr"]) * bs_global / 256.0                                   # DUNE: lr * batch / 256
@@ -208,14 +292,14 @@ class Model_Distill(pl.LightningModule):
                 lg.log_hyperparams(info)
 
     # ------------------------------------------------------------------ validation figures
-    def _stash_viz(self, name, batch):
-        """Keep up to 4 samples of the first validation batch of each dataset (CPU) for the PCA figure."""
-        if name in self._viz or self._last is None:
+    def _stash_viz(self, name, batch, teacher):
+        """Keep up to 4 samples of the first validation batch of each view / teacher (CPU) for the PCA figure."""
+        if name in self._viz or not self._last or teacher not in self._last:
             return
-        tgt, pred, g = self._last
+        tgt, pred, g = self._last[teacher]
         n = min(4, tgt.shape[0])
         tin = batch["teacher"]
-        if name == "flair":
+        if batch["dataset_name"] == "flair":
             img = tin["rgb"][:n].float().div(255).permute(0, 2, 3, 1)                 # aerial RGB
         else:
             img = tin["s2n"][:n, :, :, 0, :][..., [2, 1, 0]].float()                  # Sentinel-2 B04, B03, B02 (OlmoEarth order)
@@ -312,13 +396,15 @@ class DistillDataModule(pl.LightningDataModule):
             return
         dc, common = self.dc, dict(look_up=self.look_up, dataset_config=self.dataset_config)
         sr = self.stats_required
+        self.views = parse_flair_views(dc)
+        crops = sorted({v["crop"] for v in self.views})
         for split, aug in (("train", True), ("val", False)):
             setattr(self, f"olmo_{split}", OlmoSentinelAtoms(dc["olmo_index"], dc["olmo_tar_dir"], split, aug=aug,
                                                              stats_path=dc["olmo_stats"], stats_required=sr, **common))
             setattr(self, f"flair_{split}", FlairAtoms(dc["flair_index"], dc["flair_root"], split, int(dc["flair_crop"]), aug=aug,
                                                        stats_path=dc["flair_stats"], stats_required=sr,
                                                        aerial_section=dc.get("aerial_section", "bands_flairhub_aerial"),
-                                                       share_s2=bool(dc.get("share_s2", False)), **common))
+                                                       share_s2=bool(dc.get("share_s2", False)), crops=crops, **common))
         self._ready = True
 
     def _loader(self, ds, **kw):
@@ -328,16 +414,20 @@ class DistillDataModule(pl.LightningDataModule):
                           **{k: v for k, v in kw.items() if k != "persistent"})
 
     def train_dataloader(self):
-        sampler = RoundRobinDistributedBatchSampler(
-            [len(self.olmo_train), len(self.flair_train)], int(self.dc["batch_per_dataset"]),
-            num_replicas=self.trainer.world_size, rank=self.trainer.global_rank, shuffle=True, seed=int(self.dc.get("seed", 42)))
-        return self._loader(ConcatDataset([self.olmo_train, self.flair_train]), batch_sampler=sampler, persistent=True)
+        sampler = MixedViewBatchSampler(
+            len(self.olmo_train), len(self.flair_train), int(self.dc["batch_per_dataset"]), self.views,
+            num_replicas=self.trainer.world_size, rank=self.trainer.global_rank, seed=int(self.dc.get("seed", 42)))
+        return self._loader(DistillConcat([self.olmo_train, self.flair_train]), batch_sampler=sampler, persistent=True)
 
     def val_dataloader(self):
-        loaders = []
-        for ds in (self.olmo_val, self.flair_val):
-            sampler = DistributedSampler(ds, num_replicas=self.trainer.world_size, rank=self.trainer.global_rank, shuffle=False)
-            loaders.append(self._loader(ds, batch_size=int(self.dc["batch_per_dataset"]), sampler=sampler))
+        """Loader 0: Sentinel; then one FLAIR loader per view (fixed view, the view's batch size)."""
+        W, r = self.trainer.world_size, self.trainer.global_rank
+        loaders = [self._loader(self.olmo_val, batch_size=int(self.dc["batch_per_dataset"]),
+                                sampler=DistributedSampler(self.olmo_val, num_replicas=W, rank=r, shuffle=False))]
+        for v in self.views:
+            ds = FixedView(self.flair_val, v["crop"], v["up"])
+            loaders.append(self._loader(ds, batch_size=v["batch"],
+                                        sampler=DistributedSampler(ds, num_replicas=W, rank=r, shuffle=False)))
         return loaders
 
 

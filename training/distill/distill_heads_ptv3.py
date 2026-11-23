@@ -104,18 +104,19 @@ class PTv3DistillStudent(nn.Module):
 
     # ------------------------------------------------------------------ DistillStudent interface
     def encode(self, batch, k=None, m=None):
-        """k, m: Atomiser_Unet leaf sizes, unused. Returns ((teacher, features [B, g*g, C]), geom)."""
+        """k, m: Atomiser_Unet leaf sizes, unused. Pools over batch["patch"] pixels when given (set by Model_Distill
+        for every batch; FLAIR views change it), else the dataset teacher's default patch. Returns
+        ((patch, features [B, g*g, C]), geom)."""
         res = next(iter(batch["groups"]))
         grp = batch["groups"][res]
         teacher = self.dataset_teacher[batch["dataset_name"]]
+        patch = int(batch.get("patch") or self.patches[teacher])     # per-batch teacher patch (FLAIR views)
         chw = self.net._chw(grp["shape"])
-        feats = self._features(grp["tokens"], grp["mask"], chw, self.patches[teacher])
-        return (teacher, feats), {"teacher": teacher}
+        feats = self._features(grp["tokens"], grp["mask"], chw, patch)
+        return (patch, feats), {"patch": patch}
 
     def predict(self, teacher: str, d0, geom, pq):
-        src, feats = d0
-        if src != teacher:
-            raise RuntimeError(f"features pooled for the {src} teacher given to the {teacher} head")
+        _, feats = d0                       # one pooling per batch, shared by every teacher of that batch
         if pq is not None and pq.shape[1] != feats.shape[1]:
             raise RuntimeError(f"{teacher}: {pq.shape[1]} teacher tokens but {feats.shape[1]} student cells")
         return self.heads[teacher](feats)

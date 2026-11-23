@@ -3,7 +3,8 @@ teachers.py -- the two frozen teachers of the distillation.
 
 Where it goes: training/distill/teachers.py
     OlmoEarthTeacher : Sentinel tiles -> [B, g, g, 768]  (mean of the S2 and S1 token grids; location tokens excluded)
-    DinoV3Teacher    : aerial RGB uint8 [B, 3, H, W] -> [B, g, g, 1024]  (patch tokens; CLS and register tokens dropped)
+    DinoV3Teacher    : aerial RGB uint8 [B, 3, H, W] -> [B, g, g, 1024]  (patch tokens; CLS and register tokens dropped);
+                       t["up"] (optional, float) overrides the input upsampling for one batch
 Both take the `teacher` dict of a batch (see utils_dataset_distill.py) already on the GPU, and return the teacher's token
 map in the order of the student's queries (row-major over the grid).
 """
@@ -86,8 +87,9 @@ class DinoV3Teacher(nn.Module):
     @torch.no_grad()
     def forward(self, t):
         x = (t["rgb"].float() / 255.0 - self.mean) / self.std                    # RGB only
-        if self.up != 1.0:
-            x = F.interpolate(x, scale_factor=self.up, mode="bicubic", align_corners=True)
+        up = float(t.get("up", self.up))                                         # per-batch view (flair_views)
+        if up != 1.0:
+            x = F.interpolate(x, scale_factor=up, mode="bicubic", align_corners=True)
         assert x.shape[-1] % self.patch == 0 and x.shape[-2] % self.patch == 0, \
             f"input {tuple(x.shape[-2:])} after resizing is not a multiple of the teacher patch {self.patch}"
         h = self.model(pixel_values=x).last_hidden_state                         # [B, 1 + registers + patches, D]

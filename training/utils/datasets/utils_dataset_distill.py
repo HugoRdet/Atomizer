@@ -19,6 +19,10 @@ Student values: the teacher's own normalized input (OlmoEarth-normalized S2/S1; 
 with statistics computed once by check_distill_data.py --compute-stats (clamped to +-10, as in BurnScars).
 Augmentation (train): random flips/rotations (and a random crop for FLAIR), applied to the pixels BEFORE both the atoms and
 the teacher input, so student and teacher always see the same image. Positions never change (they come from pixel indices).
+
+FLAIR views (distill.flair_views): a FLAIR item can be requested as dataset[(i, crop, up)]: a `crop` x `crop` patch whose
+teacher input is upsampled `up` times (DINOv3 token = 16/up pixels of the crop). MixedViewBatchSampler draws one view per
+FLAIR batch (the same on every rank) and yields keys for DistillConcat; FixedView pins one view (validation).
 """
 import io
 import os
@@ -29,7 +33,7 @@ from collections import OrderedDict
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from .token_builder import TokenBuilder
 
@@ -213,7 +217,8 @@ class FlairAtoms(_AtomDataset):
 
     def __init__(self, index_csv, root, split, crop, look_up, dataset_config, aug, stats_path,
                  aerial_section="bands_flairhub_aerial", aerial_names=("RED", "GREEN", "BLUE", "NIR"),
-                 share_s2=False, s2_section="bands_mmearth_s2", stats_required=True):
+                 share_s2=False, s2_section="bands_mmearth_s2", stats_required=True, crops=None):
+        """crop: default crop side; crops: every crop side that may be requested (one token template each)."""
         import pandas as pd
         assert split in ("train", "val")
         cols = ["zip", "member", "split"] + [c for c in ("offset", "csize", "ctype") if c in pd.read_csv(index_csv, nrows=0).columns]
@@ -229,16 +234,20 @@ class FlairAtoms(_AtomDataset):
         else:
             pairs = [(aerial_section, n) for n in aerial_names]
         self.spectral_idx = spectral_indices(look_up, dataset_config, pairs)
-        self.template = AtomTemplate(TokenBuilder(look_up), look_up, 4, crop, crop, self.resolution, self.spectral_idx)
+        builder = TokenBuilder(look_up)
+        self.templates = {int(c): AtomTemplate(builder, look_up, 4, int(c), int(c), self.resolution, self.spectral_idx)
+                          for c in sorted(set([int(crop)] + [int(c) for c in (crops or [])]))}
+        self.template = self.templates[int(crop)]
         self._init_stats(stats_path, 4, stats_required)
-        print(f"[flair {split}] {len(df)} patches, crop {crop} | spectral idx R,G,B,NIR = {self.spectral_idx.tolist()} "
+        print(f"[flair {split}] {len(df)} patches, crops {sorted(self.templates)} (default {crop}) | spectral idx R,G,B,NIR = {self.spectral_idx.tolist()} "
               f"({'shared with S2' if share_s2 else aerial_section})")
 
     def __len__(self):
         return len(self.zip)
 
-    def _load(self, i, aug):
+    def _load(self, i, aug, crop=None):
         import tifffile
+        crop = int(crop or self.crop)
         if self._rng is None:
             self._rng = np.random.default_rng(torch.initial_seed() % (2 ** 32))
         z = str(self.zip[i])
@@ -260,12 +269,14 @@ class FlairAtoms(_AtomDataset):
         a = a[..., :4]
         assert a.dtype == np.uint8 and a.shape[-1] == 4, f"unexpected aerial patch {a.shape} {a.dtype}"
         H = a.shape[0]
-        if self.crop < H:
+        if crop > H or crop > a.shape[1]:
+            raise ValueError(f"crop {crop} larger than the FLAIR patch {a.shape[:2]}")
+        if crop < H:
             if aug:
-                y0, x0 = (int(v) for v in self._rng.integers(0, H - self.crop + 1, size=2))
+                y0, x0 = (int(v) for v in self._rng.integers(0, H - crop + 1, size=2))
             else:
-                y0 = x0 = (H - self.crop) // 2
-            a = a[y0:y0 + self.crop, x0:x0 + self.crop]
+                y0 = x0 = (H - crop) // 2
+            a = a[y0:y0 + crop, x0:x0 + crop]
         if aug:
             a = dihedral(a, int(self._rng.integers(4)), bool(self._rng.integers(2)))
         return np.ascontiguousarray(a)                                           # (crop, crop, 4) uint8
@@ -273,13 +284,19 @@ class FlairAtoms(_AtomDataset):
     def raw_image(self, i, aug=False):
         return torch.from_numpy(self._load(i, aug).astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
 
-    def __getitem__(self, i):
-        a = self._load(i, self.aug)
+    def __getitem__(self, key):
+        """key: index, or (index, crop, up) for a FLAIR view (up: teacher input upsampling, applied by the teacher)."""
+        i, crop, up = (key, self.crop, 1) if not isinstance(key, (tuple, list)) else (key[0], key[1], key[2])
+        crop, up = int(crop), int(up)
+        if crop not in self.templates:
+            raise KeyError(f"crop {crop} not prepared (FlairAtoms crops={sorted(self.templates)})")
+        tpl = self.templates[crop]
+        a = self._load(int(i), self.aug, crop)
         x = torch.from_numpy(a.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
-        tokens = self.template.fill(self._zscore(x))
+        tokens = tpl.fill(self._zscore(x))
         rgb = torch.from_numpy(np.ascontiguousarray(a[..., :3].transpose(2, 0, 1)))                # uint8 [3, H, W]
-        return {"groups": {self.resolution: {"tokens": tokens, "mask": self.template.mask, "shape": self.template.shape}},
-                "teacher": {"rgb": rgb}, "dataset_name": self.name}
+        return {"groups": {self.resolution: {"tokens": tokens, "mask": tpl.mask, "shape": tpl.shape}},
+                "teacher": {"rgb": rgb}, "dataset_name": self.name, "view": (crop, up)}
 
 
 def collate_distill(samples):
@@ -291,4 +308,85 @@ def collate_distill(samples):
                          "shape": samples[0]["groups"][res]["shape"]}},
         "teacher": {k: torch.stack([s["teacher"][k] for s in samples]) for k in samples[0]["teacher"]},
         "dataset_name": samples[0]["dataset_name"],
+        **_view_of(samples),
     }
+
+
+def _view_of(samples):
+    if "view" not in samples[0]:
+        return {}
+    v = tuple(samples[0]["view"])
+    if any(tuple(s["view"]) != v for s in samples):
+        raise RuntimeError(f"mixed FLAIR views in one batch: {sorted(set(tuple(s['view']) for s in samples))}")
+    return {"view": v}
+
+
+# ---------------------------------------------------------------------------------------------------------
+class DistillConcat(Dataset):
+    """Several datasets addressed by keys (d, i) or (d, i, crop, up) (as yielded by MixedViewBatchSampler)."""
+
+    def __init__(self, datasets):
+        self.datasets = list(datasets)
+
+    def __len__(self):
+        return sum(len(d) for d in self.datasets)
+
+    def __getitem__(self, key):
+        d, rest = int(key[0]), tuple(key[1:])
+        return self.datasets[d][rest[0]] if len(rest) == 1 else self.datasets[d][rest]
+
+
+class FixedView(Dataset):
+    """One FLAIR view of a FlairAtoms dataset (validation: one loader per view)."""
+
+    def __init__(self, ds, crop, up):
+        self.ds, self.crop, self.up = ds, int(crop), int(up)
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        return self.ds[(i, self.crop, self.up)]
+
+
+def _index_stream(n, g):
+    while True:
+        yield from torch.randperm(n, generator=g).tolist()
+
+
+class MixedViewBatchSampler(Sampler):
+    """Round-robin Sentinel / FLAIR batches (as RoundRobinDistributedBatchSampler) where every FLAIR batch takes a view
+    drawn from `views` (dicts with crop, up, weight, batch). All ranks draw the same view and the same global index list
+    (seed + epoch), then take their own slice, so every rank runs the same view at every step (DDP-safe; teacher
+    standardizer gathers need equal shapes). Yields keys for DistillConcat([olmo, flair]): (0, i) and (1, i, crop, up).
+    One epoch = as many rounds as the larger dataset needs at batch_per_dataset (training stops by optimizer steps)."""
+
+    def __init__(self, n_olmo, n_flair, olmo_batch, views, num_replicas=1, rank=0, seed=42):
+        self.n = (int(n_olmo), int(n_flair))
+        self.ob, self.views = int(olmo_batch), list(views)
+        self.W, self.rank, self.seed, self.epoch = int(num_replicas), int(rank), int(seed), 0
+        self.weights = torch.tensor([float(v["weight"]) for v in self.views], dtype=torch.float64)
+        if (self.weights <= 0).any():
+            raise ValueError("flair_views weights must be > 0")
+        mean_fb = float((self.weights * torch.tensor([float(v["batch"]) for v in self.views], dtype=torch.float64)).sum()
+                        / self.weights.sum())
+        self.rounds = max(1, max(self.n[0] // (self.ob * self.W), int(self.n[1] // (mean_fb * self.W))))
+
+    def __len__(self):
+        return 2 * self.rounds
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        base = self.seed + self.epoch
+        g_o, g_f, g_v = (torch.Generator() for _ in range(3))
+        g_o.manual_seed(base); g_f.manual_seed(base + 1_000_003); g_v.manual_seed(base + 2_000_029)
+        so, sf = _index_stream(self.n[0], g_o), _index_stream(self.n[1], g_f)
+        for _ in range(self.rounds):
+            glob = [next(so) for _ in range(self.ob * self.W)]
+            yield [(0, i) for i in glob[self.rank * self.ob:(self.rank + 1) * self.ob]]
+            v = self.views[int(torch.multinomial(self.weights, 1, generator=g_v))]
+            b = int(v["batch"])
+            glob = [next(sf) for _ in range(b * self.W)]
+            yield [(1, i, int(v["crop"]), int(v["up"])) for i in glob[self.rank * b:(self.rank + 1) * b]]
