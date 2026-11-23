@@ -6,6 +6,7 @@ Where it goes: training/distill/teachers.py
     DinoV3Teacher    : aerial RGB uint8 [B, 3, H, W] -> [B, g, g, 1024]  (patch tokens; CLS and register tokens dropped);
                        t["up"] (optional, float) overrides the input upsampling for one batch
     PanopticonTeacher: aerial R, G, B, NIR -> [B, S, S, 768] (Panopticon ViT-B/14, AnyUp to t["out_side"] if larger)
+    SmartiesTeacher  : Sentinel-2 (12 bands) -> [B, S, S, 768] (SMARTIES ViT-B, AnyUp to t["out_side"] if larger)
 All take the `teacher` dict of a batch (see utils_dataset_distill.py) already on the GPU, and return the teacher's token
 map in the order of the student's queries (row-major over the grid).
 """
@@ -197,3 +198,110 @@ class PanopticonTeacher(nn.Module):
         if hasattr(hr, "last_hidden_state"):
             hr = hr.last_hidden_state
         return hr.float().permute(0, 2, 3, 1)                                    # [B, S, S, 768]
+
+
+# ---------------------------------------------------------------------------------------------------------
+def load_anyup_offline(anyup_dir):
+    """AnyUp from the torch.hub cache <anyup_dir>/wimmerth_anyup_main (weights in <anyup_dir>/checkpoints), no network."""
+    import os
+    anyup_dir = os.path.abspath(anyup_dir)
+    arepo = os.path.join(anyup_dir, "wimmerth_anyup_main")
+    if not os.path.isdir(arepo):
+        raise FileNotFoundError(f"AnyUp cache missing ({arepo}): run once on a login node\n"
+                                f"  python -c \"import torch; torch.hub.set_dir('{anyup_dir}'); "
+                                f"torch.hub.load('wimmerth/anyup', 'anyup')\"")
+    torch.hub.set_dir(anyup_dir)
+    return torch.hub.load(arepo, "anyup", source="local", trust_repo=True).eval()
+
+
+def anyup_upsample(anyup, guide01, tok, S, q_chunk=256):
+    """guide01 [B, 3, H, W] RGB in [0, 1]; tok [B, g, g, D] -> [B, S, S, D] (AnyUp, fp32, ImageNet-normalized guide)."""
+    mean = torch.tensor([0.485, 0.456, 0.406], device=tok.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=tok.device).view(1, 3, 1, 1)
+    guide = F.interpolate(guide01.float(), size=(S, S), mode="bilinear", antialias=True, align_corners=False)
+    guide = (guide - mean) / std
+    lr = tok.permute(0, 3, 1, 2).float().contiguous()
+    with torch.autocast(tok.device.type, enabled=False):
+        try:
+            hr = anyup(guide, lr, output_size=(S, S), q_chunk_size=q_chunk)
+        except TypeError:
+            hr = anyup(guide, lr, output_size=(S, S))
+    if hasattr(hr, "last_hidden_state"):
+        hr = hr.last_hidden_state
+    return hr.float().permute(0, 2, 3, 1)
+
+
+class SmartiesTeacher(nn.Module):
+    """SMARTIES ViT-B (spectrum-aware multi-sensor MAE, ICCV 2025) on the 12 Sentinel-2 bands -> [B, S, S, 768].
+
+    Input: the OlmoEarth tile's t["s2n"] [B, H, W, 1, 12] (OlmoEarth-normalized, OLMO_S2 channel order), z-scored with the
+    first 12 channels of the Sentinel student statistics (olmo_stats), resized to the model's img_size (224 -> 14 x 14
+    tokens of 16 px), bands passed by SMARTIES name (its 'S2' group = Sentinel-2 without B10, mapped by position).
+    t["out_side"]: grid side returned; AnyUp upsamples the 14 x 14 tokens to it, guided by the tile's RGB (B04, B03, B02,
+    2-98 % stretch per image). Sentinel-1 is not used. Loaded offline from a local Hugging Face folder (remote code).
+    """
+    S2_ORDER = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
+    OLMO_S2 = ["B02", "B03", "B04", "B08", "B05", "B06", "B07", "B8A", "B11", "B12", "B01", "B09"]
+
+    def __init__(self, path, stats_path, anyup_dir=None, q_chunk=256):
+        super().__init__()
+        import os
+        from transformers import AutoConfig
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
+        cls = get_class_from_dynamic_module(cfg.auto_map["AutoModel"], path)
+        self.model = cls(cfg)
+        st_path = os.path.join(path, "model.safetensors")
+        if os.path.isfile(st_path):
+            from safetensors.torch import load_file
+            sd = load_file(st_path)
+        else:
+            sd = torch.load(os.path.join(path, "pytorch_model.bin"), map_location="cpu")
+        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(f"SMARTIES weights do not match: missing {missing[:5]}, unexpected {unexpected[:5]}")
+        self.model.eval()
+        groups = getattr(cfg, "sensor_band_specs", None) or getattr(self.model, "sensor_band_specs", None) or {}
+        s2 = list(groups.get("S2", []))
+        if len(s2) != 12:
+            raise RuntimeError(f"SMARTIES 'S2' group has {len(s2)} bands, expected 12: {groups}")
+        by_s2 = dict(zip(self.S2_ORDER, s2))
+        self.names = [by_s2[b] for b in self.OLMO_S2]                            # our channel order
+        self.img = int(getattr(cfg, "img_size", 224))
+        self.patch = int(getattr(cfg, "patch_size", 16))
+        st = torch.load(stats_path, weights_only=True)
+        self.register_buffer("mean", st["mean"].reshape(-1)[:12].view(1, 12, 1, 1).float(), persistent=False)
+        self.register_buffer("std", st["std"].reshape(-1)[:12].view(1, 12, 1, 1).float(), persistent=False)
+        self.rgb_idx = [self.OLMO_S2.index(b) for b in ("B04", "B03", "B02")]
+        self.q_chunk = int(q_chunk)
+        self.anyup = load_anyup_offline(anyup_dir) if anyup_dir else None
+        for q in self.parameters():
+            q.requires_grad_(False)
+        print(f"[SmartiesTeacher] {path}: img {self.img}, patch {self.patch}, bands "
+              + ", ".join(f"{a}->{b}" for a, b in zip(self.OLMO_S2, self.names))
+              + f" | AnyUp {'on' if self.anyup is not None else 'off'}")
+
+    @torch.no_grad()
+    def forward(self, t):
+        x = t["s2n"][:, :, :, 0, :].permute(0, 3, 1, 2).float()                  # [B, 12, H, W]
+        z = (x - self.mean) / self.std
+        B = x.shape[0]
+        zi = F.interpolate(z, size=(self.img, self.img), mode="bilinear", align_corners=False)
+        out = self.model(zi, is_patchify=True, bands=list(self.names), all_tokens=True)
+        tok = out.last_hidden_state if hasattr(out, "last_hidden_state") else out
+        if isinstance(tok, (list, tuple)):
+            tok = tok[0]
+        g = self.img // self.patch
+        if tok.shape[1] == g * g + 1:
+            tok = tok[:, 1:]
+        assert tok.shape[1] == g * g, f"SMARTIES returned {tok.shape[1]} tokens, expected {g}x{g} (+ CLS)"
+        tok = tok.float().reshape(B, g, g, -1)
+        S = int(t.get("out_side", g))
+        if S == g:
+            return tok
+        if self.anyup is None or S < g:
+            raise ValueError(f"SMARTIES grid {g} -> {S} needs AnyUp (smarties_anyup_dir) and S >= {g}")
+        v = x[:, self.rgb_idx]
+        lo = torch.quantile(v.flatten(1), 0.02, dim=1).view(-1, 1, 1, 1)
+        hi = torch.quantile(v.flatten(1), 0.98, dim=1).view(-1, 1, 1, 1)
+        return anyup_upsample(self.anyup, ((v - lo) / (hi - lo + 1e-6)).clamp(0, 1), tok, S, self.q_chunk)

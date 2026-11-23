@@ -1,5 +1,5 @@
 # =============================================================================
-# Distillation of OlmoEarth (Sentinel) + DINOv3 SAT-493M and LVD-1689M (FLAIR-HUB aerial) into AtomizerPTv3, DUNE recipe.
+# Distillation into AtomizerPTv3, DUNE recipe. Sentinel: OlmoEarth + SMARTIES; FLAIR-HUB aerial: DINOv3 SAT-493M + Panopticon.
 # Student = Atomizer per-pixel tokenizer + PTv3 U-Net (Sonata-size encoder, LayerNorm, linear stem), read at the
 # decoder's level-0 output and averaged over each teacher patch (training/distill/distill_heads_ptv3.py).
 #
@@ -7,6 +7,7 @@
 #   * PTv3 base-size student (linear stem, LayerNorm, RoPE 2d + CPE, dec_channels[0] = 128)
 #   * FLAIR views: crops 256 / 512, DINOv3 input upsampling x1 / x2  (flair_views)
 #   * second FLAIR teacher: Panopticon on R, G, B, NIR, AnyUp-upsampled to 2 x 2-px tokens (flair_teachers, pano_*)
+#   * second Sentinel teacher: SMARTIES on the 12 S2 bands, AnyUp-upsampled to 64 x 64 (olmo_teachers, smarties_*)
 #   * FLAIR elevation (nDSM from DEM_ELEV, quality masks) as a 5th atom (flair_elevation, flair_images_dem.csv)
 #   * band dropping: random bands on Sentinel, 4 band sets on FLAIR  (band_drop)
 #
@@ -20,6 +21,7 @@
 #   python scripts_atomizer/train_distill_atomiser.py --config ./training/configs/config_distill_ptv3_base_elev.yaml \
 #       --bands_yaml ./data/bands_info/bands_elev.yaml --xp_name ptv3_base_elev_s42 --smoke
 # Use bands_elev.yaml for viz_distill_pca.py and for every fine-tuning of these weights (same band indices).
+# Teachers are loaded offline from ./checkpoints (olmo, dinov3, panopticon, smarties, anyup caches).
 # =============================================================================
 encoder: ATOMIZER_PTv3_distill
 
@@ -147,8 +149,13 @@ distill:
               - {keep: [0, 1, 2, 3],    weight: 0.10}   # RGBI, no elevation
 
     # ---- teachers ----
+    olmo_teachers: [olmo, smarties]         # every Sentinel batch is supervised by both; loss = their mean
     olmo_ckpt: ./checkpoints/olmo/OlmoEarth-v1_2-Base
     olmo_patch: 2                           # 128 / 2 = 64 x 64 teacher tokens of 2 x 2 pixels
+    smarties_dir: ./checkpoints/smarties/SMARTIES-v1-ViT-B
+    smarties_anyup_dir: ./checkpoints/anyup
+    smarties_patch: 2                       # AnyUp 14 x 14 -> 64 x 64 (same grid as OlmoEarth)
+    smarties_q_chunk: 256                   # AnyUp query chunk (memory)
     flair_teachers: [dino, pano]            # every FLAIR batch is supervised by both; loss = their mean
     dino_ckpt: ./checkpoints/dinov3/dinov3-vitl16-pretrain-sat493m
     dino_norm: auto                         # auto -> SAT-493M statistics

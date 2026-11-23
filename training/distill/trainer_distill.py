@@ -44,7 +44,7 @@ from training.distill.distill_heads import DistillStudent, token_centers_from_to
 from training.distill.distill_losses import PatchStandardizer, distill_loss_per_image, resid_corr
 from training.distill.distill_optim import clip_per_parameter, make_optimizer, set_lr_wd
 from training.distill.distill_schedule import cosine_scheduler, dune_lr_schedule, tnorm_momentum_schedule
-from training.distill.teachers import DinoV3Teacher, OlmoEarthTeacher, PanopticonTeacher
+from training.distill.teachers import DinoV3Teacher, OlmoEarthTeacher, PanopticonTeacher, SmartiesTeacher
 from training.utils.datasets.token_grouping import RoundRobinDistributedBatchSampler
 from training.utils.datasets.utils_dataset_distill import (DistillConcat, FixedView, FlairAtoms, MixedViewBatchSampler,
                                                            OlmoSentinelAtoms, collate_distill)
@@ -80,6 +80,7 @@ def parse_flair_views(dc):
 class Model_Distill(pl.LightningModule):
     TEACHER_DIMS = {"olmo": 768, "dino": 1024}
     PANO_DIM = 768
+    SMARTIES_DIM = 768
 
     def __init__(self, config, lookup_table, name="distill"):
         super().__init__()
@@ -91,9 +92,18 @@ class Model_Distill(pl.LightningModule):
         self.flair_teachers = [str(t) for t in dc.get("flair_teachers", ["dino"])]
         if not self.flair_teachers or any(not (t.startswith("dino") or t == "pano") for t in self.flair_teachers):
             raise ValueError(f"flair_teachers: DINOv3 keys 'dino*' and/or 'pano', got {self.flair_teachers}")
-        self.teacher_dims = {"olmo": self.TEACHER_DIMS["olmo"],
+        self.olmo_teachers = [str(t) for t in dc.get("olmo_teachers", ["olmo"])]
+        if not self.olmo_teachers or any(t not in ("olmo", "smarties") for t in self.olmo_teachers):
+            raise ValueError(f"olmo_teachers: subset of ['olmo', 'smarties'], got {self.olmo_teachers}")
+        self.teacher_dims = {**{t: (self.TEACHER_DIMS["olmo"] if t == "olmo" else self.SMARTIES_DIM) for t in self.olmo_teachers},
                              **{t: (self.PANO_DIM if t == "pano" else self.TEACHER_DIMS["dino"]) for t in self.flair_teachers}}
         self.pano_patch = int(dc.get("pano_patch", DINO_PATCH))           # crop pixels per (upsampled) Panopticon token
+        # teachers whose grid is set by an AnyUp output side: footprint in tile pixels per token
+        self.teacher_patch = {"pano": self.pano_patch, "smarties": int(dc.get("smarties_patch", 2))}
+        if "smarties" in self.olmo_teachers:
+            sp = self.teacher_patch["smarties"]
+            if 128 % sp or 128 // sp < 14:
+                raise ValueError(f"smarties_patch {sp}: must divide the 128-px Sentinel tile with >= 14 tokens per side")
         if "pano" in self.flair_teachers:
             for v in self.views:
                 if v["crop"] % self.pano_patch or (v["crop"] * v["up"]) % DINO_PATCH:
@@ -130,6 +140,10 @@ class Model_Distill(pl.LightningModule):
             dc = self.dc
             if key == "olmo":
                 t = OlmoEarthTeacher(dc["olmo_ckpt"], int(dc["olmo_patch"]))
+            elif key == "smarties":              # SMARTIES on the 12 S2 bands, AnyUp to the smarties_patch grid
+                t = SmartiesTeacher(dc.get("smarties_dir", "./checkpoints/smarties/SMARTIES-v1-ViT-B"), dc["olmo_stats"],
+                                    dc.get("smarties_anyup_dir", dc.get("pano_anyup_dir", "./checkpoints/anyup")),
+                                    int(dc.get("smarties_q_chunk", 256)))
             elif key == "pano":                  # Panopticon on R, G, B, NIR, AnyUp to the pano_patch grid
                 t = PanopticonTeacher(dc.get("pano_dir", "./checkpoints/panopticon"), dc["flair_stats"],
                                       dc.get("pano_wavelengths", [664, 559, 493, 842]),
@@ -162,7 +176,7 @@ class Model_Distill(pl.LightningModule):
             teachers, hw, patch, tag = self.flair_teachers, v["crop"], v["patch"], v["tag"]
             tin = dict(tin, up=float(v["up"]))
         else:
-            teachers, hw, patch, tag = [L["teacher"]], L["hw"], L["patch"], name
+            teachers, hw, patch, tag = list(self.olmo_teachers), L["hw"], L["patch"], name
         if tokens.shape[1] % (hw * hw):
             raise RuntimeError(f"{tag}: {tokens.shape[1]} tokens do not match a {hw}x{hw} tile")
         batch["patch"] = patch                                                    # default pooling footprint
@@ -173,13 +187,13 @@ class Model_Distill(pl.LightningModule):
         no_amp = torch.autocast(self.device.type, enabled=False) if self.dc.get("teacher_fp32", False) else contextlib.nullcontext()
         per_t, losses, last = {}, [], {}
         for t in teachers:
-            pt = self.pano_patch if t == "pano" else patch                        # this teacher's footprint (crop px)
+            pt = self.teacher_patch.get(t, patch)                                 # this teacher's footprint (tile px)
             g = hw // pt
             if pt not in qs:
                 qs[pt] = token_centers_from_tokens(tokens, hw, hw, pt)            # [B, g*g, 2]
             q = qs[pt]
             with torch.no_grad(), no_amp:
-                tgt = self._teacher(t)(dict(tin, out_side=g) if t == "pano" else tin)   # [B, g, g, D]
+                tgt = self._teacher(t)(dict(tin, out_side=g) if t in self.teacher_patch else tin)   # [B, g, g, D]
             assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}/{tag}: teacher grid {tuple(tgt.shape[1:3])} != expected {g}"
             tgt = self.tnorm[t](tgt.flatten(1, 2), mom)                           # standardized [B, g*g, D]
             pred = self.student.predict(t, d0, geom, q)
