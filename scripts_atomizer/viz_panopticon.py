@@ -170,7 +170,7 @@ def main():
 
     os.makedirs(args.hub_dir, exist_ok=True)
     torch.hub.set_dir(os.path.abspath(args.hub_dir))
-    pano = torch.hub.load("Panopticon-FM/panopticon", "panopticon_vitb14").to(dev).eval()
+    pano = torch.hub.load("Panopticon-FM/panopticon", "panopticon_vitb14", trust_repo=True).to(dev).eval()
     up = load_anyup("wimmerth/anyup", "anyup", args.anyup_dir).to(dev) if args.anyup_size else None
     os.makedirs(args.out, exist_ok=True)
     lines = []
