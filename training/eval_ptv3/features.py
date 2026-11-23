@@ -65,11 +65,37 @@ class DenseExtractor(nn.Module):
     'eval' (running statistics), 'recal' (running stats re-estimated on downstream train data, then eval).
     With PTv3.norm: ln the three are identical."""
 
-    def __init__(self, net: AtomizerPTv3, bn_mode: str = "batch", time_idx_override: float | None = -1.0):
+    def __init__(self, net: AtomizerPTv3, bn_mode: str = "batch", time_idx_override: float | None = -1.0,
+                 feature: str = "dec0"):
+        """feature: 'dec0'     decoder level-0 per-pixel features [B, dec_channels[0], H, W] (what distillation trained)
+                    'enc_last' last encoder stage (coarsest level), mean over each sample's points [B, enc_channels[-1]]"""
         super().__init__()
-        self.net, self.bn_mode, self.time_override = net, bn_mode, time_idx_override
+        self.net, self.bn_mode, self.time_override, self.feature = net, bn_mode, time_idx_override, feature
         self.net.head = None
-        self.dim = self.net.backbone.cfg.dec_channels[0]
+        cfg = self.net.backbone.cfg
+        if feature == "dec0":
+            self.dim = cfg.dec_channels[0]
+        elif feature == "enc_last":
+            self.dim = cfg.enc_channels[-1]
+            self._grab = {}
+            self.net.backbone.enc[-1].register_forward_hook(self._hook)
+        else:
+            raise ValueError(feature)
+
+    def _hook(self, module, args, output):
+        x = output[0] if isinstance(output, (tuple, list)) else output
+        x = getattr(x, "feat", x)
+        grid = args[1] if len(args) > 1 else None
+        self._grab = {"feat": x, "seq_lens": None if grid is None else getattr(grid, "seq_lens", None)}
+
+    def _pool_enc_last(self, B):
+        x, lens = self._grab["feat"], self._grab["seq_lens"]
+        if lens is None:
+            raise RuntimeError("enc_last: could not read per-sample point counts (grid.seq_lens) from the last stage")
+        lens = [int(v) for v in (lens.tolist() if torch.is_tensor(lens) else lens)]
+        if len(lens) != B or sum(lens) != x.shape[0]:
+            raise RuntimeError(f"enc_last: seq_lens {lens[:4]}... (sum {sum(lens)}) vs {x.shape[0]} rows for B={B}")
+        return torch.stack([c.float().mean(0) for c in x.split(lens, 0)])      # [B, enc_channels[-1]]
 
     def _bns(self):
         return [m for m in self.net.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
@@ -98,6 +124,8 @@ class DenseExtractor(nn.Module):
         out = net.backbone(net._point(g, B, HW, feat.reshape(B * HW, -1).float()))
         if not torch.equal(out["grid_coord"].int(), g.repeat(B, 1)):
             raise RuntimeError("PTv3 output rows are not in input order")
+        if self.feature == "enc_last":
+            return self._pool_enc_last(B)
         return out["feat"].view(B, H, W, -1).permute(0, 3, 1, 2)
 
     def forward(self, batch, training=False):

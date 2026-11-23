@@ -238,6 +238,8 @@ def main():
                     help="timestamp triple for datasets without dates (same format as the OlmoEarth h5 'timestamps')")
     ap.add_argument("--bn_mode", choices=["batch", "eval", "recal"], default="batch")
     ap.add_argument("--multi_temporal", type=int, default=6, help="PASTIS frames per sample")
+    ap.add_argument("--feature", choices=["dec0", "enc_last"], default="dec0",
+                    help="dec0: decoder level-0 per pixel; enc_last: coarsest encoder level, pooled per image (cls only)")
     ap.add_argument("--keep_time_idx", action="store_true", help="feed the datasets' time_idx (distillation used -1)")
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     ap.add_argument("--label_fracs", type=float, nargs="+", default=[1.0])
@@ -259,6 +261,10 @@ def main():
     ds_cfg = read_yaml(a.ds_config) if a.ds_config else None
     ckpt = None if a.ckpt == "none" else a.ckpt
     ck_tag = "random" if ckpt is None else f"{Path(ckpt).parent.name}_{Path(ckpt).stem}"
+    if a.feature != "dec0":
+        if task != "cls" or a.model != "atomizer" or a.protocol == "finetune":
+            raise ValueError("--feature enc_last: classification, frozen Atomizer-PTv3 only")
+        ck_tag += f"_{a.feature}"
     if a.model == "olmoearth":
         dd = dcfg.get("distill", {})
         a.olmo_ckpt = a.olmo_ckpt or dd.get("olmo_ckpt")
@@ -290,7 +296,7 @@ def main():
             ext = OlmoEarthExtractor(a.olmo_ckpt, a.dataset, dsets["train"], a.olmo_patch, a.olmo_ts).to(dev)
         else:
             net = build_net(dcfg, lookup, K, ckpt)
-            ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0).to(dev)
+            ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0, a.feature).to(dev)
         for p in ext.parameters():
             p.requires_grad_(False)
         ext.set_mode(False)
@@ -310,7 +316,9 @@ def main():
                 if a.protocol == "knn":
                     if task != "cls":
                         raise ValueError("knn is for classification")
-                    pool = lambda d: torch.from_numpy(np.asarray(d.f[d.idx.numpy()], np.float32).mean((2, 3))).to(dev)
+                    def pool(d):
+                        x = np.asarray(d.f[d.idx.numpy()], np.float32)
+                        return torch.from_numpy(x.mean((2, 3)) if x.ndim == 4 else x).to(dev)
                     pred = knn_classify(pool(tr), tr.y[tr.idx].to(dev), pool(te), n_cls=K)
                     r = {"test": {"top1": cls_accuracy(pred.cpu(), te.y)}}
                 else:
