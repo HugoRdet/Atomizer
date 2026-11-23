@@ -187,6 +187,11 @@ def main():
     ap.add_argument("--context_crop", type=int, default=None,
                     help="also run the teacher on the centred context_crop x context_crop part of each tile and compare "
                          "with the full tile's tokens over the same area (how much the extra context changes them)")
+    ap.add_argument("--dino_ckpt", default=None,
+                    help="DINOv3 checkpoint (default: distill.dino_ckpt), e.g. the web model "
+                         "./checkpoints/dinov3/dinov3-vitl16-pretrain-lvd1689m")
+    ap.add_argument("--dino_norm", default=None, choices=["auto", "sat", "imagenet"],
+                    help="input normalization (default: distill.dino_norm; auto = sat if 'sat493m' in the path)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="./viz_pca/dino_upsample")
     ap.add_argument("--configs_dataset", default="./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml")
@@ -206,7 +211,11 @@ def main():
     ds = dm.flair_val
     crop = int(dc["flair_crop"])
 
-    teacher = DinoV3Teacher(dc["dino_ckpt"], dc.get("dino_norm", "auto"), student_patch=16).to(dev).eval()
+    ckpt = args.dino_ckpt or dc["dino_ckpt"]
+    norm = args.dino_norm or dc.get("dino_norm", "auto")
+    tag = os.path.basename(os.path.normpath(ckpt)).replace("dinov3-", "")
+    teacher = DinoV3Teacher(ckpt, norm, student_patch=16).to(dev).eval()
+    print(f"[dino_upsample] teacher {ckpt} | normalization mean {teacher.mean.flatten().tolist()}")
     for f in args.input_up:
         if 16 % f:
             raise ValueError(f"--input_up {f}: 16 / {f} is not an integer patch")
@@ -250,8 +259,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     img = torch.cat(imgs)
     keep = {k: torch.cat(v) for k, v in keep.items()}
-    path = os.path.join(args.out, f"dino_upsample_flair_{crop}.png")
-    render(img, keep, names, path, f"DINOv3 on FLAIR {crop}x{crop} | PCA basis: native tokens")
+    path = os.path.join(args.out, f"dino_upsample_flair_{crop}_{tag}.png")
+    render(img, keep, names, path, f"DINOv3 {tag} on FLAIR {crop}x{crop} | PCA basis: native tokens")
     lines = [f"{'variant':22s} {'grid':>9s} {'cos to native':>14s} {'border':>8s} {'inside':>8s} {'detail':>8s}"]
     for k in names[1:]:
         m = {key: sum(v * w for v, w in vals) / sum(w for _, w in vals) for key, vals in acc[k].items()}
@@ -268,8 +277,8 @@ def main():
                   f"  cos mean {float(c.mean()):.3f} | by token ring from the crop edge (0 = edge, inward): {prof}"]
     txt = "\n".join(lines)
     print(txt)
-    with open(os.path.join(args.out, f"dino_upsample_scores_{crop}.txt"), "w") as f:
-        f.write(f"{len(idx)} FLAIR val tiles, crop {crop}, seed {args.seed}\n{txt}\n")
+    with open(os.path.join(args.out, f"dino_upsample_scores_{crop}_{tag}.txt"), "w") as f:
+        f.write(f"{ckpt} ({norm})\n{len(idx)} FLAIR val tiles, crop {crop}, seed {args.seed}\n{txt}\n")
     print(f"[dino_upsample] figure -> {path}")
 
 
