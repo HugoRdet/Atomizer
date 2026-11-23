@@ -168,6 +168,10 @@ def main():
     ap.add_argument("--anyup_dir", default="./checkpoints/anyup")
     ap.add_argument("--q_chunk", type=int, default=256)
     ap.add_argument("--hub_dir", default="./checkpoints/panopticon")
+    ap.add_argument("--pca_olmo", default="column", choices=["column", "model"],
+                    help="column: one PCA basis per column (best to see whether each map has structure); "
+                         "model: Panopticon all/RGB/AnyUp share one basis (colours comparable between them)")
+    ap.add_argument("--pca_flair", default="model", choices=["column", "model"])
     ap.add_argument("--n", type=int, default=6)
     ap.add_argument("--tiles", type=int, default=32)
     ap.add_argument("--batch", type=int, default=8)
@@ -244,8 +248,12 @@ def main():
         s1 = sizes[0]
         cols = {k: (v, "teacher" if k == tname else (f"pano{s1}" if k.startswith("AnyUp") else f"pano{k.split('@')[-1]}"))
                 for k, v in keep.items()}               # AnyUp output lives in Panopticon's space: same basis as @s1
+        if getattr(args, f"pca_{name}") == "column":
+            cols = {k: (v, k) for k, (v, _) in cols.items()}                      # one basis per column
         path = os.path.join(args.out, f"panopticon_{name}.png")
-        render(torch.cat(imgs), cols, path, f"{name}: {tname} vs Panopticon (own PCA per model)")
+        mode = getattr(args, f"pca_{name}")
+        render(torch.cat(imgs), cols, path, f"{name}: {tname} vs Panopticon (PCA: "
+               + ("one basis per column" if mode == "column" else "one basis per model / input size") + ")")
         lines.append(f"== {name} ({len(idx)} val tiles; Panopticon channels {len(chans)}: ids {nm}) -> {path}")
         lines += [f"  {k:45s} {np.mean(v):.3f}" for k, v in acc.items()]
         del teacher
