@@ -51,6 +51,9 @@ parser.add_argument("--wandb_tags", nargs="*", default=None)
 parser.add_argument("--wandb_dir", default="/lustre/fsn1/projects/rech/ebp/uuk56xr/wandb",
                     help="wandb root; the offline runs are written to <wandb_dir>/wandb/offline-run-*")
 parser.add_argument("--wandb_online", action="store_true", help="sync live (needs internet); default is OFFLINE, for compute nodes")
+parser.add_argument("--wandb_same_run", action="store_true",
+                    help="on resume, continue the SAME wandb run id (unreliable offline). Default: a new run per job, "
+                         "named <xp_name>-r<k> in the group <xp_name>, plotted together on trainer/global_step")
 parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
                     help="override keys of the distill: block, e.g. --set lr=1e-3 epochs=2 batch_per_dataset=32 epoch_size=20000")
 parser.add_argument("--smoke", action="store_true", help="10 optimizer steps, validation every 5, tiny validation set")
@@ -116,16 +119,27 @@ if use_wandb:
 loggers = [CSVLogger("./logs_distill", name=args.xp_name)]
 if use_wandb:
     os.makedirs(args.wandb_dir, exist_ok=True)
-    id_file = os.path.join(ckpt_dir, "wandb_run_id.txt")
-    wkw = {}
-    if args.resume and os.path.exists(id_file):                       # resume the same wandb run
-        wkw = dict(id=open(id_file).read().strip(), resume="allow")
-    wlogger = WandbLogger(project=args.wandb_project, name=args.xp_name, group=args.wandb_group, tags=args.wandb_tags,
-                          save_dir=args.wandb_dir, offline=offline, log_model=False, **wkw)
+    id_file = os.path.join(ckpt_dir, "wandb_run_id.txt")             # id of the latest wandb run of this xp
+    ids_file = os.path.join(ckpt_dir, "wandb_run_ids.txt")           # every run of this xp, one per job
+    prev = [l.split()[0] for l in open(ids_file)] if os.path.exists(ids_file) else []
+    if not prev and os.path.exists(id_file):
+        prev = [open(id_file).read().strip()]
+    wkw, run_name = {}, args.xp_name
+    if args.resume and args.wandb_same_run and prev:                  # old behaviour: same run id
+        wkw = dict(id=prev[-1], resume="allow")
+    elif args.resume and prev:                                        # new run per resumed job, same group
+        run_name = f"{args.xp_name}-r{len(prev)}"
+    wlogger = WandbLogger(project=args.wandb_project, name=run_name, group=args.wandb_group or args.xp_name,
+                          tags=args.wandb_tags, save_dir=args.wandb_dir, offline=offline, log_model=False, **wkw)
     loggers.append(wlogger)
     if IS_RANK0:
+        rid = str(wlogger.experiment.id)
         with open(id_file, "w") as f:
-            f.write(str(wlogger.experiment.id))
+            f.write(rid)
+        if rid not in prev:
+            with open(ids_file, "a") as f:
+                f.write(f"{rid} {run_name} resume_from={args.resume}\n")
+        print(f"[Train] wandb run {run_name} (id {rid}, group {args.wandb_group or args.xp_name})")
 
 
 def _flat(d, prefix=""):
@@ -183,4 +197,5 @@ if IS_RANK0:
     print(f"[Train] config {args.config} | xp {args.xp_name} | seed {args.seed} | smoke {args.smoke}")
 trainer.fit(model, datamodule=dm, ckpt_path=args.resume)
 if IS_RANK0 and use_wandb and offline:
-    print(f"[Train] wandb ran OFFLINE. From a login node with internet (after `wandb login`):  wandb sync {args.wandb_dir}/wandb/offline-run-*")
+    print(f"[Train] wandb ran OFFLINE. From a login node with internet (after `wandb login`):  "
+          f"wandb sync {args.wandb_dir}/wandb/offline-run-*-{wlogger.experiment.id}")
