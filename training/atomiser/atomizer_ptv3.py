@@ -50,6 +50,11 @@ Config (new optional section; defaults in brackets):
       shuffle_orders: [true]
       gsd:            [10.0]
       precision:      [auto]
+      norm:           [bn]    "ln" = LayerNorm instead of BatchNorm in the stem,
+                               poolings and unpoolings (Sonata); blocks always
+                               use LayerNorm. Use "ln" when batches alternate
+                               between datasets (distillation) and to fine-tune
+                               weights distilled with "ln"
       cpe:            [true]  false = remove the convolutional positional
                                encoding (3x3 sparse conv + Linear + LayerNorm)
                                from EVERY block, encoder and decoder
@@ -269,9 +274,14 @@ class AtomizerPTv3(pl.LightningModule):
         for c in enc_channels + dec_channels:
             assert c % head_dim == 0, f"PTv3 width {c} not divisible by head_dim={head_dim}"
 
+        norm = str(p.get("norm", "bn")).lower()
+        if norm not in ("bn", "ln"):
+            raise ValueError(f"PTv3.norm must be 'bn' or 'ln', got {norm!r}")
+        cfg_kw = {} if norm == "bn" else {"norm": norm}       # "bn" = package default
         cfg = Config(
             in_channels=self.pixel_dim,
             stem=p.get("stem", "conv"),
+            **cfg_kw,
             orders=tuple(p.get("orders", ALL_ORDERS)),
             shuffle_orders=bool(p.get("shuffle_orders", True)),
             enc_depths=enc_depths,
@@ -285,6 +295,11 @@ class AtomizerPTv3(pl.LightningModule):
             drop_path=float(p.get("drop_path", 0.3)),
         )
         self.backbone = PointTransformerV3(config=cfg, precision=p.get("precision", "auto"))
+        n_bn = sum(isinstance(m, nn.modules.batchnorm._BatchNorm) for m in self.backbone.modules())
+        if norm == "ln" and n_bn:
+            raise RuntimeError(f"PTv3.norm: ln but the backbone still has {n_bn} BatchNorm layers "
+                               "(this PTv3 package version ignores Config.norm?)")
+        self.norm_type = norm
         self.head = nn.Linear(dec_channels[0], self.num_classes)
         self.gsd = float(p.get("gsd", 10.0))
         self._grid_cache = {}
@@ -339,7 +354,8 @@ class AtomizerPTv3(pl.LightningModule):
             print(f"[AtomizerPTv3] mode=streams: {S} streams {self.band_groups}, separate "
                   f"through level {self.fuse_level}, fused after; fusion params "
                   f"{n_fus/1e6:.3f}M")
-        print(f"[AtomizerPTv3] {n_blocks} blocks: CPE {'on' if self.use_cpe else 'REMOVED'}, "
+        print(f"[AtomizerPTv3] {n_blocks} blocks: norm {self.norm_type} (stem/pooling/unpooling; blocks LayerNorm), "
+              f"CPE {'on' if self.use_cpe else 'REMOVED'}, "
               f"RoPE {self.rope or 'off'}"
               + (f" (base={rope_base:g}, unit={rope_unit:g} m = 1 px)" if self.rope else "")
               + f"; backbone params {n_bb_before/1e6:.2f}M -> {n_bb_after/1e6:.2f}M")
