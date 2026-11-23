@@ -1,0 +1,185 @@
+# =============================================================================
+# Distillation of OlmoEarth (Sentinel) + DINOv3 SAT-493M and LVD-1689M (FLAIR-HUB aerial) into AtomizerPTv3, DUNE recipe.
+# Student = Atomizer per-pixel tokenizer + PTv3 U-Net (Sonata-size encoder, LayerNorm, linear stem), read at the
+# decoder's level-0 output and averaged over each teacher patch (training/distill/distill_heads_ptv3.py).
+#
+# New in this config (vs config_distill_ptv3.yaml):
+#   * PTv3 base-size student (linear stem, LayerNorm, RoPE 2d + CPE, dec_channels[0] = 128)
+#   * FLAIR views: crops 256 / 512, DINOv3 input upsampling x1 / x2  (flair_views)
+#   * second FLAIR teacher: DINOv3 trained on web images             (flair_teachers, dino_web_*)
+#   * FLAIR elevation (nDSM from DEM_ELEV, quality masks) as a 5th atom (flair_elevation, flair_images_dem.csv)
+#   * band dropping: random bands on Sentinel, 4 band sets on FLAIR  (band_drop)
+#
+# Once, before the first run (from the repo root):
+#   cp data/bands_info/bands.yaml data/bands_info/bands_elev.yaml
+#   printf '\nbands_flairhub_elevation:\n  NDSM: {bandwidth: -13, central_wavelength: -13}\n' >> data/bands_info/bands_elev.yaml
+#   PYTHONPATH=. python training/distill/check_distill_data.py --config training/configs/config_distill_ptv3_base_elev.yaml \
+#       --bands_yaml ./data/bands_info/bands_elev.yaml --compute-stats --datasets flair --value-stats
+# Launch (smoke test first):
+#   export PYTHONPATH=/path/to/PointTransformerV3/src:$PYTHONPATH
+#   python scripts_atomizer/train_distill_atomiser.py --config ./training/configs/config_distill_ptv3_base_elev.yaml \
+#       --bands_yaml ./data/bands_info/bands_elev.yaml --xp_name ptv3_base_elev_s42 --smoke
+# Use bands_elev.yaml for viz_distill_pca.py and for every fine-tuning of these weights (same band indices).
+# =============================================================================
+encoder: ATOMIZER_PTv3_distill
+
+optimizer:
+    name: ADAMW
+
+RoPE:
+    base: 100.0
+    self_compression_scale: 5000
+    cross_compression_scale: 240
+    learnable_scale: true
+
+trainer:
+    mode: "segmentation"
+    num_classes: 2              # unused by distillation (the segmentation head is dropped)
+    slide: false
+    batchsize: 96
+    train_batch_size: 96
+    val_batch_size: 96
+    test_batch_size: 96
+    max_tokens: 262144
+    max_tokens_reconstruction: 100000
+    lr: 1.0e-4                  # unused (DUNE schedule below)
+    dropout: 0.05
+    epochs: 100
+    weight_decay: 1.0e-3        # unused
+    accumulate_grad_batches: 1
+    multi_modal: True
+
+Atomiser:
+    # ---- read by AtomizerPTv3 itself ----
+    cross_heads: 4              # heads of the pixel cross-attention (if PTv3.pixel_heads is not set)
+    attn_dropout: 0.0           # dropout of the pixel cross-attention
+    skip_resolution: 10.0       # fallback only: the student reads the batch's single resolution group
+    # ---- tokenizer (TokenProcessor) ----
+    unet_atom_features: legacy
+    unet_atom_dim: 128
+    tokenizer_hidden_size: 256
+    tokenizer_nb_layers: 2
+    tokenizer_out_dim: 64
+    use_error_predictor: False
+    use_decoder_skip: True
+    gradient_checkpointing: true
+
+PTv3:
+    enabled: true
+    mode: pixel
+    pixel_dim: 64
+    pixel_heads: 4
+    atom_drop_p: 0.0            # per-pixel atom dropout (band dropping is done per tile in the data, see band_drop)
+    pixel_chunk: 16384
+    checkpoint_tokenizer: true
+    stem: linear                # each pixel's embedding -> enc_channels[0] by a Linear (no 5x5 conv)
+    norm: ln                    # LayerNorm (Sonata); BatchNorm mixed the two datasets' statistics
+    cpe: true
+    rope: 2d
+    enc_channels: [48, 96, 192, 384, 512]   # Sonata encoder (~108M with CPE)
+    enc_depths: [3, 3, 3, 12, 3]
+    dec_channels: [128, 96, 192, 384]       # dec_channels[0] = 128: width read by the teacher heads
+    dec_depths: [2, 2, 2, 2]
+    head_dim: 16
+    patch_size: 1024
+    drop_path: 0.3
+    gsd: 10.0                   # positions in tile pixels for both datasets (real GSD comes from the atoms)
+
+wavelengths_encoding:
+    gauss_1: { mean: 380, std: 15 }
+    gauss_2: { mean: 424, std: 15 }
+    gauss_3: { mean: 468, std: 15 }
+    gauss_4: { mean: 513, std: 15 }
+    gauss_5: { mean: 557, std: 15 }
+    gauss_6: { mean: 602, std: 15 }
+    gauss_7: { mean: 646, std: 15 }
+    gauss_8: { mean: 691, std: 15 }
+    gauss_9: { mean: 735, std: 15 }
+    gauss_10: { mean: 780, std: 15 }
+    gauss_11: { mean: 850, std: 15 }
+    gauss_12: { mean: 940, std: 15 }
+    gauss_13: { mean: 1200, std: 80 }
+    gauss_14: { mean: 1400, std: 30 }
+    gauss_15: { mean: 1600, std: 40 }
+    gauss_16: { mean: 1750, std: 40 }
+    gauss_17: { mean: 1950, std: 40 }
+    gauss_18: { mean: 2100, std: 80 }
+    gauss_19: { mean: 2215, std: 80 }
+
+distill:
+    # ---- data (paths relative to the repo root) ----
+    olmo_index: ./data/olmo_uncompressed/idx/all.csv
+    olmo_tar_dir: ./data/olmo_uncompressed/tars
+    olmo_stats: ./data/olmo_uncompressed/normalization_stats_distill.pt
+    flair_index: ./data/flair_hub/idx/flair_images_dem.csv               # aerial + DEM_ELEV locations
+    flair_root: ./data/flair_hub/data
+    flair_stats: ./data/flair_hub/normalization_stats_distill_elev.pt    # 5 channels (R, G, B, NIR, ELEV)
+    aerial_section: bands_flairhub_aerial
+    share_s2: false
+    flair_crop: 256                         # default view (also used by viz_distill_pca.py)
+    flair_patch: 16                         # default view: DINOv3 token = 16 x 16 pixels
+
+    # ---- FLAIR views: one per FLAIR batch (same on every GPU); teacher grid = crop * up / 16 ----
+    # batch: tiles per GPU for that view (512 crops: 2 tiles = the pixels of 8 tiles of 256)
+    flair_views:
+      - {crop: 256, up: 1, weight: 1, batch: 8}     # 16 x 16 tokens of 16 px
+      - {crop: 512, up: 1, weight: 1, batch: 2}     # 32 x 32 tokens of 16 px
+      - {crop: 256, up: 2, weight: 1, batch: 8}     # 32 x 32 tokens of  8 px
+      - {crop: 512, up: 2, weight: 1, batch: 2}     # 64 x 64 tokens of  8 px
+
+    # ---- FLAIR elevation: 5th atom ELEV = log1p(clip(nDSM, 0, clip_max)); invalid pixels / tiles -> masked atoms ----
+    flair_elevation:
+        section: bands_flairhub_elevation   # must exist in the --bands_yaml file (bands_elev.yaml)
+        name: NDSM
+        max_offset: 3.0                     # p5(nDSM) in [-3, 0) m: vertical bias removed
+        pixel_min: -2.0                     # pixels below -2 m after that: masked
+        min_valid: 0.7                      # < 70 % valid pixels: whole elevation channel masked (water, glaciers)
+        clip_max: 60.0
+
+    # ---- student-side band dropping (train only; the teachers always get their full input) ----
+    band_drop:
+        olmo:  {p: 0.5, max_drop: 8, min_keep: 2}   # half the tiles lose 1..8 of the 14 bands (S2 x 12, VV, VH)
+        flair:                                      # channels: 0 R, 1 G, 2 B, 3 NIR, 4 ELEV
+            sets:
+              - {keep: [0, 1, 2, 3, 4], weight: 0.30}   # full
+              - {keep: [0, 1, 2],       weight: 0.35}   # RGB only (what the teacher sees)
+              - {keep: [3, 4],          weight: 0.25}   # NIR + elevation only (cross-modal)
+              - {keep: [0, 1, 2, 3],    weight: 0.10}   # RGBI, no elevation
+
+    # ---- teachers ----
+    olmo_ckpt: ./checkpoints/olmo/OlmoEarth-v1_2-Base
+    olmo_patch: 2                           # 128 / 2 = 64 x 64 teacher tokens of 2 x 2 pixels
+    flair_teachers: [dino, dino_web]        # every FLAIR batch is supervised by both; loss = their mean
+    dino_ckpt: ./checkpoints/dinov3/dinov3-vitl16-pretrain-sat493m
+    dino_norm: auto                         # auto -> SAT-493M statistics
+    dino_web_ckpt: ./checkpoints/dinov3/dinov3-vitl16-pretrain-lvd1689m
+    dino_web_norm: auto                     # auto -> ImageNet statistics
+    teacher_fp32: false
+
+    # ---- Atomiser_Unet leaf sizes: required by Model_Distill, ignored by the PTv3 student ----
+    k_olmo: 56
+    k_flair: 1024
+    m_factor: 1.3
+    n_pre: 1                                # Atomiser_Unet heads only
+
+    # ---- DUNE optimization ----
+    batch_per_dataset: 8                    # Sentinel tiles per micro-batch per GPU (FLAIR: per view, above)
+    lr: 3.0e-4                              # peak lr = lr * global_batch / 256; global batch = (8 + 5 expected FLAIR) x GPUs
+    min_lr: 1.0e-6
+    wd: 0.03
+    betas: [0.9, 0.99]
+    eps: 1.0e-15
+    clip: 1.0
+    warmup_frac: 0.2
+    epoch_size: 100000
+    epochs: 10
+    tnorm_start: 1.0
+    tnorm_end: 0.001
+
+    # ---- logging / io ----
+    workers: 8
+    val_every_steps: 500
+    val_batches: 20                         # per validation loader: 1 Sentinel + 4 FLAIR views
+    ckpt_every_steps: 1000
+    log_every: 10
+    seed: 42

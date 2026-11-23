@@ -32,6 +32,8 @@ p.add_argument("--compute-stats", action="store_true")
 p.add_argument("--teachers", action="store_true")
 p.add_argument("--value-stats", action="store_true", help="per-band percentiles of the z-scored values and the fraction beyond the +-10 clamp (200 random augmented samples per dataset)")
 p.add_argument("--n-stats", type=int, default=500)
+p.add_argument("--datasets", nargs="+", default=["olmo", "flair"], choices=["olmo", "flair"],
+               help="which datasets --compute-stats recomputes (e.g. only flair after adding elevation)")
 args = p.parse_args()
 
 config = read_yaml(args.config)
@@ -41,10 +43,13 @@ lookup = Lookup_encoding(read_yaml(args.configs_dataset), bands, config)
 common = dict(look_up=lookup, dataset_config=bands, stats_required=False)
 olmo = OlmoSentinelAtoms(dc["olmo_index"], dc["olmo_tar_dir"], "train", aug=True, stats_path=dc["olmo_stats"], **common)
 flair = FlairAtoms(dc["flair_index"], dc["flair_root"], "train", int(dc["flair_crop"]), aug=True, stats_path=dc["flair_stats"],
-                   aerial_section=dc.get("aerial_section", "bands_flairhub_aerial"), share_s2=bool(dc.get("share_s2", False)), **common)
+                   aerial_section=dc.get("aerial_section", "bands_flairhub_aerial"), share_s2=bool(dc.get("share_s2", False)),
+                   elevation=dc.get("flair_elevation"), **common)
 
 if args.compute_stats:
     for ds in (olmo, flair):
+        if ds.name not in args.datasets:
+            continue
         t0 = time.time()
         ds.compute_and_save_stats(n=args.n_stats)
         print(f"  ({time.time() - t0:.0f}s)")
@@ -52,12 +57,12 @@ if args.compute_stats:
 if args.value_stats:
     import numpy as np
     from training.utils.datasets.utils_dataset_distill import OLMO_S1, OLMO_S2
-    names = {"olmo": OLMO_S2 + OLMO_S1, "flair": ["R", "G", "B", "NIR"]}
+    names = {"olmo": OLMO_S2 + OLMO_S1, "flair": ["R", "G", "B", "NIR"] + (["ELEV"] if flair.elev else [])}
     for name, ds in (("olmo", olmo), ("flair", flair)):
         idx = np.random.default_rng(0).choice(len(ds), min(200, len(ds)), replace=False)
         z = torch.stack([(ds.raw_image(int(i), aug=True) - ds.mean) / ds.std for i in idx])      # [n, C, H, W], before the clamp
         flat = z.permute(1, 0, 2, 3).reshape(z.shape[1], -1)
-        q = torch.quantile(flat[:, ::37].float(), torch.tensor([0.01, 0.5, 0.99]), dim=1)
+        q = torch.nanquantile(flat[:, ::37].float(), torch.tensor([0.01, 0.5, 0.99]), dim=1)
         clip = (flat.abs() > 10).float().mean(1)
         print(f"\n== z-scored values, {name} ({len(idx)} samples, before the +-10 clamp) ==")
         for c, b in enumerate(names[name]):

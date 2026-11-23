@@ -407,7 +407,8 @@ class DistillDataModule(pl.LightningDataModule):
                                                        stats_path=dc["flair_stats"], stats_required=sr,
                                                        aerial_section=dc.get("aerial_section", "bands_flairhub_aerial"),
                                                        share_s2=bool(dc.get("share_s2", False)), crops=crops,
-                                                       band_drop=bd.get("flair"), **common))
+                                                       band_drop=bd.get("flair"), elevation=dc.get("flair_elevation"),
+                                                       **common))
         self._ready = True
 
     def _loader(self, ds, **kw):

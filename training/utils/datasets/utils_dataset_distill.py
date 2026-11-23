@@ -24,6 +24,16 @@ Band dropping (distill.band_drop, train only): with probability p a tile loses k
 1..max_drop, taken among `bands`, at least min_keep bands kept): their tokens are masked (mask True, value 0), so the
 student's per-pixel attention ignores them. The teacher input is never changed (the teacher always sees every band).
 
+Band sets (distill.band_drop.<dataset>.sets, train only): instead of random bands, each tile keeps one named set of
+channels drawn with its weight, e.g. FLAIR [R, G, B, NIR, ELEV] -> {keep: [0, 1, 2], weight: 0.35} = RGB only.
+
+FLAIR elevation (distill.flair_elevation): a 5th channel ELEV from the FLAIR-HUB DEM_ELEV patch (ch0 DSM, ch1 DTM), read
+through the dem_* columns of flair_images_dem.csv (radio/add_dem_to_flair_index.py). Per crop:
+    nDSM = DSM - DTM;  if -max_offset <= p5(nDSM) < 0: nDSM -= p5 (small vertical bias of flat areas);
+    pixels with nDSM < pixel_min are invalid; if the valid fraction < min_valid, the whole channel is invalid;
+    ELEV = log1p(clip(nDSM, 0, clip_max)), then the z-score. Invalid pixels -> masked atoms (water, glaciers, cliffs).
+The teacher never sees elevation.
+
 FLAIR views (distill.flair_views): a FLAIR item can be requested as dataset[(i, crop, up)]: a `crop` x `crop` patch whose
 teacher input is upsampled `up` times (DINOv3 token = 16/up pixels of the crop). MixedViewBatchSampler draws one view per
 FLAIR batch (the same on every rank) and yields keys for DistillConcat; FixedView pins one view (validation).
@@ -129,13 +139,17 @@ class _AtomDataset(Dataset):
         idx = rng.choice(len(self), min(n, len(self)), replace=False)
         s = ss = None
         cnt = 0
-        for i in idx:
+        for i in idx:                                            # NaN = invalid pixel (FLAIR elevation): skipped
             x = self.raw_image(int(i), aug=False).double()
             if s is None:
                 s, ss = torch.zeros(x.shape[0], dtype=torch.float64), torch.zeros(x.shape[0], dtype=torch.float64)
+                cnt = torch.zeros(x.shape[0], dtype=torch.float64)
+            ok = torch.isfinite(x)
+            x = torch.where(ok, x, torch.zeros_like(x))
             s += x.sum((1, 2))
             ss += (x ** 2).sum((1, 2))
-            cnt += x.shape[1] * x.shape[2]
+            cnt += ok.sum((1, 2))
+        cnt = cnt.clamp_min(1)
         mean = s / cnt
         std = (ss / cnt - mean ** 2).clamp_min(1e-12).sqrt()
         torch.save({"mean": mean.float(), "std": std.float()}, self.stats_path)
@@ -146,8 +160,17 @@ class _AtomDataset(Dataset):
         return ((x - self.mean) / self.std).clamp(-10, 10)
 
     def _init_band_drop(self, cfg, C):
-        """cfg: None or dict(p, bands=[channel indices] (default all), max_drop (default all candidates), min_keep=1)."""
+        """cfg: None, dict(sets=[{keep: [channels], weight}]) (one set kept per tile), or dict(p, bands=[channel indices]
+        (default all), max_drop (default all candidates), min_keep=1) (random bands)."""
         self.band_drop = None
+        if cfg and cfg.get("sets"):
+            sets = [np.array(sorted(int(c) for c in st["keep"])) for st in cfg["sets"]]
+            w = np.array([float(st.get("weight", 1.0)) for st in cfg["sets"]])
+            if any(len(k) == 0 or k.min() < 0 or k.max() >= C for k in sets) or (w <= 0).any():
+                raise ValueError(f"[{self.name}] band_drop.sets must keep >= 1 channel of 0..{C - 1}, weights > 0")
+            self.band_drop = dict(sets=sets, w=w / w.sum())
+            print(f"[{self.name}] band sets (train): " + ", ".join(f"{k.tolist()} {p:.0%}" for k, p in zip(sets, w / w.sum())))
+            return
         if not cfg or float(cfg.get("p", 0.0)) <= 0.0:
             return
         bands = [int(b) for b in cfg.get("bands", range(C))]
@@ -163,10 +186,18 @@ class _AtomDataset(Dataset):
     def _drop_bands(self, tokens, mask, C):
         """Mask whole bands of one tile (channel-major tokens: band c owns rows c*HW .. (c+1)*HW)."""
         bd = self.band_drop
-        if bd is None or not self.aug or self._rng.random() >= bd["p"]:
+        if bd is None or not self.aug:
             return tokens, mask
-        k = int(self._rng.integers(1, bd["max_drop"] + 1))
-        drop = self._rng.choice(bd["bands"], size=k, replace=False)
+        if "sets" in bd:
+            keep = bd["sets"][int(self._rng.choice(len(bd["sets"]), p=bd["w"]))]
+            drop = np.setdiff1d(np.arange(C), keep)
+            if drop.size == 0:
+                return tokens, mask
+        else:
+            if self._rng.random() >= bd["p"]:
+                return tokens, mask
+            k = int(self._rng.integers(1, bd["max_drop"] + 1))
+            drop = self._rng.choice(bd["bands"], size=k, replace=False)
         HW = tokens.shape[0] // C
         mask = mask.clone().view(C, HW)
         mask[torch.from_numpy(drop)] = True
@@ -252,31 +283,66 @@ class FlairAtoms(_AtomDataset):
 
     def __init__(self, index_csv, root, split, crop, look_up, dataset_config, aug, stats_path,
                  aerial_section="bands_flairhub_aerial", aerial_names=("RED", "GREEN", "BLUE", "NIR"),
-                 share_s2=False, s2_section="bands_mmearth_s2", stats_required=True, crops=None, band_drop=None):
-        """crop: default crop side; crops: every crop side that may be requested (one token template each)."""
+                 share_s2=False, s2_section="bands_mmearth_s2", stats_required=True, crops=None, band_drop=None,
+                 elevation=None):
+        """crop: default crop side; crops: every crop side that may be requested (one token template each);
+        elevation: None or dict (distill.flair_elevation) -> 5th channel ELEV (see the module docstring)."""
         import pandas as pd
         assert split in ("train", "val")
-        cols = ["zip", "member", "split"] + [c for c in ("offset", "csize", "ctype") if c in pd.read_csv(index_csv, nrows=0).columns]
+        self.elev = None
+        if elevation and elevation.get("enabled", True):
+            self.elev = dict(section=str(elevation.get("section", "bands_flairhub_elevation")),
+                             name=str(elevation.get("name", "NDSM")),
+                             max_offset=float(elevation.get("max_offset", 3.0)),
+                             pixel_min=float(elevation.get("pixel_min", -2.0)),
+                             min_valid=float(elevation.get("min_valid", 0.7)),
+                             clip_max=float(elevation.get("clip_max", 60.0)))
+        self.C = 5 if self.elev else 4
+        head = pd.read_csv(index_csv, nrows=0).columns
+        cols = ["zip", "member", "split"] + [c for c in ("offset", "csize", "ctype") if c in head]
+        if self.elev:
+            dem_cols = ["dem_zip", "dem_offset", "dem_csize", "dem_ctype"]
+            if not all(c in head for c in dem_cols):
+                raise ValueError(f"{index_csv} has no dem_* columns: use flair_images_dem.csv (radio/add_dem_to_flair_index.py)")
+            cols += dem_cols
         df = pd.read_csv(index_csv, usecols=cols, dtype=str)
         df = df[df["split"] == ("test" if split == "val" else "train")]          # val = official test departments
         self.zip, self.member, self.root = df["zip"].to_numpy(), df["member"].to_numpy(), root
         self.raw = all(c in df.columns for c in ("offset", "csize", "ctype"))   # rebuilt index: read by byte offset
         if self.raw:
             self.offset, self.csize, self.ctype = (df[c].astype("int64").to_numpy() for c in ("offset", "csize", "ctype"))
+        if self.elev:
+            has = df["dem_offset"].notna() & (df["dem_offset"] != "")
+            self.dem_zip = df["dem_zip"].to_numpy()
+            self.dem_has = has.to_numpy()
+            self.dem_offset, self.dem_csize, self.dem_ctype = (
+                pd.to_numeric(df[c], errors="coerce").fillna(-1).astype("int64").to_numpy()
+                for c in ("dem_offset", "dem_csize", "dem_ctype"))
+            if not self.raw:
+                raise ValueError("flair elevation needs the byte-offset index (offset/csize/ctype columns)")
         self.crop, self.aug, self._z, self._rng = crop, aug, OrderedDict(), None
         if share_s2:   # aerial R, G, B, NIR take the spectral index of Sentinel-2 B04, B03, B02, B08
             pairs = [(s2_section, n) for n in ("B04", "B03", "B02", "B08")]
         else:
             pairs = [(aerial_section, n) for n in aerial_names]
+        if self.elev:
+            sec, nm = self.elev["section"], self.elev["name"]
+            if sec not in dataset_config or nm not in dataset_config[sec]:
+                raise KeyError(f"elevation band {sec}/{nm} missing from the bands yaml: add e.g.\n"
+                               f"{sec}:\n  {nm}: {{bandwidth: -13, central_wavelength: -13}}   # CANOPY_HEIGHT (height above ground)")
+            pairs = pairs + [(sec, nm)]
         self.spectral_idx = spectral_indices(look_up, dataset_config, pairs)
         builder = TokenBuilder(look_up)
-        self.templates = {int(c): AtomTemplate(builder, look_up, 4, int(c), int(c), self.resolution, self.spectral_idx)
+        C = self.C
+        self.templates = {int(c): AtomTemplate(builder, look_up, C, int(c), int(c), self.resolution, self.spectral_idx)
                           for c in sorted(set([int(crop)] + [int(c) for c in (crops or [])]))}
         self.template = self.templates[int(crop)]
-        self._init_stats(stats_path, 4, stats_required)
-        self._init_band_drop(band_drop if aug else None, 4)
-        print(f"[flair {split}] {len(df)} patches, crops {sorted(self.templates)} (default {crop}) | spectral idx R,G,B,NIR = {self.spectral_idx.tolist()} "
-              f"({'shared with S2' if share_s2 else aerial_section})")
+        self._init_stats(stats_path, C, stats_required)
+        self._init_band_drop(band_drop if aug else None, C)
+        names = "R,G,B,NIR" + (",ELEV" if self.elev else "")
+        print(f"[flair {split}] {len(df)} patches, crops {sorted(self.templates)} (default {crop}) | spectral idx {names} = "
+              f"{self.spectral_idx.tolist()} ({'shared with S2' if share_s2 else aerial_section})"
+              + (f" | elevation {self.elev}, DEM for {int(self.dem_has.sum())}/{len(df)} patches" if self.elev else ""))
 
     def __len__(self):
         return len(self.zip)
@@ -304,6 +370,7 @@ class FlairAtoms(_AtomDataset):
             a = np.moveaxis(a, 0, -1)
         a = a[..., :4]
         assert a.dtype == np.uint8 and a.shape[-1] == 4, f"unexpected aerial patch {a.shape} {a.dtype}"
+        e = self._load_dem(i, a.shape[:2]) if self.elev else None                 # (H, W, 2) float32 or None
         H = a.shape[0]
         if crop > H or crop > a.shape[1]:
             raise ValueError(f"crop {crop} larger than the FLAIR patch {a.shape[:2]}")
@@ -313,12 +380,55 @@ class FlairAtoms(_AtomDataset):
             else:
                 y0 = x0 = (H - crop) // 2
             a = a[y0:y0 + crop, x0:x0 + crop]
+            e = None if e is None else e[y0:y0 + crop, x0:x0 + crop]
         if aug:
-            a = dihedral(a, int(self._rng.integers(4)), bool(self._rng.integers(2)))
-        return np.ascontiguousarray(a)                                           # (crop, crop, 4) uint8
+            k, flip = int(self._rng.integers(4)), bool(self._rng.integers(2))
+            a = dihedral(a, k, flip)
+            e = None if e is None else dihedral(e, k, flip)
+        a = np.ascontiguousarray(a)                                              # (crop, crop, 4) uint8
+        if not self.elev:
+            return a
+        return a, (self._elevation(e) if e is not None else np.full(a.shape[:2], np.nan, np.float32))
+
+    def _load_dem(self, i, hw):
+        """DEM_ELEV patch (H, W, 2) float32 (DSM, DTM), or None if the patch has no DEM."""
+        import tifffile
+        if not self.dem_has[i]:
+            return None
+        data = read_zip_member_raw(os.path.join(self.root, str(self.dem_zip[i])), int(self.dem_offset[i]),
+                                   int(self.dem_csize[i]), int(self.dem_ctype[i]))
+        d = tifffile.imread(io.BytesIO(data))
+        if d.ndim == 3 and d.shape[0] <= 8 and d.shape[-1] > 8:
+            d = np.moveaxis(d, 0, -1)
+        if d.ndim != 3 or d.shape[-1] < 2 or tuple(d.shape[:2]) != tuple(hw):
+            raise ValueError(f"unexpected DEM patch {d.shape} for aerial {hw} ({self.dem_zip[i]})")
+        return d[..., :2].astype(np.float32)
+
+    def _elevation(self, e):
+        """(h, w, 2) DSM, DTM -> (h, w) float32 ELEV = log1p(clip(nDSM, 0, clip_max)), NaN where invalid."""
+        c = self.elev
+        nd = (e[..., 0] - e[..., 1]).astype(np.float64)
+        nd[~np.isfinite(nd)] = -1e9
+        p5 = float(np.percentile(nd, 5))
+        if -c["max_offset"] <= p5 < 0.0:                                         # small vertical bias (flat areas)
+            nd = nd - p5
+        valid = nd >= c["pixel_min"]
+        if valid.mean() < c["min_valid"]:                                        # water, glaciers, cliffs: drop the tile's DEM
+            return np.full(nd.shape, np.nan, np.float32)
+        out = np.log1p(np.clip(nd, 0.0, c["clip_max"])).astype(np.float32)
+        out[~valid] = np.nan
+        return out
+
+    def _image(self, loaded):
+        """_load output -> (uint8 aerial (h, w, 4), float [C, h, w] with NaN at invalid elevation pixels)."""
+        a, e = loaded if self.elev else (loaded, None)
+        x = torch.from_numpy(a.astype(np.float32) / 255.0).permute(2, 0, 1)
+        if e is not None:
+            x = torch.cat([x, torch.from_numpy(e)[None]], 0)
+        return a, x.contiguous()
 
     def raw_image(self, i, aug=False):
-        return torch.from_numpy(self._load(i, aug).astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+        return self._image(self._load(i, aug))[1]
 
     def __getitem__(self, key):
         """key: index, or (index, crop, up) for a FLAIR view (up: teacher input upsampling, applied by the teacher)."""
@@ -327,9 +437,13 @@ class FlairAtoms(_AtomDataset):
         if crop not in self.templates:
             raise KeyError(f"crop {crop} not prepared (FlairAtoms crops={sorted(self.templates)})")
         tpl = self.templates[crop]
-        a = self._load(int(i), self.aug, crop)
-        x = torch.from_numpy(a.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
-        tokens, mask = self._drop_bands(tpl.fill(self._zscore(x)), tpl.mask, 4)
+        a, x = self._image(self._load(int(i), self.aug, crop))
+        tokens, mask = tpl.fill(self._zscore(x)), tpl.mask
+        bad = ~torch.isfinite(tokens[:, 0])                                     # invalid elevation pixels
+        if bad.any():
+            mask = mask | bad
+            tokens[bad, 0] = 0.0
+        tokens, mask = self._drop_bands(tokens, mask, self.C)
         rgb = torch.from_numpy(np.ascontiguousarray(a[..., :3].transpose(2, 0, 1)))                # uint8 [3, H, W]
         return {"groups": {self.resolution: {"tokens": tokens, "mask": mask, "shape": tpl.shape}},
                 "teacher": {"rgb": rgb}, "dataset_name": self.name, "view": (crop, up)}
