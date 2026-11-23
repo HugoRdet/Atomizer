@@ -119,7 +119,15 @@ def make_head(task, protocol, D, K):
     return head, agg
 
 
+def fit(out, y, task):
+    """Bilinear upsampling of coarse (patch-grid) logits to the label size."""
+    if task != "cls" and out.shape[-2:] != y.shape[-2:]:
+        out = F.interpolate(out, size=y.shape[-2:], mode="bilinear", align_corners=False)
+    return out
+
+
 def loss_fn(out, y, task, ignore):
+    out = fit(out, y, task)
     return F.cross_entropy(out, y) if task == "cls" else F.cross_entropy(out, y, ignore_index=ignore)
 
 
@@ -131,7 +139,7 @@ def eval_cached(head, agg, data: Cached, task, K, ignore, dev, bs):
         f, y, doy = data.get(rows, dev)
         if agg is not None:
             f = agg(f, doy)
-        out = head(f)
+        out = fit(head(f), y, task)
         preds.append(out.argmax(1).cpu()) if task == "cls" else m.update(out, y)
     if task == "cls":
         acc = cls_accuracy(torch.cat(preds), data.y[data.idx]); return {"main": acc, "top1": acc}
@@ -180,7 +188,7 @@ def run_finetune(ext, head, agg, loaders, a, task, K, ignore, dev):
                 f = ext(batch)
                 if agg is not None:
                     f = agg(f.float(), batch.get("doy"))
-                out = head(f.float())
+                out = fit(head(f.float()), batch["label"], task)
                 if task == "cls":
                     preds.append(out.argmax(1).cpu()); ys.append(batch["label"].cpu())
                 else:
@@ -221,7 +229,13 @@ def main():
     ap.add_argument("--ref_table_wave", default=None, help="optional torch file with the distillation lookup.table_wave")
     ap.add_argument("--ds_config", default=None, help="the dataset's own training config (optional, for its keys)")
     ap.add_argument("--root", default=None)
-    ap.add_argument("--ckpt", default="none", help="encoder_*.pth, or 'none' for the random-init control")
+    ap.add_argument("--ckpt", default="none", help="encoder_*.pth / *.ckpt, or 'none' for the random-init control")
+    ap.add_argument("--model", choices=["atomizer", "olmoearth"], default="atomizer",
+                    help="olmoearth: frozen OlmoEarth (teacher) features, same splits / heads / metrics")
+    ap.add_argument("--olmo_ckpt", default=None, help="default: distill.olmo_ckpt of --distill_config")
+    ap.add_argument("--olmo_patch", type=int, default=None, help="default: distill.olmo_patch (2)")
+    ap.add_argument("--olmo_ts", type=int, nargs=3, default=[15, 6, 2018],
+                    help="timestamp triple for datasets without dates (same format as the OlmoEarth h5 'timestamps')")
     ap.add_argument("--bn_mode", choices=["batch", "eval", "recal"], default="batch")
     ap.add_argument("--multi_temporal", type=int, default=6, help="PASTIS frames per sample")
     ap.add_argument("--keep_time_idx", action="store_true", help="feed the datasets' time_idx (distillation used -1)")
@@ -245,6 +259,16 @@ def main():
     ds_cfg = read_yaml(a.ds_config) if a.ds_config else None
     ckpt = None if a.ckpt == "none" else a.ckpt
     ck_tag = "random" if ckpt is None else f"{Path(ckpt).parent.name}_{Path(ckpt).stem}"
+    if a.model == "olmoearth":
+        dd = dcfg.get("distill", {})
+        a.olmo_ckpt = a.olmo_ckpt or dd.get("olmo_ckpt")
+        a.olmo_patch = int(a.olmo_patch or dd.get("olmo_patch", 2))
+        if a.olmo_ckpt is None:
+            raise ValueError("--olmo_ckpt needed (not found in distill config)")
+        if a.protocol == "finetune":
+            raise NotImplementedError("OlmoEarth is evaluated frozen only")
+        ck_tag = f"olmoearth_p{a.olmo_patch}"
+        a.bn_mode = "eval"
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 
     lookup = build_lookup(dcfg, a.bands_yaml)
@@ -260,8 +284,13 @@ def main():
     results = []
     if a.protocol != "finetune":
         seed_all(0)                                                     # random-init control: fixed init
-        net = build_net(dcfg, lookup, K, ckpt)
-        ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0).to(dev)
+        if a.model == "olmoearth":
+            from training.eval_ptv3.features_olmo import OlmoEarthExtractor
+            net = None
+            ext = OlmoEarthExtractor(a.olmo_ckpt, a.dataset, dsets["train"], a.olmo_patch, a.olmo_ts).to(dev)
+        else:
+            net = build_net(dcfg, lookup, K, ckpt)
+            ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0).to(dev)
         for p in ext.parameters():
             p.requires_grad_(False)
         ext.set_mode(False)

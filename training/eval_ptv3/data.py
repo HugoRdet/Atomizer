@@ -63,6 +63,8 @@ def collate_eval(samples):
                          "shape": samples[0]["groups"][res]["shape"]}},
         "label": torch.stack([torch.as_tensor(s["label"]) for s in samples]),
     }
+    if "image" in samples[0]:                    # z-scored pixels: input of the foundation-model extractors
+        out["image"] = torch.stack([torch.as_tensor(s["image"]) for s in samples])
     if "time_positions" in samples[0]:
         out["doy"] = torch.stack([torch.as_tensor(s["time_positions"]).float() for s in samples])
     return out
