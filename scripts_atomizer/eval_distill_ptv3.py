@@ -255,6 +255,10 @@ def main():
     ap.add_argument("--olmo_patch", type=int, default=None, help="default: distill.olmo_patch (2)")
     ap.add_argument("--olmo_ts", type=int, nargs=3, default=[15, 6, 2018],
                     help="timestamp triple for datasets without dates (same format as the OlmoEarth h5 'timestamps')")
+    ap.add_argument("--input_norm", choices=["dataset", "distill"], default="dataset",
+                    help="Atomizer student input: dataset = the dataset class's own per-band z-score (default); "
+                         "distill = the distillation pipeline (raw -> OlmoEarth normalizer -> olmo_stats z-score), "
+                         "S2 datasets only; bands without an OlmoEarth counterpart (EuroSAT B10) are masked")
     ap.add_argument("--mask_channels", type=int, nargs="+", default=None,
                     help="Atomizer student: dataset channels whose atoms are masked (e.g. EuroSAT B10 = 10, as "
                          "OlmoEarth gets only the 12 bands it was trained on)")
@@ -296,6 +300,8 @@ def main():
     ck_tag = "random" if ckpt is None else f"{Path(ckpt).parent.name}_{Path(ckpt).stem}"
     if a.mask_channels:
         ck_tag += "_mask" + "-".join(map(str, a.mask_channels))
+    if a.input_norm == "distill":
+        ck_tag += "_distnorm"
     if a.feature != "dec0":
         if task != "cls" or a.model != "atomizer" or a.protocol == "finetune":
             raise ValueError("--feature enc_last: classification, frozen Atomizer-PTv3 only")
@@ -332,8 +338,14 @@ def main():
                                      input_norm=a.olmo_norm, ref_stats=dcfg["distill"]["olmo_stats"]).to(dev)
         else:
             net = build_net(dcfg, lookup, K, ckpt)
+            affine, mask_ch = None, list(a.mask_channels or [])
+            if a.input_norm == "distill":
+                from training.eval_ptv3.features_olmo import distill_input_affine
+                A_, B_, unmapped = distill_input_affine(a.dataset, dsets["train"], dcfg["distill"]["olmo_stats"])
+                affine, mask_ch = (A_, B_), sorted(set(mask_ch) | set(unmapped))
+                print(f"[input_norm distill] A {A_.numpy().round(2)} | B {B_.numpy().round(2)} | masked {mask_ch}")
             ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0, a.feature,
-                                 mask_channels=a.mask_channels).to(dev)
+                                 mask_channels=mask_ch, value_affine=affine).to(dev)
         for p in ext.parameters():
             p.requires_grad_(False)
         ext.set_mode(False)

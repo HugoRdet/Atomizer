@@ -24,6 +24,39 @@ DATASET_S2 = {
 }
 
 
+def distill_input_affine(dataset_name, train_ds, olmo_stats):
+    """Per dataset channel: z_distill = A + B * z_dataset, the student's distillation input pipeline applied to a
+    downstream S2 dataset: raw DN (inverted dataset z-score) -> OlmoEarth Normalizer (pretraining statistics, L2A) ->
+    z-score with the distillation statistics (olmo_stats, OLMO_S2 order). Returns (A [C], B [C], unmapped channels):
+    channels with no OlmoEarth band (e.g. EuroSAT B10) are returned for masking."""
+    from olmoearth_pretrain_minimal import Normalizer
+    from olmoearth_pretrain_minimal.olmoearth_pretrain_v1.utils.constants import Modality
+    if dataset_name not in DATASET_S2:
+        raise NotImplementedError(f"no S2 band mapping for {dataset_name}")
+    names = DATASET_S2[dataset_name]
+    norm = Normalizer(std_multiplier=2.0)
+    st = torch.load(olmo_stats, weights_only=True)
+    mu_ref = st["mean"].reshape(-1)[:12].double().numpy()
+    sd_ref = st["std"].reshape(-1)[:12].double().numpy()
+    m_ds = train_ds.norm_mean.reshape(-1).double().numpy()
+    s_ds = train_ds.norm_std.reshape(-1).double().numpy()
+    C = len(names)
+    A, B, unmapped = np.zeros(C), np.ones(C), []
+    for c, n in enumerate(names):
+        if n not in OLMO_S2:
+            unmapped.append(c)
+            continue
+        j = OLMO_S2.index(n)
+        x0 = np.zeros((1, 1, 1, 1, 12), np.float32); x1 = x0.copy()
+        x0[..., j], x1[..., j] = m_ds[c], m_ds[c] + s_ds[c]                  # dataset mean and mean + std (DN)
+        n0 = float(norm.normalize(Modality.SENTINEL2_L2A, x0)[..., j].reshape(-1)[0])
+        n1 = float(norm.normalize(Modality.SENTINEL2_L2A, x1)[..., j].reshape(-1)[0])
+        # z_ds = 0 -> n0 ; z_ds = 1 -> n1 ; then z-score with the distillation statistics
+        A[c] = (n0 - mu_ref[j]) / sd_ref[j]
+        B[c] = (n1 - n0) / sd_ref[j]
+    return torch.tensor(A).float(), torch.tensor(B).float(), unmapped
+
+
 class OlmoEarthExtractor(nn.Module):
     def __init__(self, ckpt, dataset_name, train_ds, patch=2, timestamp=(15, 6, 2018), dim=768,
                  input_norm="pretrain", ref_stats=None):
