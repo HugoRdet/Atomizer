@@ -56,6 +56,25 @@ def seed_all(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
 
 
+# ------------------------------------------------------------------------------------------------ kNN descriptors
+def pool_all(f, names, chunk=256):
+    """Cached features f [N, D, H, W] (or [N, D] already pooled) -> {name: [N, D'] float32 CPU}, in chunks."""
+    out = {n: [] for n in names}
+    for i in range(0, f.shape[0], chunk):
+        x = torch.from_numpy(np.asarray(f[i:i + chunk], np.float32))
+        if x.ndim == 2:                                                    # enc_last: one vector per image
+            for n in names:
+                out[n].append(x)
+            continue
+        x = x.flatten(2)                                                   # [n, D, HW]
+        mean, mx = x.mean(2), x.amax(2)
+        d = {"mean": mean, "max": mx, "meanmax": torch.cat([mean, mx], 1),
+             "meanstd": torch.cat([mean, x.std(2)], 1)}
+        for n in names:
+            out[n].append(d[n])
+    return {n: torch.cat(v) for n, v in out.items()}
+
+
 # ------------------------------------------------------------------------------------------------ feature cache
 @torch.no_grad()
 def cache_split(ext, loader, path: Path, dev):
@@ -251,6 +270,14 @@ def main():
     ap.add_argument("--enc_bs", type=int, default=4, help="encoder batch size (512x512 tiles: 1-2)")
     ap.add_argument("--val_every", type=int, default=5)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--knn_k", type=int, nargs="+", default=[20], help="kNN neighbours (several values: one result each)")
+    ap.add_argument("--knn_T", type=float, default=0.07, help="kNN vote temperature: weight exp(cos / T) (DINO)")
+    ap.add_argument("--knn_pool", nargs="+", default=["mean"], choices=["mean", "max", "meanmax", "meanstd"],
+                    help="image descriptor from the per-pixel features: mean (protocol), max, concat(mean, max), "
+                         "concat(mean, std)")
+    ap.add_argument("--knn_norm", nargs="+", default=["none"], choices=["none", "center", "standardize"],
+                    help="before the cosine: none (protocol), subtract the train mean, or per-dimension z-score "
+                         "with train statistics")
     ap.add_argument("--out", default="./eval_results/distill_ptv3")
     a = ap.parse_args()
 
@@ -308,6 +335,12 @@ def main():
         del ext, net; torch.cuda.empty_cache()
         enc_stats = json.load(open(cdir / "train" / "stats.json"))
 
+        pooled = {}
+        if a.protocol == "knn":
+            for sp in ("train", "test"):
+                full = Cached(cdir / sp)
+                pooled[sp] = pool_all(full.f, a.knn_pool)
+
         for frac in a.label_fracs:
             for seed in a.seeds:
                 seed_all(seed)
@@ -316,11 +349,27 @@ def main():
                 if a.protocol == "knn":
                     if task != "cls":
                         raise ValueError("knn is for classification")
-                    def pool(d):
-                        x = np.asarray(d.f[d.idx.numpy()], np.float32)
-                        return torch.from_numpy(x.mean((2, 3)) if x.ndim == 4 else x).to(dev)
-                    pred = knn_classify(pool(tr), tr.y[tr.idx].to(dev), pool(te), n_cls=K)
-                    r = {"test": {"top1": cls_accuracy(pred.cpu(), te.y)}}
+                    ftr_all, fte = pooled["train"], pooled["test"]
+                    ytr = tr.y[tr.idx].to(dev)
+                    for pname in a.knn_pool:
+                        xtr, xte = ftr_all[pname][tr.idx].to(dev), fte[pname][te.idx].to(dev)
+                        for norm in a.knn_norm:
+                            if norm == "none":
+                                ntr, nte = xtr, xte
+                            else:
+                                mu = xtr.mean(0, keepdim=True)
+                                sd = xtr.std(0, keepdim=True).clamp_min(1e-6) if norm == "standardize" else 1.0
+                                ntr, nte = (xtr - mu) / sd, (xte - mu) / sd
+                            for k in a.knn_k:
+                                pred = knn_classify(ntr, ytr, nte, k=min(k, len(ntr)), T=a.knn_T, n_cls=K)
+                                var = f"pool={pname} norm={norm} k={k}"
+                                rv = {"test": {"top1": cls_accuracy(pred.cpu(), te.y[te.idx]), "main": None},
+                                      "variant": var, "seed": seed, "label_frac": frac, "n_train": len(tr)}
+                                rv["test"]["main"] = rv["test"]["top1"]
+                                results.append(rv)
+                                print(f"[{a.dataset}|knn|{ck_tag}|frac {frac}|seed {seed}] {var:38s} "
+                                      f"test top-1 {rv['test']['top1']:.2f}")
+                    continue
                 else:
                     D = tr.f.shape[2] if task == "seg_temporal" else tr.f.shape[1]
                     head, agg = make_head(task, a.protocol, D, K)
@@ -352,13 +401,16 @@ def main():
 
     # summary: mean +- std over seeds per label fraction
     summary = {}
+    variants = sorted({r.get("variant") for r in results}, key=lambda v: (v is None, str(v)))
     for frac in a.label_fracs:
-        rs = [r for r in results if r["label_frac"] == frac]
-        for split in ("val", "test"):
-            v = [r[split].get("main", r[split].get("top1")) for r in rs if split in r]
-            if v:
-                summary[f"{split}@{frac}"] = {"mean": float(np.mean(v)), "std": float(np.std(v)), "n_seeds": len(v)}
-    tag = f"{a.dataset}_{a.protocol}_{ck_tag}_bn{a.bn_mode}"
+        for var in variants:
+            rs = [r for r in results if r["label_frac"] == frac and r.get("variant") == var]
+            for split in ("val", "test"):
+                v = [r[split].get("main", r[split].get("top1")) for r in rs if split in r]
+                if v:
+                    key = f"{split}@{frac}" + (f" | {var}" if var else "")
+                    summary[key] = {"mean": float(np.mean(v)), "std": float(np.std(v)), "n_seeds": len(v)}
+    tag = f"{a.dataset}_{a.protocol}_{ck_tag}_bn{a.bn_mode}" + (f"_{a.feature}" if a.protocol == "knn" else "")
     json.dump({"args": vars(a), "encoder_pass": enc_stats, "summary": summary, "results": results},
               open(out / f"{tag}.json", "w"), indent=1, default=float)
     print(json.dumps(summary, indent=1))
