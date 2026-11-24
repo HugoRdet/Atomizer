@@ -66,11 +66,12 @@ class DenseExtractor(nn.Module):
     With PTv3.norm: ln the three are identical."""
 
     def __init__(self, net: AtomizerPTv3, bn_mode: str = "batch", time_idx_override: float | None = -1.0,
-                 feature: str = "dec0"):
+                 feature: str = "dec0", mask_channels=None):
         """feature: 'dec0'     decoder level-0 per-pixel features [B, dec_channels[0], H, W] (what distillation trained)
                     'enc_last' last encoder stage (coarsest level), mean over each sample's points [B, enc_channels[-1]]"""
         super().__init__()
         self.net, self.bn_mode, self.time_override, self.feature = net, bn_mode, time_idx_override, feature
+        self.mask_channels = sorted(int(c) for c in (mask_channels or []))   # channels whose atoms are masked
         self.net.head = None
         cfg = self.net.backbone.cfg
         if feature == "dec0":
@@ -115,6 +116,12 @@ class DenseExtractor(nn.Module):
         HW = H * W
         if N != C * HW:
             raise RuntimeError(f"{N} tokens != C*H*W = {C}*{H}*{W} (token subsampling must be off)")
+        if self.mask_channels:                                               # e.g. B10, never seen in distillation
+            if max(self.mask_channels) >= C:
+                raise ValueError(f"mask_channels {self.mask_channels} out of range for {C} channels")
+            mask = (mask if mask.dtype == torch.bool else mask > 0.5).clone().view(B, C, HW)
+            mask[:, self.mask_channels] = True
+            mask = mask.view(B, N)
         if self.time_override is not None:
             tokens = tokens.clone(); tokens[..., 7] = self.time_override     # distillation used time_idx = -1
         tok = tokens.view(B, C, HW, Dt).transpose(1, 2)
