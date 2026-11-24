@@ -255,6 +255,9 @@ def main():
     ap.add_argument("--olmo_patch", type=int, default=None, help="default: distill.olmo_patch (2)")
     ap.add_argument("--olmo_ts", type=int, nargs=3, default=[15, 6, 2018],
                     help="timestamp triple for datasets without dates (same format as the OlmoEarth h5 'timestamps')")
+    ap.add_argument("--olmo_norm", choices=["pretrain", "dataset"], default="pretrain",
+                    help="--model olmoearth input normalization: pretraining stats, or the evaluation dataset's own "
+                         "stats mapped onto the pretraining distribution (the OlmoEarth paper sweeps both)")
     ap.add_argument("--bn_mode", choices=["batch", "eval", "recal"], default="batch")
     ap.add_argument("--multi_temporal", type=int, default=6, help="PASTIS frames per sample")
     ap.add_argument("--feature", choices=["dec0", "enc_last"], default="dec0",
@@ -300,7 +303,7 @@ def main():
             raise ValueError("--olmo_ckpt needed (not found in distill config)")
         if a.protocol == "finetune":
             raise NotImplementedError("OlmoEarth is evaluated frozen only")
-        ck_tag = f"olmoearth_p{a.olmo_patch}"
+        ck_tag = f"olmoearth_p{a.olmo_patch}" + ("_dsnorm" if a.olmo_norm == "dataset" else "")
         a.bn_mode = "eval"
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 
@@ -320,7 +323,8 @@ def main():
         if a.model == "olmoearth":
             from training.eval_ptv3.features_olmo import OlmoEarthExtractor
             net = None
-            ext = OlmoEarthExtractor(a.olmo_ckpt, a.dataset, dsets["train"], a.olmo_patch, a.olmo_ts).to(dev)
+            ext = OlmoEarthExtractor(a.olmo_ckpt, a.dataset, dsets["train"], a.olmo_patch, a.olmo_ts,
+                                     input_norm=a.olmo_norm, ref_stats=dcfg["distill"]["olmo_stats"]).to(dev)
         else:
             net = build_net(dcfg, lookup, K, ckpt)
             ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0, a.feature).to(dev)
@@ -337,7 +341,7 @@ def main():
 
         pooled = {}
         if a.protocol == "knn":
-            for sp in ("train", "test"):
+            for sp in ("train", "validation", "test"):
                 full = Cached(cdir / sp)
                 pooled[sp] = pool_all(full.f, a.knn_pool)
 
@@ -353,22 +357,25 @@ def main():
                     ytr = tr.y[tr.idx].to(dev)
                     for pname in a.knn_pool:
                         xtr, xte = ftr_all[pname][tr.idx].to(dev), fte[pname][te.idx].to(dev)
+                        xva = pooled["validation"][pname][va.idx].to(dev)
                         for norm in a.knn_norm:
                             if norm == "none":
-                                ntr, nte = xtr, xte
+                                ntr, nte, nva = xtr, xte, xva
                             else:
                                 mu = xtr.mean(0, keepdim=True)
                                 sd = xtr.std(0, keepdim=True).clamp_min(1e-6) if norm == "standardize" else 1.0
-                                ntr, nte = (xtr - mu) / sd, (xte - mu) / sd
+                                ntr, nte, nva = (xtr - mu) / sd, (xte - mu) / sd, (xva - mu) / sd
                             for k in a.knn_k:
-                                pred = knn_classify(ntr, ytr, nte, k=min(k, len(ntr)), T=a.knn_T, n_cls=K)
+                                kk = min(k, len(ntr))
+                                pred = knn_classify(ntr, ytr, nte, k=kk, T=a.knn_T, n_cls=K)
+                                pv = knn_classify(ntr, ytr, nva, k=kk, T=a.knn_T, n_cls=K)
                                 var = f"pool={pname} norm={norm} k={k}"
-                                rv = {"test": {"top1": cls_accuracy(pred.cpu(), te.y[te.idx]), "main": None},
+                                acc_t, acc_v = cls_accuracy(pred.cpu(), te.y[te.idx]), cls_accuracy(pv.cpu(), va.y[va.idx])
+                                rv = {"test": {"top1": acc_t, "main": acc_t}, "val": {"top1": acc_v, "main": acc_v},
                                       "variant": var, "seed": seed, "label_frac": frac, "n_train": len(tr)}
-                                rv["test"]["main"] = rv["test"]["top1"]
                                 results.append(rv)
                                 print(f"[{a.dataset}|knn|{ck_tag}|frac {frac}|seed {seed}] {var:38s} "
-                                      f"test top-1 {rv['test']['top1']:.2f}")
+                                      f"val top-1 {acc_v:.2f}  test top-1 {acc_t:.2f}")
                     continue
                 else:
                     D = tr.f.shape[2] if task == "seg_temporal" else tr.f.shape[1]

@@ -25,7 +25,13 @@ DATASET_S2 = {
 
 
 class OlmoEarthExtractor(nn.Module):
-    def __init__(self, ckpt, dataset_name, train_ds, patch=2, timestamp=(15, 6, 2018), dim=768):
+    def __init__(self, ckpt, dataset_name, train_ds, patch=2, timestamp=(15, 6, 2018), dim=768,
+                 input_norm="pretrain", ref_stats=None):
+        """input_norm: 'pretrain' = OlmoEarth's Normalizer with its pretraining statistics (L2A);
+        'dataset' = the same, then each band re-standardized with the EVALUATION dataset's own statistics and mapped to
+        the per-band mean/std that OlmoEarth-normalized pretraining data has (ref_stats: the distillation olmo_stats
+        file, OLMO_S2 order). The OlmoEarth paper sweeps both ('computed during pretraining vs. on the evaluation set');
+        'dataset' removes the L1C (GEO-Bench) vs L2A (pretraining) offset, band by band."""
         super().__init__()
         if dataset_name not in DATASET_S2:
             raise NotImplementedError(f"OlmoEarth input mapping not written yet for {dataset_name}")
@@ -43,7 +49,25 @@ class OlmoEarthExtractor(nn.Module):
         self.mean = train_ds.norm_mean.reshape(1, -1, 1, 1).float()          # dataset z-score stats (raw DN units)
         self.std = train_ds.norm_std.reshape(1, -1, 1, 1).float()
         self._printed = False
-        print(f"[olmo] {ckpt} | patch {patch} | S2 from {dataset_name} channels {self.s2_idx} | no S1 | ts {self.ts}")
+        self.input_norm, self.remap = input_norm, None
+        if input_norm == "dataset":
+            if ref_stats is None:
+                raise ValueError("input_norm 'dataset' needs ref_stats (distill olmo_stats file)")
+            st = torch.load(ref_stats, weights_only=True)
+            mu_ref = st["mean"].reshape(-1)[:12].numpy().astype(np.float64)
+            sd_ref = st["std"].reshape(-1)[:12].numpy().astype(np.float64)
+            # dataset mean / mean+std (raw DN) through OlmoEarth's per-band affine normalizer -> dataset stats there
+            m = self.mean.reshape(-1)[self.s2_idx].numpy().astype(np.float32)
+            s = self.std.reshape(-1)[self.s2_idx].numpy().astype(np.float32)
+            nm = self.norm.normalize(Modality.SENTINEL2_L2A, m.reshape(1, 1, 1, 1, 12)).reshape(12).astype(np.float64)
+            ns = self.norm.normalize(Modality.SENTINEL2_L2A, (m + s).reshape(1, 1, 1, 1, 12)).reshape(12).astype(np.float64)
+            sd_ds = np.abs(ns - nm).clip(1e-6)
+            self.remap = (nm, sd_ds, mu_ref, sd_ref)
+            print("[olmo] input norm 'dataset': normalized band means", nm.round(3), "-> pretraining", mu_ref.round(3))
+        elif input_norm != "pretrain":
+            raise ValueError(f"input_norm must be 'pretrain' or 'dataset', got {input_norm!r}")
+        print(f"[olmo] {ckpt} | patch {patch} | S2 from {dataset_name} channels {self.s2_idx} | no S1 | ts {self.ts} "
+              f"| input norm {input_norm}")
 
     def set_mode(self, trainable):
         self.model.eval()
@@ -54,6 +78,9 @@ class OlmoEarthExtractor(nn.Module):
         raw = img.cpu() * self.std + self.mean
         s2 = raw[:, self.s2_idx].permute(0, 2, 3, 1)[:, :, :, None, :]       # [B, H, W, 1, 12] raw DN
         s2n = self.norm.normalize(self.Modality.SENTINEL2_L2A, s2.numpy().astype(np.float32))
+        if self.remap is not None:                                           # evaluation-set statistics
+            nm, sd_ds, mu_ref, sd_ref = self.remap
+            s2n = ((s2n - nm) / sd_ds * sd_ref + mu_ref).astype(np.float32)
         if not self._printed:
             print("[olmo] normalized S2 percentiles 1/50/99:", np.percentile(s2n, [1, 50, 99]).round(2),
                   "(distillation data was roughly in [0, 1])")
