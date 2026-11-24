@@ -255,6 +255,9 @@ def main():
     ap.add_argument("--olmo_patch", type=int, default=None, help="default: distill.olmo_patch (2)")
     ap.add_argument("--olmo_ts", type=int, nargs=3, default=[15, 6, 2018],
                     help="timestamp triple for datasets without dates (same format as the OlmoEarth h5 'timestamps')")
+    ap.add_argument("--mask_channels", type=int, nargs="+", default=None,
+                    help="Atomizer student: dataset channels whose atoms are masked (e.g. EuroSAT B10 = 10, as "
+                         "OlmoEarth gets only the 12 bands it was trained on)")
     ap.add_argument("--olmo_norm", choices=["pretrain", "dataset"], default="pretrain",
                     help="--model olmoearth input normalization: pretraining stats, or the evaluation dataset's own "
                          "stats mapped onto the pretraining distribution (the OlmoEarth paper sweeps both)")
@@ -291,6 +294,8 @@ def main():
     ds_cfg = read_yaml(a.ds_config) if a.ds_config else None
     ckpt = None if a.ckpt == "none" else a.ckpt
     ck_tag = "random" if ckpt is None else f"{Path(ckpt).parent.name}_{Path(ckpt).stem}"
+    if a.mask_channels:
+        ck_tag += "_mask" + "-".join(map(str, a.mask_channels))
     if a.feature != "dec0":
         if task != "cls" or a.model != "atomizer" or a.protocol == "finetune":
             raise ValueError("--feature enc_last: classification, frozen Atomizer-PTv3 only")
@@ -327,7 +332,8 @@ def main():
                                      input_norm=a.olmo_norm, ref_stats=dcfg["distill"]["olmo_stats"]).to(dev)
         else:
             net = build_net(dcfg, lookup, K, ckpt)
-            ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0, a.feature).to(dev)
+            ext = DenseExtractor(net, a.bn_mode, None if a.keep_time_idx else -1.0, a.feature,
+                                 mask_channels=a.mask_channels).to(dev)
         for p in ext.parameters():
             p.requires_grad_(False)
         ext.set_mode(False)
