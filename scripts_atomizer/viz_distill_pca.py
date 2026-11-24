@@ -3,40 +3,39 @@ viz_distill_pca.py -- standalone PCA figures and mimicry scores for a distillati
 
 Where it goes: scripts_atomizer/viz_distill_pca.py
 
-Loads a Lightning checkpoint of Model_Distill (any student: Atomiser_Unet or AtomizerPTv3), runs both teachers and the
-student on a few validation tiles of each dataset, and writes one figure per dataset plus a score table.
+Loads a Lightning checkpoint of Model_Distill (Atomiser_Unet or AtomizerPTv3 student), runs the student ONCE per batch and
+EVERY teacher of each dataset (distill.olmo_teachers, e.g. olmo + smarties; distill.flair_teachers, e.g. dino + pano),
+each on its own grid (AnyUp-gridded teachers use teacher_patch: pano / smarties), on the same validation tiles. One
+figure per (dataset, teacher), one score line each.
 
-    export PYTHONPATH=/path/to/PointTransformerV3/src:$PYTHONPATH      # PTv3 student
-    python scripts_atomizer/viz_distill_pca.py --config training/configs/config_distill_ptv3.yaml \
-        --ckpt ./checkpoints/distill/ptv3_distill_s42/last.ckpt --n 6 --out ./viz_pca/ptv3_s42
+    export PYTHONPATH=/path/to/PointTransformerV3/src:$PYTHONPATH
+    python scripts_atomizer/viz_distill_pca.py --config training/configs/config_distill_ptv3_base_elev.yaml \
+        --bands_yaml ./data/bands_info/bands_elev.yaml \
+        --ckpt ./checkpoints/distill/ptv3_base_elev_s42/last.ckpt --n 6 --tiles 32 --batch 8 --out ./viz_pca/base_elev
+Options: --view CROP UP (FLAIR view, default flair_crop 1), --teachers dino pano (subset),
+         --keep_flair 3 4 / --keep_olmo ... (the student sees only these channels, the teachers everything: e.g. the
+         cross-modal NIR + elevation case), --datasets olmo flair.
+--bands_yaml must be the file used for training (bands_elev.yaml with flair_elevation), or the band indices differ.
 
 Figure columns, one row per tile:
     input | teacher PCA | student PCA (teacher scale) | student PCA (own scale) | 1 - cos
           [| student pixels PCA (shared) | student pixels PCA (per image)]
-  * the PCA basis is fitted on the (standardized) teacher tokens of the figure and applied to the student's predictions,
-    which live in the same space: same axes, so the hues are comparable;
-  * "teacher scale" stretches the student with the teacher's 1-99 % range (shows how much of the teacher's amplitude it
-    reproduces), "own scale" with its own range (shows its pattern even when the amplitude is still small);
-  * 1 - cos per teacher token, with a colour bar (0 = identical direction, 1 = unrelated);
-  * PTv3 student: its per-pixel level-0 features (before the average over each teacher patch), rank-equalized colours,
-    (shared) one PCA basis fitted on the pixels of all shown tiles, so colours are comparable across rows;
-    (per image) a PCA basis fitted on each tile alone: shows the tile's own dominant variations, including any pattern
-    tied to position (grid, stripes, window or patch borders) that the shared basis can hide. The label gives the
-    fraction of that tile's feature variance carried by its 3 components.
+  * the PCA basis is fitted on the (standardized) teacher tokens of the figure and applied to the student's predictions
+    for that teacher (same space): same axes, so the hues are comparable;
+  * "teacher scale" stretches the student with the teacher's 1-99 % range, "own scale" with its own range;
+  * 1 - cos per teacher token (0 = identical direction, 1 = unrelated);
+  * PTv3 student: per-pixel level-0 features (before pooling), rank-equalized colours; (shared) one basis over the
+    shown tiles; (per image) one basis per tile (shows position-tied patterns such as edge lines), with the fraction
+    of that tile's feature variance carried by its 3 components.
 
-Scores (printed and saved to scores.txt), per dataset, over the figure's tiles:
-    cos(student, teacher)     mean cosine between student prediction and teacher token
-    cos(image mean, teacher)  same for a trivial predictor that outputs each image's average teacher token
-    spread                    std of the student along the teacher's top-3 PCA axes / std of the teacher
-A student that mimics the teacher has cos(student) clearly above the image-mean baseline and a spread near 1.
+Scores (printed, and APPENDED to <out>/scores.txt with the checkpoint and step), per (dataset, teacher), over --tiles:
+    cos     student vs teacher token          global  cosine of the per-image mean tokens
+    local   cosine of the deviations from the image mean (within-image structure)
+    oracle  the teacher's own image mean vs its tokens (a reference, not a baseline to beat)
+    spread  std of the student / teacher along the teacher's top-3 PCA axes (1 = full amplitude)
+Scores are comparable across checkpoints of one run, not across teacher sets (each teacher has its own scale).
 
-BatchNorm (PTv3 with norm "bn"): the running statistics mix the two datasets, so by default (--bn batch) BatchNorm
-layers normalize each (single-dataset) batch with its own statistics, as in training. --bn eval uses the running
-statistics instead. No effect on LayerNorm models.
-
-Batch: the student runs on --batch tiles at once (default: distill.batch_per_dataset, the training batch), so
-per-batch BatchNorm statistics come from as many tiles as in training. --tiles N scores N tiles per dataset in several
-forward passes (e.g. --tiles 128 --batch 32: 4 passes). The figure shows the first --n tiles.
+BatchNorm (norm "bn" only): --bn batch (default) normalizes each batch with its own statistics; no effect with LN.
 """
 import argparse
 import os
@@ -115,67 +114,109 @@ def input_rgb(name, teacher_in, n):
     return torch.stack(out).cpu()
 
 
+def mask_channels(batch, keep):
+    """Student-side band subset (as the band sets of training): atoms of the channels NOT in `keep` are masked."""
+    if keep is None:
+        return batch
+    grp = batch["groups"][next(iter(batch["groups"]))]
+    C, H, W = (int(x) for x in grp["shape"])
+    B = grp["tokens"].shape[0]
+    drop = [c for c in range(C) if c not in keep]
+    if not drop:
+        return batch
+    m = grp["mask"].clone().bool().view(B, C, H * W)
+    m[:, drop] = True
+    grp["mask"] = m.view(B, -1)
+    grp["tokens"] = grp["tokens"].clone()
+    grp["tokens"][..., 0] = grp["tokens"][..., 0].masked_fill(grp["mask"], 0.0)
+    return batch
+
+
+def teachers_of(model, name):
+    if name == "olmo":
+        return list(getattr(model, "olmo_teachers", [model.layout["olmo"]["teacher"]]))
+    return list(getattr(model, "flair_teachers", [model.layout["flair"]["teacher"]]))
+
+
 @torch.no_grad()
-def run_chunk(model, name, ds, idx, dev):
-    """One forward pass on the tiles `idx` (one batch)."""
+def run_chunk(model, name, ds, idx, dev, view, keep, teachers):
+    """One forward pass of the student on the tiles `idx`, then every teacher of the dataset on its own grid."""
     L = model.layout[name]
-    t, hw, patch = L["teacher"], L["hw"], L["patch"]
-    batch = to_device(collate_distill([ds[i] for i in idx]), dev)
+    tp = getattr(model, "teacher_patch", {})                   # AnyUp-gridded teachers: tile px per token
+    if name == "flair":
+        crop, up = view
+        items = [ds[(i, crop, up)] for i in idx]
+        hw, patch_default = crop, 16 // up
+    else:
+        items = [ds[i] for i in idx]
+        hw, patch_default, up = L["hw"], L["patch"], 1
+    batch = to_device(mask_channels(collate_distill(items), keep), dev)
     tokens = batch["groups"][next(iter(batch["groups"]))]["tokens"]
-    g = hw // patch
+    tin = dict(batch["teacher"], up=float(up)) if name == "flair" else batch["teacher"]
     amp = torch.autocast(dev.type, dtype=torch.bfloat16) if dev.type == "cuda" else torch.autocast("cpu", enabled=False)
+    out = {}
     with amp:
-        tgt = model._teacher(t)(batch["teacher"])                                  # [B, g, g, D]
-        assert tgt.shape[1] == g and tgt.shape[2] == g, f"teacher grid {tuple(tgt.shape[1:3])} != {g}"
-        tgt = model.tnorm[t](tgt.flatten(1, 2), 0.0)                                # standardized, no stats update
+        batch["patch"] = patch_default
         m = int(float(model.dc.get("m_factor", 1.3)) * L["k"])
-        d0, geom = model.student.encode(batch, L["k"], m)
-        q = token_centers_from_tokens(tokens, hw, hw, patch)
-        pred = model.student.predict(t, d0, geom, q)
-    tgt, pred = tgt.float().cpu(), pred.float().cpu()
+        d0, geom = model.student.encode(batch, L["k"], m)                       # once per batch
+        for t in teachers:
+            pt = tp.get(t, patch_default)
+            g = hw // pt
+            tgt = model._teacher(t)(dict(tin, out_side=g) if t in tp else tin)  # [B, g, g, D]
+            assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}: teacher grid {tuple(tgt.shape[1:3])} != {g}"
+            tgt = model.tnorm[t](tgt.flatten(1, 2), 0.0)                         # standardized, no stats update
+            q = token_centers_from_tokens(tokens, hw, hw, pt)
+            pred = model.student.predict(t, d0, geom, q)
+            out[t] = dict(tgt=tgt.float().cpu(), pred=pred.float().cpu(), g=g)
     dense = getattr(model.student, "last_dense", None)
     dense = None if dense is None else dense[:len(idx)].float().cpu()
-    return dict(idx=idx, tgt=tgt, pred=pred, g=g, img=input_rgb(name, batch["teacher"], len(idx)), dense=dense)
+    return out, input_rgb(name, batch["teacher"], len(idx)), dense
 
 
-def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep):
-    """n_tiles validation tiles in forward passes of `batch` tiles. Teacher targets and student predictions of all tiles
-    are kept (CPU) for the scores; images and per-pixel features only for the first `keep` tiles (the figure)."""
+def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, teachers):
+    """n_tiles validation tiles in passes of `batch`. Targets / predictions of all tiles kept (CPU) for the scores;
+    images and per-pixel features only for the first `keep_n` tiles (the figures)."""
     rng = np.random.default_rng(seed)
     idx = rng.choice(len(ds), size=min(n_tiles, len(ds)), replace=False).tolist()
-    tgts, preds, imgs, denses, g = [], [], [], [], None
+    acc = {t: dict(tgt=[], pred=[], g=None) for t in teachers}
+    imgs, denses = [], []
     for s0 in range(0, len(idx), batch):
-        chunk = idx[s0:s0 + batch]
-        r = run_chunk(model, name, ds, chunk, dev)
-        tgts.append(r["tgt"]); preds.append(r["pred"]); g = r["g"]
-        need = keep - sum(x.shape[0] for x in imgs)
+        out, img, dense = run_chunk(model, name, ds, idx[s0:s0 + batch], dev, view, keep, teachers)
+        for t, r in out.items():
+            acc[t]["tgt"].append(r["tgt"]); acc[t]["pred"].append(r["pred"]); acc[t]["g"] = r["g"]
+        need = keep_n - sum(x.shape[0] for x in imgs)
         if need > 0:
-            imgs.append(r["img"][:need])
-            if r["dense"] is not None:
-                denses.append(r["dense"][:need])
+            imgs.append(img[:need])
+            if dense is not None:
+                denses.append(dense[:need])
         print(f"[viz] {name}: {min(s0 + batch, len(idx))}/{len(idx)} tiles")
-    return dict(idx=idx, tgt=torch.cat(tgts), pred=torch.cat(preds), g=g, img=torch.cat(imgs),
-                dense=torch.cat(denses) if denses else None)
+    res = {t: dict(idx=idx, tgt=torch.cat(a["tgt"]), pred=torch.cat(a["pred"]), g=a["g"]) for t, a in acc.items()}
+    return res, torch.cat(imgs), (torch.cat(denses) if denses else None)
 
 
 def scores(tgt, pred):
+    """cos: student vs teacher token | global: per-image mean tokens | local: deviations from the image mean (the
+    within-image structure) | oracle: the teacher's own image mean (a reference, not a baseline to beat) | spread:
+    std of the student / teacher along the teacher's top-3 PCA axes."""
     cos_s = F.cosine_similarity(pred, tgt, dim=-1)                                  # [B, M]
-    base = tgt.mean(dim=1, keepdim=True).expand_as(tgt)                             # image-mean predictor
-    cos_b = F.cosine_similarity(base, tgt, dim=-1)
+    mt, mp = tgt.mean(dim=1, keepdim=True), pred.mean(dim=1, keepdim=True)
+    cos_g = F.cosine_similarity(mp[:, 0], mt[:, 0], dim=-1)                         # [B]
+    cos_l = F.cosine_similarity(pred - mp, tgt - mt, dim=-1)                        # [B, M]
+    cos_o = F.cosine_similarity(mt.expand_as(tgt), tgt, dim=-1)
     D = tgt.shape[-1]
     mu, V = pca3(tgt.reshape(-1, D))
     zt, zp = (tgt.reshape(-1, D) - mu) @ V, (pred.reshape(-1, D) - mu) @ V
     spread = float(zp.std(0).mean() / (zt.std(0).mean() + 1e-12))
-    return dict(cos_student=float(cos_s.mean()), cos_image_mean=float(cos_b.mean()), spread=spread,
-                cos_per_image=cos_s.mean(1).tolist(), base_per_image=cos_b.mean(1).tolist())
+    return dict(cos=float(cos_s.mean()), glob=float(cos_g.mean()), local=float(cos_l.mean()), oracle=float(cos_o.mean()),
+                spread=spread, cos_per_image=cos_s.mean(1).tolist(), local_per_image=cos_l.mean(1).tolist())
 
 
-def render(name, r, sc, path, title):
+def render(label, r, sc, img, dense, path, title):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    tgt, pred, g, img, dense = r["tgt"], r["pred"], r["g"], r["img"], r["dense"]
+    tgt, pred, g = r["tgt"], r["pred"], r["g"]
     n, M, D = tgt.shape
     mu, V = pca3(tgt.reshape(-1, D))
     zt, zp = (tgt - mu) @ V, (pred - mu) @ V
@@ -195,7 +236,7 @@ def render(name, r, sc, path, title):
             cdi.append(equalize((Xi - mui) @ Vi).reshape(*x.shape[:2], 3))
             fvi.append(fv)
 
-    cols = ["input", "teacher PCA", "student PCA\n(teacher scale)", "student PCA\n(own scale)", "1 - cos"]
+    cols = ["input", f"teacher PCA\n{g}x{g}", "student PCA\n(teacher scale)", "student PCA\n(own scale)", "1 - cos"]
     if cd is not None:
         cols += ["student pixels PCA\n(shared)", "student pixels PCA\n(per image)"]
     fig, ax = plt.subplots(n, len(cols), figsize=(2.3 * len(cols), 2.3 * n + 0.6), squeeze=False)
@@ -209,15 +250,15 @@ def render(name, r, sc, path, title):
             ax[i, 5].imshow(cd[i].numpy(), interpolation="nearest")
             ax[i, 6].imshow(cdi[i].numpy(), interpolation="nearest")
             ax[i, 6].set_xlabel(f"top-3 var {fvi[i]:.0%}", fontsize=7)
-        ax[i, 0].set_ylabel(f"#{r['idx'][i]}\ncos {sc['cos_per_image'][i]:.2f} | base {sc['base_per_image'][i]:.2f}",
+        ax[i, 0].set_ylabel(f"#{r['idx'][i]}\ncos {sc['cos_per_image'][i]:.2f} | local {sc['local_per_image'][i]:.2f}",
                             fontsize=7)
         for a in ax[i]:
             a.set_xticks([]); a.set_yticks([])
     for j, c in enumerate(cols):
         ax[0, j].set_title(c, fontsize=9)
     fig.colorbar(im, ax=ax[:, 4], fraction=0.05, pad=0.02, label="1 - cos")
-    fig.suptitle(f"{title} | {name}: cos(student) {sc['cos_student']:.3f} vs cos(image mean) "
-                 f"{sc['cos_image_mean']:.3f} | spread x{sc['spread']:.2f}", fontsize=9)
+    fig.suptitle(f"{title} | {label}: cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
+                 f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f}", fontsize=9)
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
 
@@ -233,11 +274,19 @@ def main():
                     help="tiles per dataset for the scores, run in forward passes of --batch (default: --batch)")
     ap.add_argument("--seed", type=int, default=0, help="which validation tiles")
     ap.add_argument("--datasets", nargs="+", default=["olmo", "flair"], choices=["olmo", "flair"])
+    ap.add_argument("--teachers", nargs="+", default=None, help="subset of the teachers (default: all of each dataset)")
+    ap.add_argument("--view", type=int, nargs=2, default=None, metavar=("CROP", "UP"),
+                    help="FLAIR view (default: flair_crop 1); must be one of distill.flair_views")
+    ap.add_argument("--keep_olmo", type=int, nargs="+", default=None,
+                    help="student sees only these Sentinel channels (OLMO_S2 order + VV 12, VH 13); teachers see all")
+    ap.add_argument("--keep_flair", type=int, nargs="+", default=None,
+                    help="student sees only these FLAIR channels (0 R, 1 G, 2 B, 3 NIR, 4 ELEV), e.g. 3 4")
     ap.add_argument("--out", default="./viz_pca")
     ap.add_argument("--bn", default="batch", choices=["batch", "eval"],
-                    help="BatchNorm statistics: per batch (as in training) or running (eval mode)")
+                    help="BatchNorm statistics: per batch (as in training) or running (eval mode); no effect with LN")
     ap.add_argument("--configs_dataset", default="./data/Tiny_BigEarthNet/configs_dataset_u_regular.yaml")
-    ap.add_argument("--bands_yaml", default="./data/bands_info/bands.yaml")
+    ap.add_argument("--bands_yaml", default="./data/bands_info/bands.yaml",
+                    help="the SAME bands file as training (bands_elev.yaml for configs with flair_elevation)")
     args = ap.parse_args()
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -264,7 +313,8 @@ def main():
     tiles = max(int(args.tiles or batch), args.n)
     if hasattr(model.student, "dense_keep"):
         model.student.dense_keep = args.n
-    print(f"[viz] {tiles} tiles per dataset in forward passes of {batch}, figure shows {args.n}")
+    view = tuple(args.view) if args.view else (int(config["distill"]["flair_crop"]), 1)
+    print(f"[viz] {tiles} tiles per dataset in forward passes of {batch}, figure shows {args.n}; FLAIR view {view}")
     print(f"[viz] {n_bn} BatchNorm layers, statistics: {args.bn if n_bn else 'n/a (no BatchNorm)'}")
 
     dm = DistillDataModule(config, lookup, bands)
@@ -273,20 +323,26 @@ def main():
     title = f"{os.path.basename(os.path.dirname(os.path.abspath(args.ckpt)))} step {ck.get('global_step', '?')}"
     lines = []
     for name in args.datasets:
-        r = run_dataset(model, name, getattr(dm, f"{name}_val"), tiles, batch, args.seed, dev, args.n)
-        sc = scores(r["tgt"], r["pred"])                                  # all tiles
-        k = min(args.n, len(r["idx"]))
-        shown = dict(idx=r["idx"][:k], tgt=r["tgt"][:k], pred=r["pred"][:k], g=r["g"], img=r["img"][:k],
-                     dense=None if r["dense"] is None else r["dense"][:k])
-        sc_shown = dict(sc, cos_per_image=sc["cos_per_image"][:k], base_per_image=sc["base_per_image"][:k])
-        path = os.path.join(args.out, f"pca_{name}.png")
-        render(name, shown, sc_shown, path, title)
-        line = (f"{name:6s} cos(student, teacher) {sc['cos_student']:.3f} | cos(image mean, teacher) "
-                f"{sc['cos_image_mean']:.3f} | spread x{sc['spread']:.2f} | {len(r['idx'])} tiles -> {path}")
-        print(line)
-        lines.append(line)
-    with open(os.path.join(args.out, "scores.txt"), "w") as f:
-        f.write(f"{args.ckpt}\n" + "\n".join(lines) + "\n")
+        teachers = [t for t in teachers_of(model, name) if args.teachers is None or t in args.teachers]
+        if not teachers:
+            continue
+        keep = args.keep_olmo if name == "olmo" else args.keep_flair
+        res, img, dense = run_dataset(model, name, getattr(dm, f"{name}_val"), tiles, batch, args.seed, dev, args.n,
+                                      view, keep, teachers)
+        tag = (name if name == "olmo" else f"flair_c{view[0]}_x{view[1]}") + (f"_keep{''.join(map(str, keep))}" if keep else "")
+        for t, r in res.items():
+            sc = scores(r["tgt"], r["pred"])                                       # all tiles
+            k = min(args.n, len(r["idx"]))
+            shown = dict(idx=r["idx"][:k], tgt=r["tgt"][:k], pred=r["pred"][:k], g=r["g"])
+            sc_shown = dict(sc, cos_per_image=sc["cos_per_image"][:k], local_per_image=sc["local_per_image"][:k])
+            path = os.path.join(args.out, f"pca_{tag}_{t}.png")
+            render(f"{tag} / {t}", shown, sc_shown, img[:k], None if dense is None else dense[:k], path, title)
+            line = (f"{tag:22s} {t:9s} cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
+                    f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f} | grid {r['g']} | {len(r['idx'])} tiles -> {path}")
+            print(line)
+            lines.append(line)
+    with open(os.path.join(args.out, "scores.txt"), "a") as f:
+        f.write(f"{args.ckpt} (step {ck.get('global_step', '?')})\n" + "\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
