@@ -139,7 +139,7 @@ def teachers_of(model, name):
 
 
 @torch.no_grad()
-def run_chunk(model, name, ds, idx, dev, view, keep, teachers):
+def run_chunk(model, name, ds, idx, dev, view, keep, teachers, tnorm="batch"):
     """One forward pass of the student on the tiles `idx`, then every teacher of the dataset on its own grid."""
     L = model.layout[name]
     tp = getattr(model, "teacher_patch", {})                   # AnyUp-gridded teachers: tile px per token
@@ -164,7 +164,11 @@ def run_chunk(model, name, ds, idx, dev, view, keep, teachers):
             g = hw // pt
             tgt = model._teacher(t)(dict(tin, out_side=g) if t in tp else tin)  # [B, g, g, D]
             assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}: teacher grid {tuple(tgt.shape[1:3])} != {g}"
-            tgt = model.tnorm[t](tgt.flatten(1, 2), 0.0)                         # standardized, no stats update
+            tgt = tgt.flatten(1, 2).float()
+            if tnorm == "batch":                 # as in training: this batch's own per-channel statistics
+                tgt = (tgt - tgt.mean(dim=(0, 1))) / tgt.std(dim=(0, 1)).clamp(min=model.tnorm[t].eps)
+            else:                                # running (EMA) statistics stored in the checkpoint
+                tgt = model.tnorm[t](tgt, 0.0)
             q = token_centers_from_tokens(tokens, hw, hw, pt)
             pred = model.student.predict(t, d0, geom, q)
             out[t] = dict(tgt=tgt.float().cpu(), pred=pred.float().cpu(), g=g)
@@ -173,7 +177,7 @@ def run_chunk(model, name, ds, idx, dev, view, keep, teachers):
     return out, input_rgb(name, batch["teacher"], len(idx)), dense
 
 
-def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, teachers):
+def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, teachers, tnorm="batch"):
     """n_tiles validation tiles in passes of `batch`. Targets / predictions of all tiles kept (CPU) for the scores;
     images and per-pixel features only for the first `keep_n` tiles (the figures)."""
     rng = np.random.default_rng(seed)
@@ -181,7 +185,7 @@ def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, 
     acc = {t: dict(tgt=[], pred=[], g=None) for t in teachers}
     imgs, denses = [], []
     for s0 in range(0, len(idx), batch):
-        out, img, dense = run_chunk(model, name, ds, idx[s0:s0 + batch], dev, view, keep, teachers)
+        out, img, dense = run_chunk(model, name, ds, idx[s0:s0 + batch], dev, view, keep, teachers, tnorm)
         for t, r in out.items():
             acc[t]["tgt"].append(r["tgt"]); acc[t]["pred"].append(r["pred"]); acc[t]["g"] = r["g"]
         need = keep_n - sum(x.shape[0] for x in imgs)
@@ -281,6 +285,10 @@ def main():
                     help="student sees only these Sentinel channels (OLMO_S2 order + VV 12, VH 13); teachers see all")
     ap.add_argument("--keep_flair", type=int, nargs="+", default=None,
                     help="student sees only these FLAIR channels (0 R, 1 G, 2 B, 3 NIR, 4 ELEV), e.g. 3 4")
+    ap.add_argument("--tnorm", default="batch", choices=["batch", "ema"],
+                    help="teacher target standardization: batch = each batch's own statistics, as in training "
+                         "(default; scores do not depend on which FLAIR view preceded the checkpoint); ema = the "
+                         "running statistics stored in the checkpoint (what validation uses)")
     ap.add_argument("--out", default="./viz_pca")
     ap.add_argument("--bn", default="batch", choices=["batch", "eval"],
                     help="BatchNorm statistics: per batch (as in training) or running (eval mode); no effect with LN")
@@ -328,7 +336,7 @@ def main():
             continue
         keep = args.keep_olmo if name == "olmo" else args.keep_flair
         res, img, dense = run_dataset(model, name, getattr(dm, f"{name}_val"), tiles, batch, args.seed, dev, args.n,
-                                      view, keep, teachers)
+                                      view, keep, teachers, args.tnorm)
         tag = (name if name == "olmo" else f"flair_c{view[0]}_x{view[1]}") + (f"_keep{''.join(map(str, keep))}" if keep else "")
         for t, r in res.items():
             sc = scores(r["tgt"], r["pred"])                                       # all tiles
@@ -337,7 +345,7 @@ def main():
             sc_shown = dict(sc, cos_per_image=sc["cos_per_image"][:k], local_per_image=sc["local_per_image"][:k])
             path = os.path.join(args.out, f"pca_{tag}_{t}.png")
             render(f"{tag} / {t}", shown, sc_shown, img[:k], None if dense is None else dense[:k], path, title)
-            line = (f"{tag:22s} {t:9s} cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
+            line = (f"{tag:22s} {t:9s} [{args.tnorm}] cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
                     f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f} | grid {r['g']} | {len(r['idx'])} tiles -> {path}")
             print(line)
             lines.append(line)
