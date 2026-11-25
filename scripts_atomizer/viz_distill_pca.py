@@ -12,17 +12,21 @@ figure per (dataset, teacher), one score line each.
     python scripts_atomizer/viz_distill_pca.py --config training/configs/config_distill_ptv3_base_elev.yaml \
         --bands_yaml ./data/bands_info/bands_elev.yaml \
         --ckpt ./checkpoints/distill/ptv3_base_elev_s42/last.ckpt --n 6 --tiles 32 --batch 8 --out ./viz_pca/base_elev
+Sentinel: OlmoEarth is also run at patch 4 by default (--olmo_patch_extra 4): teacher 'olmo@4' (32 x 32 tokens of 4 x 4
+px), the student's OlmoEarth head applied to its features pooled over 4 x 4 px; files pca_olmo_olmo_p4.png.
 Options: --view CROP UP (FLAIR view, default flair_crop 1), --teachers dino pano (subset),
          --keep_flair 3 4 / --keep_olmo ... (the student sees only these channels, the teachers everything: e.g. the
          cross-modal NIR + elevation case), --datasets olmo flair.
 --bands_yaml must be the file used for training (bands_elev.yaml with flair_elevation), or the band indices differ.
 
 Figure columns, one row per tile:
-    input | teacher PCA | student PCA (teacher scale) | student PCA (own scale) | 1 - cos
+    input | teacher PCA | teacher PCA (per image) | student PCA (teacher basis) | 1 - cos
           [| student pixels PCA (shared) | student pixels PCA (per image)]
-  * the PCA basis is fitted on the (standardized) teacher tokens of the figure and applied to the student's predictions
-    for that teacher (same space): same axes, so the hues are comparable;
-  * "teacher scale" stretches the student with the teacher's 1-99 % range, "own scale" with its own range;
+  * teacher PCA: one basis fitted on the (standardized) teacher tokens of all shown tiles; the student's predictions for
+    that teacher are projected on the same basis and stretched with the teacher's 1-99 % range (same axes and scale,
+    so hues AND amplitude are comparable);
+  * teacher PCA (per image): a basis fitted on each tile's own teacher tokens: the structure the teacher sees in that
+    tile, to compare with the student's per-image pixel PCA; label = variance carried by its 3 components;
   * 1 - cos per teacher token (0 = identical direction, 1 = unrelated);
   * PTv3 student: per-pixel level-0 features (before pooling), rank-equalized colours; (shared) one basis over the
     shown tiles; (per image) one basis per tile (shows position-tied patterns such as edge lines), with the fraction
@@ -132,9 +136,13 @@ def mask_channels(batch, keep):
     return batch
 
 
-def teachers_of(model, name):
+def teachers_of(model, name, olmo_extra=()):
+    """Teachers of a dataset; for Sentinel also 'olmo@<p>': OlmoEarth run at patch size p (the student's OlmoEarth head
+    applied to its features pooled over p x p pixels), e.g. olmo@4 = OlmoEarth's usual evaluation patch size."""
     if name == "olmo":
-        return list(getattr(model, "olmo_teachers", [model.layout["olmo"]["teacher"]]))
+        ts = list(getattr(model, "olmo_teachers", [model.layout["olmo"]["teacher"]]))
+        base = int(model.layout["olmo"]["patch"])
+        return ts + [f"olmo@{p}" for p in olmo_extra if int(p) != base and "olmo" in ts]
     return list(getattr(model, "flair_teachers", [model.layout["flair"]["teacher"]]))
 
 
@@ -160,17 +168,26 @@ def run_chunk(model, name, ds, idx, dev, view, keep, teachers, tnorm="batch"):
         m = int(float(model.dc.get("m_factor", 1.3)) * L["k"])
         d0, geom = model.student.encode(batch, L["k"], m)                       # once per batch
         for t in teachers:
-            pt = tp.get(t, patch_default)
+            base, _, pp = t.partition("@")                                      # "olmo@4": OlmoEarth at patch 4
+            pt = int(pp) if pp else tp.get(t, patch_default)
             g = hw // pt
-            tgt = model._teacher(t)(dict(tin, out_side=g) if t in tp else tin)  # [B, g, g, D]
+            teacher = model._teacher(base)
+            if pp:                                                              # same OlmoEarth, other patch size
+                old, teacher.patch = teacher.patch, pt
+                try:
+                    tgt = teacher(tin)
+                finally:
+                    teacher.patch = old
+            else:
+                tgt = teacher(dict(tin, out_side=g) if t in tp else tin)        # [B, g, g, D]
             assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}: teacher grid {tuple(tgt.shape[1:3])} != {g}"
             tgt = tgt.flatten(1, 2).float()
             if tnorm == "batch":                 # as in training: this batch's own per-channel statistics
-                tgt = (tgt - tgt.mean(dim=(0, 1))) / tgt.std(dim=(0, 1)).clamp(min=model.tnorm[t].eps)
+                tgt = (tgt - tgt.mean(dim=(0, 1))) / tgt.std(dim=(0, 1)).clamp(min=model.tnorm[base].eps)
             else:                                # running (EMA) statistics stored in the checkpoint
-                tgt = model.tnorm[t](tgt, 0.0)
+                tgt = model.tnorm[base](tgt, 0.0)
             q = token_centers_from_tokens(tokens, hw, hw, pt)
-            pred = model.student.predict(t, d0, geom, q)
+            pred = model.student.predict(base, d0, geom, q)
             out[t] = dict(tgt=tgt.float().cpu(), pred=pred.float().cpu(), g=g)
     dense = getattr(model.student, "last_dense", None)
     dense = None if dense is None else dense[:len(idx)].float().cpu()
@@ -226,7 +243,12 @@ def render(label, r, sc, img, dense, path, title):
     zt, zp = (tgt - mu) @ V, (pred - mu) @ V
     ct = stretch(zt, zt).reshape(n, g, g, 3)
     cp_t = stretch(zp, zt).reshape(n, g, g, 3)                                     # teacher's scale
-    cp_o = stretch(zp, zp).reshape(n, g, g, 3)                                     # student's own scale
+    cti, tvi = [], []                                                              # teacher PCA per image
+    for x in tgt:
+        mui, Vi, fv = pca3_var(x)
+        zi = (x - mui) @ Vi
+        cti.append(stretch(zi, zi).reshape(g, g, 3))
+        tvi.append(fv)
     err = (1 - F.cosine_similarity(pred, tgt, dim=-1)).reshape(n, g, g)
     cd = None
     if dense is not None:
@@ -240,15 +262,16 @@ def render(label, r, sc, img, dense, path, title):
             cdi.append(equalize((Xi - mui) @ Vi).reshape(*x.shape[:2], 3))
             fvi.append(fv)
 
-    cols = ["input", f"teacher PCA\n{g}x{g}", "student PCA\n(teacher scale)", "student PCA\n(own scale)", "1 - cos"]
+    cols = ["input", f"teacher PCA\n{g}x{g}", "teacher PCA\n(per image)", "student PCA\n(teacher basis)", "1 - cos"]
     if cd is not None:
         cols += ["student pixels PCA\n(shared)", "student pixels PCA\n(per image)"]
     fig, ax = plt.subplots(n, len(cols), figsize=(2.3 * len(cols), 2.3 * n + 0.6), squeeze=False)
     for i in range(n):
         ax[i, 0].imshow(img[i].numpy())
         ax[i, 1].imshow(ct[i].numpy(), interpolation="nearest")
-        ax[i, 2].imshow(cp_t[i].numpy(), interpolation="nearest")
-        ax[i, 3].imshow(cp_o[i].numpy(), interpolation="nearest")
+        ax[i, 2].imshow(cti[i].numpy(), interpolation="nearest")
+        ax[i, 2].set_xlabel(f"top-3 var {tvi[i]:.0%}", fontsize=7)
+        ax[i, 3].imshow(cp_t[i].numpy(), interpolation="nearest")
         im = ax[i, 4].imshow(err[i].numpy(), cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
         if cd is not None:
             ax[i, 5].imshow(cd[i].numpy(), interpolation="nearest")
@@ -285,6 +308,9 @@ def main():
                     help="student sees only these Sentinel channels (OLMO_S2 order + VV 12, VH 13); teachers see all")
     ap.add_argument("--keep_flair", type=int, nargs="+", default=None,
                     help="student sees only these FLAIR channels (0 R, 1 G, 2 B, 3 NIR, 4 ELEV), e.g. 3 4")
+    ap.add_argument("--olmo_patch_extra", type=int, nargs="*", default=[4],
+                    help="also run OlmoEarth at these patch sizes on the Sentinel tiles (figure + scores 'olmo@p'); "
+                         "none: --olmo_patch_extra")
     ap.add_argument("--tnorm", default="batch", choices=["batch", "ema"],
                     help="teacher target standardization: batch = each batch's own statistics, as in training "
                          "(default; scores do not depend on which FLAIR view preceded the checkpoint); ema = the "
@@ -331,7 +357,8 @@ def main():
     title = f"{os.path.basename(os.path.dirname(os.path.abspath(args.ckpt)))} step {ck.get('global_step', '?')}"
     lines = []
     for name in args.datasets:
-        teachers = [t for t in teachers_of(model, name) if args.teachers is None or t in args.teachers]
+        teachers = [t for t in teachers_of(model, name, args.olmo_patch_extra)
+                    if args.teachers is None or t.partition("@")[0] in args.teachers]
         if not teachers:
             continue
         keep = args.keep_olmo if name == "olmo" else args.keep_flair
@@ -343,7 +370,7 @@ def main():
             k = min(args.n, len(r["idx"]))
             shown = dict(idx=r["idx"][:k], tgt=r["tgt"][:k], pred=r["pred"][:k], g=r["g"])
             sc_shown = dict(sc, cos_per_image=sc["cos_per_image"][:k], local_per_image=sc["local_per_image"][:k])
-            path = os.path.join(args.out, f"pca_{tag}_{t}.png")
+            path = os.path.join(args.out, f"pca_{tag}_{t.replace('@', '_p')}.png")
             render(f"{tag} / {t}", shown, sc_shown, img[:k], None if dense is None else dense[:k], path, title)
             line = (f"{tag:22s} {t:9s} [{args.tnorm}] cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
                     f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f} | grid {r['g']} | {len(r['idx'])} tiles -> {path}")
