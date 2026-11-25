@@ -20,13 +20,14 @@ Options: --view CROP UP (FLAIR view, default flair_crop 1), --teachers dino pano
 --bands_yaml must be the file used for training (bands_elev.yaml with flair_elevation), or the band indices differ.
 
 Figure columns, one row per tile:
-    input | teacher PCA | teacher PCA (per image) | student PCA (teacher basis) | 1 - cos
+    input | teacher PCA | student PCA (teacher basis) | teacher PCA (per image) | student PCA (per image) | 1 - cos
           [| student pixels PCA (shared) | student pixels PCA (per image)]
   * teacher PCA: one basis fitted on the (standardized) teacher tokens of all shown tiles; the student's predictions for
     that teacher are projected on the same basis and stretched with the teacher's 1-99 % range (same axes and scale,
     so hues AND amplitude are comparable);
   * teacher PCA (per image): a basis fitted on each tile's own teacher tokens: the structure the teacher sees in that
-    tile, to compare with the student's per-image pixel PCA; label = variance carried by its 3 components;
+    tile; student PCA (per image): the same for the student's predictions (after its teacher-specific head), so the
+    two per-image columns compare the structure each one sees in the tile; labels = variance of the 3 components;
   * 1 - cos per teacher token (0 = identical direction, 1 = unrelated);
   * PTv3 student: per-pixel level-0 features (before pooling), rank-equalized colours; (shared) one basis over the
     shown tiles; (per image) one basis per tile (shows position-tied patterns such as edge lines), with the fraction
@@ -243,12 +244,16 @@ def render(label, r, sc, img, dense, path, title):
     zt, zp = (tgt - mu) @ V, (pred - mu) @ V
     ct = stretch(zt, zt).reshape(n, g, g, 3)
     cp_t = stretch(zp, zt).reshape(n, g, g, 3)                                     # teacher's scale
-    cti, tvi = [], []                                                              # teacher PCA per image
-    for x in tgt:
+    cti, tvi, cpi, pvi = [], [], [], []                                            # per-image PCA: teacher, student
+    for x, y in zip(tgt, pred):
         mui, Vi, fv = pca3_var(x)
         zi = (x - mui) @ Vi
         cti.append(stretch(zi, zi).reshape(g, g, 3))
         tvi.append(fv)
+        muy, Vy, fy = pca3_var(y)                                                  # student after its teacher head
+        zy = (y - muy) @ Vy
+        cpi.append(stretch(zy, zy).reshape(g, g, 3))
+        pvi.append(fy)
     err = (1 - F.cosine_similarity(pred, tgt, dim=-1)).reshape(n, g, g)
     cd = None
     if dense is not None:
@@ -262,28 +267,31 @@ def render(label, r, sc, img, dense, path, title):
             cdi.append(equalize((Xi - mui) @ Vi).reshape(*x.shape[:2], 3))
             fvi.append(fv)
 
-    cols = ["input", f"teacher PCA\n{g}x{g}", "teacher PCA\n(per image)", "student PCA\n(teacher basis)", "1 - cos"]
+    cols = ["input", f"teacher PCA\n{g}x{g}", "student PCA\n(teacher basis)", "teacher PCA\n(per image)",
+            "student PCA\n(per image)", "1 - cos"]
     if cd is not None:
         cols += ["student pixels PCA\n(shared)", "student pixels PCA\n(per image)"]
     fig, ax = plt.subplots(n, len(cols), figsize=(2.3 * len(cols), 2.3 * n + 0.6), squeeze=False)
     for i in range(n):
         ax[i, 0].imshow(img[i].numpy())
         ax[i, 1].imshow(ct[i].numpy(), interpolation="nearest")
-        ax[i, 2].imshow(cti[i].numpy(), interpolation="nearest")
-        ax[i, 2].set_xlabel(f"top-3 var {tvi[i]:.0%}", fontsize=7)
-        ax[i, 3].imshow(cp_t[i].numpy(), interpolation="nearest")
-        im = ax[i, 4].imshow(err[i].numpy(), cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
+        ax[i, 2].imshow(cp_t[i].numpy(), interpolation="nearest")
+        ax[i, 3].imshow(cti[i].numpy(), interpolation="nearest")
+        ax[i, 3].set_xlabel(f"top-3 var {tvi[i]:.0%}", fontsize=7)
+        ax[i, 4].imshow(cpi[i].numpy(), interpolation="nearest")
+        ax[i, 4].set_xlabel(f"top-3 var {pvi[i]:.0%}", fontsize=7)
+        im = ax[i, 5].imshow(err[i].numpy(), cmap="viridis", vmin=0, vmax=1, interpolation="nearest")
         if cd is not None:
-            ax[i, 5].imshow(cd[i].numpy(), interpolation="nearest")
-            ax[i, 6].imshow(cdi[i].numpy(), interpolation="nearest")
-            ax[i, 6].set_xlabel(f"top-3 var {fvi[i]:.0%}", fontsize=7)
+            ax[i, 6].imshow(cd[i].numpy(), interpolation="nearest")
+            ax[i, 7].imshow(cdi[i].numpy(), interpolation="nearest")
+            ax[i, 7].set_xlabel(f"top-3 var {fvi[i]:.0%}", fontsize=7)
         ax[i, 0].set_ylabel(f"#{r['idx'][i]}\ncos {sc['cos_per_image'][i]:.2f} | local {sc['local_per_image'][i]:.2f}",
                             fontsize=7)
         for a in ax[i]:
             a.set_xticks([]); a.set_yticks([])
     for j, c in enumerate(cols):
         ax[0, j].set_title(c, fontsize=9)
-    fig.colorbar(im, ax=ax[:, 4], fraction=0.05, pad=0.02, label="1 - cos")
+    fig.colorbar(im, ax=ax[:, 5], fraction=0.05, pad=0.02, label="1 - cos")
     fig.suptitle(f"{title} | {label}: cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
                  f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f}", fontsize=9)
     fig.savefig(path, dpi=110, bbox_inches="tight")
