@@ -249,6 +249,16 @@ def positional_stats(pos, window=32, border=8):
     return out, M.float()
 
 
+def token_positional_share(x):
+    """x [N tiles, M tokens, D] (teacher targets or student predictions, one grid): share of the variance that depends
+    on the token's position in the tile = sum_d var_m(mean over tiles) / total variance (noise floor ~ 1 / N)."""
+    x = x.double()
+    Mx = x.mean(0)                                                       # [M, D] average token at each position
+    var_pos = Mx.var(0, unbiased=False).sum()
+    var_tot = x.reshape(-1, x.shape[-1]).var(0, unbiased=False).sum()
+    return float(var_pos / var_tot)
+
+
 def render_positional(M, st, path, title, grid):
     """PCA image of the across-tile mean feature map M (shared position pattern), with the window grid."""
     import matplotlib
@@ -441,6 +451,7 @@ def main():
         tag = (name if name == "olmo" else f"flair_c{view[0]}_x{view[1]}") + (f"_keep{''.join(map(str, keep))}" if keep else "")
         for t, r in res.items():
             sc = scores(r["tgt"], r["pred"])                                       # all tiles
+            sc["pos_t"], sc["pos_p"] = token_positional_share(r["tgt"]), token_positional_share(r["pred"])
             k = min(args.n, len(r["idx"]))
             shown = dict(idx=r["idx"][:k], tgt=r["tgt"][:k], pred=r["pred"][:k], g=r["g"])
             sc_shown = dict(sc, cos_per_image=sc["cos_per_image"][:k], local_per_image=sc["local_per_image"][:k])
@@ -448,7 +459,8 @@ def main():
             render(f"{tag} / {t}", shown, sc_shown, img[:k], None if dense is None else dense[:k], path, title,
                    grid=args.grid)
             line = (f"{tag:22s} {t:9s} [{args.tnorm}] cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
-                    f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f} | grid {r['g']} | {len(r['idx'])} tiles -> {path}")
+                    f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f} | positional share teacher "
+                    f"{sc['pos_t']:.3f} / student {sc['pos_p']:.3f} | grid {r['g']} | {len(r['idx'])} tiles -> {path}")
             print(line)
             lines.append(line)
         if pos["n"]:
