@@ -204,10 +204,16 @@ def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, 
     idx = rng.choice(len(ds), size=min(n_tiles, len(ds)), replace=False).tolist()
     acc = {t: dict(tgt=[], pred=[], g=None) for t in teachers}
     imgs, denses = [], []
+    pos = dict(sum=None, sq=None, n=0)                         # per-pixel-position sums of the student features
     for s0 in range(0, len(idx), batch):
         out, img, dense = run_chunk(model, name, ds, idx[s0:s0 + batch], dev, view, keep, teachers, tnorm)
         for t, r in out.items():
             acc[t]["tgt"].append(r["tgt"]); acc[t]["pred"].append(r["pred"]); acc[t]["g"] = r["g"]
+        if dense is not None:
+            d = dense.double()
+            pos["sum"] = d.sum(0) if pos["sum"] is None else pos["sum"] + d.sum(0)
+            pos["sq"] = (d ** 2).sum(0) if pos["sq"] is None else pos["sq"] + (d ** 2).sum(0)
+            pos["n"] += d.shape[0]
         need = keep_n - sum(x.shape[0] for x in imgs)
         if need > 0:
             imgs.append(img[:need])
@@ -215,7 +221,57 @@ def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, 
                 denses.append(dense[:need])
         print(f"[viz] {name}: {min(s0 + batch, len(idx))}/{len(idx)} tiles")
     res = {t: dict(idx=idx, tgt=torch.cat(a["tgt"]), pred=torch.cat(a["pred"]), g=a["g"]) for t, a in acc.items()}
-    return res, torch.cat(imgs), (torch.cat(denses) if denses else None)
+    return res, torch.cat(imgs), (torch.cat(denses) if denses else None), pos
+
+
+def positional_stats(pos, window=32, border=8):
+    """How much of the student's per-pixel features depends on pixel POSITION rather than content.
+    M(y, x) = feature averaged over all scored tiles at that position (content averages out, position does not).
+      positional share = sum_c var_(y,x)(M_c) / sum_c var_(tiles, y, x)(f_c)       (0 = no position dependence)
+      noise floor      ~ 1 / n_tiles (what the content left in M alone would give)
+      window share     = the part of M that repeats with period `window` (fixed attention windows) / total variance
+      border / inside  = |M - mean M| averaged within `border` px of the tile edge vs elsewhere
+    Returns (dict, M [H, W, C] float)."""
+    n = pos["n"]
+    M = pos["sum"] / n                                                    # [H, W, C]
+    var_tot = (pos["sq"] / n - M ** 2).mean((0, 1)) + M.var((0, 1), unbiased=False)   # per-channel total variance
+    var_pos = M.var((0, 1), unbiased=False)
+    H, W, C = M.shape
+    out = dict(n=n, share=float(var_pos.sum() / var_tot.sum()), floor=1.0 / n)
+    if H % window == 0 and W % window == 0 and (H > window or W > window):
+        P = M.view(H // window, window, W // window, window, C).mean((0, 2))          # [window, window, C] periodic part
+        out["window_share"] = float(P.var((0, 1), unbiased=False).sum() / var_tot.sum())
+    dev = (M - M.mean((0, 1))).norm(dim=-1)
+    ring = torch.zeros(H, W, dtype=torch.bool)
+    ring[:border] = ring[-border:] = True
+    ring[:, :border] = ring[:, -border:] = True
+    out["border"], out["inside"] = float(dev[ring].mean()), float(dev[~ring].mean())
+    return out, M.float()
+
+
+def render_positional(M, st, path, title, grid):
+    """PCA image of the across-tile mean feature map M (shared position pattern), with the window grid."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    H, W, C = M.shape
+    X = M.reshape(-1, C)
+    mu, V, fv = pca3_var(X)
+    z = (X - mu) @ V
+    fig, ax = plt.subplots(1, 2, figsize=(9, 4.6))
+    for a, img, t in ((ax[0], stretch(z, z).reshape(H, W, 3), "linear colours"),
+                      (ax[1], equalize(z).reshape(H, W, 3), "rank-equalized colours")):
+        a.imshow(img.numpy(), interpolation="nearest")
+        if grid:
+            for k in range(grid, max(H, W), grid):
+                a.axhline(k - 0.5, color="white", lw=0.6, alpha=0.7); a.axvline(k - 0.5, color="white", lw=0.6, alpha=0.7)
+        a.set_title(t, fontsize=9); a.set_xticks([]); a.set_yticks([])
+    ws = f" | {grid}-px periodic share {st['window_share']:.3f}" if "window_share" in st else ""
+    fig.suptitle(f"{title}\nstudent features averaged over {st['n']} tiles per pixel position: positional share "
+                 f"{st['share']:.3f} (noise floor ~{st['floor']:.3f}){ws} | |dev| border {st['border']:.3f} vs "
+                 f"inside {st['inside']:.3f} | top-3 var {fv:.0%}", fontsize=8)
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
 
 
 def scores(tgt, pred):
@@ -235,7 +291,7 @@ def scores(tgt, pred):
                 spread=spread, cos_per_image=cos_s.mean(1).tolist(), local_per_image=cos_l.mean(1).tolist())
 
 
-def render(label, r, sc, img, dense, path, title):
+def render(label, r, sc, img, dense, path, title, grid=0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -286,6 +342,12 @@ def render(label, r, sc, img, dense, path, title):
             ax[i, 6].imshow(cd[i].numpy(), interpolation="nearest")
             ax[i, 7].imshow(cdi[i].numpy(), interpolation="nearest")
             ax[i, 7].set_xlabel(f"top-3 var {fvi[i]:.0%}", fontsize=7)
+            if grid:                                     # attention-window grid on the per-pixel columns
+                h, w = cd.shape[1:3]
+                for j in (6, 7):
+                    for k in range(grid, max(h, w), grid):
+                        ax[i, j].axhline(k - 0.5, color="white", lw=0.5, alpha=0.6)
+                        ax[i, j].axvline(k - 0.5, color="white", lw=0.5, alpha=0.6)
         ax[i, 0].set_ylabel(f"#{r['idx'][i]}\ncos {sc['cos_per_image'][i]:.2f} | local {sc['local_per_image'][i]:.2f}",
                             fontsize=7)
         for a in ax[i]:
@@ -320,6 +382,9 @@ def main():
     ap.add_argument("--olmo_patch_extra", type=int, nargs="*", default=[4],
                     help="also run OlmoEarth at these patch sizes on the Sentinel tiles (figure + scores 'olmo@p'); "
                          "none: --olmo_patch_extra")
+    ap.add_argument("--grid", type=int, default=32,
+                    help="attention-window size: grid drawn on the per-pixel columns and the positional map, and the "
+                         "period of the 'periodic share' (0: no grid)")
     ap.add_argument("--tnorm", default="batch", choices=["batch", "ema"],
                     help="teacher target standardization: batch = each batch's own statistics, as in training "
                          "(default; scores do not depend on which FLAIR view preceded the checkpoint); ema = the "
@@ -355,7 +420,7 @@ def main():
     batch = int(args.batch or config["distill"]["batch_per_dataset"])
     tiles = max(int(args.tiles or batch), args.n)
     if hasattr(model.student, "dense_keep"):
-        model.student.dense_keep = args.n
+        model.student.dense_keep = max(args.n, batch)            # per-pixel features of every tile (positional stats)
     view = tuple(args.view) if args.view else (int(config["distill"]["flair_crop"]), 1)
     print(f"[viz] {tiles} tiles per dataset in forward passes of {batch}, figure shows {args.n}; FLAIR view {view}")
     print(f"[viz] {n_bn} BatchNorm layers, statistics: {args.bn if n_bn else 'n/a (no BatchNorm)'}")
@@ -371,7 +436,7 @@ def main():
         if not teachers:
             continue
         keep = args.keep_olmo if name == "olmo" else args.keep_flair
-        res, img, dense = run_dataset(model, name, getattr(dm, f"{name}_val"), tiles, batch, args.seed, dev, args.n,
+        res, img, dense, pos = run_dataset(model, name, getattr(dm, f"{name}_val"), tiles, batch, args.seed, dev, args.n,
                                       view, keep, teachers, args.tnorm)
         tag = (name if name == "olmo" else f"flair_c{view[0]}_x{view[1]}") + (f"_keep{''.join(map(str, keep))}" if keep else "")
         for t, r in res.items():
@@ -380,9 +445,19 @@ def main():
             shown = dict(idx=r["idx"][:k], tgt=r["tgt"][:k], pred=r["pred"][:k], g=r["g"])
             sc_shown = dict(sc, cos_per_image=sc["cos_per_image"][:k], local_per_image=sc["local_per_image"][:k])
             path = os.path.join(args.out, f"pca_{tag}_{t.replace('@', '_p')}.png")
-            render(f"{tag} / {t}", shown, sc_shown, img[:k], None if dense is None else dense[:k], path, title)
+            render(f"{tag} / {t}", shown, sc_shown, img[:k], None if dense is None else dense[:k], path, title,
+                   grid=args.grid)
             line = (f"{tag:22s} {t:9s} [{args.tnorm}] cos {sc['cos']:.3f} | global {sc['glob']:.3f} | local {sc['local']:.3f} | "
                     f"oracle {sc['oracle']:.3f} | spread x{sc['spread']:.2f} | grid {r['g']} | {len(r['idx'])} tiles -> {path}")
+            print(line)
+            lines.append(line)
+        if pos["n"]:
+            st, M = positional_stats(pos, window=args.grid or 32)
+            ppath = os.path.join(args.out, f"pca_{tag}_positional.png")
+            render_positional(M, st, ppath, f"{title} | {tag}", args.grid)
+            line = (f"{tag:22s} positional share {st['share']:.3f} (noise floor ~{st['floor']:.3f})"
+                    + (f" | {args.grid or 32}-px periodic {st['window_share']:.3f}" if "window_share" in st else "")
+                    + f" | |dev| border {st['border']:.3f} inside {st['inside']:.3f} | {st['n']} tiles -> {ppath}")
             print(line)
             lines.append(line)
     with open(os.path.join(args.out, "scores.txt"), "a") as f:
