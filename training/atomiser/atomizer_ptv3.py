@@ -63,6 +63,10 @@ Config (new optional section; defaults in brackets):
       rope_base:      [100.0] RoPE frequency base
       rope_unit:      [gsd]   coordinates are divided by this before RoPE, so
                                positions are in input pixels at every level
+      shift_windows:  [false] true = every second block of each stage attends in
+                               windows shifted by window_shift pixels (Swin), so
+                               window borders alternate (see ShiftedWindowAttention)
+      window_shift:   [window/2] shift in pixels of the level (16 for patch 1024)
 
 Ladder step "RoPE instead of CPE":  cpe: false, rope: 2d.  The stem conv is
 kept (stem: linear removes it too, i.e. no convolution left anywhere).
@@ -113,12 +117,92 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from point_transformer_v3 import Config, Point, PointTransformerV3
 from point_transformer_v3.model import _LevelOrders
-from point_transformer_v3.modules import Block, check_input, check_orders
+from point_transformer_v3.modules import Block, SerializedAttention, check_input, check_orders
 from point_transformer_v3.structure import Level, auto_depth
 from training.utils.token_building.processor import TokenProcessor
 
 
 ALL_ORDERS = ("z", "z-trans", "hilbert", "hilbert-trans")
+
+
+class ShiftedWindowAttention(SerializedAttention):
+    """Swin-style shifted windows for dense rasters, same parameters as SerializedAttention.
+
+    On a full pixel grid every serialization order cuts each level into the SAME aligned
+    window x window squares (window = sqrt(patch_size), 32 for 1024), so a pixel always attends
+    inside one fixed square. Blocks converted to this class (every second block of each stage)
+    attend inside squares shifted by `shift` pixels (window // 2), so window borders alternate
+    from one block to the next (Liu et al., Swin Transformer, 2021).
+
+    Shifting pads, it does not wrap: windows on the tile border are partial (e.g. 16 x 32), so
+    opposite edges of a tile never attend to each other (Swin's cyclic shift needs a mask for
+    that). Windows are grouped by their number of pixels and each group runs plain SDPA without
+    any mask (fast kernels). Same qkv / RoPE / proj and the same scale (head_dim ** -0.5) as the
+    base class; parameter names are unchanged, so checkpoints load either way.
+
+    Falls back to the parent's serialized attention when the level is not a full raster (point
+    clouds, missing pixels) or fits in a single window (coarse levels: already global).
+    The window plan is built once per level grid and kept in grid.cache (the encoder and decoder
+    blocks of a level share it).
+    """
+
+    window: int = 32
+    shift: int = 16
+    CHUNK = 16384                       # windows x heads per SDPA call
+
+    def _plan(self, grid):
+        key = ("shifted_windows", self.window, self.shift)
+        if key in grid.cache:
+            return grid.cache[key]
+        plan = None
+        gc = grid.grid_coord
+        N = gc.shape[0]
+        if N and not bool(gc[:, 2].any()):                                  # flat raster (z = 0)
+            x, y = gc[:, 0].long(), gc[:, 1].long()
+            Hl, Wl = int(y.max()) + 1, int(x.max()) + 1
+            B = len(grid.seq_lens)
+            if (Hl > self.window or Wl > self.window) and N == B * Hl * Wl:    # dense, several windows
+                ws, sh = self.window, self.shift
+                nwh, nww = -(-(Hl + sh) // ws), -(-(Wl + sh) // ws)
+                b = grid.batch_index().long()
+                wid = (b * nwh + (y + sh) // ws) * nww + (x + sh) // ws
+                pos = ((y + sh) % ws) * ws + (x + sh) % ws
+                perm = torch.argsort(wid * (ws * ws) + pos)
+                counts = torch.bincount(wid, minlength=B * nwh * nww)
+                starts = torch.cumsum(counts, 0) - counts
+                plan = []
+                for c in sorted(set(counts[counts > 0].tolist())):
+                    w = torch.nonzero(counts == c).flatten()
+                    idx = perm[starts[w].unsqueeze(1) + torch.arange(c, device=gc.device)]   # [nW, c] rows
+                    plan.append(idx)
+                assert sum(i.numel() for i in plan) == N, "shifted windows do not cover the level"
+        grid.cache[key] = plan
+        return plan
+
+    def forward(self, x, grid, order):
+        plan = self._plan(grid)
+        if plan is None:
+            return super().forward(x, grid, order)
+        H, hd = self.num_heads, self.head_dim
+        C = H * hd
+        qkv = self.qkv(x)
+        if self.rope is not None:
+            qkv = self.rope(qkv, grid.coord)
+        out = qkv.new_empty(x.shape[0], C)
+        for idx in plan:
+            nW, c = idx.shape
+            flat = idx.reshape(-1)
+            t = qkv.index_select(0, flat).view(nW, c, 3, H, hd)
+            q, k, v = (t[:, :, i].transpose(1, 2) for i in range(3))         # [nW, H, c, hd]
+            step = max(1, self.CHUNK // H)
+            o = torch.cat([F.scaled_dot_product_attention(q[i:i + step], k[i:i + step], v[i:i + step],
+                                                          scale=self.scale)
+                           for i in range(0, nW, step)], 0)
+            out.index_copy_(0, flat, o.transpose(1, 2).reshape(nW * c, C).to(out.dtype))
+        return self.proj(out)
+
+    def extra_repr(self):
+        return super().extra_repr() + f", shifted window={self.window} shift={self.shift}"
 
 
 class NoCpe(nn.Module):
@@ -325,6 +409,21 @@ class AtomizerPTv3(pl.LightningModule):
                     m.attn.rope = Rope2d(m.attn.head_dim, base=rope_base, unit=rope_unit)
         n_bb_after = sum(q.numel() for q in self.backbone.parameters())
 
+        # ── shifted windows (Swin): every second block of each stage ─────
+        self.shift_windows = bool(p.get("shift_windows", False))
+        n_shift = 0
+        if self.shift_windows:
+            win = int(round(math.sqrt(patch_size)))
+            if win * win != patch_size:
+                raise ValueError(f"shift_windows needs a square patch_size (window x window), got {patch_size}")
+            shift = int(p.get("window_shift", win // 2))
+            for stage in list(self.backbone.enc) + list(self.backbone.dec):
+                for i, blk in enumerate(stage.blocks):
+                    if i % 2 == 1:
+                        blk.attn.__class__ = ShiftedWindowAttention       # same parameters, new forward
+                        blk.attn.window, blk.attn.shift = win, shift
+                        n_shift += 1
+
         # ── spectral streams ─────────────────────────────────────────────
         self.mode = str(p.get("mode", "pixel"))
         if self.mode not in ("pixel", "streams"):
@@ -358,7 +457,8 @@ class AtomizerPTv3(pl.LightningModule):
               f"CPE {'on' if self.use_cpe else 'REMOVED'}, "
               f"RoPE {self.rope or 'off'}"
               + (f" (base={rope_base:g}, unit={rope_unit:g} m = 1 px)" if self.rope else "")
-              + f"; backbone params {n_bb_before/1e6:.2f}M -> {n_bb_after/1e6:.2f}M")
+              + f"; backbone params {n_bb_before/1e6:.2f}M -> {n_bb_after/1e6:.2f}M"
+              + (f"; shifted windows in {n_shift} blocks" if self.shift_windows else ""))
 
         n_tok = sum(q.numel() for q in self.input_processor.parameters())
         n_pix = sum(q.numel() for m in (self.pixel_cross_attn, self.pixel_q_norm,
