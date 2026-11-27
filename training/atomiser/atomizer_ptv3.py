@@ -63,6 +63,12 @@ Config (new optional section; defaults in brackets):
       rope_base:      [100.0] RoPE frequency base
       rope_unit:      [gsd]   coordinates are divided by this before RoPE, so
                                positions are in input pixels at every level
+      lite:           [false] true = LitePT (Yue et al., CVPR 2026): blocks of levels
+                               < conv_levels keep only their CPE (sparse conv + Linear
+                               + LayerNorm, residual), blocks above have RoPE
+                               attention + MLP and no CPE; dec_depths [0, 0, 0, 0]
+                               gives LitePT's unpooling-only decoder
+      conv_levels:    [3]     number of convolution-only levels (LitePT's L_c)
       shift_windows:  [false] true = every second block of each stage attends in
                                windows shifted by window_shift pixels (Swin), so
                                window borders alternate (see ShiftedWindowAttention)
@@ -203,6 +209,16 @@ class ShiftedWindowAttention(SerializedAttention):
 
     def extra_repr(self):
         return super().extra_repr() + f", shifted window={self.window} shift={self.shift}"
+
+
+class ConvOnlyBlock(Block):
+    """LitePT convolution block: x + drop_path(cpe(x)), where cpe = sparse 3x3(x3) conv + Linear + LayerNorm
+    (PTv3's own CPE, which is exactly LitePT's ConvBlock). No attention, no MLP: their weights are removed
+    (norm1 / attn / norm2 / mlp -> Identity). Same call and return as Block.forward."""
+
+    def forward(self, x, grid, order, cpe_input=None):
+        branch = self.drop_path(self.cpe(x if cpe_input is None else cpe_input, grid))
+        return x + branch, branch
 
 
 class NoCpe(nn.Module):
@@ -407,6 +423,25 @@ class AtomizerPTv3(pl.LightningModule):
                     if m.attn.rope is not None:
                         raise RuntimeError("block already has a RoPE (Config.rope_base set?)")
                     m.attn.rope = Rope2d(m.attn.head_dim, base=rope_base, unit=rope_unit)
+        # ── LitePT (Yue et al., CVPR 2026): conv blocks at the fine levels, RoPE attention at the coarse ones ──
+        self.lite = bool(p.get("lite", False))
+        self.conv_levels = int(p.get("conv_levels", 3))
+        if self.lite:
+            if not self.use_cpe:
+                raise ValueError("PTv3.lite needs cpe: true (the conv blocks ARE the CPE; attention blocks drop it anyway)")
+            if p.get("stem", "conv") != "linear":
+                print("[AtomizerPTv3] lite: note, stem is not 'linear' (LitePT's own stem is a 5x5 conv)")
+            stages = [(s, st) for s, st in enumerate(self.backbone.enc)] + [(s, st) for s, st in enumerate(self.backbone.dec)]
+            for level, stage in stages:                   # encoder stage s and decoder stage s work on level s
+                for blk in stage.blocks:
+                    if level < self.conv_levels:          # ConvBlock: CPE only
+                        blk.__class__ = ConvOnlyBlock
+                        blk.norm1 = blk.attn = blk.norm2 = blk.mlp = nn.Identity()
+                    else:                                 # AttnBlock: RoPE attention + MLP, no CPE
+                        blk.cpe = NoCpe()
+                        if blk.attn.rope is None:
+                            blk.attn.rope = Rope2d(blk.attn.head_dim, base=rope_base, unit=rope_unit)
+            self.use_cpe, self.rope = True, "2d"          # for the summary line: CPE in conv levels, RoPE in attention
         n_bb_after = sum(q.numel() for q in self.backbone.parameters())
 
         # ── shifted windows (Swin): every second block of each stage ─────
@@ -419,7 +454,7 @@ class AtomizerPTv3(pl.LightningModule):
             shift = int(p.get("window_shift", win // 2))
             for stage in list(self.backbone.enc) + list(self.backbone.dec):
                 for i, blk in enumerate(stage.blocks):
-                    if i % 2 == 1:
+                    if i % 2 == 1 and isinstance(blk.attn, SerializedAttention):
                         blk.attn.__class__ = ShiftedWindowAttention       # same parameters, new forward
                         blk.attn.window, blk.attn.shift = win, shift
                         n_shift += 1
@@ -458,7 +493,9 @@ class AtomizerPTv3(pl.LightningModule):
               f"RoPE {self.rope or 'off'}"
               + (f" (base={rope_base:g}, unit={rope_unit:g} m = 1 px)" if self.rope else "")
               + f"; backbone params {n_bb_before/1e6:.2f}M -> {n_bb_after/1e6:.2f}M"
-              + (f"; shifted windows in {n_shift} blocks" if self.shift_windows else ""))
+              + (f"; shifted windows in {n_shift} blocks" if self.shift_windows else "")
+              + (f"; LitePT: conv blocks at levels < {self.conv_levels}, RoPE attention (no CPE) above, decoder depths "
+                 f"{tuple(len(st.blocks) for st in self.backbone.dec)}" if self.lite else ""))
 
         n_tok = sum(q.numel() for q in self.input_processor.parameters())
         n_pix = sum(q.numel() for m in (self.pixel_cross_attn, self.pixel_q_norm,

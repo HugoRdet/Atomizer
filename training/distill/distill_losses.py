@@ -35,6 +35,38 @@ def concat_all_gather(x: torch.Tensor) -> torch.Tensor:
     return torch.cat(out, 0)
 
 
+class PositionalDebias(nn.Module):
+    """Removes a teacher's position-dependent component from its (standardized) targets x [B, M, D]: a running
+    average of the target at each of the M token positions of a FIXED grid is subtracted, so the student is asked
+    only for the part of the teacher that depends on content. Motivation: ViT teachers with absolute position
+    embeddings (SMARTIES: 13 % of its target variance depends on the token position in the tile) make the student
+    encode absolute tile position; the dihedral augmentation even forces it, since the teacher's positional pattern
+    stays fixed in the tile frame while the content rotates.
+
+    Update (training only, statistics over all ranks): mean += r * (batch_mean - mean), r = max(1 / (n + 1), momentum),
+    i.e. an exact running average for the first 1 / momentum updates, then an EMA."""
+
+    def __init__(self, num_tokens: int, dim: int, momentum: float = 1e-3):
+        super().__init__()
+        self.momentum = float(momentum)
+        self.register_buffer("mean", torch.zeros(num_tokens, dim))
+        self.register_buffer("count", torch.zeros((), dtype=torch.long))
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        xa = concat_all_gather(x.float())
+        rate = max(1.0 / (float(self.count) + 1.0), self.momentum)
+        self.mean.add_(rate * (xa.mean(0) - self.mean))
+        self.count.add_(1)
+
+    def forward(self, x: torch.Tensor, update: bool = False) -> torch.Tensor:
+        if x.shape[1:] != self.mean.shape:
+            raise ValueError(f"PositionalDebias: targets {tuple(x.shape[1:])} vs buffer {tuple(self.mean.shape)}")
+        if update:
+            self.update(x)
+        return x - self.mean
+
+
 class PatchStandardizer(nn.Module):
     """DUNE's StandardNormalizer for patch tokens x [B, M, D] (statistics over B and M, per channel)."""
 

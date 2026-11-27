@@ -41,7 +41,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from training.distill.distill_heads import DistillStudent, token_centers_from_tokens
-from training.distill.distill_losses import PatchStandardizer, distill_loss_per_image, resid_corr
+from training.distill.distill_losses import PatchStandardizer, PositionalDebias, distill_loss_per_image, resid_corr
 from training.distill.distill_optim import clip_per_parameter, make_optimizer, set_lr_wd
 from training.distill.distill_schedule import cosine_scheduler, dune_lr_schedule, tnorm_momentum_schedule
 from training.distill.teachers import DinoV3Teacher, OlmoEarthTeacher, PanopticonTeacher, SmartiesTeacher
@@ -123,6 +123,16 @@ class Model_Distill(pl.LightningModule):
         else:
             self.student = DistillStudent(config, lookup_table, self.teacher_dims, n_pre=int(dc.get("n_pre", 1)))
         self.tnorm = nn.ModuleDict({k: PatchStandardizer(d) for k, d in self.teacher_dims.items()})
+        # positional debiasing (distill.debias_position: [teacher, ...]): one running mean map per (teacher, grid)
+        self.debias = nn.ModuleDict()
+        for t in [str(x) for x in (dc.get("debias_position") or [])]:
+            if t not in self.teacher_dims:
+                raise ValueError(f"debias_position: unknown teacher {t!r} (teachers {list(self.teacher_dims)})")
+            for g in sorted(self._grids_of(t)):
+                self.debias[f"{t}_g{g}"] = PositionalDebias(g * g, self.teacher_dims[t],
+                                                            float(dc.get("debias_momentum", 1e-3)))
+        if len(self.debias):
+            print(f"[Distill] positional debiasing of the targets: {list(self.debias)}")
         print(f"[Distill] FLAIR teachers {self.flair_teachers} | views "
               + ", ".join(f"{v['tag']} (grid {v['crop'] * v['up'] // DINO_PATCH}, batch {v['batch']}, w {v['weight']:g})"
                           for v in self.views))
@@ -133,6 +143,15 @@ class Model_Distill(pl.LightningModule):
         self._val_acc = []
         self._viz, self._last = {}, None        # validation visualization buffers
         self._t_last, self.bs_global = None, None
+
+    def _grids_of(self, t):
+        """Token grid sides a teacher can produce in this run (one debias map each)."""
+        if t in ("olmo", "smarties"):
+            p = self.teacher_patch.get(t, self.layout["olmo"]["patch"])
+            return {self.layout["olmo"]["hw"] // p}
+        if t in self.teacher_patch:                                   # AnyUp-gridded FLAIR teacher (pano)
+            return {v["crop"] // self.teacher_patch[t] for v in self.views}
+        return {v["crop"] // v["patch"] for v in self.views}            # DINOv3: crop * up / 16
 
     # ------------------------------------------------------------------ teachers (lazy, on the right device)
     def _teacher(self, key):
@@ -197,6 +216,8 @@ class Model_Distill(pl.LightningModule):
                 tgt = self._teacher(t)(dict(tin, out_side=g) if t in self.teacher_patch else tin)   # [B, g, g, D]
             assert tgt.shape[1] == g and tgt.shape[2] == g, f"{t}/{tag}: teacher grid {tuple(tgt.shape[1:3])} != expected {g}"
             tgt = self.tnorm[t](tgt.flatten(1, 2), mom)                           # standardized [B, g*g, D]
+            if f"{t}_g{g}" in self.debias:                                        # minus its per-position mean
+                tgt = self.debias[f"{t}_g{g}"](tgt, update=train)
             pred = self.student.predict(t, d0, geom, q)
             loss_i, mets = distill_loss_per_image(pred, tgt)
             losses.append(loss_i.mean())

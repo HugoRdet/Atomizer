@@ -150,7 +150,7 @@ def teachers_of(model, name, olmo_extra=()):
 
 
 @torch.no_grad()
-def run_chunk(model, name, ds, idx, dev, view, keep, teachers, tnorm="batch"):
+def run_chunk(model, name, ds, idx, dev, view, keep, teachers, tnorm="batch", debias=True):
     """One forward pass of the student on the tiles `idx`, then every teacher of the dataset on its own grid."""
     L = model.layout[name]
     tp = getattr(model, "teacher_patch", {})                   # AnyUp-gridded teachers: tile px per token
@@ -189,6 +189,9 @@ def run_chunk(model, name, ds, idx, dev, view, keep, teachers, tnorm="batch"):
                 tgt = (tgt - tgt.mean(dim=(0, 1))) / tgt.std(dim=(0, 1)).clamp(min=model.tnorm[base].eps)
             else:                                # running (EMA) statistics stored in the checkpoint
                 tgt = model.tnorm[base](tgt, 0.0)
+            db = getattr(model, "debias", {})
+            if debias and f"{base}_g{g}" in db and int(db[f"{base}_g{g}"].count) > 0:   # as in training
+                tgt = db[f"{base}_g{g}"](tgt.to(db[f"{base}_g{g}"].mean.device)).float()
             q = token_centers_from_tokens(tokens, hw, hw, pt)
             pred = model.student.predict(base, d0, geom, q)
             out[t] = dict(tgt=tgt.float().cpu(), pred=pred.float().cpu(), g=g)
@@ -197,7 +200,7 @@ def run_chunk(model, name, ds, idx, dev, view, keep, teachers, tnorm="batch"):
     return out, input_rgb(name, batch["teacher"], len(idx)), dense
 
 
-def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, teachers, tnorm="batch"):
+def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, teachers, tnorm="batch", debias=True):
     """n_tiles validation tiles in passes of `batch`. Targets / predictions of all tiles kept (CPU) for the scores;
     images and per-pixel features only for the first `keep_n` tiles (the figures)."""
     rng = np.random.default_rng(seed)
@@ -206,7 +209,7 @@ def run_dataset(model, name, ds, n_tiles, batch, seed, dev, keep_n, view, keep, 
     imgs, denses = [], []
     pos = dict(sum=None, sq=None, n=0)                         # per-pixel-position sums of the student features
     for s0 in range(0, len(idx), batch):
-        out, img, dense = run_chunk(model, name, ds, idx[s0:s0 + batch], dev, view, keep, teachers, tnorm)
+        out, img, dense = run_chunk(model, name, ds, idx[s0:s0 + batch], dev, view, keep, teachers, tnorm, debias)
         for t, r in out.items():
             acc[t]["tgt"].append(r["tgt"]); acc[t]["pred"].append(r["pred"]); acc[t]["g"] = r["g"]
         if dense is not None:
@@ -392,6 +395,9 @@ def main():
     ap.add_argument("--olmo_patch_extra", type=int, nargs="*", default=[4],
                     help="also run OlmoEarth at these patch sizes on the Sentinel tiles (figure + scores 'olmo@p'); "
                          "none: --olmo_patch_extra")
+    ap.add_argument("--debias", default="auto", choices=["auto", "off"],
+                    help="auto: subtract the positional mean maps stored in the checkpoint (distill.debias_position), "
+                         "as training does; off: raw targets")
     ap.add_argument("--grid", type=int, default=32,
                     help="attention-window size: grid drawn on the per-pixel columns and the positional map, and the "
                          "period of the 'periodic share' (0: no grid)")
@@ -447,7 +453,7 @@ def main():
             continue
         keep = args.keep_olmo if name == "olmo" else args.keep_flair
         res, img, dense, pos = run_dataset(model, name, getattr(dm, f"{name}_val"), tiles, batch, args.seed, dev, args.n,
-                                      view, keep, teachers, args.tnorm)
+                                      view, keep, teachers, args.tnorm, args.debias == "auto")
         tag = (name if name == "olmo" else f"flair_c{view[0]}_x{view[1]}") + (f"_keep{''.join(map(str, keep))}" if keep else "")
         for t, r in res.items():
             sc = scores(r["tgt"], r["pred"])                                       # all tiles

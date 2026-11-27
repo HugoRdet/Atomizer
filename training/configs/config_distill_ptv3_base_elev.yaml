@@ -155,7 +155,12 @@ distill:
     smarties_dir: ./checkpoints/smarties/SMARTIES-v1-ViT-B
     smarties_anyup_dir: ./checkpoints/anyup
     smarties_patch: 2                       # AnyUp 14 x 14 -> 64 x 64 (same grid as OlmoEarth)
-    smarties_q_chunk: 256                   # AnyUp query chunk (memory)
+    smarties_q_chunk: 256
+    # positional debiasing: SMARTIES's targets are 13 % position-dependent (viz: positional share teacher 0.129),
+    # which made the student encode absolute tile position (0.17 of its pixel features); its per-position running
+    # mean is subtracted from the targets. OlmoEarth / DINOv3 / Panopticon are at the noise floor: not debiased.
+    debias_position: [smarties]
+    debias_momentum: 1.0e-3                   # AnyUp query chunk (memory)
     flair_teachers: [dino, pano]            # every FLAIR batch is supervised by both; loss = their mean
     dino_ckpt: ./checkpoints/dinov3/dinov3-vitl16-pretrain-sat493m
     dino_norm: auto                         # auto -> SAT-493M statistics
