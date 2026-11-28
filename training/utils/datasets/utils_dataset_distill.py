@@ -278,6 +278,140 @@ class OlmoSentinelAtoms(_AtomDataset):
 
 
 # ---------------------------------------------------------------------------------------------------------
+N_SLOTS, SLOT_DAYS = 12, 30
+
+
+def parse_slot_date(col):
+    """index t_first / t_last ('day-month0-year', month 0-indexed as `timestamps`) -> datetime64[D] array."""
+    import pandas as pd
+    d = col.astype(str).str.split("-", expand=True).astype(int)
+    return pd.to_datetime(dict(year=d[2], month=d[1] + 1, day=d[0])).to_numpy().astype("datetime64[D]")
+
+
+def gse_year_and_slots(t_first):
+    """t_first datetime64[D] (N,) -> (year (N,), in_year (N, 12) bool).
+    AlphaEarth (`gse`) was fetched over [t_first, t_first + 370 d] and rslearn kept the earliest annual image, dated
+    1 January of its year (olmoearth_pretrain config_google_satembedding.json + GoogleSatelliteEmbeddings):
+    year = first Y with 1 Jan Y in that range. Slot k = [t_first + 30 k, + 30 d) belongs to Y if it starts in Y."""
+    y0 = t_first.astype("datetime64[Y]")
+    year = np.where(t_first == y0.astype("datetime64[D]"), y0, y0 + 1).astype(int) + 1970
+    starts = t_first[:, None] + (np.arange(N_SLOTS) * SLOT_DAYS).astype("timedelta64[D]")
+    return year, starts.astype("datetime64[Y]").astype(int) + 1970 == year[:, None]
+
+
+class OlmoSeriesAtoms(_AtomDataset):
+    """OlmoEarth tiles as S2 + S1 time series aligned with their AlphaEarth (`gse`) year, for the temporal student.
+
+    The h5 stores only the present 30-day slots of each modality (missing_timesteps_masks); they are put back in their
+    slot. Slots outside the AlphaEarth year, or without S2, are dropped (seen as masked parts of the series); tiles with
+    fewer than `min_slots` kept slots are filtered out. Per kept slot, values follow OlmoSentinelAtoms exactly
+    (OlmoEarth normalizer, then the same per-band z-score: distill.olmo_stats), so the per-date student input is the
+    distillation input. Same dihedral augmentation on every slot and on the target.
+
+    Item: {"series": [T, 14, H, W] float (12 S2 + VV, VH; S1 = 0 where missing), "s1_ok": [T] bool,
+           "doy": [T] long (day of the AlphaEarth year at which the slot starts, 0..364), "ts": [T, 3] (day, month0, year),
+           "gse": [H, W, 64] float (x = v / 8192 - 1, unit vectors), "gse_ok": [H, W] bool, "year": int, "dataset_name"}
+    with T = number of kept slots (variable): batch with collate_series (padding + t_pad mask)."""
+    name, resolution, HW, C = "olmo_series", 10.0, 128, 14
+
+    def __init__(self, index_csv, tar_dir, split, stats_path, aug, min_slots=6, val_mod=200, require_s1=0):
+        import pandas as pd
+        assert split in ("train", "val")
+        df = pd.read_csv(index_csv, usecols=["tar", "offset", "size", "sid", "t_first", "s2_mask", "s1_mask", "mods",
+                                             "error"], dtype=str)
+        ok = df["error"].isna().to_numpy() & df["mods"].fillna("").str.contains("gse").to_numpy()
+        df = df[ok].reset_index(drop=True)
+        year, in_year = gse_year_and_slots(parse_slot_date(df["t_first"]))
+        s2, s1 = parse_masks(df["s2_mask"]), parse_masks(df["s1_mask"])
+        keep_t = s2 & in_year
+        n = keep_t.sum(1)
+        val = df["sid"].astype("int64").to_numpy() % val_mod == 0
+        keep = (n >= int(min_slots)) & ((s1 & keep_t).sum(1) >= int(require_s1)) & (val if split == "val" else ~val)
+        self.tar, self.tar_dir = df["tar"].to_numpy()[keep], tar_dir
+        self.offset = df["offset"].astype("int64").to_numpy()[keep]
+        self.size = df["size"].astype("int64").to_numpy()[keep]
+        self.year, self.keep_t = year[keep], keep_t[keep]
+        self.aug, self._fh, self._rng, self._norm = aug, {}, None, None
+        self._init_stats(stats_path, self.C, True)
+        hist = np.bincount(n[keep], minlength=13)[int(min_slots):]
+        print(f"[olmo_series {split}] {int(keep.sum())} tiles with gse and >= {min_slots} slots in the gse year "
+              f"(of {int(ok.sum())} with gse) | kept slots per tile {dict(zip(range(int(min_slots), 13), hist.tolist()))}")
+
+    def __len__(self):
+        return len(self.tar)
+
+    def _read(self, i):
+        name = str(self.tar[i])
+        if name not in self._fh:
+            self._fh[name] = open(os.path.join(self.tar_dir, name), "rb")
+        f = self._fh[name]
+        f.seek(int(self.offset[i]))
+        return f.read(int(self.size[i]))
+
+    def __getitem__(self, i):
+        import h5py
+        import hdf5plugin  # noqa: F401
+        from olmoearth_pretrain_minimal import Normalizer
+        from olmoearth_pretrain_minimal.olmoearth_pretrain_v1.utils.constants import Modality
+        if self._rng is None:
+            self._rng = np.random.default_rng(torch.initial_seed() % (2 ** 32))
+            self._norm = Normalizer(std_multiplier=2.0)
+        slots = np.flatnonzero(self.keep_t[i])                                   # kept slot indices, in time order
+        H = W = self.HW
+        with h5py.File(io.BytesIO(self._read(i)), "r") as h:
+            dense = {}
+            for key, mod, c in (("sentinel2_l2a", Modality.SENTINEL2_L2A, 12), ("sentinel1", Modality.SENTINEL1, 2)):
+                out = np.zeros((H, W, len(slots), c), np.float32)
+                ok = np.zeros(len(slots), bool)
+                if key in h:
+                    m = h[f"missing_timesteps_masks/{key}"][()].astype(bool)
+                    pos = np.cumsum(m) - 1                                       # slot -> index in the stored array
+                    have = m[slots]
+                    if have.any():
+                        a = h[key][:, :, np.sort(pos[slots[have]]), :].astype(np.float32)   # h5py: increasing indices
+                        out[:, :, have] = self._norm.normalize(mod, a[None])[0]
+                    ok = have
+                dense[key] = (out, ok)
+            ts = h["timestamps"][()][slots].astype(np.int64)
+            gse = h["gse"][()][:, :, 0, :]
+        assert dense["sentinel2_l2a"][1].all(), "kept slot without S2 (index masks disagree with the h5)"
+        s1_ok = dense["sentinel1"][1]
+        x = np.concatenate([dense["sentinel2_l2a"][0], dense["sentinel1"][0]], -1)  # (H, W, T, 14)
+        gse_ok = (gse != 0).any(-1)
+        if self.aug:
+            k, flip = int(self._rng.integers(4)), bool(self._rng.integers(2))
+            x, gse, gse_ok = dihedral(x, k, flip), dihedral(gse, k, flip), dihedral(gse_ok, k, flip)
+        x = torch.from_numpy(x).permute(2, 3, 0, 1)                              # [T, 14, H, W]
+        x = self._zscore(x)
+        x[:, 12:][~torch.from_numpy(s1_ok)] = 0.0
+        jan1 = np.datetime64(f"{int(self.year[i])}-01-01")
+        dates = np.array([np.datetime64(f"{y:04d}-{m + 1:02d}-{d:02d}") for d, m, y in ts])
+        doy = (dates - jan1).astype(int).clip(0, 364)
+        return {"series": x, "s1_ok": torch.from_numpy(s1_ok), "doy": torch.from_numpy(doy).long(),
+                "ts": torch.from_numpy(ts),
+                "gse": torch.from_numpy(gse.astype(np.float32) / 8192.0 - 1.0), "gse_ok": torch.from_numpy(gse_ok),
+                "year": int(self.year[i]), "dataset_name": self.name}
+
+
+def collate_series(samples):
+    """Variable-length series -> padded batch: series [B, Tmax, 14, H, W], t_pad [B, Tmax] (True = padding slot),
+    s1_ok / doy / ts padded with False / 0. Kept slots stay in time order at the front of each row."""
+    B, T = len(samples), max(s["series"].shape[0] for s in samples)
+    x0 = samples[0]["series"]
+    series = x0.new_zeros((B, T) + tuple(x0.shape[1:]))
+    t_pad = torch.ones(B, T, dtype=torch.bool)
+    s1_ok = torch.zeros(B, T, dtype=torch.bool)
+    doy = torch.zeros(B, T, dtype=torch.long)
+    ts = torch.zeros(B, T, 3, dtype=torch.long)
+    for b, s in enumerate(samples):
+        n = s["series"].shape[0]
+        series[b, :n], t_pad[b, :n], s1_ok[b, :n], doy[b, :n], ts[b, :n] = s["series"], False, s["s1_ok"], s["doy"], s["ts"]
+    return {"series": series, "t_pad": t_pad, "s1_ok": s1_ok, "doy": doy, "ts": ts,
+            "gse": torch.stack([s["gse"] for s in samples]), "gse_ok": torch.stack([s["gse_ok"] for s in samples]),
+            "year": torch.tensor([s["year"] for s in samples]), "dataset_name": samples[0]["dataset_name"]}
+
+
+# ---------------------------------------------------------------------------------------------------------
 class FlairAtoms(_AtomDataset):
     name, resolution = "flair", 0.2
 
