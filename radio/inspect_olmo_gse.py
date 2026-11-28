@@ -39,11 +39,21 @@ def main():
     print(f"\n== index: {int(has.sum())} / {len(df)} rows have gse ({has.mean():.1%})")
     mod_counts = Counter(m for s in df["mods"] for m in s.replace(";", ",").replace("|", ",").split(",") if m)
     print("  modality counts:", dict(mod_counts.most_common()))
+    # t_first / t_last = start dates of the first / last 30-day slot, "day-month0-year" (month 0-indexed, as `timestamps`)
+    def start(col):
+        d = col.str.split("-", expand=True).astype(int)
+        return pd.to_datetime(dict(year=d[2], month=d[1] + 1, day=d[0]), errors="coerce")
     for name, sub in (("all", df), ("gse", df[has])):
-        y0 = sub["t_first"].str[:4]
-        y1 = sub["t_last"].str[:4]
-        same = (y0 == y1).mean()
-        print(f"  {name:4s}: first-slot year {dict(Counter(y0).most_common(10))} | window inside one calendar year: {same:.1%}")
+        t0, t1 = start(sub["t_first"]), start(sub["t_last"]) + pd.Timedelta(days=30)   # end of the last slot
+        y0, y1 = t0.dt.year, t1.dt.year
+        nxt = pd.to_datetime(dict(year=y0 + 1, month=1, day=1))
+        days_y0 = (nxt.clip(upper=t1) - t0).dt.days                        # days of the window in its first year
+        major = np.where(days_y0 >= (t1 - t0).dt.days / 2, y0, y1)
+        print(f"  {name:4s}: window length days {dict(Counter((t1 - t0).dt.days).most_common(3))} | "
+              f"start in January {(t0.dt.month == 1).mean():.1%}")
+        print(f"        majority calendar year {dict(sorted(Counter(major).items()))}")
+        print(f"        days in the majority year: p5 {np.percentile(np.maximum(days_y0, (t1 - t0).dt.days - days_y0), 5):.0f}"
+              f" | median {np.median(np.maximum(days_y0, (t1 - t0).dt.days - days_y0)):.0f}")
     n_sid = df["sid"].nunique()
     print(f"  distinct sid: {n_sid} | rows per sid: {dict(Counter(df.groupby('sid').size()).most_common(5))}")
 
